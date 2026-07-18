@@ -64,20 +64,9 @@ impl MpvPlayer {
         Ok(!paused)
     }
 
-    pub fn stop(&mut self) -> Result<()> {
-        self.mpv.command("stop", &[])?;
-        self.last_render_size = None;
-        Ok(())
-    }
-
     pub fn seek_relative(&self, seconds: f64) -> Result<()> {
         self.mpv
             .command("seek", &[&seconds.to_string(), "relative+exact"])?;
-        Ok(())
-    }
-
-    pub fn seek_absolute(&self, seconds: f64) -> Result<()> {
-        self.mpv.set_property("time-pos", seconds.max(0.0))?;
         Ok(())
     }
 
@@ -96,10 +85,6 @@ impl MpvPlayer {
 
     pub fn paused(&self) -> Option<bool> {
         self.mpv.get_property("pause").ok()
-    }
-
-    pub fn title(&self) -> Option<String> {
-        self.mpv.get_property("media-title").ok()
     }
 
     /// Render a pending frame. `None` means libmpv had no new frame and the
