@@ -6,8 +6,8 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight, KeyBinding,
-    ListAlignment, ListState, ObjectFit, PathPromptOptions, Render, RenderImage, SharedString,
-    Stateful, Task, Window, actions, div, img, list, prelude::*, px, relative, rgb,
+    ListAlignment, ListState, LruImageCache, ObjectFit, PathPromptOptions, Render, RenderImage,
+    SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px, relative, rgb,
 };
 use image::{Frame, RgbaImage};
 use rpc::{
@@ -24,6 +24,7 @@ use crate::{
         client::{DaemonClient, DaemonEvent},
         reducer,
     },
+    image_cache::TimelineImageLoader,
     media_cache::MediaCache,
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::MpvPlayer,
@@ -36,6 +37,7 @@ const MIN_COMPOSER_HEIGHT: f32 = 82.0;
 const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
 const VIDEO_WIDTH: usize = 704;
 const VIDEO_HEIGHT: usize = 396;
+const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 actions!(
     chatt_gui,
@@ -75,6 +77,7 @@ pub struct ChattView {
     editing: Option<(RoomId, rpc::ids::MessageId, String)>,
     composer: gpui::Entity<Composer>,
     media_cache: Arc<Mutex<MediaCache>>,
+    image_cache: gpui::Entity<LruImageCache<TimelineImageLoader>>,
     list_state: ListState,
     player: Option<MpvPlayer>,
     active_video: Option<u64>,
@@ -98,20 +101,18 @@ impl ChattView {
         ));
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let composer = cx.new(Composer::new);
+        let image_cache =
+            LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         window.focus(&composer.focus_handle(cx), cx);
-        let (player, status) = match MpvPlayer::new() {
-            Ok(player) => (Some(player), "Discovering Chatt daemon…".into()),
-            Err(error) => (
-                None,
-                format!("Discovering daemon · video unavailable: {error}").into(),
-            ),
-        };
         let tick_task = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(25))
                     .await;
-                if this.update_in(cx, |this, _, cx| this.tick(cx)).is_err() {
+                if this
+                    .update_in(cx, |this, window, cx| this.tick(window, cx))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -125,15 +126,16 @@ impl ChattView {
             editing: None,
             composer,
             media_cache,
+            image_cache,
             list_state,
-            player,
+            player: None,
             active_video: None,
             frame: None,
             position: 0.0,
             duration: 0.0,
             paused: true,
             media_volume: 100.0,
-            status,
+            status: "Discovering Chatt daemon…".into(),
             tick_count: 0,
             _tick_task: tick_task,
         }
@@ -151,9 +153,10 @@ impl ChattView {
         BulkTransferId(id)
     }
 
-    fn tick(&mut self, cx: &mut Context<Self>) {
-        let mut changed = self.drain_daemon(cx);
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = self.drain_daemon(window, cx);
         self.tick_count = self.tick_count.wrapping_add(1);
+        let mut terminal_video_status = None;
         if let Some(player) = self.player.as_mut()
             && self.active_video.is_some()
         {
@@ -162,29 +165,42 @@ impl ChattView {
                     if let Some(buffer) =
                         RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
                     {
-                        self.frame = Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])));
+                        let next_frame = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
+                        if let Some(previous_frame) = self.frame.replace(next_frame) {
+                            cx.drop_image(previous_frame, Some(window));
+                        }
                         changed = true;
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.status = format!("Video render failed: {error}").into();
-                    changed = true;
+                    terminal_video_status = Some(format!("Video render failed: {error}"));
                 }
             }
             if self.tick_count.is_multiple_of(6) {
                 self.position = player.position().unwrap_or(self.position).max(0.0);
                 self.duration = player.duration().unwrap_or(self.duration).max(0.0);
                 self.paused = player.paused().unwrap_or(self.paused);
+                if self.duration > 0.
+                    && (player.eof_reached().unwrap_or(false)
+                        || player.idle_active().unwrap_or(false))
+                {
+                    terminal_video_status = Some("Playback finished".into());
+                }
                 changed = true;
             }
+        }
+        if let Some(status) = terminal_video_status {
+            self.release_video(window, cx);
+            self.status = status.into();
+            changed = true;
         }
         if changed {
             cx.notify();
         }
     }
 
-    fn drain_daemon(&mut self, cx: &mut Context<Self>) -> bool {
+    fn drain_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         while let Ok(event) = self.daemon_events.try_recv() {
             changed = true;
@@ -240,14 +256,19 @@ impl ChattView {
                     self.status = reason.into();
                 }
                 DaemonEvent::Frame(frame) => {
-                    self.apply_daemon_state_frame(frame, cx);
+                    self.apply_daemon_state_frame(frame, window, cx);
                 }
             }
         }
         changed
     }
 
-    fn apply_daemon_state_frame(&mut self, frame: DaemonFrame, cx: &mut Context<Self>) {
+    fn apply_daemon_state_frame(
+        &mut self,
+        frame: DaemonFrame,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let pending = match &frame {
             DaemonFrame::RequestResult(result) => {
                 self.model.pending.get(&result.request_id).cloned()
@@ -255,7 +276,13 @@ impl ChattView {
             _ => None,
         };
         let old_len = self.model.messages.len();
+        let old_selected_room = self.model.selected_room;
         let effect = reducer::apply(&mut self.model, frame);
+        if self.model.selected_room != old_selected_room {
+            self.release_video(window, cx);
+            self.image_cache
+                .update(cx, |cache, cx| cache.clear(window, cx));
+        }
         if effect.replace_messages {
             self.list_state
                 .splice(0..old_len, self.model.messages.len());
@@ -278,16 +305,11 @@ impl ChattView {
                 RequestOutcome::Accepted => {
                     self.status = format!("{} accepted", operation_label(&result.operation)).into();
                     if let Some(pending) = pending.as_ref()
-                        && matches!(
-                            pending.operation,
-                            Operation::SendMessage | Operation::EditMessage
-                        )
+                        && pending.operation == Operation::EditMessage
                         && pending.draft.as_deref() == Some(self.composer.read(cx).text().as_str())
                     {
                         self.composer.update(cx, |composer, cx| composer.clear(cx));
-                        if pending.operation == Operation::EditMessage {
-                            self.editing = None;
-                        }
+                        self.editing = None;
                     }
                 }
                 RequestOutcome::Rejected { message, .. } => {
@@ -353,6 +375,7 @@ impl ChattView {
                 },
             )
         };
+        let clears_composer_on_enqueue = operation == Operation::SendMessage;
         self.model.pending.insert(
             request_id,
             PendingRequest {
@@ -366,6 +389,9 @@ impl ChattView {
             self.model.pending.remove(&request_id);
             self.status = error.into();
         } else {
+            if clears_composer_on_enqueue {
+                self.composer.update(cx, |composer, cx| composer.clear(cx));
+            }
             self.status = "Sending…".into();
         }
         cx.notify();
@@ -884,6 +910,7 @@ impl ChattView {
                 descriptor.height.unwrap_or(3),
             );
             return img(path)
+                .image_cache(&self.image_cache)
                 .id(("image", message_id as usize))
                 .mt_2()
                 .w(px(width))
@@ -954,11 +981,16 @@ impl ChattView {
                                 if active && !self.paused { "Ⅱ" } else { "▶" },
                             )
                             .on_click(cx.listener(
-                                move |this, _, _, cx| {
+                                move |this, _, window, cx| {
                                     if this.active_video == Some(message_id) {
                                         this.toggle_playback_inner(cx);
                                     } else {
-                                        this.activate_video(message_id, play_path.clone(), cx);
+                                        this.activate_video(
+                                            message_id,
+                                            play_path.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 },
                             )),
@@ -1089,22 +1121,59 @@ impl ChattView {
         cx.notify();
     }
 
-    fn activate_video(&mut self, message_id: u64, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(player) = self.player.as_mut() else {
-            return;
-        };
-        match player.load(&path.to_string_lossy()) {
+    fn activate_video(
+        &mut self,
+        message_id: u64,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.player.is_none() {
+            match MpvPlayer::new() {
+                Ok(player) => self.player = Some(player),
+                Err(error) => {
+                    self.status = format!("Video unavailable: {error}").into();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        if let Some(frame) = self.frame.take() {
+            cx.drop_image(frame, Some(window));
+        }
+        let player = self
+            .player
+            .as_mut()
+            .expect("player was initialized immediately above");
+        let load_result = player
+            .set_volume(self.media_volume)
+            .and_then(|_| player.load(&path.to_string_lossy()));
+        match load_result {
             Ok(()) => {
                 self.active_video = Some(message_id);
-                self.frame = None;
                 self.position = 0.;
                 self.duration = 0.;
                 self.paused = false;
                 self.status = "Playing cached attachment".into();
             }
-            Err(error) => self.status = format!("Could not open video: {error}").into(),
+            Err(error) => {
+                self.player = None;
+                self.active_video = None;
+                self.status = format!("Could not open video: {error}").into();
+            }
         }
         cx.notify();
+    }
+
+    fn release_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(frame) = self.frame.take() {
+            cx.drop_image(frame, Some(window));
+        }
+        self.player = None;
+        self.active_video = None;
+        self.position = 0.;
+        self.duration = 0.;
+        self.paused = true;
     }
 
     fn toggle_playback_inner(&mut self, cx: &mut Context<Self>) {

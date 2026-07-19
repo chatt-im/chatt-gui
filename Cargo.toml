@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 env_logger = "0.11"
-gpui = { path = "/code/ref/zed/crates/gpui" }
-gpui_platform = { path = "/code/ref/zed/crates/gpui_platform", features = ["font-kit", "wayland", "x11"] }
+gpui = { path = "/code/ref/zed/crates/gpui", default-features = false, features = ["font-kit", "wayland"] }
+gpui_platform = { path = "/code/ref/zed/crates/gpui_platform", default-features = false, features = ["font-kit", "wayland"] }
 image = { version = "0.25", default-features = false }
 libmpv2 = { version = "6", default-features = false }
 libmpv2-sys = "4.0.1"

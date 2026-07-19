@@ -14,13 +14,14 @@ pub struct MpvPlayer {
     render_context: *mut sys::mpv_render_context,
     mpv: Mpv,
     last_render_size: Option<(usize, usize)>,
+    surface: AlignedSurface,
 }
 
 impl MpvPlayer {
     pub fn new() -> Result<Self> {
         let mpv = Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "libmpv")?;
-            initializer.set_option("keep-open", "yes")?;
+            initializer.set_option("keep-open", "no")?;
             initializer.set_option("idle", "yes")?;
             initializer.set_option("osc", "no")?;
             Ok(())
@@ -53,6 +54,7 @@ impl MpvPlayer {
             render_context,
             mpv,
             last_render_size: None,
+            surface: AlignedSurface::new(0),
         })
     }
 
@@ -91,6 +93,14 @@ impl MpvPlayer {
         self.mpv.get_property("pause").ok()
     }
 
+    pub fn eof_reached(&self) -> Option<bool> {
+        self.mpv.get_property("eof-reached").ok()
+    }
+
+    pub fn idle_active(&self) -> Option<bool> {
+        self.mpv.get_property("idle-active").ok()
+    }
+
     /// Render a pending frame. `None` means libmpv had no new frame and the
     /// existing GPUI image should remain on screen.
     pub fn render_frame(&mut self, width: usize, height: usize) -> Result<Option<VideoFrame>> {
@@ -117,7 +127,7 @@ impl MpvPlayer {
         let byte_len = stride
             .checked_mul(height)
             .ok_or_else(|| anyhow!("video frame is too large"))?;
-        let mut surface = AlignedSurface::new(byte_len);
+        self.surface.resize(byte_len);
         let mut size = [width as i32, height as i32];
         let mut stride_value = stride;
         let mut params = [
@@ -135,7 +145,7 @@ impl MpvPlayer {
             },
             sys::mpv_render_param {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
-                data: surface.as_mut_ptr().cast(),
+                data: self.surface.as_mut_ptr().cast(),
             },
             sys::mpv_render_param {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
@@ -149,7 +159,7 @@ impl MpvPlayer {
             unsafe { sys::mpv_render_context_render(self.render_context, params.as_mut_ptr()) };
         check_mpv(code, "render video frame")?;
 
-        let mut pixels = surface.as_bytes().to_vec();
+        let mut pixels = self.surface.as_bytes().to_vec();
         // bgr0 matches GPUI's BGRA channel order, but mpv leaves the last byte
         // unspecified. GPUI needs it to be fully opaque.
         for alpha in pixels.iter_mut().skip(3).step_by(4) {
@@ -203,6 +213,13 @@ impl AlignedSurface {
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.blocks.as_mut_ptr().cast()
+    }
+
+    fn resize(&mut self, len: usize) {
+        debug_assert_eq!(len % 64, 0);
+        self.blocks
+            .resize(len / 64, AlignedBlock { _bytes: [0; 64] });
+        self.len = len;
     }
 
     fn as_bytes(&self) -> &[u8] {

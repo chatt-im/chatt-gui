@@ -1,6 +1,7 @@
 mod app;
 mod composer;
 mod daemon;
+mod image_cache;
 mod media_cache;
 mod model;
 mod mpv_player;
