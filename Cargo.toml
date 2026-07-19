@@ -11,3 +11,7 @@ gpui_platform = { path = "/code/ref/zed/crates/gpui_platform", features = ["font
 image = { version = "0.25", default-features = false }
 libmpv2 = { version = "6", default-features = false }
 libmpv2-sys = "4.0.1"
+rpc = { path = "../chatt/crates/rpc" }
+unicode-segmentation = "1"
+aws-lc-rs = { version = "1.17", default-features = false, features = ["alloc", "non-fips"] }
+tempfile = "3"

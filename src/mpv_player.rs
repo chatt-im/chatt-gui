@@ -41,7 +41,11 @@ impl MpvPlayer {
         // SAFETY: `mpv` has been initialized, `params` is null-terminated, and
         // the render context is freed before the owning mpv handle in Drop.
         let code = unsafe {
-            sys::mpv_render_context_create(&mut render_context, mpv.ctx.as_ptr(), params.as_mut_ptr())
+            sys::mpv_render_context_create(
+                &mut render_context,
+                mpv.ctx.as_ptr(),
+                params.as_mut_ptr(),
+            )
         };
         check_mpv(code, "create software render context")?;
 
@@ -96,9 +100,8 @@ impl MpvPlayer {
 
         // SAFETY: calls on a render context stay on GPUI's foreground thread.
         let updates = unsafe { sys::mpv_render_context_update(self.render_context) };
-        let frame_pending = updates
-            & u64::from(sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME)
-            != 0;
+        let frame_pending =
+            updates & u64::from(sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME) != 0;
         let size_changed = self.last_render_size != Some((width, height));
         if !frame_pending && !size_changed {
             return Ok(None);
@@ -142,9 +145,8 @@ impl MpvPlayer {
 
         // SAFETY: all parameter pointers remain valid for the duration of this
         // synchronous call, and the output allocation is 64-byte aligned.
-        let code = unsafe {
-            sys::mpv_render_context_render(self.render_context, params.as_mut_ptr())
-        };
+        let code =
+            unsafe { sys::mpv_render_context_render(self.render_context, params.as_mut_ptr()) };
         check_mpv(code, "render video frame")?;
 
         let mut pixels = surface.as_bytes().to_vec();
