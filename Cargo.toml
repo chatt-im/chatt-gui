@@ -5,13 +5,15 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+ash = "0.38"
 async-channel = "2.5"
 env_logger = "0.11"
 gpui = { path = "/code/ref/zed/crates/gpui", default-features = false, features = ["font-kit", "wayland"] }
 gpui_platform = { path = "/code/ref/zed/crates/gpui_platform", default-features = false, features = ["font-kit", "wayland"] }
+gpui_wgpu = { path = "/code/ref/zed/crates/gpui_wgpu", features = ["font-kit"] }
 image = { version = "0.25", default-features = false }
-libmpv2 = { version = "6", default-features = false }
-libmpv2-sys = "4.0.1"
+libmpv2 = { path = "vendor/libmpv2-rs", default-features = false, features = ["render", "vendored"] }
+log = "0.4"
 markdown = { path = "/code/ref/zed/crates/markdown" }
 rpc = { package = "chatt-rpc", path = "crates/chatt_rpc" }
 settings = { path = "/code/ref/zed/crates/settings" }
@@ -28,3 +30,11 @@ codegen-units = 1
 
 [profile.release]
 debug = 1
+
+[patch.crates-io]
+naga = { path = "vendor/wgpu/naga" }
+wgpu = { path = "vendor/wgpu/wgpu" }
+wgpu-core = { path = "vendor/wgpu/wgpu-core" }
+wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }
+wgpu-naga-bridge = { path = "vendor/wgpu/wgpu-naga-bridge" }
+wgpu-types = { path = "vendor/wgpu/wgpu-types" }

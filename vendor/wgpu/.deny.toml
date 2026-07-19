@@ -1,0 +1,107 @@
+[bans]
+multiple-versions = "deny"
+skip-tree = [
+    { name = "rustc-hash", version = "1.1.0" },
+
+    # introduced by Deno, to be investigated
+    { name = "petgraph", version = "0.6.5" },
+
+    # Winit 0.30 uses an older objc2
+    { name = "objc2-foundation", version = "0.2" },
+
+    # glutin and tracy-client-sys use windows-sys 0.52, pulling older windows-targets
+    { name = "windows-targets", version = "0.52" },
+
+    # winit uses an old version via android-activity → jni
+    { name = "windows-targets", version = "0.42" },
+]
+skip = [
+    # flume -> fastrand uses an old version only on wasm32
+    { name = "getrandom", version = "0.2.17" },
+    # the ecosystem is migrating from getrandom 0.3 to 0.4, so this captures many stragglers
+    { name = "getrandom", version = "0.3.4" },
+
+    # Deno uses an old version
+    { name = "bincode", version = "1.3.3" },
+    { name = "which", version = "6.0.3" },
+
+    # Winit uses an old version via android-activity → jni
+    { name = "windows-sys", version = "0.45" },
+
+    # Winit uses an old version via calloop → rustix 0.38
+    { name = "linux-raw-sys", version = "0.4" },
+    { name = "rustix", version = "0.38" },
+    { name = "windows-sys", version = "0.59" },
+
+    # Winit uses an old version directly
+    { name = "redox_syscall", version = "0.4.1" },
+
+    # Winit uses an old version via android-activity
+    { name = "thiserror", version = "1" },
+    { name = "thiserror-impl", version = "1" },
+
+    # glutin uses an old version
+    { name = "windows-sys", version = "0.52" },
+
+    # getrandom 0.3 uses an old version
+    { name = "r-efi", version = "5" },
+
+    # parking-lot uses an old version
+    { name = "redox_syscall", version = "0.5.18" },
+
+    # deno uses an old version
+    { name = "bit-vec", version = "0.8.0" },
+    { name = "bit-set", version = "0.8.0" },
+]
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+ignore = [
+    # `paste` crate is no longer maintained https://rustsec.org/advisories/RUSTSEC-2024-0436
+    # It's a dependency of `metal` (which is to be replaced with `objc2-metal`), and a
+    # transitive dependency of `deno`. https://github.com/gfx-rs/wgpu/issues/7873
+    "RUSTSEC-2024-0436",
+    # `unic-*` crates are no longer maintained https://rustsec.org/advisories/RUSTSEC-2025-0100
+    # These are used via `deno`. https://github.com/gfx-rs/wgpu/issues/8393
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+    # `bincode` is no longer maintained https://rustsec.org/advisories/RUSTSEC-2025-0141
+    # We only use it directly for tests and tools. It is also used indirectly via deno.
+    "RUSTSEC-2025-0141",
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MPL-2.0",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+private = { ignore = true }
+
+[sources]
+allow-git = [
+    # Waiting on releases; used in examples/tests only
+
+    # Pending a release for https://github.com/rust-cli/env_logger/commit/143fa647ab33ed3acc9f160dfa3cb075cc62b5a3
+    "https://github.com/rust-cli/env_logger",
+    # Pending merge/release for https://github.com/LukasKalbertodt/libtest-mimic/pull/58
+    "https://github.com/cwfitzgerald/libtest-mimic",
+]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+
+[sources.allow-org]
+github = []

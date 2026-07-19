@@ -16,7 +16,14 @@ use gpui_platform::application;
 use crate::app::ChattView;
 
 fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("warn,chatt_gui=info,gpui_wgpu::video=info"),
+    )
+    .init();
+    log::info!(
+        "logging initialized (set RUST_LOG for Rust diagnostics and CHATT_MPV_LOG for native mpv diagnostics)"
+    );
     application().run(move |cx: &mut App| {
         fonts::load(cx);
         settings::init(cx);

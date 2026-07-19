@@ -7,11 +7,10 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight, KeyBinding,
-    ListAlignment, ListState, LruImageCache, ObjectFit, PathPromptOptions, Render, RenderImage,
-    ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px,
-    relative, rgb, rgba,
+    ListAlignment, ListState, LruImageCache, ObjectFit, PathPromptOptions, Render, ScrollWheelEvent,
+    SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px, relative, rgb,
+    rgba, surface,
 };
-use image::{Frame, RgbaImage};
 use markdown::{
     Markdown, MarkdownElement, MarkdownFont, MarkdownSelectionArea, MarkdownSelectionGroup,
     MarkdownSelectionKey, MarkdownStyle,
@@ -44,8 +43,6 @@ const SIDEBAR_WIDTH: f32 = 232.0;
 const TOP_BAR_HEIGHT: f32 = 52.0;
 const MIN_COMPOSER_HEIGHT: f32 = 82.0;
 const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
-const VIDEO_WIDTH: usize = 704;
-const VIDEO_HEIGHT: usize = 396;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SCROLL_RESPONSE_SECONDS: f32 = 0.006;
 const SCROLL_SETTLE_THRESHOLD: f32 = 0.50;
@@ -193,7 +190,6 @@ pub struct ChattView {
     player: Option<MpvPlayer>,
     video_wakeup: async_channel::Sender<()>,
     active_video: Option<u64>,
-    frame: Option<Arc<RenderImage>>,
     position: f64,
     duration: f64,
     paused: bool,
@@ -267,7 +263,6 @@ impl ChattView {
             player: None,
             video_wakeup,
             active_video: None,
-            frame: None,
             position: 0.0,
             duration: 0.0,
             paused: true,
@@ -306,17 +301,6 @@ impl ChattView {
                 }
                 Err(error) => {
                     terminal_video_status = Some(format!("Video event failed: {error}"));
-                }
-            }
-            if terminal_video_status.is_none() {
-                if let Some(frame) = player.render_frame()
-                    && let Some(buffer) =
-                        RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
-                {
-                    let next_frame = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
-                    if let Some(previous_frame) = self.frame.replace(next_frame) {
-                        cx.drop_image(previous_frame, Some(window));
-                    }
                 }
             }
         }
@@ -1144,7 +1128,9 @@ impl ChattView {
             && let Some(path) = cache_path
         {
             let active = self.active_video == Some(message_id);
-            let frame = active.then(|| self.frame.clone()).flatten();
+            let video_surface = active
+                .then(|| self.player.as_ref().map(MpvPlayer::surface))
+                .flatten();
             let progress = if active && self.duration > 0. {
                 (self.position / self.duration).clamp(0., 1.) as f32
             } else {
@@ -1154,22 +1140,22 @@ impl ChattView {
             return div()
                 .id(("video", message_id as usize))
                 .mt_2()
-                .w(px(704.))
-                .max_w_full()
+                .w_full()
                 .border_1()
                 .border_color(rgb(if active { 0x596a90 } else { 0x292d34 }))
                 .bg(rgb(0x08090b))
                 .child(
                     div()
-                        .h(px(396.))
+                        .w_full()
+                        .aspect_ratio(16. / 9.)
                         .flex()
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
-                        .when_some(frame, |viewport, frame| {
-                            viewport.child(img(frame).size_full().object_fit(ObjectFit::Contain))
+                        .when_some(video_surface, |viewport, video_surface| {
+                            viewport.child(surface(video_surface).size_full())
                         })
-                        .when(!active || self.frame.is_none(), |viewport| {
+                        .when(!active, |viewport| {
                             viewport.child(
                                 div()
                                     .flex()
@@ -1449,11 +1435,11 @@ impl ChattView {
         &mut self,
         message_id: u64,
         path: PathBuf,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.player.is_none() {
-            match MpvPlayer::new(self.video_wakeup.clone(), VIDEO_WIDTH, VIDEO_HEIGHT) {
+            match MpvPlayer::new(self.video_wakeup.clone()) {
                 Ok(player) => self.player = Some(player),
                 Err(error) => {
                     self.status = format!("Video unavailable: {error}").into();
@@ -1461,9 +1447,6 @@ impl ChattView {
                     return;
                 }
             }
-        }
-        if let Some(frame) = self.frame.take() {
-            cx.drop_image(frame, Some(window));
         }
         let player = self
             .player
@@ -1489,10 +1472,7 @@ impl ChattView {
         cx.notify();
     }
 
-    fn release_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(frame) = self.frame.take() {
-            cx.drop_image(frame, Some(window));
-        }
+    fn release_video(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.player = None;
         self.active_video = None;
         self.position = 0.;
