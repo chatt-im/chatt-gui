@@ -32,7 +32,8 @@ use crate::{
 
 const SIDEBAR_WIDTH: f32 = 232.0;
 const TOP_BAR_HEIGHT: f32 = 52.0;
-const COMPOSER_HEIGHT: f32 = 82.0;
+const MIN_COMPOSER_HEIGHT: f32 = 82.0;
+const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
 const VIDEO_WIDTH: usize = 704;
 const VIDEO_HEIGHT: usize = 396;
 
@@ -55,7 +56,11 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
         KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
-        KeyBinding::new("space", TogglePlayback, Some("Chatt")),
+        KeyBinding::new(
+            "space",
+            TogglePlayback,
+            Some("Chatt && !ChattComposer"),
+        ),
         KeyBinding::new("left", SeekBack, Some("Chatt")),
         KeyBinding::new("right", SeekForward, Some("Chatt")),
     ]);
@@ -1465,7 +1470,7 @@ impl Render for ChattView {
                     })
                     .child(
                         div()
-                            .h(px(COMPOSER_HEIGHT))
+                            .min_h(px(MIN_COMPOSER_HEIGHT))
                             .flex_none()
                             .px_4()
                             .pt_3()
@@ -1475,7 +1480,7 @@ impl Render for ChattView {
                             .bg(rgb(0x111317))
                             .child(
                                 div()
-                                    .h_full()
+                                    .min_h(px(MIN_COMPOSER_FRAME_HEIGHT))
                                     .flex()
                                     .items_center()
                                     .gap_3()

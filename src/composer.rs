@@ -49,8 +49,9 @@ pub struct Composer {
     selected: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
+    last_layout: Vec<ComposerLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    last_line_height: Option<Pixels>,
 }
 
 impl Composer {
@@ -62,8 +63,9 @@ impl Composer {
             selected: 0..0,
             reversed: false,
             marked: None,
-            last_layout: None,
+            last_layout: Vec::new(),
             last_bounds: None,
+            last_line_height: None,
         }
     }
 
@@ -77,12 +79,14 @@ impl Composer {
         self.content = "".into();
         self.selected = 0..0;
         self.marked = None;
+        self.last_layout.clear();
         cx.notify();
     }
     pub fn restore(&mut self, text: String, cx: &mut Context<Self>) {
         let end = text.len();
         self.content = text.into();
         self.selected = end..end;
+        self.last_layout.clear();
         cx.notify();
     }
 
@@ -205,6 +209,34 @@ impl Composer {
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
+
+    fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
+        let local = self.last_bounds?.localize(&point)?;
+        let line_height = self.last_line_height?;
+        let line_index = ((local.y / line_height).floor() as usize)
+            .min(self.last_layout.len().checked_sub(1)?);
+        let line = &self.last_layout[line_index];
+        let offset = line.layout.closest_index_for_x(local.x);
+        Some(line.range.start + offset)
+    }
+}
+
+fn logical_lines(text: &str) -> impl Iterator<Item = (Range<usize>, &str)> {
+    let mut start = 0;
+    text.split('\n')
+        .map(move |line| {
+            let end = start + line.len();
+            let range = start..end;
+            start = end + 1;
+            (range, line)
+        })
+}
+
+fn line_for_offset(lines: &[ComposerLine], offset: usize) -> Option<&ComposerLine> {
+    lines
+        .iter()
+        .find(|line| offset <= line.range.end)
+        .or_else(|| lines.last())
 }
 
 impl EntityInputHandler for Composer {
@@ -253,6 +285,7 @@ impl EntityInputHandler for Composer {
         let end = range.start + text.len();
         self.selected = end..end;
         self.marked = None;
+        self.last_layout.clear();
         cx.notify();
     }
     fn replace_and_mark_text_in_range(
@@ -278,12 +311,37 @@ impl EntityInputHandler for Composer {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let line = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range);
-        Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
-        ))
+        let start_line = line_for_offset(&self.last_layout, range.start)?;
+        let end_line = line_for_offset(&self.last_layout, range.end)?;
+        let start_offset = start_line.local_offset(range.start);
+        let end_offset = end_line.local_offset(range.end);
+        let start_line_offset = self.last_layout.element_offset(start_line)?;
+        let end_line_offset = self.last_layout.element_offset(end_line)?;
+        let line_height = self.last_line_height?;
+        if std::ptr::eq(start_line, end_line) {
+            Some(Bounds::from_corners(
+                point(
+                    bounds.left() + start_line.layout.x_for_index(start_offset),
+                    bounds.top() + line_height * start_line_offset as f32,
+                ),
+                point(
+                    bounds.left() + end_line.layout.x_for_index(end_offset),
+                    bounds.top() + line_height * (end_line_offset + 1) as f32,
+                ),
+            ))
+        } else {
+            Some(Bounds::from_corners(
+                point(
+                    bounds.left(),
+                    bounds.top() + line_height * start_line_offset as f32,
+                ),
+                point(
+                    bounds.right(),
+                    bounds.top() + line_height * (end_line_offset + 1) as f32,
+                ),
+            ))
+        }
     }
     fn character_index_for_point(
         &mut self,
@@ -291,10 +349,22 @@ impl EntityInputHandler for Composer {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.last_bounds?;
-        let line = self.last_layout.as_ref()?;
-        let index = line.index_for_x(point.x - bounds.left())?;
-        Some(self.offset_to_utf16(index))
+        self.offset_for_point(point)
+            .map(|offset| self.offset_to_utf16(offset))
+    }
+}
+
+#[derive(Clone)]
+struct ComposerLine {
+    range: Range<usize>,
+    layout: ShapedLine,
+}
+
+impl ComposerLine {
+    fn local_offset(&self, offset: usize) -> usize {
+        offset
+            .saturating_sub(self.range.start)
+            .min(self.range.len())
     }
 }
 
@@ -302,9 +372,9 @@ struct ComposerElement {
     input: Entity<Composer>,
 }
 struct Prepaint {
-    line: ShapedLine,
+    lines: Vec<ComposerLine>,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
+    selection: Vec<PaintQuad>,
 }
 impl IntoElement for ComposerElement {
     type Element = Self;
@@ -328,9 +398,10 @@ impl Element for ComposerElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
+        let line_count = self.input.read(cx).content.split('\n').count().max(1);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = px(42.).into();
+        style.size.height = (window.line_height() * line_count as f32).into();
         (window.request_layout(style, [], cx), ())
     }
     fn prepaint(
@@ -343,57 +414,95 @@ impl Element for ComposerElement {
         cx: &mut App,
     ) -> Prepaint {
         let input = self.input.read(cx);
-        let (text, color) = if input.content.is_empty() {
-            (input.placeholder.clone(), rgb(0x747a84).into())
+        let is_placeholder = input.content.is_empty();
+        let color = if is_placeholder {
+            rgb(0x747a84).into()
         } else {
-            (input.content.clone(), window.text_style().color)
+            window.text_style().color
         };
-        let run = TextRun {
-            len: text.len(),
-            font: window.text_style().font(),
-            color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+        let font = window.text_style().font();
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let shape_line = |range, text: SharedString| {
+            let run = TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            ComposerLine {
+                range,
+                layout: window
+                    .text_system()
+                    .shape_line(text, font_size, &[run], None),
+            }
         };
-        let line = window.text_system().shape_line(
-            text,
-            window.text_style().font_size.to_pixels(window.rem_size()),
-            &[run],
-            None,
-        );
-        let cursor_x = line.x_for_index(input.cursor());
+        let lines = if is_placeholder {
+            vec![shape_line(0..0, input.placeholder.clone())]
+        } else {
+            logical_lines(&input.content)
+                .map(|(range, text)| shape_line(range, text.to_string().into()))
+                .collect::<Vec<_>>()
+        };
+        let line_height = window.line_height();
+        let cursor_line = line_for_offset(&lines, input.cursor())
+            .expect("composer always lays out at least one logical line");
+        let cursor_line_offset = lines
+            .element_offset(cursor_line)
+            .expect("cursor line belongs to the composer layout");
+        let cursor_x = cursor_line
+            .layout
+            .x_for_index(cursor_line.local_offset(input.cursor()));
         let (selection, cursor) = if input.selected.is_empty() {
             (
-                None,
+                Vec::new(),
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_x, bounds.top()),
-                        size(px(2.), bounds.bottom() - bounds.top()),
+                        point(
+                            bounds.left() + cursor_x,
+                            bounds.top() + line_height * cursor_line_offset as f32,
+                        ),
+                        size(px(2.), line_height),
                     ),
                     rgb(0x8ca9d8),
                 )),
             )
         } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(
-                            bounds.left() + line.x_for_index(input.selected.start),
-                            bounds.top(),
+            let mut line_top = bounds.top();
+            let selection = lines
+                .iter()
+                .filter_map(|line| {
+                    let top = line_top;
+                    line_top += line_height;
+                    let selects_text = input.selected.start < line.range.end
+                        && input.selected.end > line.range.start;
+                    let selects_newline = line.range.end < input.content.len()
+                        && input.selected.start <= line.range.end
+                        && input.selected.end > line.range.end;
+                    if !selects_text && !selects_newline {
+                        return None;
+                    }
+                    let start = line.local_offset(input.selected.start);
+                    let end = line.local_offset(input.selected.end);
+                    let left = bounds.left() + line.layout.x_for_index(start);
+                    let mut right = bounds.left() + line.layout.x_for_index(end);
+                    if selects_newline {
+                        right += px(4.);
+                    }
+                    Some(fill(
+                        Bounds::from_corners(
+                            point(left, top),
+                            point(right, top + line_height),
                         ),
-                        point(
-                            bounds.left() + line.x_for_index(input.selected.end),
-                            bounds.bottom(),
-                        ),
-                    ),
-                    rgba(0x6f8fc044),
-                )),
-                None,
-            )
+                        rgba(0x6f8fc044),
+                    ))
+                })
+                .collect();
+            (selection, None)
         };
         Prepaint {
-            line,
+            lines,
             cursor,
             selection,
         }
@@ -414,28 +523,33 @@ impl Element for ComposerElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = state.selection.take() {
+        for selection in state.selection.drain(..) {
             window.paint_quad(selection);
         }
-        state
-            .line
-            .paint(
-                bounds.origin,
-                window.line_height(),
-                gpui::TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .unwrap();
+        let line_height = window.line_height();
+        let mut origin = bounds.origin;
+        for line in &state.lines {
+            line.layout
+                .paint(
+                    origin,
+                    window.line_height(),
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .unwrap();
+            origin.y += line_height;
+        }
         if focus.is_focused(window)
             && let Some(cursor) = state.cursor.take()
         {
             window.paint_quad(cursor);
         }
         self.input.update(cx, |input, _| {
-            input.last_layout = Some(state.line.clone());
+            input.last_layout = state.lines.clone();
             input.last_bounds = Some(bounds);
+            input.last_line_height = Some(line_height);
         });
     }
 }
@@ -443,6 +557,8 @@ impl Element for ComposerElement {
 impl Render for Composer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .flex()
+            .items_center()
             .key_context("ChattComposer")
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
@@ -462,17 +578,13 @@ impl Render for Composer {
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
                     let offset = this
-                        .last_bounds
-                        .zip(this.last_layout.as_ref())
-                        .and_then(|(bounds, line)| {
-                            line.index_for_x(event.position.x - bounds.left())
-                        })
+                        .offset_for_point(event.position)
                         .unwrap_or(this.content.len());
                     this.move_to(offset, cx);
                 }),
             )
             .w_full()
-            .h(px(42.))
+            .min_h(px(42.))
             .child(ComposerElement { input: cx.entity() })
     }
 }
@@ -480,5 +592,47 @@ impl Render for Composer {
 impl Focusable for Composer {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComposerLine, line_for_offset, logical_lines};
+
+    #[test]
+    fn splits_multiline_content_before_single_line_shaping() {
+        let text = "first\n\nthird\n";
+        let lines = logical_lines(text).collect::<Vec<_>>();
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..5, 6..6, 7..12, 13..13]
+        );
+        assert!(lines
+            .iter()
+            .all(|(_, line)| !line.contains('\n')));
+    }
+
+    #[test]
+    fn maps_offsets_on_newlines_to_the_adjacent_logical_lines() {
+        let lines = logical_lines("one\n\nthree")
+            .map(|(range, _)| ComposerLine {
+                range,
+                layout: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let line_at = |offset| {
+            line_for_offset(&lines, offset)
+                .map(|line| (line.range.clone(), line.local_offset(offset)))
+        };
+
+        assert_eq!(line_at(3), Some((0..3, 3)));
+        assert_eq!(line_at(4), Some((4..4, 0)));
+        assert_eq!(line_at(5), Some((5..10, 0)));
+        assert_eq!(line_at(10), Some((5..10, 5)));
+        assert!(line_for_offset(&[], 0).is_none());
     }
 }
