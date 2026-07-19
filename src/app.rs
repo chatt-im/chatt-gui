@@ -241,7 +241,7 @@ impl ChattView {
             while video_updates.recv().await.is_ok() {
                 while video_updates.try_recv().is_ok() {}
                 if this
-                    .update_in(cx, |this, window, cx| this.tick(window, cx))
+                    .update_in(cx, |_, window, _| window.refresh())
                     .is_err()
                 {
                     return;
@@ -290,8 +290,7 @@ impl ChattView {
         BulkTransferId(id)
     }
 
-    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = false;
+    fn advance_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut terminal_video_status = None;
         if let Some(player) = self.player.as_mut()
             && self.active_video.is_some()
@@ -301,7 +300,6 @@ impl ChattView {
                     self.position = playback.position;
                     self.duration = playback.duration;
                     self.paused = playback.paused;
-                    changed = true;
                     if playback.finished {
                         terminal_video_status = Some("Playback finished".into());
                     }
@@ -311,21 +309,13 @@ impl ChattView {
                 }
             }
             if terminal_video_status.is_none() {
-                match player.render_frame(VIDEO_WIDTH, VIDEO_HEIGHT) {
-                    Ok(Some(frame)) => {
-                        if let Some(buffer) =
-                            RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
-                        {
-                            let next_frame = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
-                            if let Some(previous_frame) = self.frame.replace(next_frame) {
-                                cx.drop_image(previous_frame, Some(window));
-                            }
-                            changed = true;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        terminal_video_status = Some(format!("Video render failed: {error}"));
+                if let Some(frame) = player.render_frame()
+                    && let Some(buffer) =
+                        RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
+                {
+                    let next_frame = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
+                    if let Some(previous_frame) = self.frame.replace(next_frame) {
+                        cx.drop_image(previous_frame, Some(window));
                     }
                 }
             }
@@ -333,10 +323,6 @@ impl ChattView {
         if let Some(status) = terminal_video_status {
             self.release_video(window, cx);
             self.status = status.into();
-            changed = true;
-        }
-        if changed {
-            cx.notify();
         }
     }
 
@@ -1467,7 +1453,7 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         if self.player.is_none() {
-            match MpvPlayer::new(self.video_wakeup.clone()) {
+            match MpvPlayer::new(self.video_wakeup.clone(), VIDEO_WIDTH, VIDEO_HEIGHT) {
                 Ok(player) => self.player = Some(player),
                 Err(error) => {
                     self.status = format!("Video unavailable: {error}").into();
@@ -1515,7 +1501,7 @@ impl ChattView {
     }
 
     fn toggle_playback_inner(&mut self, cx: &mut Context<Self>) {
-        if let Some(player) = self.player.as_ref() {
+        if let Some(player) = self.player.as_mut() {
             match player.toggle_pause() {
                 Ok(paused) => self.paused = paused,
                 Err(error) => self.status = format!("Playback failed: {error}").into(),
@@ -1792,6 +1778,9 @@ impl ChattView {
 
 impl Render for ChattView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.active_video.is_some() {
+            self.advance_video(window, cx);
+        }
         if self.scroll_animation_active {
             self.advance_timeline_scroll(window);
         }

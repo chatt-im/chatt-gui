@@ -65,6 +65,5 @@ if [ ! -e "$RUNTIME_CONFIG" ]; then
 fi
 
 BENCH=$(cargo --config "target.'cfg(unix)'.runner = 'echo'" run -q --release)
-$BENCH
-#samply record -r 3000 --presymbolicate --save-only --output "/tmp/profile.json" $BENCH profile  "$@" || exit 1
+samply record -r 5000 --presymbolicate --save-only --output "/tmp/profile.json" $BENCH profile  "$@" || exit 1
 '''
