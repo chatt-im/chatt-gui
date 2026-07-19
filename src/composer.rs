@@ -78,6 +78,7 @@ impl Composer {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.content = "".into();
         self.selected = 0..0;
+        self.reversed = false;
         self.marked = None;
         self.last_layout.clear();
         cx.notify();
@@ -86,6 +87,8 @@ impl Composer {
         let end = text.len();
         self.content = text.into();
         self.selected = end..end;
+        self.reversed = false;
+        self.marked = None;
         self.last_layout.clear();
         cx.notify();
     }
@@ -175,8 +178,9 @@ impl Composer {
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected.is_empty() {
+            let selected = self.normalize_range(self.selected.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected.clone()].to_string(),
+                self.content[selected].to_string(),
             ));
         }
     }
@@ -185,29 +189,27 @@ impl Composer {
         self.replace_text_in_range(None, "", window, cx);
     }
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        self.content
-            .chars()
-            .scan((0, 0), |state, ch| {
-                if state.1 >= offset {
-                    return None;
-                }
-                state.0 += ch.len_utf8();
-                state.1 += ch.len_utf16();
-                Some(state.0)
-            })
-            .last()
-            .unwrap_or(0)
+        offset_from_utf16(&self.content, offset)
     }
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        self.content[..offset.min(self.content.len())]
+        self.content[..self.clamp_offset(offset)]
             .encode_utf16()
             .count()
     }
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+        self.normalize_range(
+            self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end),
+        )
     }
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        let range = self.normalize_range(range.clone());
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+    fn clamp_offset(&self, offset: usize) -> usize {
+        clamp_offset(&self.content, offset)
+    }
+    fn normalize_range(&self, range: Range<usize>) -> Range<usize> {
+        normalize_range(&self.content, range)
     }
 
     fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
@@ -219,6 +221,41 @@ impl Composer {
         let offset = line.layout.closest_index_for_x(local.x);
         Some(line.range.start + offset)
     }
+}
+
+fn clamp_offset(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn normalize_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = clamp_offset(text, range.start);
+    let end = clamp_offset(text, range.end);
+    start.min(end)..start.max(end)
+}
+
+fn offset_from_utf16(text: &str, offset: usize) -> usize {
+    text.chars()
+        .scan((0, 0), |state, ch| {
+            if state.1 >= offset {
+                return None;
+            }
+            state.0 += ch.len_utf8();
+            state.1 += ch.len_utf16();
+            Some(state.0)
+        })
+        .last()
+        .unwrap_or(0)
+}
+
+fn range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+    normalize_range(
+        text,
+        offset_from_utf16(text, range.start)..offset_from_utf16(text, range.end),
+    )
 }
 
 fn logical_lines(text: &str) -> impl Iterator<Item = (Range<usize>, &str)> {
@@ -280,6 +317,7 @@ impl EntityInputHandler for Composer {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked.clone())
             .unwrap_or(self.selected.clone());
+        let range = self.normalize_range(range);
         self.content =
             (self.content[..range.start].to_owned() + text + &self.content[range.end..]).into();
         let end = range.start + text.len();
@@ -298,10 +336,11 @@ impl EntityInputHandler for Composer {
     ) {
         self.replace_text_in_range(range, text, window, cx);
         let end = self.selected.end;
-        self.marked = (!text.is_empty()).then_some(end - text.len()..end);
+        let inserted = end - text.len()..end;
+        self.marked = (!text.is_empty()).then_some(inserted.clone());
         if let Some(selected) = selected {
-            let selected = self.range_from_utf16(&selected);
-            self.selected = end - text.len() + selected.start..end - text.len() + selected.end;
+            let selected = range_from_utf16(text, &selected);
+            self.selected = inserted.start + selected.start..inserted.start + selected.end;
         }
     }
     fn bounds_for_range(
@@ -597,7 +636,9 @@ impl Focusable for Composer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerLine, line_for_offset, logical_lines};
+    use super::{
+        ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16,
+    };
 
     #[test]
     fn splits_multiline_content_before_single_line_shaping() {
@@ -634,5 +675,16 @@ mod tests {
         assert_eq!(line_at(5), Some((5..10, 0)));
         assert_eq!(line_at(10), Some((5..10, 5)));
         assert!(line_for_offset(&[], 0).is_none());
+    }
+
+    #[test]
+    fn clamps_stale_platform_replacement_ranges() {
+        assert_eq!(normalize_range("", 7..7), 0..0);
+        assert_eq!(normalize_range("é", 1..99), 0..2);
+    }
+
+    #[test]
+    fn maps_utf16_ranges_relative_to_composition_text() {
+        assert_eq!(range_from_utf16("a😀b", &(1..3)), 1..5);
     }
 }

@@ -2,16 +2,20 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight, KeyBinding,
     ListAlignment, ListState, LruImageCache, ObjectFit, PathPromptOptions, Render, RenderImage,
-    SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px, relative, rgb,
-    rgba,
+    ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px,
+    relative, rgb, rgba,
 };
 use image::{Frame, RgbaImage};
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use markdown::{
+    Markdown, MarkdownElement, MarkdownFont, MarkdownSelectionArea, MarkdownSelectionGroup,
+    MarkdownSelectionKey, MarkdownStyle,
+};
 use rpc::{
     daemon::{
         frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
@@ -30,6 +34,7 @@ use crate::{
     media_cache::MediaCache,
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::MpvPlayer,
+    scroll_capture::capture_scroll,
     timeline::{self, Attachment},
 };
 
@@ -40,6 +45,8 @@ const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
 const VIDEO_WIDTH: usize = 704;
 const VIDEO_HEIGHT: usize = 396;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const SCROLL_RESPONSE_SECONDS: f32 = 0.006;
+const SCROLL_SETTLE_THRESHOLD: f32 = 0.50;
 
 actions!(
     chatt_gui,
@@ -81,7 +88,11 @@ pub struct ChattView {
     media_cache: Arc<Mutex<MediaCache>>,
     image_cache: gpui::Entity<LruImageCache<TimelineImageLoader>>,
     list_state: ListState,
+    pending_scroll: gpui::Pixels,
+    scroll_animation_active: bool,
+    last_scroll_frame: Option<Instant>,
     message_markdown: HashMap<u64, gpui::Entity<Markdown>>,
+    timeline_selection: MarkdownSelectionGroup,
     player: Option<MpvPlayer>,
     video_wakeup: async_channel::Sender<()>,
     active_video: Option<u64>,
@@ -105,6 +116,7 @@ impl ChattView {
         ));
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let composer = cx.new(Composer::new);
+        let timeline_selection = MarkdownSelectionGroup::new(cx.focus_handle());
         let image_cache =
             LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         window.focus(&composer.focus_handle(cx), cx);
@@ -149,7 +161,11 @@ impl ChattView {
             media_cache,
             image_cache,
             list_state,
+            pending_scroll: px(0.),
+            scroll_animation_active: false,
+            last_scroll_frame: None,
             message_markdown: HashMap::new(),
+            timeline_selection,
             player: None,
             video_wakeup,
             active_video: None,
@@ -304,6 +320,16 @@ impl ChattView {
         let old_len = self.model.messages.len();
         let old_selected_room = self.model.selected_room;
         let effect = reducer::apply(&mut self.model, frame);
+        if self.model.selected_room != old_selected_room || effect.replace_messages {
+            self.timeline_selection.clear();
+        } else if !effect.splices.is_empty() {
+            self.timeline_selection.retain_items(
+                self.model
+                    .messages
+                    .iter()
+                    .map(|message| MarkdownSelectionKey(message.id)),
+            );
+        }
         if self.model.selected_room != old_selected_room {
             self.release_video(window, cx);
             self.message_markdown.clear();
@@ -900,7 +926,13 @@ impl ChattView {
                                         )),
                                 )
                             })
-                            .child(MarkdownElement::new(message_markdown, markdown_style))
+                            .child(
+                                MarkdownElement::new(message_markdown, markdown_style)
+                                    .selection_group(
+                                        self.timeline_selection.clone(),
+                                        MarkdownSelectionKey(message_id),
+                                    ),
+                            )
                             .when_some(attachment, |content, attachment| {
                                 content.child(self.render_attachment(message_id, attachment, cx))
                             }),
@@ -1393,10 +1425,117 @@ impl ChattView {
                 ),
         )
     }
+
+    fn scroll_timeline(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let distance = -event.delta.pixel_delta(px(20.)).y;
+        if distance == px(0.) {
+            return false;
+        }
+
+        crate::frame_stats::record_scroll_input();
+        let input_delta = f32::from(event.delta.pixel_delta(px(20.)).y);
+        let input_offset = self.list_state.logical_scroll_top();
+        let input_following = self.list_state.is_following_tail();
+        crate::frame_stats::trace_scroll(|| {
+            format!(
+                "input delta_y={input_delta:.2}px distance={:.2}px at item={} offset={:.2}px following={input_following}",
+                f32::from(distance),
+                input_offset.item_ix,
+                f32::from(input_offset.offset_in_item),
+            )
+        });
+        if input_following {
+            crate::frame_stats::trace_scroll(|| {
+                "passing input to GPUI list to leave follow-tail".to_string()
+            });
+            return false;
+        }
+
+        let old_pending = f32::from(self.pending_scroll);
+        let new_distance = f32::from(distance);
+        if old_pending != 0.0 && old_pending.signum() != new_distance.signum() {
+            self.pending_scroll = distance;
+        } else {
+            self.pending_scroll += distance;
+        }
+
+        if !self.scroll_animation_active {
+            self.scroll_animation_active = true;
+            self.last_scroll_frame = Some(Instant::now());
+        }
+        cx.notify();
+        true
+    }
+
+    fn autoscroll_timeline_selection(
+        &mut self,
+        distance: gpui::Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_scroll = px(0.);
+        self.scroll_animation_active = false;
+        self.last_scroll_frame = None;
+        self.list_state.scroll_by(distance);
+        cx.notify();
+    }
+
+    fn advance_timeline_scroll(&mut self, window: &mut Window) {
+        let now = Instant::now();
+        let elapsed = self
+            .last_scroll_frame
+            .replace(now)
+            .map_or_else(Default::default, |last| now.saturating_duration_since(last));
+        let pending = f32::from(self.pending_scroll);
+        let before = self.list_state.logical_scroll_top();
+        let following_before = self.list_state.is_following_tail();
+
+        let step = if pending.abs() <= SCROLL_SETTLE_THRESHOLD {
+            let step = self.pending_scroll;
+            self.pending_scroll = px(0.);
+            self.scroll_animation_active = false;
+            self.last_scroll_frame = None;
+            step
+        } else {
+            let response = 1.0
+                - (-elapsed.as_secs_f32() / SCROLL_RESPONSE_SECONDS)
+                    .exp()
+                    .clamp(0.0, 1.0);
+            let step = self.pending_scroll * response.clamp(0.25, 0.85);
+            self.pending_scroll -= step;
+            step
+        };
+        self.list_state.scroll_by(step);
+
+        let after = self.list_state.logical_scroll_top();
+        let following_after = self.list_state.is_following_tail();
+        crate::frame_stats::trace_scroll(|| {
+            format!(
+                "apply step={:.2}px item={}:{}({:.2}px->{:.2}px) following={following_before}->{following_after}",
+                f32::from(step),
+                before.item_ix,
+                after.item_ix,
+                f32::from(before.offset_in_item),
+                f32::from(after.offset_in_item),
+            )
+        });
+
+        crate::frame_stats::record_scroll_update();
+        if self.scroll_animation_active {
+            window.request_animation_frame();
+        }
+    }
 }
 
 impl Render for ChattView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.scroll_animation_active {
+            self.advance_timeline_scroll(window);
+        }
         let count = self.model.messages.len();
         let online = self
             .model
@@ -1415,9 +1554,26 @@ impl Render for ChattView {
             .map(|room| security_label(room.trust))
             .unwrap_or("");
         let ready = self.model.is_ready();
-        let timeline = list(self.list_state.clone(), cx.processor(Self::render_message))
-            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-            .flex_grow_1();
+        let timeline_view = cx.entity().downgrade();
+        let selection_view = cx.entity().downgrade();
+        let timeline = MarkdownSelectionArea::new(
+            capture_scroll(
+                list(self.list_state.clone(), cx.processor(Self::render_message))
+                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                    .flex_grow_1(),
+                move |event, window, cx| {
+                    timeline_view
+                        .update(cx, |view, cx| view.scroll_timeline(event, window, cx))
+                        .unwrap_or(false)
+                },
+            ),
+            self.timeline_selection.clone(),
+        )
+        .on_vertical_autoscroll(move |distance, _, cx| {
+            let _ = selection_view.update(cx, |view, cx| {
+                view.autoscroll_timeline_selection(distance, cx)
+            });
+        });
         div()
             .id("chatt")
             .key_context("Chatt")

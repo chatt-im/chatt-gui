@@ -1,10 +1,13 @@
 mod app;
 mod composer;
 mod daemon;
+mod frame_stats;
+mod fonts;
 mod image_cache;
 mod media_cache;
 mod model;
 mod mpv_player;
+mod scroll_capture;
 mod timeline;
 
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
@@ -15,9 +18,11 @@ use crate::app::ChattView;
 fn main() {
     env_logger::init();
     application().run(move |cx: &mut App| {
+        fonts::load(cx);
         settings::init(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         app::bind_keys(cx);
+        frame_stats::start(cx);
 
         let bounds = Bounds::centered(None, size(px(1240.0), px(820.0)), cx);
         cx.open_window(
@@ -25,7 +30,10 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            move |window, cx| cx.new(|cx| ChattView::new(window, cx)),
+            move |window, cx| {
+                frame_stats::start_window(window);
+                cx.new(|cx| ChattView::new(window, cx))
+            },
         )
         .expect("failed to open Chatt window");
 
