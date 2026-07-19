@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use rpc::{
     daemon::{
-        frame::{Operation, RequestOutcome},
+        frame::{NegotiatedLimits, Operation, RequestOutcome},
         model::{
             ConnectionState, DaemonInstanceId, Participant, RequestId, RoomSummary,
             TransferSummary, VoiceState,
@@ -28,12 +28,15 @@ pub struct PendingRequest {
     pub operation: Operation,
     pub room_id: Option<RoomId>,
     pub draft: Option<String>,
+    pub transfer_id: Option<rpc::daemon::model::BulkTransferId>,
 }
 
 pub struct ChatModel {
     pub phase: ConnectionPhase,
     pub daemon_instance: Option<DaemonInstanceId>,
     pub expected_seq: Option<u64>,
+    pub resync_requested: bool,
+    pub limits: NegotiatedLimits,
     pub active_server: Option<String>,
     pub server_connection: ConnectionState,
     pub local_identity: Option<String>,
@@ -55,6 +58,8 @@ impl Default for ChatModel {
             phase: ConnectionPhase::Discovering,
             daemon_instance: None,
             expected_seq: None,
+            resync_requested: false,
+            limits: NegotiatedLimits::default(),
             active_server: None,
             server_connection: ConnectionState::Offline,
             local_identity: None,

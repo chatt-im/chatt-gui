@@ -1,6 +1,6 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, mpsc::Receiver},
+    sync::{Arc, Mutex, mpsc::Receiver},
     time::Duration,
 };
 
@@ -69,7 +69,7 @@ pub struct ChattView {
     next_transfer_id: u64,
     editing: Option<(RoomId, rpc::ids::MessageId, String)>,
     composer: gpui::Entity<Composer>,
-    media_cache: MediaCache,
+    media_cache: Arc<Mutex<MediaCache>>,
     list_state: ListState,
     player: Option<MpvPlayer>,
     active_video: Option<u64>,
@@ -88,7 +88,10 @@ impl ChattView {
         let model = ChatModel::default();
         let list_state = ListState::new(0, ListAlignment::Bottom, px(1_600.0));
         list_state.set_follow_mode(FollowMode::Tail);
-        let (daemon, daemon_events) = DaemonClient::spawn();
+        let media_cache = Arc::new(Mutex::new(
+            MediaCache::new(512 * 1024 * 1024).expect("failed to create private media cache"),
+        ));
+        let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let composer = cx.new(Composer::new);
         window.focus(&composer.focus_handle(cx), cx);
         let (player, status) = match MpvPlayer::new() {
@@ -116,8 +119,7 @@ impl ChattView {
             next_transfer_id: 1,
             editing: None,
             composer,
-            media_cache: MediaCache::new(512 * 1024 * 1024)
-                .expect("failed to create private media cache"),
+            media_cache,
             list_state,
             player,
             active_video: None,
@@ -133,9 +135,15 @@ impl ChattView {
     }
 
     fn request_id(&mut self) -> RequestId {
-        let id = self.next_request_id.max(1);
-        self.next_request_id = id.wrapping_add(1).max(1);
+        let id = self.next_request_id.clamp(1, (1u64 << 63) - 1);
+        self.next_request_id = if id == (1u64 << 63) - 1 { 1 } else { id + 1 };
         RequestId(id)
+    }
+
+    fn transfer_id(&mut self) -> BulkTransferId {
+        let id = self.next_transfer_id.clamp(1, (1u64 << 63) - 1);
+        self.next_transfer_id = if id == (1u64 << 63) - 1 { 1 } else { id + 1 };
+        BulkTransferId(id)
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
@@ -180,7 +188,11 @@ impl ChattView {
                 DaemonEvent::Connecting => self.model.phase = ConnectionPhase::Connecting,
                 DaemonEvent::TransportConnected => self.model.phase = ConnectionPhase::Syncing,
                 DaemonEvent::Disconnected(reason) => {
-                    self.media_cache.cancel_all();
+                    self.media_cache
+                        .lock()
+                        .expect("media cache lock poisoned")
+                        .cancel_all();
+                    self.model.resync_requested = false;
                     self.model.phase = ConnectionPhase::Disconnected {
                         reason: reason.clone(),
                     };
@@ -197,99 +209,105 @@ impl ChattView {
                     };
                     self.status = format!("Cannot connect · {details}").into();
                 }
-                DaemonEvent::UploadPreparationFailed { request_id, reason } => {
-                    self.model.pending.remove(&request_id);
+                DaemonEvent::UploadPreparationFailed {
+                    begin_request,
+                    finish_request,
+                    reason,
+                } => {
+                    self.model.pending.remove(&begin_request);
+                    self.model.pending.remove(&finish_request);
                     self.status = format!("Could not prepare upload · {reason}").into();
                 }
+                DaemonEvent::MediaTransferStarted => {
+                    self.status = "Receiving attachment…".into();
+                }
+                DaemonEvent::MediaCached(descriptor) => {
+                    self.status = format!("Cached {}", descriptor.file_name).into();
+                }
+                DaemonEvent::MediaTransferFailed {
+                    transfer_id,
+                    reason,
+                } => {
+                    self.media_cache
+                        .lock()
+                        .expect("media cache lock poisoned")
+                        .cancel(transfer_id);
+                    self.status = reason.into();
+                }
                 DaemonEvent::Frame(frame) => {
-                    let pending = match &frame {
-                        DaemonFrame::RequestResult(result) => {
-                            self.model.pending.get(&result.request_id).cloned()
-                        }
-                        _ => None,
-                    };
-                    match &frame {
-                        DaemonFrame::BulkStarted(started) => {
-                            if let Err(error) = self.media_cache.begin(started.clone()) {
-                                self.status = error.into();
-                            }
-                        }
-                        DaemonFrame::BulkChunk(chunk) => {
-                            if let Err(error) = self.media_cache.chunk(chunk.clone()) {
-                                self.status = error.into();
-                            }
-                        }
-                        DaemonFrame::BulkFinished(finished) => {
-                            match self.media_cache.finish(finished.clone()) {
-                                Ok(descriptor) => {
-                                    self.status = format!("Cached {}", descriptor.file_name).into()
-                                }
-                                Err(error) => self.status = error.into(),
-                            }
-                        }
-                        DaemonFrame::BulkCanceled {
-                            transfer_id,
-                            reason,
-                        } => {
-                            self.media_cache.cancel(*transfer_id);
-                            self.status = reason.clone().into();
-                        }
-                        _ => {}
-                    }
-                    let old_len = self.model.messages.len();
-                    let effect = reducer::apply(&mut self.model, frame);
-                    if effect.replace_messages {
-                        self.list_state
-                            .splice(0..old_len, self.model.messages.len());
-                    }
-                    for (start, end, count) in effect.splices {
-                        self.list_state.splice(start..end, count);
-                    }
-                    if effect.request_resync {
-                        let request_id = self.request_id();
-                        let _ = self
-                            .daemon
-                            .send(ClientFrame::RequestSnapshot { request_id });
-                    }
-                    if let Some(result) = effect.request_result {
-                        match result.outcome {
-                            RequestOutcome::Accepted => {
-                                self.status =
-                                    format!("{} accepted", operation_label(&result.operation))
-                                        .into();
-                                if let Some(pending) = pending.as_ref()
-                                    && matches!(
-                                        pending.operation,
-                                        Operation::SendMessage | Operation::EditMessage
-                                    )
-                                    && pending.draft.as_deref()
-                                        == Some(self.composer.read(cx).text().as_str())
-                                {
-                                    self.composer.update(cx, |composer, cx| composer.clear(cx));
-                                    if pending.operation == Operation::EditMessage {
-                                        self.editing = None;
-                                    }
-                                }
-                            }
-                            RequestOutcome::Rejected { message, .. } => {
-                                self.status = if pending.as_ref().is_some_and(|pending| {
-                                    pending.room_id.is_some()
-                                        && pending.room_id != self.model.selected_room
-                                }) {
-                                    format!("Request for another room failed · {message}").into()
-                                } else {
-                                    message.into()
-                                };
-                            }
-                        }
-                    }
-                    if self.model.is_ready() && self.model.last_error.is_none() {
-                        self.status = connection_label(&self.model).into();
-                    }
+                    self.apply_daemon_state_frame(frame, cx);
                 }
             }
         }
         changed
+    }
+
+    fn apply_daemon_state_frame(&mut self, frame: DaemonFrame, cx: &mut Context<Self>) {
+        let pending = match &frame {
+            DaemonFrame::RequestResult(result) => {
+                self.model.pending.get(&result.request_id).cloned()
+            }
+            _ => None,
+        };
+        let old_len = self.model.messages.len();
+        let effect = reducer::apply(&mut self.model, frame);
+        if effect.replace_messages {
+            self.list_state
+                .splice(0..old_len, self.model.messages.len());
+        }
+        for (start, end, count) in effect.splices {
+            self.list_state.splice(start..end, count);
+        }
+        if effect.request_resync {
+            let request_id = self.request_id();
+            if let Err(error) = self
+                .daemon
+                .send(ClientFrame::RequestSnapshot { request_id })
+            {
+                self.model.resync_requested = false;
+                self.status = format!("Could not request daemon resync · {error}").into();
+            }
+        }
+        if let Some(result) = effect.request_result {
+            match result.outcome {
+                RequestOutcome::Accepted => {
+                    self.status = format!("{} accepted", operation_label(&result.operation)).into();
+                    if let Some(pending) = pending.as_ref()
+                        && matches!(
+                            pending.operation,
+                            Operation::SendMessage | Operation::EditMessage
+                        )
+                        && pending.draft.as_deref() == Some(self.composer.read(cx).text().as_str())
+                    {
+                        self.composer.update(cx, |composer, cx| composer.clear(cx));
+                        if pending.operation == Operation::EditMessage {
+                            self.editing = None;
+                        }
+                    }
+                }
+                RequestOutcome::Rejected { message, .. } => {
+                    if let Some(transfer_id) = pending.as_ref().and_then(|pending| {
+                        (pending.operation == Operation::BeginAttachmentRead)
+                            .then_some(pending.transfer_id)
+                            .flatten()
+                    }) {
+                        self.media_cache
+                            .lock()
+                            .expect("media cache lock poisoned")
+                            .cancel(transfer_id);
+                    }
+                    self.status = if pending.as_ref().is_some_and(|pending| {
+                        pending.room_id.is_some() && pending.room_id != self.model.selected_room
+                    }) {
+                        format!("Request for another room failed · {message}").into()
+                    } else {
+                        message.into()
+                    };
+                }
+            }
+        } else if self.model.is_ready() && self.model.last_error.is_none() {
+            self.status = connection_label(&self.model).into();
+        }
     }
 
     fn send_message(&mut self, _: &SendMessage, _: &mut Window, cx: &mut Context<Self>) {
@@ -336,6 +354,7 @@ impl ChattView {
                 operation,
                 room_id: Some(room_id),
                 draft: Some(draft),
+                transfer_id: None,
             },
         );
         if let Err(error) = self.daemon.send(frame) {
@@ -380,6 +399,7 @@ impl ChattView {
                 operation: Operation::DeleteMessage,
                 room_id: Some(room_id),
                 draft: None,
+                transfer_id: None,
             },
         );
         if let Err(error) = self.daemon.send(ClientFrame::DeleteMessage {
@@ -406,6 +426,7 @@ impl ChattView {
                 operation: Operation::SelectRoom,
                 room_id: Some(room_id),
                 draft: None,
+                transfer_id: None,
             },
         );
         if let Err(error) = self.daemon.send(ClientFrame::SelectRoom {
@@ -434,6 +455,7 @@ impl ChattView {
                 operation: Operation::LoadOlder,
                 room_id: Some(room_id),
                 draft: None,
+                transfer_id: None,
             },
         );
         if let Err(error) = self.daemon.send(ClientFrame::LoadOlder {
@@ -485,18 +507,33 @@ impl ChattView {
         for path in paths {
             let begin_request = self.request_id();
             let finish_request = self.request_id();
-            let transfer_id = BulkTransferId(self.next_transfer_id);
-            self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+            let transfer_id = self.transfer_id();
             self.model.pending.insert(
                 begin_request,
                 PendingRequest {
                     operation: Operation::BeginUpload,
                     room_id: Some(room_id),
                     draft: None,
+                    transfer_id: Some(transfer_id),
                 },
             );
-            self.daemon
-                .upload_file(path, room_id, transfer_id, begin_request, finish_request);
+            self.model.pending.insert(
+                finish_request,
+                PendingRequest {
+                    operation: Operation::FinishUpload,
+                    room_id: Some(room_id),
+                    draft: None,
+                    transfer_id: Some(transfer_id),
+                },
+            );
+            self.daemon.upload_file(
+                path,
+                room_id,
+                transfer_id,
+                begin_request,
+                finish_request,
+                self.model.limits.upload_bytes,
+            );
         }
         self.status = "Preparing daemon upload…".into();
         cx.notify();
@@ -514,11 +551,16 @@ impl ChattView {
                 operation: Operation::SetMuted,
                 room_id: self.model.selected_room,
                 draft: None,
+                transfer_id: None,
             },
         );
-        let _ = self
+        if let Err(error) = self
             .daemon
-            .send(ClientFrame::SetMuted { request_id, muted });
+            .send(ClientFrame::SetMuted { request_id, muted })
+        {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        }
         cx.notify();
     }
 
@@ -534,12 +576,16 @@ impl ChattView {
                 operation: Operation::SetDeafened,
                 room_id: self.model.selected_room,
                 draft: None,
+                transfer_id: None,
             },
         );
-        let _ = self.daemon.send(ClientFrame::SetDeafened {
+        if let Err(error) = self.daemon.send(ClientFrame::SetDeafened {
             request_id,
             deafened,
-        });
+        }) {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        }
         cx.notify();
     }
 
@@ -554,10 +600,7 @@ impl ChattView {
         let (operation, frame) = if self.model.voice.joined_room == Some(room_id) {
             (
                 Operation::LeaveVoice,
-                ClientFrame::LeaveVoice {
-                    request_id,
-                    room_id,
-                },
+                ClientFrame::LeaveVoice { request_id },
             )
         } else {
             (
@@ -574,9 +617,13 @@ impl ChattView {
                 operation,
                 room_id: Some(room_id),
                 draft: None,
+                transfer_id: None,
             },
         );
-        let _ = self.daemon.send(frame);
+        if let Err(error) = self.daemon.send(frame) {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        }
         cx.notify();
     }
 
@@ -585,22 +632,56 @@ impl ChattView {
             return;
         }
         let request_id = self.request_id();
-        let volume = (self.model.voice.output_volume + delta).clamp(0., 200.);
+        let volume = (self.model.voice.output_volume + delta)
+            .clamp(0., rpc::daemon::MAX_OUTPUT_VOLUME_PERCENT);
         self.model.pending.insert(
             request_id,
             PendingRequest {
                 operation: Operation::SetOutputVolume,
                 room_id: self.model.selected_room,
                 draft: None,
+                transfer_id: None,
             },
         );
-        let _ = self
+        if let Err(error) = self
             .daemon
-            .send(ClientFrame::SetOutputVolume { request_id, volume });
+            .send(ClientFrame::SetOutputVolume { request_id, volume })
+        {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        }
         cx.notify();
     }
 
-    fn cancel_transfer(&mut self, transfer_id: BulkTransferId, cx: &mut Context<Self>) {
+    fn cancel_file_transfer(
+        &mut self,
+        transfer_id: rpc::ids::FileTransferId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.model.is_ready() {
+            return;
+        }
+        let request_id = self.request_id();
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::CancelFileTransfer,
+                room_id: self.model.selected_room,
+                draft: None,
+                transfer_id: None,
+            },
+        );
+        if let Err(error) = self.daemon.send(ClientFrame::CancelFileTransfer {
+            request_id,
+            transfer_id,
+        }) {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        }
+        cx.notify();
+    }
+
+    fn cancel_bulk_read(&mut self, transfer_id: BulkTransferId, cx: &mut Context<Self>) {
         if !self.model.is_ready() {
             return;
         }
@@ -611,12 +692,16 @@ impl ChattView {
                 operation: Operation::CancelBulkTransfer,
                 room_id: self.model.selected_room,
                 draft: None,
+                transfer_id: Some(transfer_id),
             },
         );
-        let _ = self.daemon.send(ClientFrame::CancelBulkTransfer {
+        if let Err(error) = self.daemon.send(ClientFrame::CancelBulkTransfer {
             request_id,
             transfer_id,
-        });
+        }) {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        }
         cx.notify();
     }
 
@@ -753,8 +838,14 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let descriptor = attachment.descriptor.clone();
-        let cache_path = self.media_cache.path_for(&descriptor);
-        if let Some(transfer_id) = self.media_cache.active_transfer(&descriptor) {
+        let (cache_path, active_transfer) = {
+            let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
+            (
+                cache.path_for(&descriptor),
+                cache.active_transfer(&descriptor),
+            )
+        };
+        if let Some(transfer_id) = active_transfer {
             return div()
                 .id(("attachment-active", message_id as usize))
                 .mt_2()
@@ -775,7 +866,7 @@ impl ChattView {
                 )
                 .child(
                     mini_button(("cancel-read", transfer_id.0 as usize), "Cancel").on_click(
-                        cx.listener(move |this, _, _, cx| this.cancel_transfer(transfer_id, cx)),
+                        cx.listener(move |this, _, _, cx| this.cancel_bulk_read(transfer_id, cx)),
                     ),
                 )
                 .into_any_element();
@@ -938,21 +1029,38 @@ impl ChattView {
         descriptor: rpc::daemon::model::AttachmentDescriptor,
         cx: &mut Context<Self>,
     ) {
-        if !self.model.is_ready() || self.media_cache.path_for(&descriptor).is_some() {
+        if !self.model.is_ready()
+            || self
+                .media_cache
+                .lock()
+                .expect("media cache lock poisoned")
+                .path_for(&descriptor)
+                .is_some()
+        {
             return;
         }
         let Some(room_id) = self.model.selected_room else {
             return;
         };
         let request_id = self.request_id();
-        let transfer_id = BulkTransferId(self.next_transfer_id);
-        self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+        let transfer_id = self.transfer_id();
+        if let Err(error) = self
+            .media_cache
+            .lock()
+            .expect("media cache lock poisoned")
+            .reserve(transfer_id, &descriptor)
+        {
+            self.status = error.into();
+            cx.notify();
+            return;
+        }
         self.model.pending.insert(
             request_id,
             PendingRequest {
                 operation: Operation::BeginAttachmentRead,
                 room_id: Some(room_id),
                 draft: None,
+                transfer_id: Some(transfer_id),
             },
         );
         let read = rpc::daemon::bulk::BeginAttachmentRead {
@@ -965,6 +1073,10 @@ impl ChattView {
             .send(ClientFrame::BeginAttachmentRead { request_id, read })
         {
             self.model.pending.remove(&request_id);
+            self.media_cache
+                .lock()
+                .expect("media cache lock poisoned")
+                .cancel(transfer_id);
             self.status = error.into();
         } else {
             self.status = format!("Fetching {}…", descriptor.file_name).into();
@@ -1118,7 +1230,7 @@ impl ChattView {
                         .child(
                             mini_button(("cancel-transfer", transfer_id.0 as usize), "×").on_click(
                                 cx.listener(move |this, _, _, cx| {
-                                    this.cancel_transfer(transfer_id, cx)
+                                    this.cancel_file_transfer(transfer_id, cx)
                                 }),
                             ),
                         ),
@@ -1445,6 +1557,8 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::LeaveVoice => "Voice leave",
         Operation::SetOutputVolume => "Volume change",
         Operation::BeginUpload => "Upload",
+        Operation::CancelBulkTransfer => "Attachment cancellation",
+        Operation::CancelFileTransfer => "File transfer cancellation",
         _ => "Request",
     }
 }

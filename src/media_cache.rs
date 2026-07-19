@@ -8,7 +8,7 @@ use std::{
 
 use aws_lc_rs::digest::{Context, SHA256};
 use rpc::daemon::{
-    bulk::{BulkChunk, BulkFinished, BulkObject, BulkStarted},
+    bulk::{BulkChunk, BulkFinished, BulkStarted},
     model::{AttachmentDescriptor, AttachmentId, BulkTransferId},
 };
 
@@ -28,9 +28,11 @@ struct CacheEntry {
 
 pub struct MediaCache {
     root: tempfile::TempDir,
+    requested: HashMap<BulkTransferId, (AttachmentId, [u8; 32])>,
     partial: HashMap<BulkTransferId, PartialEntry>,
     entries: HashMap<(AttachmentId, [u8; 32]), CacheEntry>,
     total_bytes: u64,
+    partial_bytes: u64,
     budget_bytes: u64,
     clock: u64,
 }
@@ -42,9 +44,11 @@ impl MediaCache {
             .tempdir()?;
         Ok(Self {
             root,
+            requested: HashMap::new(),
             partial: HashMap::new(),
             entries: HashMap::new(),
             total_bytes: 0,
+            partial_bytes: 0,
             budget_bytes,
             clock: 0,
         })
@@ -58,27 +62,84 @@ impl MediaCache {
     }
 
     pub fn active_transfer(&self, descriptor: &AttachmentDescriptor) -> Option<BulkTransferId> {
-        self.partial.iter().find_map(|(transfer_id, partial)| {
-            (partial.descriptor.id == descriptor.id
-                && partial.descriptor.digest == descriptor.digest)
-                .then_some(*transfer_id)
-        })
+        self.requested
+            .iter()
+            .find_map(|(transfer_id, (id, digest))| {
+                (*id == descriptor.id && *digest == descriptor.digest).then_some(*transfer_id)
+            })
+            .or_else(|| {
+                self.partial.iter().find_map(|(transfer_id, partial)| {
+                    (partial.descriptor.id == descriptor.id
+                        && partial.descriptor.digest == descriptor.digest)
+                        .then_some(*transfer_id)
+                })
+            })
+    }
+
+    pub fn reserve(
+        &mut self,
+        transfer_id: BulkTransferId,
+        descriptor: &AttachmentDescriptor,
+    ) -> Result<(), String> {
+        if self.requested.len() + self.partial.len() >= rpc::daemon::MAX_CONCURRENT_TRANSFERS {
+            return Err("too many media transfers".into());
+        }
+        if self.requested.contains_key(&transfer_id) || self.partial.contains_key(&transfer_id) {
+            return Err("bulk transfer id is already active".into());
+        }
+        if self
+            .entries
+            .contains_key(&(descriptor.id, descriptor.digest))
+            || self.active_transfer(descriptor).is_some()
+        {
+            return Err("attachment is already cached or requested".into());
+        }
+        self.requested
+            .insert(transfer_id, (descriptor.id, descriptor.digest));
+        Ok(())
     }
 
     pub fn begin(&mut self, started: BulkStarted) -> Result<(), String> {
-        let BulkObject::Attachment(descriptor) = started.object else {
-            return Err("bulk object is not an attachment".into());
+        let descriptor = started.attachment;
+        let byte_len = descriptor.byte_len;
+        let Some((expected_id, expected_digest)) = self.requested.remove(&started.transfer_id)
+        else {
+            return Err("attachment transfer was not requested".into());
         };
-        if descriptor.byte_len != started.byte_len || descriptor.digest != started.digest {
-            return Err("attachment metadata changed at transfer start".into());
+        if expected_id != descriptor.id || expected_digest != descriptor.digest {
+            return Err("attachment transfer does not match its request".into());
         }
         if self.partial.len() >= rpc::daemon::MAX_CONCURRENT_TRANSFERS {
             return Err("too many media transfers".into());
         }
-        let path = self
-            .root
-            .path()
-            .join(format!("{}.part", hex_id(descriptor.id)));
+        if self.partial.contains_key(&started.transfer_id) {
+            return Err("bulk transfer id is already active".into());
+        }
+        if self
+            .entries
+            .contains_key(&(descriptor.id, descriptor.digest))
+        {
+            return Err("attachment is already cached".into());
+        }
+        if self.partial.values().any(|partial| {
+            partial.descriptor.id == descriptor.id && partial.descriptor.digest == descriptor.digest
+        }) {
+            return Err("attachment transfer is already active".into());
+        }
+        self.make_room(descriptor.byte_len);
+        if self
+            .total_bytes
+            .saturating_add(self.partial_bytes)
+            .saturating_add(descriptor.byte_len)
+            > self.budget_bytes
+        {
+            return Err("attachment exceeds the available media cache budget".into());
+        }
+        let path = self.root.path().join(format!(
+            "{}-{}.part",
+            hex_id(descriptor.id),
+            started.transfer_id.0
+        ));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -95,6 +156,7 @@ impl MediaCache {
                 digest: Context::new(&SHA256),
             },
         );
+        self.partial_bytes = self.partial_bytes.saturating_add(byte_len);
         Ok(())
     }
 
@@ -111,10 +173,11 @@ impl MediaCache {
             self.cancel(chunk.transfer_id);
             return Err("bulk chunk exceeds declared attachment length".into());
         }
-        partial
-            .file
-            .write_all(&chunk.bytes)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = partial.file.write_all(&chunk.bytes) {
+            let reason = error.to_string();
+            self.cancel(chunk.transfer_id);
+            return Err(reason);
+        }
         partial.digest.update(&chunk.bytes);
         partial.offset += chunk.bytes.len() as u64;
         Ok(())
@@ -124,6 +187,9 @@ impl MediaCache {
         let Some(mut partial) = self.partial.remove(&finished.transfer_id) else {
             return Err("bulk finish has no active transfer".into());
         };
+        self.partial_bytes = self
+            .partial_bytes
+            .saturating_sub(partial.descriptor.byte_len);
         let actual_digest = partial.digest.finish();
         if partial.offset != finished.byte_len
             || partial.offset != partial.descriptor.byte_len
@@ -133,15 +199,20 @@ impl MediaCache {
             let _ = fs::remove_file(&partial.path);
             return Err("attachment length or digest verification failed".into());
         }
-        partial.file.flush().map_err(|error| error.to_string())?;
-        partial.file.sync_all().map_err(|error| error.to_string())?;
+        if let Err(error) = partial.file.flush().and_then(|_| partial.file.sync_all()) {
+            let _ = fs::remove_file(&partial.path);
+            return Err(error.to_string());
+        }
         drop(partial.file);
         let final_path = self.root.path().join(format!(
             "{}-{}.cache",
             hex_id(partial.descriptor.id),
             hex_digest_prefix(partial.descriptor.digest)
         ));
-        fs::rename(&partial.path, &final_path).map_err(|error| error.to_string())?;
+        if let Err(error) = fs::rename(&partial.path, &final_path) {
+            let _ = fs::remove_file(&partial.path);
+            return Err(error.to_string());
+        }
         self.clock = self.clock.wrapping_add(1);
         self.total_bytes = self.total_bytes.saturating_add(partial.offset);
         self.entries.insert(
@@ -157,13 +228,18 @@ impl MediaCache {
     }
 
     pub fn cancel(&mut self, transfer_id: BulkTransferId) {
+        self.requested.remove(&transfer_id);
         if let Some(partial) = self.partial.remove(&transfer_id) {
+            self.partial_bytes = self
+                .partial_bytes
+                .saturating_sub(partial.descriptor.byte_len);
             drop(partial.file);
             let _ = fs::remove_file(partial.path);
         }
     }
 
     pub fn cancel_all(&mut self) {
+        self.requested.clear();
         let transfers = self.partial.keys().copied().collect::<Vec<_>>();
         for transfer in transfers {
             self.cancel(transfer);
@@ -172,6 +248,28 @@ impl MediaCache {
 
     fn evict(&mut self) {
         while self.total_bytes > self.budget_bytes {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.byte_len);
+                let _ = fs::remove_file(entry.path);
+            }
+        }
+    }
+
+    fn make_room(&mut self, incoming: u64) {
+        while self
+            .total_bytes
+            .saturating_add(self.partial_bytes)
+            .saturating_add(incoming)
+            > self.budget_bytes
+        {
             let Some(key) = self
                 .entries
                 .iter()
@@ -201,7 +299,7 @@ fn hex_digest_prefix(digest: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::daemon::{bulk::BulkTransport, model::MediaKind};
+    use rpc::daemon::model::MediaKind;
 
     #[test]
     fn rejects_non_contiguous_chunks_and_cleans_partial() {
@@ -220,13 +318,11 @@ mod tests {
             height: None,
         };
         let mut cache = MediaCache::new(1024).unwrap();
+        cache.reserve(BulkTransferId(1), &descriptor).unwrap();
         cache
             .begin(BulkStarted {
                 transfer_id: BulkTransferId(1),
-                object: BulkObject::Attachment(descriptor),
-                byte_len: 5,
-                digest: digest_bytes,
-                transport: BulkTransport::RpcChunksV1,
+                attachment: descriptor,
             })
             .unwrap();
         assert!(
@@ -239,6 +335,31 @@ mod tests {
                 .is_err()
         );
         assert!(cache.partial.is_empty());
+    }
+
+    #[test]
+    fn rejects_unrequested_and_duplicate_attachment_transfers() {
+        let descriptor = AttachmentDescriptor {
+            id: AttachmentId([9; 16]),
+            file_name: "photo.png".into(),
+            media_kind: MediaKind::Image,
+            content_type: "image/png".into(),
+            byte_len: 0,
+            digest: [0; 32],
+            width: None,
+            height: None,
+        };
+        let mut cache = MediaCache::new(1024).unwrap();
+        assert!(
+            cache
+                .begin(BulkStarted {
+                    transfer_id: BulkTransferId(9),
+                    attachment: descriptor.clone(),
+                })
+                .is_err()
+        );
+        cache.reserve(BulkTransferId(9), &descriptor).unwrap();
+        assert!(cache.reserve(BulkTransferId(10), &descriptor).is_err());
     }
 
     #[test]
@@ -258,13 +379,11 @@ mod tests {
             height: None,
         };
         let mut cache = MediaCache::new(1024).unwrap();
+        cache.reserve(BulkTransferId(2), &descriptor).unwrap();
         cache
             .begin(BulkStarted {
                 transfer_id: BulkTransferId(2),
-                object: BulkObject::Attachment(descriptor.clone()),
-                byte_len: bytes.len() as u64,
-                digest: digest_bytes,
-                transport: BulkTransport::RpcChunksV1,
+                attachment: descriptor.clone(),
             })
             .unwrap();
         cache

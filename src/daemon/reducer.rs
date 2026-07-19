@@ -22,6 +22,8 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         DaemonFrame::Welcome(welcome) => {
             model.daemon_instance = Some(welcome.instance_id);
             model.expected_seq = Some(welcome.first_event_seq);
+            model.resync_requested = false;
+            model.limits = welcome.limits;
             model.active_server = welcome.active_server;
             model.server_connection = welcome.connection;
             model.phase = ConnectionPhase::Syncing;
@@ -33,20 +35,26 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         } => {
             if model.daemon_instance != Some(instance_id) {
                 model.phase = ConnectionPhase::Syncing;
-                effect.request_resync = true;
+                effect.request_resync = !model.resync_requested;
+                model.resync_requested = true;
                 return effect;
             }
             install_snapshot(model, snapshot);
             model.expected_seq = Some(event_seq.wrapping_add(1));
+            model.resync_requested = false;
             model.phase = ConnectionPhase::Ready;
             effect.replace_messages = true;
         }
         DaemonFrame::Event(event) => {
+            if model.resync_requested {
+                return effect;
+            }
             if model.daemon_instance != Some(event.instance_id)
                 || model.expected_seq != Some(event.event_seq)
             {
                 model.phase = ConnectionPhase::Syncing;
-                effect.request_resync = true;
+                effect.request_resync = !model.resync_requested;
+                model.resync_requested = true;
                 return effect;
             }
             model.expected_seq = Some(event.event_seq.wrapping_add(1));
@@ -60,8 +68,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         | DaemonFrame::BulkStarted(_)
         | DaemonFrame::BulkChunk(_)
         | DaemonFrame::BulkFinished(_)
-        | DaemonFrame::BulkCanceled { .. }
-        | DaemonFrame::SharedMemoryOffer(_) => {}
+        | DaemonFrame::BulkCanceled { .. } => {}
     }
     effect
 }
@@ -88,12 +95,32 @@ fn install_snapshot(model: &mut ChatModel, snapshot: StateSnapshot) {
         model.participants.clear();
     }
     model.voice = snapshot.voice;
-    model.transfers = snapshot.transfers;
+    model.transfers = snapshot
+        .transfers
+        .into_iter()
+        .filter(|transfer| {
+            !matches!(
+                transfer.status,
+                rpc::daemon::model::TransferStatus::Complete
+                    | rpc::daemon::model::TransferStatus::Canceled
+                    | rpc::daemon::model::TransferStatus::Failed
+            )
+        })
+        .collect();
 }
 
 fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffect) {
     match delta {
-        StateDelta::RoomCatalogReset { rooms } => model.rooms = rooms,
+        StateDelta::RoomCatalogReset { rooms } => {
+            if model
+                .selected_room
+                .is_some_and(|selected| !rooms.iter().any(|room| room.id == selected))
+            {
+                request_resync(model, effect);
+                return;
+            }
+            model.rooms = rooms;
+        }
         StateDelta::RoomUpserted { room } => {
             if let Some(existing) = model.rooms.iter_mut().find(|item| item.id == room.id) {
                 *existing = room;
@@ -102,7 +129,13 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 model.rooms.sort_by_key(|item| item.id);
             }
         }
-        StateDelta::RoomRemoved { room_id } => model.rooms.retain(|room| room.id != room_id),
+        StateDelta::RoomRemoved { room_id } => {
+            model.rooms.retain(|room| room.id != room_id);
+            if model.selected_room == Some(room_id) {
+                model.selected_room = None;
+                clear_room_state(model, effect);
+            }
+        }
         StateDelta::RoomUnreadChanged {
             room_id,
             unread,
@@ -113,7 +146,13 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 room.behind_head = behind_head;
             }
         }
-        StateDelta::ActiveRoomChanged { room_id } => model.selected_room = room_id,
+        StateDelta::ActiveRoomChanged { room_id } => {
+            let changed = model.selected_room != room_id;
+            model.selected_room = room_id;
+            if changed {
+                clear_room_state(model, effect);
+            }
+        }
         StateDelta::RoomSnapshot(room) => {
             model.selected_room = Some(room.room_id);
             model.older_cursor = room.older_cursor;
@@ -127,15 +166,36 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             effect.replace_messages = true;
         }
         StateDelta::MessagesPrepended {
+            room_id,
             messages,
             older_cursor,
             at_start,
-            ..
         } => {
+            if !is_active_room(model, room_id, effect) {
+                return;
+            }
             model.older_cursor = older_cursor;
             model.at_start = at_start;
             let mut incoming: Vec<_> = messages.into_iter().map(timeline::from_daemon).collect();
-            incoming.retain(|message| !model.messages.iter().any(|item| item.id == message.id));
+            let first_existing = model.messages.first().map(|message| message.id);
+            if incoming.iter().any(|message| {
+                first_existing.is_some_and(|first| {
+                    message.id >= first
+                        && model
+                            .messages
+                            .binary_search_by_key(&message.id, |item| item.id)
+                            .is_err()
+                })
+            }) {
+                request_resync(model, effect);
+                return;
+            }
+            incoming.retain(|message| {
+                model
+                    .messages
+                    .binary_search_by_key(&message.id, |item| item.id)
+                    .is_err()
+            });
             let added = incoming.len();
             incoming.append(&mut model.messages);
             model.messages = incoming;
@@ -143,21 +203,44 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 effect.splices.push((0, 0, added));
             }
         }
+        StateDelta::HistoryStateChanged {
+            room_id,
+            older_cursor,
+            at_start,
+        } => {
+            if !is_active_room(model, room_id, effect) {
+                return;
+            }
+            model.older_cursor = older_cursor;
+            model.at_start = at_start;
+        }
         StateDelta::MessageUpserted { message } => {
+            if !is_active_room(model, message.room_id, effect) {
+                return;
+            }
             let message = timeline::from_daemon(message);
-            if let Some(existing) = model.messages.iter_mut().find(|item| item.id == message.id) {
-                *existing = message;
-            } else {
-                let index = model.messages.len();
-                model.messages.push(message);
-                effect.splices.push((index, index, 1));
+            match model
+                .messages
+                .binary_search_by_key(&message.id, |item| item.id)
+            {
+                Ok(index) => model.messages[index] = message,
+                Err(index) => {
+                    model.messages.insert(index, message);
+                    effect.splices.push((index, index, 1));
+                }
             }
         }
-        StateDelta::MessageDeleted { message_id, .. } => {
+        StateDelta::MessageDeleted {
+            room_id,
+            message_id,
+        } => {
+            if !is_active_room(model, room_id, effect) {
+                return;
+            }
             if let Some(index) = model
                 .messages
-                .iter()
-                .position(|message| message.id == message_id.0)
+                .binary_search_by_key(&message_id.0, |message| message.id)
+                .ok()
             {
                 model.messages.remove(index);
                 effect.splices.push((index, index + 1, 0));
@@ -166,7 +249,8 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
         StateDelta::VoiceStateChanged { voice } => model.voice = voice,
         StateDelta::ResyncRequired { .. } => {
             model.phase = ConnectionPhase::Syncing;
-            effect.request_resync = true;
+            effect.request_resync = !model.resync_requested;
+            model.resync_requested = true;
         }
         StateDelta::DaemonStopping => {
             model.phase = ConnectionPhase::Disconnected {
@@ -186,6 +270,9 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             }
         }
         StateDelta::TransferChanged { transfer } => {
+            if !is_active_room(model, transfer.room_id, effect) {
+                return;
+            }
             if matches!(
                 transfer.status,
                 rpc::daemon::model::TransferStatus::Complete
@@ -205,30 +292,64 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 model.transfers.push(transfer);
             }
         }
-        StateDelta::ParticipantsChanged { participants, .. } => model.participants = participants,
-        StateDelta::ShareAvailable { .. }
-        | StateDelta::ShareConfig { .. }
-        | StateDelta::ShareEnded { .. } => {}
+        StateDelta::TransferRemoved { transfer_id } => {
+            model
+                .transfers
+                .retain(|transfer| transfer.transfer_id != transfer_id);
+        }
+        StateDelta::ParticipantsChanged {
+            room_id,
+            participants,
+        } => {
+            if is_active_room(model, room_id, effect) {
+                model.participants = participants;
+            }
+        }
     }
+}
+
+fn clear_room_state(model: &mut ChatModel, effect: &mut ReduceEffect) {
+    model.older_cursor = None;
+    model.at_start = true;
+    model.messages.clear();
+    model.participants.clear();
+    model.transfers.clear();
+    effect.replace_messages = true;
+}
+
+fn is_active_room(
+    model: &mut ChatModel,
+    room_id: rpc::ids::RoomId,
+    effect: &mut ReduceEffect,
+) -> bool {
+    if model.selected_room == Some(room_id) {
+        true
+    } else {
+        request_resync(model, effect);
+        false
+    }
+}
+
+fn request_resync(model: &mut ChatModel, effect: &mut ReduceEffect) {
+    model.phase = ConnectionPhase::Syncing;
+    effect.request_resync = !model.resync_requested;
+    model.resync_requested = true;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rpc::daemon::{
-        bulk::BulkTransport,
         frame::{NegotiatedLimits, StateEvent, Welcome},
-        model::{ConnectionState, DaemonInstanceId, FrontendClientId, VoiceState},
+        model::{ConnectionState, DaemonInstanceId, Participant, VoiceState},
     };
+    use rpc::ids::{RoomId, UserId};
 
     fn welcome(instance: DaemonInstanceId) -> DaemonFrame {
         DaemonFrame::Welcome(Welcome {
             version: 1,
-            capabilities: Vec::new(),
-            client_id: FrontendClientId(1),
             instance_id: instance,
             daemon_build: "test".into(),
-            bulk_transport: BulkTransport::RpcChunksV1,
             connection: ConnectionState::Online,
             active_server: Some("local".into()),
             first_event_seq: 4,
@@ -251,6 +372,23 @@ mod tests {
                 joined_room: None,
             },
             transfers: Vec::new(),
+        }
+    }
+
+    fn message(room_id: RoomId, message_id: u64) -> rpc::daemon::model::Message {
+        rpc::daemon::model::Message {
+            room_id,
+            message_id: rpc::ids::MessageId(message_id),
+            sender_id: UserId(1),
+            sender_name: "alice".into(),
+            body: message_id.to_string(),
+            timestamp_ms: message_id,
+            local: false,
+            edited: false,
+            unverified: false,
+            notice: false,
+            reference: None,
+            attachment: None,
         }
     }
 
@@ -295,5 +433,118 @@ mod tests {
         );
         assert!(effect.request_resync);
         assert_eq!(model.phase, ConnectionPhase::Syncing);
+
+        let repeated = apply(
+            &mut model,
+            DaemonFrame::Event(StateEvent {
+                instance_id: instance,
+                event_seq: 7,
+                delta: StateDelta::DaemonStopping,
+            }),
+        );
+        assert!(!repeated.request_resync);
+    }
+
+    #[test]
+    fn clearing_active_room_clears_room_scoped_state() {
+        let instance = DaemonInstanceId([3; 16]);
+        let mut model = ChatModel::default();
+        apply(&mut model, welcome(instance));
+        apply(
+            &mut model,
+            DaemonFrame::Snapshot {
+                instance_id: instance,
+                event_seq: 4,
+                snapshot: snapshot(),
+            },
+        );
+        model.selected_room = Some(RoomId(1));
+        model.at_start = false;
+        model.participants.push(Participant {
+            user_id: UserId(1),
+            name: "alice".into(),
+            online: true,
+            speaking: false,
+            muted: false,
+            deafened: false,
+        });
+        let effect = apply(
+            &mut model,
+            DaemonFrame::Event(StateEvent {
+                instance_id: instance,
+                event_seq: 5,
+                delta: StateDelta::ActiveRoomChanged { room_id: None },
+            }),
+        );
+        assert!(effect.replace_messages);
+        assert_eq!(model.selected_room, None);
+        assert!(model.at_start);
+        assert!(model.participants.is_empty());
+    }
+
+    #[test]
+    fn rejects_delta_for_a_different_active_room() {
+        let instance = DaemonInstanceId([3; 16]);
+        let mut model = ChatModel::default();
+        apply(&mut model, welcome(instance));
+        apply(
+            &mut model,
+            DaemonFrame::Snapshot {
+                instance_id: instance,
+                event_seq: 4,
+                snapshot: snapshot(),
+            },
+        );
+        model.selected_room = Some(RoomId(1));
+        let effect = apply(
+            &mut model,
+            DaemonFrame::Event(StateEvent {
+                instance_id: instance,
+                event_seq: 5,
+                delta: StateDelta::MessageUpserted {
+                    message: message(RoomId(2), 1),
+                },
+            }),
+        );
+        assert!(effect.request_resync);
+        assert!(model.messages.is_empty());
+    }
+
+    #[test]
+    fn inserts_message_upserts_in_id_order() {
+        let instance = DaemonInstanceId([3; 16]);
+        let mut model = ChatModel::default();
+        apply(&mut model, welcome(instance));
+        apply(
+            &mut model,
+            DaemonFrame::Snapshot {
+                instance_id: instance,
+                event_seq: 4,
+                snapshot: snapshot(),
+            },
+        );
+        model.selected_room = Some(RoomId(1));
+        model.messages = vec![
+            timeline::from_daemon(message(RoomId(1), 1)),
+            timeline::from_daemon(message(RoomId(1), 3)),
+        ];
+        apply(
+            &mut model,
+            DaemonFrame::Event(StateEvent {
+                instance_id: instance,
+                event_seq: 5,
+                delta: StateDelta::MessageUpserted {
+                    message: message(RoomId(1), 2),
+                },
+            }),
+        );
+        assert_eq!(
+            model
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }
