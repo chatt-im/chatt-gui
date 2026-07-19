@@ -15,6 +15,8 @@ use crate::app::ChattView;
 fn main() {
     env_logger::init();
     application().run(move |cx: &mut App| {
+        settings::init(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
         app::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1240.0), px(820.0)), cx);

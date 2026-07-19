@@ -1,15 +1,17 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc::Receiver},
-    time::Duration,
+    sync::{Arc, Mutex},
 };
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight, KeyBinding,
     ListAlignment, ListState, LruImageCache, ObjectFit, PathPromptOptions, Render, RenderImage,
     SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px, relative, rgb,
+    rgba,
 };
 use image::{Frame, RgbaImage};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use rpc::{
     daemon::{
         frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
@@ -56,6 +58,7 @@ actions!(
 pub fn bind_keys(cx: &mut App) {
     crate::composer::bind_keys(cx);
     cx.bind_keys([
+        KeyBinding::new("cmd-c", markdown::Copy, Some("Markdown")),
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
         KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
         KeyBinding::new(
@@ -71,7 +74,6 @@ pub fn bind_keys(cx: &mut App) {
 pub struct ChattView {
     model: ChatModel,
     daemon: DaemonClient,
-    daemon_events: Receiver<DaemonEvent>,
     next_request_id: u64,
     next_transfer_id: u64,
     editing: Option<(RoomId, rpc::ids::MessageId, String)>,
@@ -79,7 +81,9 @@ pub struct ChattView {
     media_cache: Arc<Mutex<MediaCache>>,
     image_cache: gpui::Entity<LruImageCache<TimelineImageLoader>>,
     list_state: ListState,
+    message_markdown: HashMap<u64, gpui::Entity<Markdown>>,
     player: Option<MpvPlayer>,
+    video_wakeup: async_channel::Sender<()>,
     active_video: Option<u64>,
     frame: Option<Arc<RenderImage>>,
     position: f64,
@@ -87,8 +91,8 @@ pub struct ChattView {
     paused: bool,
     media_volume: f64,
     status: SharedString,
-    tick_count: u64,
-    _tick_task: Task<()>,
+    _daemon_task: Task<()>,
+    _video_task: Task<()>,
 }
 
 impl ChattView {
@@ -104,11 +108,29 @@ impl ChattView {
         let image_cache =
             LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         window.focus(&composer.focus_handle(cx), cx);
-        let tick_task = cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(25))
-                    .await;
+        let daemon_task = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(first_event) = daemon_events.recv().await {
+                let mut events = vec![first_event];
+                while let Ok(event) = daemon_events.try_recv() {
+                    events.push(event);
+                }
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        for event in events {
+                            this.apply_daemon_event(event, window, cx);
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let (video_wakeup, video_updates) = async_channel::bounded(1);
+        let video_task = cx.spawn_in(window, async move |this, cx| {
+            while video_updates.recv().await.is_ok() {
+                while video_updates.try_recv().is_ok() {}
                 if this
                     .update_in(cx, |this, window, cx| this.tick(window, cx))
                     .is_err()
@@ -120,7 +142,6 @@ impl ChattView {
         Self {
             model,
             daemon,
-            daemon_events,
             next_request_id: 1,
             next_transfer_id: 1,
             editing: None,
@@ -128,7 +149,9 @@ impl ChattView {
             media_cache,
             image_cache,
             list_state,
+            message_markdown: HashMap::new(),
             player: None,
+            video_wakeup,
             active_video: None,
             frame: None,
             position: 0.0,
@@ -136,8 +159,8 @@ impl ChattView {
             paused: true,
             media_volume: 100.0,
             status: "Discovering Chatt daemon…".into(),
-            tick_count: 0,
-            _tick_task: tick_task,
+            _daemon_task: daemon_task,
+            _video_task: video_task,
         }
     }
 
@@ -154,40 +177,43 @@ impl ChattView {
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = self.drain_daemon(window, cx);
-        self.tick_count = self.tick_count.wrapping_add(1);
+        let mut changed = false;
         let mut terminal_video_status = None;
         if let Some(player) = self.player.as_mut()
             && self.active_video.is_some()
         {
-            match player.render_frame(VIDEO_WIDTH, VIDEO_HEIGHT) {
-                Ok(Some(frame)) => {
-                    if let Some(buffer) =
-                        RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
-                    {
-                        let next_frame = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
-                        if let Some(previous_frame) = self.frame.replace(next_frame) {
-                            cx.drop_image(previous_frame, Some(window));
-                        }
-                        changed = true;
+            match player.drain_events() {
+                Ok(playback) => {
+                    self.position = playback.position;
+                    self.duration = playback.duration;
+                    self.paused = playback.paused;
+                    changed = true;
+                    if playback.finished {
+                        terminal_video_status = Some("Playback finished".into());
                     }
                 }
-                Ok(None) => {}
                 Err(error) => {
-                    terminal_video_status = Some(format!("Video render failed: {error}"));
+                    terminal_video_status = Some(format!("Video event failed: {error}"));
                 }
             }
-            if self.tick_count.is_multiple_of(6) {
-                self.position = player.position().unwrap_or(self.position).max(0.0);
-                self.duration = player.duration().unwrap_or(self.duration).max(0.0);
-                self.paused = player.paused().unwrap_or(self.paused);
-                if self.duration > 0.
-                    && (player.eof_reached().unwrap_or(false)
-                        || player.idle_active().unwrap_or(false))
-                {
-                    terminal_video_status = Some("Playback finished".into());
+            if terminal_video_status.is_none() {
+                match player.render_frame(VIDEO_WIDTH, VIDEO_HEIGHT) {
+                    Ok(Some(frame)) => {
+                        if let Some(buffer) =
+                            RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
+                        {
+                            let next_frame = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
+                            if let Some(previous_frame) = self.frame.replace(next_frame) {
+                                cx.drop_image(previous_frame, Some(window));
+                            }
+                            changed = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        terminal_video_status = Some(format!("Video render failed: {error}"));
+                    }
                 }
-                changed = true;
             }
         }
         if let Some(status) = terminal_video_status {
@@ -200,67 +226,67 @@ impl ChattView {
         }
     }
 
-    fn drain_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let mut changed = false;
-        while let Ok(event) = self.daemon_events.try_recv() {
-            changed = true;
-            match event {
-                DaemonEvent::Discovering => self.model.phase = ConnectionPhase::Discovering,
-                DaemonEvent::Connecting => self.model.phase = ConnectionPhase::Connecting,
-                DaemonEvent::TransportConnected => self.model.phase = ConnectionPhase::Syncing,
-                DaemonEvent::Disconnected(reason) => {
-                    self.media_cache
-                        .lock()
-                        .expect("media cache lock poisoned")
-                        .cancel_all();
-                    self.model.resync_requested = false;
-                    self.model.phase = ConnectionPhase::Disconnected {
-                        reason: reason.clone(),
-                    };
-                    if !self.model.pending.is_empty() {
-                        self.model.pending.clear();
-                        self.model.last_error =
-                            Some("Connection changed; pending operations were not replayed".into());
-                    }
-                    self.status = format!("Offline · {reason}").into();
+    fn apply_daemon_event(
+        &mut self,
+        event: DaemonEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            DaemonEvent::Discovering => self.model.phase = ConnectionPhase::Discovering,
+            DaemonEvent::Connecting => self.model.phase = ConnectionPhase::Connecting,
+            DaemonEvent::TransportConnected => self.model.phase = ConnectionPhase::Syncing,
+            DaemonEvent::Disconnected(reason) => {
+                self.media_cache
+                    .lock()
+                    .expect("media cache lock poisoned")
+                    .cancel_all();
+                self.model.resync_requested = false;
+                self.model.phase = ConnectionPhase::Disconnected {
+                    reason: reason.clone(),
+                };
+                if !self.model.pending.is_empty() {
+                    self.model.pending.clear();
+                    self.model.last_error =
+                        Some("Connection changed; pending operations were not replayed".into());
                 }
-                DaemonEvent::Incompatible(details) => {
-                    self.model.phase = ConnectionPhase::Incompatible {
-                        details: details.clone(),
-                    };
-                    self.status = format!("Cannot connect · {details}").into();
-                }
-                DaemonEvent::UploadPreparationFailed {
-                    begin_request,
-                    finish_request,
-                    reason,
-                } => {
-                    self.model.pending.remove(&begin_request);
-                    self.model.pending.remove(&finish_request);
-                    self.status = format!("Could not prepare upload · {reason}").into();
-                }
-                DaemonEvent::MediaTransferStarted => {
-                    self.status = "Receiving attachment…".into();
-                }
-                DaemonEvent::MediaCached(descriptor) => {
-                    self.status = format!("Cached {}", descriptor.file_name).into();
-                }
-                DaemonEvent::MediaTransferFailed {
-                    transfer_id,
-                    reason,
-                } => {
-                    self.media_cache
-                        .lock()
-                        .expect("media cache lock poisoned")
-                        .cancel(transfer_id);
-                    self.status = reason.into();
-                }
-                DaemonEvent::Frame(frame) => {
-                    self.apply_daemon_state_frame(frame, window, cx);
-                }
+                self.status = format!("Offline · {reason}").into();
+            }
+            DaemonEvent::Incompatible(details) => {
+                self.model.phase = ConnectionPhase::Incompatible {
+                    details: details.clone(),
+                };
+                self.status = format!("Cannot connect · {details}").into();
+            }
+            DaemonEvent::UploadPreparationFailed {
+                begin_request,
+                finish_request,
+                reason,
+            } => {
+                self.model.pending.remove(&begin_request);
+                self.model.pending.remove(&finish_request);
+                self.status = format!("Could not prepare upload · {reason}").into();
+            }
+            DaemonEvent::MediaTransferStarted => {
+                self.status = "Receiving attachment…".into();
+            }
+            DaemonEvent::MediaCached(descriptor) => {
+                self.status = format!("Cached {}", descriptor.file_name).into();
+            }
+            DaemonEvent::MediaTransferFailed {
+                transfer_id,
+                reason,
+            } => {
+                self.media_cache
+                    .lock()
+                    .expect("media cache lock poisoned")
+                    .cancel(transfer_id);
+                self.status = reason.into();
+            }
+            DaemonEvent::Frame(frame) => {
+                self.apply_daemon_state_frame(frame, window, cx);
             }
         }
-        changed
     }
 
     fn apply_daemon_state_frame(
@@ -280,6 +306,7 @@ impl ChattView {
         let effect = reducer::apply(&mut self.model, frame);
         if self.model.selected_room != old_selected_room {
             self.release_video(window, cx);
+            self.message_markdown.clear();
             self.image_cache
                 .update(cx, |cache, cx| cache.clear(window, cx));
         }
@@ -739,10 +766,10 @@ impl ChattView {
     fn render_message(
         &mut self,
         index: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(message) = self.model.messages.get(index).cloned() else {
+        let Some(message) = self.model.messages.get(index) else {
             return div().into_any_element();
         };
         let continuation = timeline::is_continuation(&self.model.messages, index);
@@ -754,8 +781,36 @@ impl ChattView {
         } else {
             0x111317
         };
+        let message_id = message.id;
+        let message_markdown = match self.message_markdown.get(&message.id) {
+            Some(markdown) if markdown.read(cx).source().as_ref() == message.body.as_str() => {
+                markdown.clone()
+            }
+            _ => {
+                let markdown = cx.new(|cx| {
+                    Markdown::new(message.body.clone().into(), None, None, cx)
+                });
+                self.message_markdown.insert(message.id, markdown.clone());
+                markdown
+            }
+        };
+        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        markdown_style.base_text_style.color = rgb(0xd7d9dd).into();
+        markdown_style.selection_background_color = rgba(0x5277a866).into();
+        let sender = message.sender.clone();
+        let edited = message.edited;
+        let unverified = message.unverified;
+        let timestamp_ms = message.timestamp_ms;
+        let edit = (message.local && !message.notice).then(|| {
+            (
+                message.room_id,
+                rpc::ids::MessageId(message.id),
+                message.body.clone(),
+            )
+        });
+        let attachment = message.attachment.clone();
         div()
-            .id(("message", message.id as usize))
+            .id(("message", message_id as usize))
             .w_full()
             .pl(px(64.))
             .pr(px(28.))
@@ -764,22 +819,23 @@ impl ChattView {
             .hover(|row| row.bg(rgb(0x1b1e24)))
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .max_w(px(860.))
-                    .flex()
+                    .pl(px(15.))
                     .child(
                         div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
                             .w(px(3.))
-                            .self_stretch()
-                            .mr_3()
                             .bg(rgb(if continuation { background } else { accent })),
                     )
                     .child(
                         div()
-                            .flex_1()
+                            .w_full()
                             .min_w_0()
-                            .flex()
-                            .flex_col()
                             .when(!continuation, |content| {
                                 content.child(
                                     div()
@@ -791,9 +847,9 @@ impl ChattView {
                                             div()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(accent))
-                                                .child(message.sender.clone()),
+                                                .child(sender),
                                         )
-                                        .when(message.edited, |meta| {
+                                        .when(edited, |meta| {
                                             meta.child(
                                                 div()
                                                     .text_xs()
@@ -801,7 +857,7 @@ impl ChattView {
                                                     .child("edited"),
                                             )
                                         })
-                                        .when(message.unverified, |meta| {
+                                        .when(unverified, |meta| {
                                             meta.child(
                                                 div()
                                                     .text_xs()
@@ -810,19 +866,16 @@ impl ChattView {
                                             )
                                         })
                                         .child(div().flex_1())
-                                        .when(message.local && !message.notice, |header| {
-                                            let edit_body = message.body.clone();
-                                            let edit_room = message.room_id;
-                                            let edit_id = rpc::ids::MessageId(message.id);
+                                        .when_some(edit, |header, (room_id, edit_id, edit_body)| {
                                             header
                                                 .child(
                                                     mini_button(
-                                                        ("edit", message.id as usize),
+                                                        ("edit", message_id as usize),
                                                         "Edit",
                                                     )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.begin_edit(
-                                                            edit_room,
+                                                            room_id,
                                                             edit_id,
                                                             edit_body.clone(),
                                                             cx,
@@ -831,31 +884,25 @@ impl ChattView {
                                                 )
                                                 .child(
                                                     mini_button(
-                                                        ("delete", message.id as usize),
+                                                        ("delete", message_id as usize),
                                                         "Delete",
                                                     )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.delete_message(edit_room, edit_id, cx)
+                                                        this.delete_message(room_id, edit_id, cx)
                                                     })),
                                                 )
                                         })
                                         .child(div().text_xs().text_color(rgb(0x777d87)).child(
                                             timeline::format_age(
-                                                message.timestamp_ms,
+                                                timestamp_ms,
                                                 timeline::now_ms(),
                                             ),
                                         )),
                                 )
                             })
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .line_height(relative(1.55))
-                                    .text_color(rgb(0xd7d9dd))
-                                    .child(message.body.clone()),
-                            )
-                            .when_some(message.attachment.clone(), |content, attachment| {
-                                content.child(self.render_attachment(message.id, attachment, cx))
+                            .child(MarkdownElement::new(message_markdown, markdown_style))
+                            .when_some(attachment, |content, attachment| {
+                                content.child(self.render_attachment(message_id, attachment, cx))
                             }),
                     ),
             )
@@ -1129,7 +1176,7 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         if self.player.is_none() {
-            match MpvPlayer::new() {
+            match MpvPlayer::new(self.video_wakeup.clone()) {
                 Ok(player) => self.player = Some(player),
                 Err(error) => {
                     self.status = format!("Video unavailable: {error}").into();

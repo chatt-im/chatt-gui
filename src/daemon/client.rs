@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use async_channel::{Receiver as EventReceiver, Sender as EventSender};
 use rpc::daemon::{
     bulk::{BeginUpload, BulkChunk, BulkFinished},
     frame::{ClientFrame, ClientHello, DaemonFrame, Operation, RequestOutcome},
@@ -39,7 +40,7 @@ pub enum DaemonEvent {
 #[derive(Clone)]
 pub struct DaemonClient {
     commands: SyncSender<ConnectorCommand>,
-    events: SyncSender<DaemonEvent>,
+    events: EventSender<DaemonEvent>,
 }
 
 enum ConnectorCommand {
@@ -70,9 +71,9 @@ struct ActiveUpload {
 impl DaemonClient {
     pub fn spawn(
         media_cache: std::sync::Arc<std::sync::Mutex<crate::media_cache::MediaCache>>,
-    ) -> (Self, Receiver<DaemonEvent>) {
+    ) -> (Self, EventReceiver<DaemonEvent>) {
         let (command_tx, command_rx) = mpsc::sync_channel(128);
-        let (event_tx, event_rx) = mpsc::sync_channel(64);
+        let (event_tx, event_rx) = async_channel::bounded(64);
         let connector_events = event_tx.clone();
         let connector_commands = command_tx.clone();
         thread::Builder::new()
@@ -122,7 +123,7 @@ impl DaemonClient {
                 let file = match File::open(&path) {
                     Ok(file) => file,
                     Err(error) => {
-                        let _ = events.send(DaemonEvent::UploadPreparationFailed {
+                        let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
                             begin_request,
                             finish_request,
                             reason: error.to_string(),
@@ -133,7 +134,7 @@ impl DaemonClient {
                 let metadata = match file.metadata() {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        let _ = events.send(DaemonEvent::UploadPreparationFailed {
+                        let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
                             begin_request,
                             finish_request,
                             reason: error.to_string(),
@@ -142,7 +143,7 @@ impl DaemonClient {
                     }
                 };
                 if metadata.len() > max_upload_bytes {
-                    let _ = events.send(DaemonEvent::UploadPreparationFailed {
+                    let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
                         begin_request,
                         finish_request,
                         reason: format!(
@@ -171,7 +172,7 @@ impl DaemonClient {
                     }))
                     .is_err()
                 {
-                    let _ = events.send(DaemonEvent::UploadPreparationFailed {
+                    let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
                         begin_request,
                         finish_request,
                         reason: "daemon connector stopped".into(),
@@ -195,7 +196,7 @@ impl DaemonClient {
 fn connection_loop(
     mut commands: Receiver<ConnectorCommand>,
     command_tx: SyncSender<ConnectorCommand>,
-    events: SyncSender<DaemonEvent>,
+    events: EventSender<DaemonEvent>,
     media_cache: std::sync::Arc<std::sync::Mutex<crate::media_cache::MediaCache>>,
 ) {
     let mut delay = Duration::from_millis(250);
@@ -212,7 +213,7 @@ fn connection_loop(
                     Ok(stream) => stream,
                     Err(error) => {
                         if events
-                            .send(DaemonEvent::Disconnected(error.to_string()))
+                            .send_blocking(DaemonEvent::Disconnected(error.to_string()))
                             .is_err()
                         {
                             return;
@@ -228,7 +229,7 @@ fn connection_loop(
                 {
                     Ok(thread) => thread,
                     Err(error) => {
-                        let _ = events.send(DaemonEvent::Disconnected(error.to_string()));
+                        let _ = events.send_blocking(DaemonEvent::Disconnected(error.to_string()));
                         return;
                     }
                 };
@@ -271,7 +272,7 @@ fn connection_loop(
                             ) {
                                 continue;
                             }
-                            if events.send(DaemonEvent::Frame(frame)).is_err() {
+                            if events.send_blocking(DaemonEvent::Frame(frame)).is_err() {
                                 let _ = command_tx.send(ConnectorCommand::SessionEnded);
                                 let _ = writer_thread.join();
                                 return;
@@ -289,7 +290,10 @@ fn connection_loop(
                     .lock()
                     .expect("media cache lock poisoned")
                     .cancel_all();
-                if events.send(DaemonEvent::Disconnected(reason)).is_err() {
+                if events
+                    .send_blocking(DaemonEvent::Disconnected(reason))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -298,14 +302,17 @@ fn connection_loop(
                 | ConnectError::Permission(details)
                 | ConnectError::Rejected(details),
             ) => {
-                if events.send(DaemonEvent::Incompatible(details)).is_err() {
+                if events
+                    .send_blocking(DaemonEvent::Incompatible(details))
+                    .is_err()
+                {
                     return;
                 }
                 wait_for_retry(&commands, Duration::from_secs(5));
             }
             Err(error) => {
                 if events
-                    .send(DaemonEvent::Disconnected(error.to_string()))
+                    .send_blocking(DaemonEvent::Disconnected(error.to_string()))
                     .is_err()
                 {
                     return;
@@ -321,7 +328,7 @@ fn handle_bulk_frame(
     frame: DaemonFrame,
     media_cache: &std::sync::Mutex<crate::media_cache::MediaCache>,
     commands: &SyncSender<ConnectorCommand>,
-    events: &SyncSender<DaemonEvent>,
+    events: &EventSender<DaemonEvent>,
 ) -> Option<DaemonFrame> {
     match frame {
         DaemonFrame::BulkStarted(started) => {
@@ -332,7 +339,7 @@ fn handle_bulk_frame(
                 .begin(started)
             {
                 Ok(()) => {
-                    let _ = events.send(DaemonEvent::MediaTransferStarted);
+                    let _ = events.send_blocking(DaemonEvent::MediaTransferStarted);
                 }
                 Err(reason) => cancel_failed_download(transfer_id, reason, commands, events),
             }
@@ -357,7 +364,7 @@ fn handle_bulk_frame(
                 .finish(finished)
             {
                 Ok(descriptor) => {
-                    let _ = events.send(DaemonEvent::MediaCached(descriptor));
+                    let _ = events.send_blocking(DaemonEvent::MediaCached(descriptor));
                 }
                 Err(reason) => cancel_failed_download(transfer_id, reason, commands, events),
             }
@@ -371,7 +378,7 @@ fn handle_bulk_frame(
                 .lock()
                 .expect("media cache lock poisoned")
                 .cancel(transfer_id);
-            let _ = events.send(DaemonEvent::MediaTransferFailed {
+            let _ = events.send_blocking(DaemonEvent::MediaTransferFailed {
                 transfer_id,
                 reason,
             });
@@ -385,10 +392,10 @@ fn cancel_failed_download(
     transfer_id: BulkTransferId,
     reason: String,
     commands: &SyncSender<ConnectorCommand>,
-    events: &SyncSender<DaemonEvent>,
+    events: &EventSender<DaemonEvent>,
 ) {
     let _ = commands.send(ConnectorCommand::CancelBulk(transfer_id));
-    let _ = events.send(DaemonEvent::MediaTransferFailed {
+    let _ = events.send_blocking(DaemonEvent::MediaTransferFailed {
         transfer_id,
         reason,
     });
@@ -397,7 +404,7 @@ fn cancel_failed_download(
 fn writer_loop(
     commands: Receiver<ConnectorCommand>,
     stream: std::os::unix::net::UnixStream,
-    events: SyncSender<DaemonEvent>,
+    events: EventSender<DaemonEvent>,
 ) -> Receiver<ConnectorCommand> {
     let mut writer = FrameWriter::new(stream);
     let mut prepared = HashMap::<RequestId, PreparedUpload>::new();
@@ -588,12 +595,12 @@ fn stream_upload_chunk(
 }
 
 fn report_upload_error(
-    events: &SyncSender<DaemonEvent>,
+    events: &EventSender<DaemonEvent>,
     begin_request: RequestId,
     finish_request: RequestId,
     reason: String,
 ) {
-    let _ = events.send(DaemonEvent::UploadPreparationFailed {
+    let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
         begin_request,
         finish_request,
         reason,

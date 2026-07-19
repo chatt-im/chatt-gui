@@ -1,7 +1,11 @@
 use std::{ffi::CStr, os::raw::c_void, ptr};
 
 use anyhow::{Result, anyhow, bail};
-use libmpv2::Mpv;
+use async_channel::Sender;
+use libmpv2::{
+    Format, Mpv,
+    events::{Event, PropertyData},
+};
 use libmpv2_sys as sys;
 
 const FORMAT_BGR0: &[u8] = b"bgr0\0";
@@ -13,13 +17,15 @@ const FORMAT_BGR0: &[u8] = b"bgr0\0";
 pub struct MpvPlayer {
     render_context: *mut sys::mpv_render_context,
     mpv: Mpv,
+    _render_wakeup: Box<Sender<()>>,
     last_render_size: Option<(usize, usize)>,
     surface: AlignedSurface,
+    playback: PlaybackState,
 }
 
 impl MpvPlayer {
-    pub fn new() -> Result<Self> {
-        let mpv = Mpv::with_initializer(|initializer| {
+    pub fn new(wakeup: Sender<()>) -> Result<Self> {
+        let mut mpv = Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "libmpv")?;
             initializer.set_option("keep-open", "no")?;
             initializer.set_option("idle", "yes")?;
@@ -50,17 +56,41 @@ impl MpvPlayer {
         };
         check_mpv(code, "create software render context")?;
 
+        mpv.observe_property("time-pos", Format::Double, 1)?;
+        mpv.observe_property("duration", Format::Double, 2)?;
+        mpv.observe_property("pause", Format::Flag, 3)?;
+        mpv.observe_property("eof-reached", Format::Flag, 4)?;
+        mpv.observe_property("idle-active", Format::Flag, 5)?;
+
+        let event_wakeup = wakeup.clone();
+        mpv.set_wakeup_callback(move || {
+            let _ = event_wakeup.try_send(());
+        });
+        let render_wakeup = Box::new(wakeup);
+        // SAFETY: the boxed sender remains at a stable address until Drop,
+        // where the callback is disabled before the box is released.
+        unsafe {
+            sys::mpv_render_context_set_update_callback(
+                render_context,
+                Some(render_update),
+                (&*render_wakeup as *const Sender<()>).cast_mut().cast(),
+            );
+        }
+
         Ok(Self {
             render_context,
             mpv,
+            _render_wakeup: render_wakeup,
             last_render_size: None,
             surface: AlignedSurface::new(0),
+            playback: PlaybackState::default(),
         })
     }
 
     pub fn load(&mut self, path: &str) -> Result<()> {
         self.mpv.command("loadfile", &[path, "replace"])?;
         self.last_render_size = None;
+        self.playback = PlaybackState::default();
         Ok(())
     }
 
@@ -81,24 +111,31 @@ impl MpvPlayer {
         Ok(())
     }
 
-    pub fn position(&self) -> Option<f64> {
-        self.mpv.get_property("time-pos").ok()
-    }
-
-    pub fn duration(&self) -> Option<f64> {
-        self.mpv.get_property("duration").ok()
-    }
-
-    pub fn paused(&self) -> Option<bool> {
-        self.mpv.get_property("pause").ok()
-    }
-
-    pub fn eof_reached(&self) -> Option<bool> {
-        self.mpv.get_property("eof-reached").ok()
-    }
-
-    pub fn idle_active(&self) -> Option<bool> {
-        self.mpv.get_property("idle-active").ok()
+    pub fn drain_events(&mut self) -> Result<PlaybackState> {
+        while let Some(event) = self.mpv.wait_event(0.0) {
+            match event? {
+                Event::PropertyChange { name, change, .. } => match (name, change) {
+                    ("time-pos", PropertyData::Double(value)) => {
+                        self.playback.position = value.max(0.0)
+                    }
+                    ("duration", PropertyData::Double(value)) => {
+                        self.playback.duration = value.max(0.0)
+                    }
+                    ("pause", PropertyData::Flag(value)) => self.playback.paused = value,
+                    ("eof-reached", PropertyData::Flag(value)) => {
+                        self.playback.finished |= value
+                    }
+                    ("idle-active", PropertyData::Flag(value)) => {
+                        self.playback.finished |= value && self.playback.duration > 0.0
+                    }
+                    _ => {}
+                },
+                Event::EndFile(_) => self.playback.finished = true,
+                Event::Shutdown => self.playback.finished = true,
+                _ => {}
+            }
+        }
+        Ok(self.playback)
     }
 
     /// Render a pending frame. `None` means libmpv had no new frame and the
@@ -179,10 +216,31 @@ impl Drop for MpvPlayer {
     fn drop(&mut self) {
         if !self.render_context.is_null() {
             // SAFETY: this is the unique render context owned by this value.
-            unsafe { sys::mpv_render_context_free(self.render_context) };
+            unsafe {
+                sys::mpv_render_context_set_update_callback(
+                    self.render_context,
+                    None,
+                    ptr::null_mut(),
+                );
+                sys::mpv_render_context_free(self.render_context);
+            }
             self.render_context = ptr::null_mut();
         }
     }
+}
+
+unsafe extern "C" fn render_update(context: *mut c_void) {
+    if let Some(wakeup) = unsafe { (context as *const Sender<()>).as_ref() } {
+        let _ = wakeup.try_send(());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlaybackState {
+    pub position: f64,
+    pub duration: f64,
+    pub paused: bool,
+    pub finished: bool,
 }
 
 pub struct VideoFrame {

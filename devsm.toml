@@ -42,3 +42,28 @@ fi
 cargo run --release
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
+
+[action.alice-profile-release]
+profiles = ["default", "pop"]
+managed = false
+allow_multiple = true
+cli.forward_arguments = true
+env.RUST_BACKTRACE = "1"
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.XDG_DATA_HOME = "/tmp/chatt-dev/data"
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
+env.SAMPLY_USE_DEBUGINFOD = "1"
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
+sh = '''
+RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
+if [ ! -e "$RUNTIME_CONFIG" ]; then
+  mkdir -p "$(dirname "$RUNTIME_CONFIG")"
+  cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
+fi
+
+BENCH=$(cargo --config "target.'cfg(unix)'.runner = 'echo'" run -q --release)
+samply record -r 10000 --presymbolicate --save-only --output "/tmp/profile.json" $BENCH profile  "$@" || exit 1
+'''
