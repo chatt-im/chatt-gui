@@ -76,6 +76,11 @@ impl MediaCache {
             })
     }
 
+    pub fn available_transfer_slots(&self) -> usize {
+        rpc::daemon::MAX_CONCURRENT_TRANSFERS
+            .saturating_sub(self.requested.len() + self.partial.len())
+    }
+
     pub fn reserve(
         &mut self,
         transfer_id: BulkTransferId,
@@ -360,6 +365,32 @@ mod tests {
         );
         cache.reserve(BulkTransferId(9), &descriptor).unwrap();
         assert!(cache.reserve(BulkTransferId(10), &descriptor).is_err());
+    }
+
+    #[test]
+    fn reports_remaining_attachment_read_capacity() {
+        let mut cache = MediaCache::new(1024).unwrap();
+        assert_eq!(
+            cache.available_transfer_slots(),
+            rpc::daemon::MAX_CONCURRENT_TRANSFERS
+        );
+        for index in 0..rpc::daemon::MAX_CONCURRENT_TRANSFERS {
+            let marker = (index + 1) as u8;
+            let descriptor = AttachmentDescriptor {
+                id: AttachmentId([marker; 16]),
+                file_name: format!("photo-{index}.png"),
+                media_kind: MediaKind::Image,
+                content_type: "image/png".into(),
+                byte_len: 0,
+                digest: [marker; 32],
+                width: Some(320),
+                height: Some(240),
+            };
+            cache
+                .reserve(BulkTransferId((index + 1) as u64), &descriptor)
+                .unwrap();
+        }
+        assert_eq!(cache.available_transfer_slots(), 0);
     }
 
     #[test]
