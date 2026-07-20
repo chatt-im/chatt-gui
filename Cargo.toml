@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1"
 ash = "0.38"
 async-channel = "2.5"
-env_logger = "0.11"
 gpui = { path = "/code/ref/zed/crates/gpui", default-features = false, features = ["font-kit", "wayland"] }
 gpui_platform = { path = "/code/ref/zed/crates/gpui_platform", default-features = false, features = ["font-kit", "wayland"] }
 gpui_wgpu = { path = "/code/ref/zed/crates/gpui_wgpu", features = ["font-kit"] }
@@ -15,11 +14,9 @@ image = { version = "0.25", default-features = false }
 libc = "0.2"
 libmpv2 = { path = "vendor/libmpv2-rs", default-features = false, features = ["render", "vendored"] }
 log = "0.4"
-markdown = { path = "/code/ref/zed/crates/markdown" }
+markdown = { path = "/code/ref/zed/crates/markdown", default-features = false }
 rpc = { package = "chatt-rpc", path = "crates/chatt_rpc" }
-settings = { path = "/code/ref/zed/crates/settings" }
 theme = { path = "/code/ref/zed/crates/theme" }
-theme_settings = { path = "/code/ref/zed/crates/theme_settings" }
 unicode-segmentation = "1"
 aws-lc-rs = { version = "1.17", default-features = false, features = ["alloc", "non-fips"] }
 tempfile = "3"
@@ -28,6 +25,9 @@ tempfile = "3"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+[profile.dev]
+debug = 0
 
 [profile.release]
 debug = 1

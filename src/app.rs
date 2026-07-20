@@ -15,8 +15,8 @@ use gpui::{
     list, point, prelude::*, px, relative, rgb, rgba, surface,
 };
 use markdown::{
-    Markdown, MarkdownElement, MarkdownFont, MarkdownSelectionArea, MarkdownSelectionGroup,
-    MarkdownSelectionKey, MarkdownStyle,
+    Markdown, MarkdownElement, MarkdownSelectionArea, MarkdownSelectionGroup, MarkdownSelectionKey,
+    MarkdownStyle,
 };
 use rpc::{
     daemon::{
@@ -1512,7 +1512,7 @@ impl ChattView {
                 markdown
             }
         };
-        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let mut markdown_style = MarkdownStyle::simple(window, cx);
         markdown_style.base_text_style.color = rgb(0xd7d9dd).into();
         markdown_style.selection_background_color = rgba(0x5277a866).into();
         let sender = message.sender.clone();

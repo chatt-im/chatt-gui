@@ -6,9 +6,13 @@ edition = "2024"
 [lib]
 path = "../../../chatt/crates/rpc/src/lib.rs"
 
+[features]
+default = []
+toml = ["dep:toml-spanner"]
+
 [dependencies]
 aws-lc-rs = { version = "1.17.1", default-features = false, features = ["alloc", "non-fips"] }
 jsony = "0.1.10"
 libc = "0.2"
 mio = { version = "1.2.1", features = ["os-poll"] }
-toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
+toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"], optional = true }
