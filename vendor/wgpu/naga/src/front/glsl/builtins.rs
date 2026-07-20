@@ -2260,37 +2260,22 @@ impl MacroCall {
                 result
             }
             MacroCall::SubgroupAllEqual => {
-                let ty = ctx.resolve_type_handle(args[0], meta)?;
-                let first = ctx.interrupt_expression(
-                    Expression::SubgroupOperationResult { ty },
-                    meta,
-                );
-                ctx.body.push(
-                    Statement::SubgroupGather {
-                        mode: GatherMode::BroadcastFirst,
-                        argument: args[0],
-                        result: first,
+                let ty = ctx.module.types.insert(
+                    Type {
+                        name: Some("__naga_glsl_subgroup_all_equal".into()),
+                        inner: TypeInner::Scalar(Scalar::BOOL),
                     },
                     meta,
                 );
-                let equal = ctx.add_expression(
-                    Expression::Binary {
-                        op: BinaryOperator::Equal,
-                        left: args[0],
-                        right: first,
-                    },
-                    meta,
-                )?;
-                let bool_ty = ctx.resolve_type_handle(equal, meta)?;
                 let result = ctx.interrupt_expression(
-                    Expression::SubgroupOperationResult { ty: bool_ty },
+                    Expression::SubgroupOperationResult { ty },
                     meta,
                 );
                 ctx.body.push(
                     Statement::SubgroupCollectiveOperation {
                         op: SubgroupOperation::All,
                         collective_op: CollectiveOperation::Reduce,
-                        argument: equal,
+                        argument: args[0],
                         result,
                     },
                     meta,
@@ -2335,41 +2320,26 @@ impl MacroCall {
                 result
             }
             MacroCall::SubgroupBallotBitCount => {
-                let counts = ctx.add_expression(
-                    Expression::Math {
-                        fun: MathFunction::CountOneBits,
-                        arg: args[0],
-                        arg1: None,
-                        arg2: None,
-                        arg3: None,
+                let ty = ctx.module.types.insert(
+                    Type {
+                        name: Some("__naga_glsl_subgroup_ballot_bit_count".into()),
+                        inner: TypeInner::Scalar(Scalar::U32),
                     },
                     meta,
-                )?;
-                let mut total = ctx.add_expression(
-                    Expression::AccessIndex {
-                        base: counts,
-                        index: 0,
+                );
+                let result = ctx.interrupt_expression(
+                    Expression::SubgroupOperationResult { ty },
+                    meta,
+                );
+                ctx.body.push(
+                    Statement::SubgroupGather {
+                        mode: GatherMode::BroadcastFirst,
+                        argument: args[0],
+                        result,
                     },
                     meta,
-                )?;
-                for index in 1..4 {
-                    let component = ctx.add_expression(
-                        Expression::AccessIndex {
-                            base: counts,
-                            index,
-                        },
-                        meta,
-                    )?;
-                    total = ctx.add_expression(
-                        Expression::Binary {
-                            op: BinaryOperator::Add,
-                            left: total,
-                            right: component,
-                        },
-                        meta,
-                    )?;
-                }
-                total
+                );
+                result
             }
             MacroCall::Barrier => {
                 ctx.emit_restart();

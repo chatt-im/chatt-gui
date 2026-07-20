@@ -344,6 +344,7 @@ fn compile_glsl(request: CompileRequest<'_>) -> Result<Vec<u32>, String> {
         ValidationFlags::all(),
         spv::supported_capabilities(),
     );
+    validator.allow_glsl_scalar_atomics(true);
     let info = validator.validate(&module).map_err(|error| {
         format!(
             "{} shader: Naga validation failed:\n{}",
@@ -616,21 +617,34 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        for (name, source) in [
-            ("combined-sampler", FRAGMENT),
+        for (name, stage, source) in [
+            ("combined-sampler", STAGE_FRAGMENT, FRAGMENT),
             (
                 "libplacebo-runtime",
+                STAGE_FRAGMENT,
                 include_str!("../tests/shaders/libplacebo_runtime.frag"),
             ),
-            ("polar-gather", include_str!("../tests/shaders/polar_gather.frag")),
-            ("peak-detect", include_str!("../tests/shaders/peak_detect.comp")),
-            ("texel-buffer", include_str!("../tests/shaders/texel_buffer.frag")),
+            (
+                "polar-gather",
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/polar_gather.frag"),
+            ),
+            (
+                "peak-detect",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/peak_detect.comp"),
+            ),
+            (
+                "texel-buffer",
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/texel_buffer.frag"),
+            ),
+            (
+                "storage-texel-buffer",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/storage_texel_buffer.comp"),
+            ),
         ] {
-            let stage = if name == "peak-detect" {
-                STAGE_COMPUTE
-            } else {
-                STAGE_FRAGMENT
-            };
             let words = compile(&request(stage, source, SPIRV_1_5)).unwrap();
             let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
             let path = directory.path().join(format!("{name}.spv"));
@@ -723,8 +737,16 @@ mod tests {
         .unwrap();
         assert!(contains_opcode(&peak, 349), "missing OpGroupNonUniformIAdd");
         assert!(contains_opcode(&peak, 333), "missing OpGroupNonUniformElect");
-        assert!(contains_opcode(&peak, 338), "missing OpGroupNonUniformBroadcastFirst");
+        assert!(contains_opcode(&peak, 336), "missing OpGroupNonUniformAllEqual");
         assert!(contains_opcode(&peak, 339), "missing OpGroupNonUniformBallot");
+        assert!(
+            contains_opcode(&peak, 342),
+            "missing OpGroupNonUniformBallotBitCount"
+        );
+        assert!(
+            !contains_opcode(&peak, 338),
+            "subgroupAllEqual was expanded through OpGroupNonUniformBroadcastFirst"
+        );
         assert!(contains_opcode(&peak, 234), "missing OpAtomicIAdd");
 
         let texel_buffer = compile(&request(
@@ -737,6 +759,49 @@ mod tests {
         assert!(instructions(&texel_buffer).any(|(opcode, operands)| {
             opcode == 25 && operands.len() >= 3 && operands[2] == 5
         }), "missing Buffer-dimensional OpTypeImage");
+        assert!(instructions(&texel_buffer).any(|(opcode, operands)| {
+            opcode == 17 && operands.first() == Some(&46)
+        }), "missing SampledBuffer capability");
+
+        let storage_texel_buffer = compile(&request(
+            STAGE_COMPUTE,
+            include_str!("../tests/shaders/storage_texel_buffer.comp"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&storage_texel_buffer, 98), "missing OpImageRead");
+        assert!(contains_opcode(&storage_texel_buffer, 99), "missing OpImageWrite");
+        assert!(instructions(&storage_texel_buffer).any(|(opcode, operands)| {
+            opcode == 25
+                && operands.len() >= 7
+                && operands[2] == 5
+                && operands[6] == 2
+        }), "missing storage Buffer-dimensional OpTypeImage");
+        assert!(instructions(&storage_texel_buffer).any(|(opcode, operands)| {
+            opcode == 17 && operands.first() == Some(&47)
+        }), "missing ImageBuffer capability");
+    }
+
+    #[test]
+    fn scalar_atomics_are_enabled_only_for_the_glsl_spirv_bridge() {
+        let source = "#version 450\nlayout(local_size_x=1) in;\nshared uint value;\nvoid main() { atomicAdd(value, 1u); }\n";
+        let mut frontend = glsl::Frontend::default();
+        let module = frontend
+            .parse(&glsl::Options::from(ShaderStage::Compute), source)
+            .unwrap();
+
+        let mut portable = Validator::new(
+            ValidationFlags::all(),
+            spv::supported_capabilities(),
+        );
+        assert!(portable.validate(&module).is_err());
+
+        let mut glsl_spirv = Validator::new(
+            ValidationFlags::all(),
+            spv::supported_capabilities(),
+        );
+        glsl_spirv.allow_glsl_scalar_atomics(true);
+        assert!(glsl_spirv.validate(&module).is_ok());
     }
 
     #[test]
@@ -841,6 +906,7 @@ mod tests {
             (STAGE_FRAGMENT, include_str!("../tests/shaders/polar_gather.frag")),
             (STAGE_COMPUTE, include_str!("../tests/shaders/peak_detect.comp")),
             (STAGE_FRAGMENT, include_str!("../tests/shaders/texel_buffer.frag")),
+            (STAGE_COMPUTE, include_str!("../tests/shaders/storage_texel_buffer.comp")),
         ];
 
         for (stage, source) in fixtures {

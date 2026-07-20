@@ -371,6 +371,10 @@ pub struct Validator {
     /// constant expressions as errors.
     overrides_resolved: bool,
 
+    /// Accept GLSL's representation of 32-bit integer atomics, where the
+    /// pointee remains an ordinary scalar instead of `TypeInner::Atomic`.
+    allow_glsl_scalar_atomics: bool,
+
     /// A checklist of expressions that must be visited by a specific kind of
     /// statement.
     ///
@@ -613,10 +617,22 @@ impl Validator {
             valid_expression_set: HandleSet::new(),
             override_ids: FastHashSet::default(),
             overrides_resolved: false,
+            allow_glsl_scalar_atomics: false,
             needs_visit: HandleSet::new(),
             trace_rays_vertex_return: TraceRayVertexReturnState::NoTraceRays,
             trace_rays_payload_type: None,
         }
+    }
+
+    /// Permit 32-bit integer atomic operations on ordinary scalar pointees.
+    ///
+    /// GLSL and SPIR-V attach atomicity to the operation, whereas Naga's
+    /// portable IR normally records it in `TypeInner::Atomic`. Enable this
+    /// only for a GLSL module that will be emitted directly as SPIR-V; other
+    /// backends rely on the normal atomic pointee invariant.
+    pub const fn allow_glsl_scalar_atomics(&mut self, allow: bool) -> &mut Self {
+        self.allow_glsl_scalar_atomics = allow;
+        self
     }
 
     // TODO(https://github.com/gfx-rs/wgpu/issues/8207): Consider removing this

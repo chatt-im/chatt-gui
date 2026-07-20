@@ -216,6 +216,16 @@ pub fn parse_type(type_name: &str) -> Option<Type> {
 
                 // TODO: glsl support multisampled storage images, naga doesn't
                 let (dim, arrayed) = match size {
+                    "Buffer" => {
+                        return Some(Type {
+                            name: Some(format!("{BUFFER_IMAGE_TYPE_PREFIX}{word}")),
+                            inner: TypeInner::Image {
+                                dim: ImageDimension::D1,
+                                arrayed: false,
+                                class,
+                            },
+                        });
+                    }
                     "1D" => (ImageDimension::D1, false),
                     "1DArray" => (ImageDimension::D1, true),
                     "2D" => (ImageDimension::D2, false),

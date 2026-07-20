@@ -1202,6 +1202,35 @@ impl super::Instruction {
 
         instruction
     }
+    pub(super) fn group_non_uniform_all_equal(
+        result_type_id: Word,
+        id: Word,
+        exec_scope_id: Word,
+        value: Word,
+    ) -> Self {
+        let mut instruction = Self::new(Op::GroupNonUniformAllEqual);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+        instruction.add_operand(exec_scope_id);
+        instruction.add_operand(value);
+
+        instruction
+    }
+    pub(super) fn group_non_uniform_ballot_bit_count(
+        result_type_id: Word,
+        id: Word,
+        exec_scope_id: Word,
+        value: Word,
+    ) -> Self {
+        let mut instruction = Self::new(Op::GroupNonUniformBallotBitCount);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+        instruction.add_operand(exec_scope_id);
+        instruction.add_operand(spirv::GroupOperation::Reduce as u32);
+        instruction.add_operand(value);
+
+        instruction
+    }
     pub(super) fn group_non_uniform_broadcast_first(
         result_type_id: Word,
         id: Word,

@@ -40,6 +40,33 @@ impl BlockContext<'_> {
         result: Handle<crate::Expression>,
         block: &mut Block,
     ) -> Result<(), Error> {
+        let all_equal = match self.ir_function.expressions[result] {
+            crate::Expression::SubgroupOperationResult { ty } => self.ir_module.types[ty]
+                .name
+                .as_deref()
+                == Some("__naga_glsl_subgroup_all_equal"),
+            _ => false,
+        };
+        if all_equal {
+            self.writer.require_any(
+                "GroupNonUniformVote",
+                &[spirv::Capability::GroupNonUniformVote],
+            )?;
+            let id = self.gen_id();
+            let result_type_id = self.get_expression_type_id(&self.fun_info[result].ty);
+            let exec_scope_id = self.get_index_constant(spirv::Scope::Subgroup as u32);
+            block
+                .body
+                .push(Instruction::group_non_uniform_all_equal(
+                    result_type_id,
+                    id,
+                    exec_scope_id,
+                    self.cached[argument],
+                ));
+            self.cached[result] = id;
+            return Ok(());
+        }
+
         use crate::SubgroupOperation as sg;
         match *op {
             sg::All | sg::Any => {
@@ -125,14 +152,13 @@ impl BlockContext<'_> {
         result: Handle<crate::Expression>,
         block: &mut Block,
     ) -> Result<(), Error> {
-        let elect = match self.ir_function.expressions[result] {
-            crate::Expression::SubgroupOperationResult { ty } => self.ir_module.types[ty]
-                .name
-                .as_deref()
-                == Some("__naga_glsl_subgroup_elect"),
-            _ => false,
+        let special = match self.ir_function.expressions[result] {
+            crate::Expression::SubgroupOperationResult { ty } => {
+                self.ir_module.types[ty].name.as_deref()
+            }
+            _ => None,
         };
-        if elect {
+        if special == Some("__naga_glsl_subgroup_elect") {
             self.writer.require_any(
                 "GroupNonUniform",
                 &[spirv::Capability::GroupNonUniform],
@@ -146,6 +172,25 @@ impl BlockContext<'_> {
                 id,
                 exec_scope_id,
             ));
+            self.cached[result] = id;
+            return Ok(());
+        }
+        if special == Some("__naga_glsl_subgroup_ballot_bit_count") {
+            self.writer.require_any(
+                "GroupNonUniformBallot",
+                &[spirv::Capability::GroupNonUniformBallot],
+            )?;
+            let id = self.gen_id();
+            let result_type_id = self.get_expression_type_id(&self.fun_info[result].ty);
+            let exec_scope_id = self.get_index_constant(spirv::Scope::Subgroup as u32);
+            block
+                .body
+                .push(Instruction::group_non_uniform_ballot_bit_count(
+                    result_type_id,
+                    id,
+                    exec_scope_id,
+                    self.cached[argument],
+                ));
             self.cached[result] = id;
             return Ok(());
         }

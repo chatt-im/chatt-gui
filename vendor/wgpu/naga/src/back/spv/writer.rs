@@ -2194,10 +2194,25 @@ impl Writer {
         // because some types which map to the same LocalType have different
         // capability requirements. See https://github.com/gfx-rs/wgpu/issues/5569
         if Self::is_glsl_buffer_image_type(ty) {
-            self.require_any(
-                "sampled buffer images",
-                &[spirv::Capability::SampledBuffer],
-            )?;
+            match ty.inner {
+                crate::TypeInner::Image {
+                    class: crate::ImageClass::Storage { format, .. },
+                    ..
+                } => {
+                    self.request_image_format_capabilities(format.into())?;
+                    self.require_any(
+                        "storage buffer images",
+                        &[spirv::Capability::ImageBuffer],
+                    )?;
+                }
+                crate::TypeInner::Image { .. } => {
+                    self.require_any(
+                        "sampled buffer images",
+                        &[spirv::Capability::SampledBuffer],
+                    )?;
+                }
+                _ => unreachable!("GLSL buffer image marker on a non-image type"),
+            }
         } else {
             self.request_type_capabilities(&ty.inner)?;
         }

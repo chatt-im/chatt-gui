@@ -436,14 +436,13 @@ impl super::Validator {
         };
         let pointer_scalar = match context.types[pointer_base].inner {
             crate::TypeInner::Atomic(scalar) => scalar,
-            // GLSL represents atomic-capable shared and storage integers with
-            // their ordinary scalar type. SPIR-V has the same representation;
-            // atomicity belongs to the operation, not the pointee type.
             crate::TypeInner::Scalar(scalar)
-                if matches!(
-                    pointer_space,
-                    crate::AddressSpace::WorkGroup | crate::AddressSpace::Storage { .. }
-                ) =>
+                if self.allow_glsl_scalar_atomics
+                    && matches!(scalar, crate::Scalar::I32 | crate::Scalar::U32)
+                    && matches!(
+                        pointer_space,
+                        crate::AddressSpace::WorkGroup | crate::AddressSpace::Storage { .. }
+                    ) =>
             {
                 scalar
             }
@@ -664,6 +663,33 @@ impl super::Validator {
         result: Handle<crate::Expression>,
         context: &BlockContext,
     ) -> Result<(), WithSpan<FunctionError>> {
+        let glsl_all_equal = match context.expressions[result] {
+            crate::Expression::SubgroupOperationResult { ty } => context.types[ty]
+                .name
+                .as_deref()
+                == Some("__naga_glsl_subgroup_all_equal"),
+            _ => false,
+        };
+        if glsl_all_equal
+            && *op == crate::SubgroupOperation::All
+            && *collective_op == crate::CollectiveOperation::Reduce
+        {
+            let argument_inner =
+                context.resolve_type_inner(argument, &self.valid_expression_set)?;
+            if matches!(
+                *argument_inner,
+                crate::TypeInner::Scalar(
+                    crate::Scalar::BOOL
+                        | crate::Scalar::F32
+                        | crate::Scalar::I32
+                        | crate::Scalar::U32
+                )
+            ) {
+                self.emit_expression(result, context)?;
+                return Ok(());
+            }
+        }
+
         let argument_inner = context.resolve_type_inner(argument, &self.valid_expression_set)?;
 
         let (is_scalar, scalar) = match *argument_inner {
@@ -732,16 +758,32 @@ impl super::Validator {
         result: Handle<crate::Expression>,
         context: &BlockContext,
     ) -> Result<(), WithSpan<FunctionError>> {
-        let glsl_elect = match context.expressions[result] {
-            crate::Expression::SubgroupOperationResult { ty } => context.types[ty]
-                .name
-                .as_deref()
-                == Some("__naga_glsl_subgroup_elect"),
-            _ => false,
+        let special = match context.expressions[result] {
+            crate::Expression::SubgroupOperationResult { ty } => {
+                context.types[ty].name.as_deref()
+            }
+            _ => None,
         };
-        if glsl_elect {
+        if special == Some("__naga_glsl_subgroup_elect")
+            && *mode == crate::GatherMode::BroadcastFirst
+        {
             self.emit_expression(result, context)?;
             return Ok(());
+        }
+        if special == Some("__naga_glsl_subgroup_ballot_bit_count")
+            && *mode == crate::GatherMode::BroadcastFirst
+        {
+            let argument_inner =
+                context.resolve_type_inner(argument, &self.valid_expression_set)?;
+            if *argument_inner
+                == (crate::TypeInner::Vector {
+                    size: crate::VectorSize::Quad,
+                    scalar: crate::Scalar::U32,
+                })
+            {
+                self.emit_expression(result, context)?;
+                return Ok(());
+            }
         }
 
         match *mode {

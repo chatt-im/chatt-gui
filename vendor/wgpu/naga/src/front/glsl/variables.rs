@@ -610,9 +610,10 @@ impl Frontend {
                                     _ => unreachable!(),
                                 }
 
+                                let name = ctx.module.types[ty].name.clone();
                                 ty = ctx.module.types.insert(
                                     Type {
-                                        name: None,
+                                        name,
                                         inner: TypeInner::Image {
                                             dim,
                                             arrayed,

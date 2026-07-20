@@ -1,0 +1,14 @@
+#version 450
+#extension GL_ARB_texture_buffer_object : require
+#extension GL_ARB_shader_image_load_store : require
+
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, r32ui) readonly restrict uniform uimageBuffer source_data;
+layout(set = 0, binding = 1, r32ui) writeonly restrict uniform uimageBuffer target_data;
+
+void main()
+{
+    int index = int(gl_GlobalInvocationID.x);
+    uint value = imageLoad(source_data, index).x;
+    imageStore(target_data, index, uvec4(value + 1u));
+}
