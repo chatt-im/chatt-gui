@@ -49,7 +49,7 @@ pub struct MpvPlayer {
 
 impl MpvPlayer {
     pub fn new(gpui_wakeup: AsyncSender<()>) -> Result<Self> {
-        Self::new_internal(gpui_wakeup, false)
+        Self::new_internal(gpui_wakeup, false, None)
     }
 
     pub fn new_live(
@@ -58,7 +58,8 @@ impl MpvPlayer {
         stream: std::os::unix::net::UnixStream,
     ) -> Result<Self> {
         let source_wakeup = gpui_wakeup.clone();
-        let mut player = Self::new_internal(gpui_wakeup, true)?;
+        let render_size = (share.coded_width, share.coded_height);
+        let mut player = Self::new_internal(gpui_wakeup, true, Some(render_size))?;
         let source = crate::live_stream::LiveStreamSource::start(
             player.mpv.clone(),
             share,
@@ -77,7 +78,11 @@ impl MpvPlayer {
         Ok(player)
     }
 
-    fn new_internal(gpui_wakeup: AsyncSender<()>, live: bool) -> Result<Self> {
+    fn new_internal(
+        gpui_wakeup: AsyncSender<()>,
+        live: bool,
+        fixed_render_size: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let live_diagnostics = live.then(|| Arc::new(crate::live_stream::LiveDiagnostics::new()));
         let mpv = Arc::new(Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "libmpv")?;
@@ -136,10 +141,9 @@ impl MpvPlayer {
         }
 
         let (render_sender, render_messages) = mpsc::channel();
-        let resize_sender = render_sender.clone();
-        let video_surface = WgpuVideoSurface::new(move |width, height| {
-            let _ = resize_sender.send(RenderMessage::Resize { width, height });
-        })?;
+        // The texture size is intrinsic to the media, not the element displaying
+        // it. GPUI scales this persistent surface when its viewport changes.
+        let video_surface = WgpuVideoSurface::new(|_, _| {})?;
         let surface = video_surface.platform_surface();
 
         let mut backend = match create_vulkan_context(&mpv, &video_surface, live) {
@@ -206,11 +210,24 @@ impl MpvPlayer {
             })
             .context("spawn mpv render thread")?;
 
+        // Live streams declare their coded size up front. Attachment players
+        // configure later from mpv's decoded display dimensions.
+        if let Some((width, height)) = fixed_render_size {
+            render_sender
+                .send(RenderMessage::Resize {
+                    width,
+                    height,
+                    redraw: false,
+                })
+                .map_err(|_| anyhow!("mpv render thread stopped during initial resize"))?;
+        }
+
         let (control_sender, control_commands) = mpsc::channel();
         let playback = Arc::new(SharedPlaybackState::default());
         let control_playback = playback.clone();
         let control_mpv = mpv.clone();
         let control_error_sender = error_sender.clone();
+        let control_render_sender = render_sender.clone();
         let control_thread = match thread::Builder::new()
             .name("mpv-control".into())
             .spawn(move || {
@@ -220,6 +237,8 @@ impl MpvPlayer {
                     control_playback,
                     gpui_wakeup,
                     control_error_sender,
+                    control_render_sender,
+                    fixed_render_size,
                 );
             })
         {
@@ -429,7 +448,11 @@ pub(crate) enum ControlCommand {
 
 enum RenderMessage {
     Update,
-    Resize { width: u32, height: u32 },
+    Resize {
+        width: u32,
+        height: u32,
+        redraw: bool,
+    },
     Reset,
     Shutdown,
 }
@@ -469,7 +492,7 @@ impl RenderBackend {
         }
     }
 
-    fn resize(&mut self, surface: &WgpuVideoSurface, width: u32, height: u32) -> Result<()> {
+    fn resize(&mut self, surface: &WgpuVideoSurface, width: u32, height: u32) -> Result<bool> {
         match self {
             Self::Vulkan {
                 context,
@@ -481,7 +504,7 @@ impl RenderBackend {
                     .and_then(|generation| generation.textures.first())
                     .is_some_and(|texture| texture.width() == width && texture.height() == height)
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Some(old) = generation.take() {
                     log::debug!(
@@ -519,7 +542,7 @@ impl RenderBackend {
                     .and_then(|generation| generation.textures.first())
                     .is_some_and(|texture| texture.width() == width && texture.height() == height)
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if generation.take().is_some() {
                     surface
@@ -538,7 +561,7 @@ impl RenderBackend {
                 *next_texture = 0;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn render(
@@ -755,15 +778,19 @@ fn control_worker(
     playback: Arc<SharedPlaybackState>,
     gpui_wakeup: AsyncSender<()>,
     errors: mpsc::Sender<String>,
+    render_sender: mpsc::Sender<RenderMessage>,
+    initial_render_size: Option<(u32, u32)>,
 ) {
     log::info!("mpv control worker started");
     let mut state = PlaybackState::default();
+    let mut configured_size = initial_render_size;
     loop {
         while let Ok(command) = commands.try_recv() {
             let result = match command {
                 ControlCommand::Load(path) => {
                     log::info!("loading media path={path:?}");
                     state = PlaybackState::default();
+                    configured_size = initial_render_size;
                     playback.publish(state);
                     mpv.command("loadfile", &[&path, "replace"])
                 }
@@ -796,6 +823,35 @@ fn control_worker(
         }
 
         if let Some(event) = mpv.wait_event(-1.0) {
+            if matches!(event.as_ref(), Ok(Event::FileLoaded | Event::VideoReconfig))
+            {
+                match video_display_size(&mpv) {
+                    Ok(size) if configured_size != Some(size) => {
+                        log::info!(
+                            "video texture configured at decoded display size={}x{}",
+                            size.0,
+                            size.1,
+                        );
+                        configured_size = Some(size);
+                        if render_sender
+                            .send(RenderMessage::Resize {
+                                width: size.0,
+                                height: size.1,
+                                redraw: true,
+                            })
+                            .is_err()
+                        {
+                            let message = "mpv render thread stopped during video configuration";
+                            log::error!("{message}");
+                            let _ = errors.send(message.into());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::debug!("decoded video size is not ready: {error:#}");
+                    }
+                }
+            }
             let notify_gpui = match apply_event(event, &mut state) {
                 Ok(notify_gpui) => notify_gpui,
                 Err(error) => {
@@ -810,6 +866,22 @@ fn control_worker(
             }
         }
     }
+}
+
+fn video_display_size(mpv: &Mpv) -> Result<(u32, u32)> {
+    let width = mpv
+        .get_property::<i64>("dwidth")
+        .context("read decoded video display width")?;
+    let height = mpv
+        .get_property::<i64>("dheight")
+        .context("read decoded video display height")?;
+    checked_video_size(width, height)
+        .ok_or_else(|| anyhow!("invalid decoded video display size {width}x{height}"))
+}
+
+fn checked_video_size(width: i64, height: i64) -> Option<(u32, u32)> {
+    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+        .filter(|(width, height)| *width != 0 && *height != 0)
 }
 
 fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> Result<bool> {
@@ -972,10 +1044,14 @@ fn render_worker(
                 };
                 ("update", result)
             }
-            RenderMessage::Resize { width, height } => {
+            RenderMessage::Resize {
+                width,
+                height,
+                redraw,
+            } => {
                 diagnostics.resizes += 1;
-                let result = backend.resize(&surface, width, height).and_then(|()| {
-                    if has_frame {
+                let result = backend.resize(&surface, width, height).and_then(|resized| {
+                    if (resized && has_frame) || redraw {
                         backend.render(&surface, false, &mut diagnostics)
                     } else {
                         Ok(false)
@@ -1085,6 +1161,69 @@ mod tests {
             flags,
             target_time: 0,
         }
+    }
+
+    #[test]
+    fn accepts_only_positive_decoded_video_sizes() {
+        assert_eq!(checked_video_size(320, 240), Some((320, 240)));
+        assert_eq!(checked_video_size(0, 240), None);
+        assert_eq!(checked_video_size(320, -1), None);
+        assert_eq!(checked_video_size(i64::from(u32::MAX) + 1, 240), None);
+    }
+
+    #[test]
+    fn libmpv_reports_the_decoded_display_size_for_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("intrinsic-size.mkv");
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x180:d=0.04",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "ffv1",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg is available with the required libmpv dependency");
+        assert!(
+            output.status.success(),
+            "ffmpeg could not create the attachment fixture: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let mpv = Mpv::with_initializer(|initializer| {
+            initializer.set_option("vo", "null")?;
+            initializer.set_option("audio", "no")?;
+            initializer.set_option("pause", "yes")?;
+            Ok(())
+        })
+        .unwrap();
+        mpv.command("loadfile", &[&path.to_string_lossy(), "replace"])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut display_size = None;
+        while Instant::now() < deadline {
+            match mpv.wait_event(0.1) {
+                Some(Ok(Event::FileLoaded | Event::VideoReconfig)) => {
+                    if let Ok(size) = video_display_size(&mpv) {
+                        display_size = Some(size);
+                        break;
+                    }
+                }
+                Some(Err(error)) => panic!("libmpv event failed: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(display_size, Some((320, 180)));
     }
 
     #[test]

@@ -1,16 +1,18 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, Mutex},
     time::Instant,
 };
 
 use gpui::{
-    AnyElement, App, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight, KeyBinding,
-    ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, PathPromptOptions, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, Stateful, Task, Window, actions, div, img, list, point, prelude::*, px, relative,
-    rgb, rgba, surface,
+    AnyElement, App, Bounds, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight,
+    KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
+    list, point, prelude::*, px, relative, rgb, rgba, surface,
 };
 use markdown::{
     Markdown, MarkdownElement, MarkdownFont, MarkdownSelectionArea, MarkdownSelectionGroup,
@@ -64,8 +66,57 @@ struct EagerImageFetch {
 struct LivePlayerView {
     player: MpvPlayer,
     zoom: f32,
-    pan: Point<gpui::Pixels>,
-    last_mouse_position: Option<Point<gpui::Pixels>>,
+    pan: Point<Pixels>,
+    last_mouse_position: Option<Point<Pixels>>,
+    coded_size: (u32, u32),
+    viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+fn live_pan_limits(
+    coded_size: (u32, u32),
+    viewport: Bounds<Pixels>,
+    zoom: f32,
+) -> Point<Pixels> {
+    let (coded_width, coded_height) = coded_size;
+    let viewport_width = viewport.size.width.as_f32();
+    let viewport_height = viewport.size.height.as_f32();
+    if coded_width == 0 || coded_height == 0 || viewport_width <= 0.0 || viewport_height <= 0.0 {
+        return point(px(0.0), px(0.0));
+    }
+
+    let fit_scale = (viewport_width / coded_width as f32)
+        .min(viewport_height / coded_height as f32);
+    let scaled_width = coded_width as f32 * fit_scale * zoom;
+    let scaled_height = coded_height as f32 * fit_scale * zoom;
+    point(
+        px(((scaled_width - viewport_width) / 2.0).max(0.0)),
+        px(((scaled_height - viewport_height) / 2.0).max(0.0)),
+    )
+}
+
+fn clamp_live_pan(
+    pan: Point<Pixels>,
+    coded_size: (u32, u32),
+    viewport: Bounds<Pixels>,
+    zoom: f32,
+) -> Point<Pixels> {
+    let limits = live_pan_limits(coded_size, viewport, zoom);
+    point(
+        pan.x.clamp(-limits.x, limits.x),
+        pan.y.clamp(-limits.y, limits.y),
+    )
+}
+
+fn zoom_live_pan(
+    pan: Point<Pixels>,
+    old_zoom: f32,
+    new_zoom: f32,
+    viewport: Bounds<Pixels>,
+    focal_point: Point<Pixels>,
+) -> Point<Pixels> {
+    let focal_from_center = focal_point - viewport.center();
+    let ratio = new_zoom / old_zoom;
+    focal_from_center - (focal_from_center - pan) * ratio
 }
 
 impl EagerImageFetch {
@@ -425,14 +476,30 @@ impl ChattView {
         }
     }
 
-    fn zoom_live_view(&mut self, stream_id: StreamId, factor: f32, cx: &mut Context<Self>) {
+    fn zoom_live_view_at(
+        &mut self,
+        stream_id: StreamId,
+        factor: f32,
+        focal_point: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = self.live_players.get_mut(&stream_id) {
-            view.zoom = (view.zoom * factor).clamp(1.0, 8.0);
-            if view.zoom == 1.0 {
+            let old_zoom = view.zoom;
+            let new_zoom = (old_zoom * factor).clamp(1.0, 8.0);
+            if let Some(viewport) = view.viewport_bounds.get() {
+                let focal_point = focal_point.unwrap_or_else(|| viewport.center());
+                view.pan = zoom_live_pan(view.pan, old_zoom, new_zoom, viewport, focal_point);
+                view.pan = clamp_live_pan(view.pan, view.coded_size, viewport, new_zoom);
+            } else if new_zoom == 1.0 {
                 view.pan = point(px(0.), px(0.));
             }
+            view.zoom = new_zoom;
             cx.notify();
         }
+    }
+
+    fn zoom_live_view(&mut self, stream_id: StreamId, factor: f32, cx: &mut Context<Self>) {
+        self.zoom_live_view_at(stream_id, factor, None, cx);
     }
 
     fn pan_live_view(
@@ -444,6 +511,9 @@ impl ChattView {
     ) {
         if let Some(view) = self.live_players.get_mut(&stream_id) {
             view.pan += point(px(x), px(y));
+            if let Some(viewport) = view.viewport_bounds.get() {
+                view.pan = clamp_live_pan(view.pan, view.coded_size, viewport, view.zoom);
+            }
             cx.notify();
         }
     }
@@ -513,8 +583,31 @@ impl ChattView {
             ScrollDelta::Pixels(delta) => f32::from(delta.y),
             ScrollDelta::Lines(delta) => delta.y * 20.0,
         };
-        let factor = if delta > 0.0 { 1.1 } else { 1.0 / 1.1 };
-        self.zoom_live_view(stream_id, factor, cx);
+        if delta == 0.0 {
+            return;
+        }
+        let factor = if delta > 0.0 {
+            1.0 + delta.abs() * 0.01
+        } else {
+            1.0 / (1.0 + delta.abs() * 0.01)
+        };
+        self.zoom_live_view_at(stream_id, factor, Some(event.position), cx);
+        cx.stop_propagation();
+    }
+
+    fn pinch_live_view(
+        &mut self,
+        stream_id: StreamId,
+        event: &PinchEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_live_view_at(
+            stream_id,
+            (1.0 + event.delta).max(0.01),
+            Some(event.position),
+            cx,
+        );
+        cx.stop_propagation();
     }
 
     fn live_mouse_down(
@@ -528,7 +621,7 @@ impl ChattView {
         }
         if event.click_count == 2 {
             let factor = if event.modifiers.shift { 0.5 } else { 2.0 };
-            self.zoom_live_view(stream_id, factor, cx);
+            self.zoom_live_view_at(stream_id, factor, Some(event.position), cx);
             return;
         }
         if let Some(view) = self.live_players.get_mut(&stream_id) {
@@ -547,6 +640,9 @@ impl ChattView {
         };
         if let Some(last) = view.last_mouse_position {
             view.pan += event.position - last;
+            if let Some(viewport) = view.viewport_bounds.get() {
+                view.pan = clamp_live_pan(view.pan, view.coded_size, viewport, view.zoom);
+            }
             view.last_mouse_position = Some(event.position);
             cx.notify();
         }
@@ -664,6 +760,7 @@ impl ChattView {
                     self.status = "Screen share ended before playback started".into();
                     return;
                 };
+                let coded_size = (share.coded_width, share.coded_height);
                 match MpvPlayer::new_live(self.video_wakeup.clone(), share, stream) {
                     Ok(player) => {
                         self.live_players.insert(
@@ -673,6 +770,8 @@ impl ChattView {
                                 zoom: 1.0,
                                 pan: point(px(0.), px(0.)),
                                 last_mouse_position: None,
+                                coded_size,
+                                viewport_bounds: Rc::new(Cell::new(None)),
                             },
                         );
                         self.status = "Playing live screen share".into();
@@ -1875,11 +1974,17 @@ impl ChattView {
     ) -> Stateful<Div> {
         let stream_id = share.stream_id;
         let active = self.live_players.get(&stream_id).map(|view| {
+            let viewport_bounds = view.viewport_bounds.clone();
+            let pan = viewport_bounds
+                .get()
+                .map(|bounds| clamp_live_pan(view.pan, view.coded_size, bounds, view.zoom))
+                .unwrap_or(view.pan);
             (
                 view.player.surface(),
                 view.zoom,
-                view.pan,
+                pan,
                 view.last_mouse_position.is_some(),
+                viewport_bounds,
             )
         });
         let mut card = div()
@@ -1914,7 +2019,7 @@ impl ChattView {
                     )
                     .child(div().flex_1()),
             );
-        if let Some((video_surface, zoom, pan, dragging)) = active {
+        if let Some((video_surface, zoom, pan, dragging, viewport_bounds)) = active {
             let stop_id = stream_id;
             let reset_id = stream_id;
             let zoom_out_id = stream_id;
@@ -1980,6 +2085,7 @@ impl ChattView {
                     let down_id = stream_id;
                     let move_id = stream_id;
                     let up_id = stream_id;
+                    let pinch_id = stream_id;
                     div()
                         .relative()
                         .overflow_hidden()
@@ -1997,6 +2103,9 @@ impl ChattView {
                                 this.scroll_live_view(scroll_id, event, cx)
                             },
                         ))
+                        .on_pinch(cx.listener(move |this, event: &PinchEvent, _, cx| {
+                            this.pinch_live_view(pinch_id, event, cx)
+                        }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2015,13 +2124,28 @@ impl ChattView {
                             }),
                         )
                         .child(
+                            canvas(
+                                move |bounds, _, _| viewport_bounds.set(Some(bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .child(
                             div()
                                 .absolute()
                                 .left(pan.x)
                                 .top(pan.y)
-                                .w(relative(zoom))
-                                .h(relative(zoom))
-                                .child(surface(video_surface).size_full()),
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .w(relative(zoom))
+                                        .h(relative(zoom))
+                                        .child(surface(video_surface).size_full()),
+                                ),
                         )
                 });
         } else {
@@ -2777,5 +2901,40 @@ mod tests {
         unknown.width = None;
         unknown.height = None;
         assert_eq!(image_box_size(&unknown), None);
+    }
+
+    #[test]
+    fn live_pan_is_clamped_to_the_zoomed_video_edges() {
+        let viewport = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: gpui::size(px(1000.0), px(1000.0)),
+        };
+
+        assert_eq!(
+            live_pan_limits((1600, 900), viewport, 2.0),
+            point(px(500.0), px(62.5)),
+        );
+        assert_eq!(
+            clamp_live_pan(point(px(900.0), px(-100.0)), (1600, 900), viewport, 2.0),
+            point(px(500.0), px(-62.5)),
+        );
+        assert_eq!(
+            clamp_live_pan(point(px(100.0), px(100.0)), (1600, 900), viewport, 1.0),
+            point(px(0.0), px(0.0)),
+        );
+    }
+
+    #[test]
+    fn live_zoom_keeps_the_focal_pixel_stationary() {
+        let viewport = Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: gpui::size(px(1000.0), px(600.0)),
+        };
+        let focal = viewport.center() + point(px(100.0), px(-50.0));
+
+        assert_eq!(
+            zoom_live_pan(point(px(0.0), px(0.0)), 1.0, 2.0, viewport, focal),
+            point(px(-100.0), px(50.0)),
+        );
     }
 }
