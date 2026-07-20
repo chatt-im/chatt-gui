@@ -558,6 +558,11 @@ impl Drop for MpvPlayer {
         if let Some(thread) = self.control_thread.take() {
             let _ = thread.join();
         }
+        // `mpv_destroy` only detaches this client handle and permits the core,
+        // its internal clients, and registered stream callbacks to outlive it.
+        // All application workers are joined now, so synchronously terminate
+        // the core when the final Arc is released below.
+        self.mpv.terminate_on_drop();
         log::debug!("mpv player threads stopped");
     }
 }

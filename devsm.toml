@@ -65,6 +65,6 @@ if [ ! -e "$RUNTIME_CONFIG" ]; then
 fi
 #gdb /tmp/rust-target/release/chatt-gui
 BENCH=$(cargo --config "target.'cfg(unix)'.runner = 'echo'" run -q --release)
-gdb $BENCH
+$BENCH
 #@samply record -r 5000 --presymbolicate --save-only --output "/tmp/profile.json" $BENCH profile  "$@" || exit 1
 '''

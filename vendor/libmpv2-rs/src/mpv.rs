@@ -23,7 +23,10 @@ use std::{
     mem::MaybeUninit,
     ops::Deref,
     ptr::{self, NonNull},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 fn mpv_err<T>(ret: T, err: ctype::c_int) -> Result<T> {
@@ -244,6 +247,7 @@ pub struct Mpv {
     pub ctx: NonNull<libmpv2_sys::mpv_handle>,
     wakeup_callback_cleanup: Option<Box<dyn FnOnce()>>,
     pub(crate) protocol_cleanup: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    terminate_on_drop: AtomicBool,
 }
 
 unsafe impl Send for Mpv {}
@@ -256,7 +260,11 @@ impl Drop for Mpv {
         }
 
         unsafe {
-            libmpv2_sys::mpv_destroy(self.ctx.as_ptr());
+            if self.terminate_on_drop.load(Ordering::Acquire) {
+                libmpv2_sys::mpv_terminate_destroy(self.ctx.as_ptr());
+            } else {
+                libmpv2_sys::mpv_destroy(self.ctx.as_ptr());
+            }
         }
         for cleanup in self.protocol_cleanup.get_mut().unwrap().drain(..) {
             cleanup();
@@ -265,6 +273,16 @@ impl Drop for Mpv {
 }
 
 impl Mpv {
+    /// Quit the player core and wait for all of its clients and registered
+    /// stream callbacks to finish when this handle is dropped.
+    ///
+    /// Plain `mpv_destroy` only detaches a client handle. Embedded players
+    /// that own the core should enable synchronous termination before
+    /// releasing their final handle.
+    pub fn terminate_on_drop(&self) {
+        self.terminate_on_drop.store(true, Ordering::Release);
+    }
+
     /// Interrupt a blocking event wait. This function is thread-safe.
     pub fn wakeup(&self) {
         unsafe { libmpv2_sys::mpv_wakeup(self.ctx.as_ptr()) };
@@ -361,6 +379,7 @@ impl Mpv {
             ctx,
             wakeup_callback_cleanup: None,
             protocol_cleanup: Mutex::new(Vec::new()),
+            terminate_on_drop: AtomicBool::new(false),
         })
     }
 
@@ -399,6 +418,7 @@ impl Mpv {
             ctx,
             wakeup_callback_cleanup: None,
             protocol_cleanup: Mutex::new(Vec::new()),
+            terminate_on_drop: AtomicBool::new(false),
         })
     }
 
