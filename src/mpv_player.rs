@@ -31,6 +31,8 @@ use libmpv2::{
 const FORMAT_RGBA: &CStr = c"rgba";
 const RENDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
 const RENDER_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const RENDER_RETRY_INTERVAL: Duration = Duration::from_millis(16);
+const INITIAL_RENDER_TRACE_LIMIT: u64 = 8;
 
 /// The render path selected by the first attachment player. Later players can
 /// reuse this decision instead of repeating capability probing and a known-to-
@@ -64,6 +66,7 @@ pub struct MpvPlayer {
     surface: PlatformSurface,
     mpv: Arc<Mpv>,
     live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
+    live_input_gate: Option<Arc<crate::live_stream::LiveInputGate>>,
     live_source: Option<crate::live_stream::LiveStreamSource>,
 }
 
@@ -72,7 +75,7 @@ impl MpvPlayer {
         gpui_wakeup: AsyncSender<()>,
         preferred_backend: Option<AttachmentRenderBackend>,
     ) -> Result<(Self, AttachmentRenderBackend)> {
-        Self::new_internal(gpui_wakeup, false, None, preferred_backend)
+        Self::new_internal(gpui_wakeup, false, None, preferred_backend, None)
     }
 
     pub fn new_live(
@@ -82,7 +85,13 @@ impl MpvPlayer {
     ) -> Result<Self> {
         let source_wakeup = gpui_wakeup.clone();
         let render_size = (share.coded_width, share.coded_height);
-        let (mut player, _) = Self::new_internal(gpui_wakeup, true, Some(render_size), None)?;
+        let (mut player, _) = Self::new_internal(
+            gpui_wakeup,
+            true,
+            Some(render_size),
+            None,
+            Some(&share.codec),
+        )?;
         let source = crate::live_stream::LiveStreamSource::start(
             player.mpv.clone(),
             share,
@@ -95,6 +104,7 @@ impl MpvPlayer {
             player.control_sender.clone(),
             player.error_sender.clone(),
             source_wakeup,
+            player.live_input_gate.clone(),
         )?;
         player.live_source = Some(source);
         player.load("chatt-live://stream")?;
@@ -106,7 +116,16 @@ impl MpvPlayer {
         live: bool,
         fixed_render_size: Option<(u32, u32)>,
         preferred_backend: Option<AttachmentRenderBackend>,
+        live_codec: Option<&str>,
     ) -> Result<(Self, AttachmentRenderBackend)> {
+        let force_live_software = live
+            && std::env::var("CHATT_LIVE_RENDER_BACKEND")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("software"));
+        let preferred_backend = if force_live_software {
+            Some(AttachmentRenderBackend::Software)
+        } else {
+            preferred_backend
+        };
         let preferred_backend_name = match preferred_backend.as_ref() {
             Some(AttachmentRenderBackend::Vulkan(_)) => "vulkan",
             Some(AttachmentRenderBackend::Software) => "software",
@@ -116,6 +135,7 @@ impl MpvPlayer {
             "video player construction started live={live} preferred_backend={preferred_backend_name}"
         );
         let live_diagnostics = live.then(|| Arc::new(crate::live_stream::LiveDiagnostics::new()));
+        let live_input_gate = live.then(|| Arc::new(crate::live_stream::LiveInputGate::default()));
         // The texture size is intrinsic to the media, not the element displaying
         // it. GPUI scales this persistent surface when its viewport changes.
         let video_surface = WgpuVideoSurface::new(|_, _| {})?;
@@ -131,8 +151,42 @@ impl MpvPlayer {
             .and_then(|native| native.drm_render_node.as_ref())
             .and_then(|path| path.to_str())
             .map(str::to_owned);
+        let default_hwdec = if live {
+            let supports_vulkan_decode = native_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.as_ref().ok())
+                .is_some_and(|native| {
+                    supports_vulkan_video_decode(
+                        &native.device_extensions,
+                        native.queue_flags,
+                        live_codec,
+                    )
+                });
+            if supports_vulkan_decode {
+                "vulkan,auto-copy-safe"
+            } else if cfg!(target_os = "linux") {
+                // Rendering through Vulkan does not imply support for Vulkan
+                // Video. Prefer the Linux copy decoder that auto-probing chose
+                // successfully in practice, without first consuming the only
+                // keyframe in failed Vulkan and CUDA decoder attempts.
+                "vaapi-copy,auto-copy-safe"
+            } else {
+                "auto-copy-safe"
+            }
+        } else {
+            "vulkan,auto-safe"
+        };
+        let hwdec = if live {
+            std::env::var("CHATT_LIVE_HWDEC")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| default_hwdec.to_owned())
+        } else {
+            default_hwdec.to_owned()
+        };
         log::info!(
-            "initializing embedded libmpv live={live} hwdec=vulkan,auto-safe vaapi_device={}",
+            "initializing embedded libmpv live={live} hwdec={hwdec} codec={} vaapi_device={} forced_software_render={force_live_software}",
+            live_codec.unwrap_or("probe-at-load"),
             vaapi_device.as_deref().unwrap_or("none")
         );
         let mpv = Mpv::with_initializer(|initializer| {
@@ -154,7 +208,7 @@ impl MpvPlayer {
             // The vendored libmpv has Lua disabled, so it has no `osc`
             // option. Embedded rendering does not use mpv's OSC anyway.
             set_option!("profile", if live { "low-latency" } else { "fast" });
-            set_option!("hwdec", "vulkan,auto-safe");
+            set_option!("hwdec", hwdec.as_str());
             if let Some(device) = vaapi_device.as_deref() {
                 set_option!("vaapi-device", device);
             }
@@ -314,6 +368,7 @@ impl MpvPlayer {
         let render_error_sender = error_sender.clone();
         let render_gpui_wakeup = gpui_wakeup.clone();
         let render_live_diagnostics = live_diagnostics.clone();
+        let render_live_input_gate = live_input_gate.clone();
         let render_thread = thread::Builder::new()
             .name("mpv-render".into())
             .spawn(move || {
@@ -325,6 +380,7 @@ impl MpvPlayer {
                     render_gpui_wakeup,
                     render_error_sender,
                     render_live_diagnostics,
+                    render_live_input_gate,
                     render_playback,
                 );
             })
@@ -388,6 +444,7 @@ impl MpvPlayer {
             surface,
             mpv,
             live_diagnostics,
+            live_input_gate,
             live_source: None,
         }, selected_backend))
     }
@@ -517,6 +574,40 @@ impl VulkanQueueLock for WgpuQueueLock {
     }
 }
 
+fn supports_vulkan_video_decode(
+    device_extensions: &[&CStr],
+    queue_flags: vk::QueueFlags,
+    codec: Option<&str>,
+) -> bool {
+    let has = |required: &CStr| {
+        device_extensions
+            .iter()
+            .any(|extension| *extension == required)
+    };
+    if !queue_flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+        || !has(c"VK_KHR_video_queue")
+        || !has(c"VK_KHR_video_decode_queue")
+    {
+        return false;
+    }
+    match codec {
+        Some(codec) if codec.starts_with("avc1.") || codec.eq_ignore_ascii_case("h264") => {
+            has(c"VK_KHR_video_decode_h264")
+        }
+        Some(codec)
+            if codec.starts_with("hvc1.")
+                || codec.starts_with("hev1.")
+                || codec.eq_ignore_ascii_case("hevc") =>
+        {
+            has(c"VK_KHR_video_decode_h265")
+        }
+        Some(codec) if codec.starts_with("av01.") || codec.eq_ignore_ascii_case("av1") => {
+            has(c"VK_KHR_video_decode_av1")
+        }
+        _ => false,
+    }
+}
+
 fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevice>> {
     let native = Arc::new(surface.vulkan_device()?);
     let has_external_memory_fd = native
@@ -554,14 +645,18 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_KHR_video_decode_av1");
+    let queue_has_video_decode = native
+        .queue_flags
+        .contains(vk::QueueFlags::VIDEO_DECODE_KHR);
     let drm_render_node = native
         .drm_render_node
         .as_deref()
         .map_or_else(|| "none".into(), |path| path.display().to_string());
     log::info!(
-        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} enabled_queue_families={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} drm_render_node={} vulkan_video_core={} vulkan_video_h264={} vulkan_video_h265={} vulkan_video_av1={}",
+        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} queue_video_decode={} enabled_queue_families={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} drm_render_node={} vulkan_video_core={} vulkan_video_h264={} vulkan_video_h265={} vulkan_video_av1={}",
         native.queue_family,
         native.queue_index,
+        queue_has_video_decode,
         native.enabled_queue_families.len(),
         native.instance_extensions.len(),
         native.device_extensions.len(),
@@ -731,6 +826,14 @@ impl RenderBackend {
         match self {
             Self::Vulkan { .. } => "vulkan",
             Self::Software { .. } => "software",
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        match self {
+            Self::Vulkan { generation, .. } | Self::Software { generation, .. } => {
+                generation.is_some()
+            }
         }
     }
 
@@ -1023,7 +1126,7 @@ impl RenderDiagnostics {
         }) {
             self.last_pressure_log = Some(now);
             log::warn!(
-                "all video textures are still in use; dropping render request backend={backend} generation={generation} busy_total={}",
+                "all video textures are still in use; deferring render request backend={backend} generation={generation} busy_total={}",
                 self.ring_busy,
             );
         }
@@ -1078,6 +1181,8 @@ fn control_worker(
     let mut state = PlaybackState::default();
     let mut configured_size = initial_render_size;
     let mut pending_start = None;
+    let delay_render_until_reconfiguration = initial_render_size.is_some();
+    let mut render_enabled = false;
     loop {
         while let Ok(command) = commands.try_recv() {
             let result = match command {
@@ -1094,6 +1199,7 @@ fn control_worker(
                     };
                     configured_size = initial_render_size;
                     pending_start = (position > 0.0).then_some(position);
+                    render_enabled = false;
                     playback.publish(state);
                     // `stop` is synchronous. Drain the events it enqueued
                     // before opening the replacement so a pooled core cannot
@@ -1176,39 +1282,59 @@ fn control_worker(
             {
                 log::warn!("failed to restore retained playback position: {error}");
             }
-            if matches!(event.as_ref(), Ok(Event::FileLoaded))
-                && render_sender.send(RenderMessage::Enable).is_err()
-            {
-                let message = "mpv render thread stopped while enabling the new media";
-                log::error!("{message}");
-                let _ = errors.send(message.into());
-            }
-            if matches!(event.as_ref(), Ok(Event::FileLoaded | Event::VideoReconfig)) {
+            let file_loaded = matches!(event.as_ref(), Ok(Event::FileLoaded));
+            let video_reconfigured = matches!(event.as_ref(), Ok(Event::VideoReconfig));
+            if file_loaded || video_reconfigured {
                 match video_display_size(&mpv) {
-                    Ok(size) if configured_size != Some(size) => {
-                        log::info!(
-                            "video texture configured at decoded display size={}x{}",
-                            size.0,
-                            size.1,
-                        );
+                    Ok(size) => {
+                        let resized = configured_size != Some(size);
+                        if resized {
+                            log::info!(
+                                "video texture configured at decoded display size={}x{}",
+                                size.0,
+                                size.1,
+                            );
+                        }
                         configured_size = Some(size);
-                        if render_sender
-                            .send(RenderMessage::Resize {
-                                width: size.0,
-                                height: size.1,
-                                redraw: true,
-                            })
-                            .is_err()
+                        if resized
+                            && render_sender
+                                .send(RenderMessage::Resize {
+                                    width: size.0,
+                                    height: size.1,
+                                    redraw: false,
+                                })
+                                .is_err()
                         {
                             let message = "mpv render thread stopped during video configuration";
                             log::error!("{message}");
                             let _ = errors.send(message.into());
                         }
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         log::debug!("decoded video size is not ready: {error:#}");
                     }
+                }
+            }
+            let should_enable_render = !render_enabled
+                && ((!delay_render_until_reconfiguration && file_loaded)
+                    || (delay_render_until_reconfiguration && video_reconfigured));
+            if should_enable_render {
+                log::info!(
+                    "enabling video rendering trigger={} preserved_frame=true",
+                    if video_reconfigured {
+                        "video-reconfiguration"
+                    } else {
+                        "file-loaded"
+                    }
+                );
+                let enabled = render_sender.send(RenderMessage::Enable).is_ok()
+                    && render_sender.send(RenderMessage::Update).is_ok();
+                if enabled {
+                    render_enabled = true;
+                } else {
+                    let message = "mpv render thread stopped while enabling the new media";
+                    log::error!("{message}");
+                    let _ = errors.send(message.into());
                 }
             }
             let notify_gpui = match apply_event(event, &mut state) {
@@ -1367,6 +1493,7 @@ fn render_worker(
     gpui_wakeup: AsyncSender<()>,
     errors: mpsc::Sender<String>,
     live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
+    live_input_gate: Option<Arc<crate::live_stream::LiveInputGate>>,
     playback: Arc<SharedPlaybackState>,
 ) {
     let backend_name = backend.name();
@@ -1374,27 +1501,93 @@ fn render_worker(
     let mut diagnostics = RenderDiagnostics::new();
     let mut has_frame = false;
     let mut enabled = false;
-    while let Ok(message) = messages.recv() {
+    let mut redraw_pending = false;
+    loop {
+        let message = if redraw_pending {
+            match messages.recv_timeout(RENDER_RETRY_INTERVAL) {
+                Ok(message) => Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match messages.recv() {
+                Ok(message) => Some(message),
+                Err(_) => break,
+            }
+        };
+        if message.is_none() {
+            let result = backend.render(&surface, false, &mut diagnostics);
+            match result {
+                Ok(true) => {
+                    diagnostics.rendered += 1;
+                    has_frame = true;
+                    redraw_pending = false;
+                    playback.frame_ready.store(true, Ordering::Release);
+                    let _ = gpui_wakeup.try_send(());
+                    if live_input_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.release())
+                    {
+                        log::info!(
+                            "released live decoder input after first rendered output backend={backend_name}"
+                        );
+                    }
+                    if diagnostics.rendered <= INITIAL_RENDER_TRACE_LIMIT {
+                        log::info!(
+                            "video render output published ordinal={} operation=deferred-redraw",
+                            diagnostics.rendered
+                        );
+                    }
+                }
+                Ok(false) => {
+                    redraw_pending = backend.is_configured();
+                }
+                Err(error) => {
+                    diagnostics.errors += 1;
+                    redraw_pending = false;
+                    log::error!(
+                        "video render worker operation failed backend={backend_name} operation=deferred redraw: {error:#}"
+                    );
+                    let _ = errors.send(format!("{error:#}"));
+                    let _ = gpui_wakeup.try_send(());
+                }
+            }
+            diagnostics.maybe_log_summary(backend_name);
+            continue;
+        }
+        let message = message.unwrap();
         let (operation, result) = match message {
             RenderMessage::Update => {
                 diagnostics.callbacks += 1;
                 pending.store(false, Ordering::Release);
                 let updates = backend.context().update();
                 if !enabled {
-                    let result = if updates & u64::from(mpv_render_update::Frame) != 0 {
-                        backend
-                            .context()
-                            .skip_rendering()
-                            .map(|()| false)
-                            .map_err(Into::into)
-                    } else {
-                        Ok(false)
-                    };
-                    ("disabled update", result)
+                    // A live stream can expose its first decoded frame before
+                    // Vulkan output reconfiguration has settled. Keep that
+                    // frame pending; Enable is followed by an explicit Update
+                    // so it is rendered once the target is ready.
+                    ("disabled update", Ok(false))
                 } else {
                     let frame_info = backend.context().next_frame_info().ok();
                     let frame_pts = backend.context().next_frame_video_pts().ok();
-                    let result = match render_action(updates, frame_info, has_frame) {
+                    let action = render_action(updates, frame_info, has_frame);
+                    if diagnostics.callbacks <= INITIAL_RENDER_TRACE_LIMIT {
+                        log::info!(
+                            "video render callback ordinal={} updates=0x{:x} action={:?} frame_info_available={} frame_flags=0x{:x} present={} repeat={} redraw={} target_time_ns={:?} pts={:?} has_frame={}",
+                            diagnostics.callbacks,
+                            updates,
+                            action,
+                            frame_info.is_some(),
+                            frame_info.map_or(0, |info| info.flags),
+                            frame_info.is_some_and(|info| info.is_present()),
+                            frame_info.is_some_and(|info| info.is_repeat()),
+                            frame_info.is_some_and(|info| info.is_redraw()),
+                            frame_info.map(|info| info.target_time),
+                            frame_pts,
+                            has_frame,
+                        );
+                    }
+                    let result = match action {
                         RenderAction::None => {
                             diagnostics.callbacks_without_frames += 1;
                             Ok::<bool, anyhow::Error>(false)
@@ -1409,6 +1602,8 @@ fn render_worker(
                         }
                         RenderAction::Render => {
                             let result = backend.render(&surface, true, &mut diagnostics);
+                            redraw_pending = result.as_ref().is_ok_and(|rendered| !rendered)
+                                && backend.is_configured();
                             if result.as_ref().is_ok_and(|rendered| *rendered)
                                 && let (Some(diagnostics), Some(pts)) =
                                     (live_diagnostics.as_ref(), frame_pts)
@@ -1444,6 +1639,7 @@ fn render_worker(
                 log::debug!("resetting published video frame backend={backend_name}");
                 enabled = false;
                 has_frame = false;
+                redraw_pending = false;
                 playback.frame_ready.store(false, Ordering::Release);
                 surface.clear();
                 ("reset", Ok(false))
@@ -1452,6 +1648,7 @@ fn render_worker(
                 log::debug!("releasing pooled video frame resources backend={backend_name}");
                 enabled = false;
                 has_frame = false;
+                redraw_pending = false;
                 playback.frame_ready.store(false, Ordering::Release);
                 surface.clear();
                 (
@@ -1468,8 +1665,23 @@ fn render_worker(
                 if rendered {
                     diagnostics.rendered += 1;
                     has_frame = true;
+                    redraw_pending = false;
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
+                    if live_input_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.release())
+                    {
+                        log::info!(
+                            "released live decoder input after first rendered output backend={backend_name}"
+                        );
+                    }
+                    if diagnostics.rendered <= INITIAL_RENDER_TRACE_LIMIT {
+                        log::info!(
+                            "video render output published ordinal={} operation={operation}",
+                            diagnostics.rendered
+                        );
+                    }
                 }
             }
             Err(error) => {
@@ -1705,6 +1917,35 @@ mod tests {
     #[test]
     fn ignores_callback_without_frame_update() {
         assert_eq!(render_action(0, None, true), RenderAction::None);
+    }
+
+    #[test]
+    fn vulkan_decode_requires_core_and_matching_codec_extensions() {
+        let h264 = [
+            c"VK_KHR_video_queue",
+            c"VK_KHR_video_decode_queue",
+            c"VK_KHR_video_decode_h264",
+        ];
+        assert!(supports_vulkan_video_decode(
+            &h264,
+            vk::QueueFlags::VIDEO_DECODE_KHR,
+            Some("avc1.64001F")
+        ));
+        assert!(!supports_vulkan_video_decode(
+            &h264,
+            vk::QueueFlags::VIDEO_DECODE_KHR,
+            Some("hvc1.1.6.L93")
+        ));
+        assert!(!supports_vulkan_video_decode(
+            &[c"VK_KHR_video_decode_h264"],
+            vk::QueueFlags::VIDEO_DECODE_KHR,
+            Some("h264")
+        ));
+        assert!(!supports_vulkan_video_decode(
+            &h264,
+            vk::QueueFlags::GRAPHICS,
+            Some("h264")
+        ));
     }
 
     #[test]

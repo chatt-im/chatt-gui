@@ -6,7 +6,11 @@ use std::{
     os::fd::AsRawFd,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -298,9 +302,39 @@ pub struct LiveStreamSource {
     reader: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+pub(crate) struct LiveInputGate {
+    released: AtomicBool,
+    lock: Mutex<()>,
+    ready: Condvar,
+}
+
+impl LiveInputGate {
+    pub(crate) fn release(&self) -> bool {
+        let _guard = self.lock.lock().unwrap();
+        if self.released.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.ready.notify_all();
+        true
+    }
+
+    fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    fn wait(&self) {
+        let mut guard = self.lock.lock().unwrap();
+        while !self.is_released() {
+            guard = self.ready.wait(guard).unwrap();
+        }
+    }
+}
+
 struct NutQueue {
     stream_id: u32,
     header: Vec<u8>,
+    input_gate: Option<Arc<LiveInputGate>>,
     state: Mutex<QueueState>,
     ready: Condvar,
 }
@@ -314,6 +348,7 @@ struct QueueState {
     seen_keyframe: bool,
     awaiting_keyframe: bool,
     bootstrapping: bool,
+    bootstrap_end_received: bool,
     closed: bool,
     dropped_before_key: u64,
     overflow_count: u64,
@@ -336,6 +371,8 @@ struct NutCursor {
     current_offset: usize,
     logged_first_read: bool,
     logged_first_frame: bool,
+    delivered_frames: u64,
+    logged_input_gate: bool,
 }
 
 impl LiveStreamSource {
@@ -347,6 +384,7 @@ impl LiveStreamSource {
         controls: mpsc::Sender<ControlCommand>,
         errors: mpsc::Sender<String>,
         gpui_wakeup: async_channel::Sender<()>,
+        input_gate: Option<Arc<LiveInputGate>>,
     ) -> Result<Self> {
         let codec = codec_from_string(&share.codec)?;
         let recorder = LiveRecordingWriter::from_env(&share);
@@ -365,6 +403,7 @@ impl LiveStreamSource {
         let queue = Arc::new(NutQueue {
             stream_id: share.stream_id.0,
             header,
+            input_gate,
             state: Mutex::new(QueueState {
                 bootstrapping: true,
                 ..QueueState::default()
@@ -469,6 +508,15 @@ fn read_frames(
                 "live video frame belongs to stream {}, expected {expected_stream_id}",
                 header.stream_id
             )
+        }
+        if header.bootstrap_end {
+            queue.finish_bootstrap();
+            log::info!(
+                "live video cached GOP complete stream_id={} cached_frames={}",
+                header.stream_id,
+                received_frames
+            );
+            continue;
         }
         let payload_len = header.size - rpc::video::VIDEO_FRAME_HEADER_LEN;
         let base = *base_timestamp.get_or_insert(header.ts_ms);
@@ -729,13 +777,26 @@ impl NutQueue {
         self.state.lock().unwrap().frames.len()
     }
 
-    fn close(&self) {
+    fn finish_bootstrap(&self) {
         let mut state = self.state.lock().unwrap();
-        state.closed = true;
-        state.clear_frames();
-        state.recycled.clear();
-        state.recycled_bytes = 0;
+        state.bootstrap_end_received = true;
+        if state.frames.is_empty() {
+            state.bootstrapping = false;
+        }
+    }
+
+    fn close(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            state.clear_frames();
+            state.recycled.clear();
+            state.recycled_bytes = 0;
+        }
         self.ready.notify_all();
+        if let Some(gate) = self.input_gate.as_ref() {
+            gate.release();
+        }
     }
 }
 
@@ -743,7 +804,7 @@ impl QueueState {
     fn pop_frame(&mut self) -> Option<NutFrame> {
         let frame = self.frames.pop_front()?;
         self.pending_bytes -= frame.retained_bytes();
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.bootstrap_end_received {
             self.bootstrapping = false;
         }
         Some(frame)
@@ -790,6 +851,8 @@ fn open_stream(queue: &mut Arc<NutQueue>, _uri: &str) -> NutCursor {
         current_offset: 0,
         logged_first_read: false,
         logged_first_frame: false,
+        delivered_frames: 0,
+        logged_input_gate: false,
     }
 }
 
@@ -830,6 +893,26 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
             continue;
         }
         if cursor.current.is_none() {
+            if cursor.delivered_frames != 0
+                && let Some(gate) = cursor.queue.input_gate.as_ref()
+                && !gate.is_released()
+            {
+                if written != 0 {
+                    break;
+                }
+                if !cursor.logged_input_gate {
+                    cursor.logged_input_gate = true;
+                    log::info!(
+                        "holding live decoder input after first frame until video output is ready stream_id={}",
+                        cursor.queue.stream_id
+                    );
+                }
+                gate.wait();
+                log::info!(
+                    "released remaining live decoder input stream_id={}",
+                    cursor.queue.stream_id
+                );
+            }
             let frame = if written == 0 {
                 cursor.queue.pop()
             } else {
@@ -859,6 +942,7 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
             let frame = cursor.current.take().unwrap();
             cursor.queue.recycle_buffer(frame.bytes);
             cursor.current_offset = 0;
+            cursor.delivered_frames += 1;
         }
     }
     written as i64
@@ -1250,6 +1334,7 @@ mod tests {
             control_sender,
             error_sender,
             wakeup_sender,
+            None,
         )
         .unwrap();
         mpv.command("loadfile", &["chatt-live://stream", "replace"])
@@ -1300,6 +1385,7 @@ mod tests {
         let queue = NutQueue {
             stream_id: 1,
             header: Vec::new(),
+            input_gate: None,
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         };
@@ -1314,10 +1400,57 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_only_ends_at_the_explicit_daemon_boundary() {
+        let queue = NutQueue {
+            stream_id: 1,
+            header: Vec::new(),
+            input_gate: None,
+            state: Mutex::new(QueueState {
+                bootstrapping: true,
+                ..QueueState::default()
+            }),
+            ready: Condvar::new(),
+        };
+        assert!(!queue.push(queued(&[0]), true));
+        assert_eq!(queue.pop().unwrap().bytes, [0]);
+
+        // mpv can drain the first cached frame before the rest of the cached
+        // GOP crosses the socket. That temporary emptiness is not a boundary.
+        for marker in 1..=MAX_PENDING_FRAMES + 1 {
+            assert!(!queue.push(queued(&[marker as u8]), false));
+        }
+        assert!(queue.state.lock().unwrap().bootstrapping);
+
+        queue.finish_bootstrap();
+        assert!(queue.state.lock().unwrap().bootstrapping);
+        while queue.try_pop().is_some() {}
+        assert!(!queue.state.lock().unwrap().bootstrapping);
+    }
+
+    #[test]
+    fn empty_cached_gop_boundary_enters_live_mode_immediately() {
+        let queue = NutQueue {
+            stream_id: 1,
+            header: Vec::new(),
+            input_gate: None,
+            state: Mutex::new(QueueState {
+                bootstrapping: true,
+                ..QueueState::default()
+            }),
+            ready: Condvar::new(),
+        };
+        queue.finish_bootstrap();
+        let state = queue.state.lock().unwrap();
+        assert!(state.bootstrap_end_received);
+        assert!(!state.bootstrapping);
+    }
+
+    #[test]
     fn protocol_read_returns_a_complete_frame_without_waiting_for_the_next() {
         let queue = Arc::new(NutQueue {
             stream_id: 1,
             header: vec![1],
+            input_gate: None,
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         });
@@ -1327,6 +1460,30 @@ mod tests {
         assert_eq!(read_stream(&mut cursor, &mut output), 4);
         assert_eq!(&output[..4], &[1, 2, 3, 4]);
         assert_eq!(queue.state.lock().unwrap().recycled.len(), 1);
+    }
+
+    #[test]
+    fn protocol_holds_frames_after_key_until_video_output_is_ready() {
+        let gate = Arc::new(LiveInputGate::default());
+        let queue = Arc::new(NutQueue {
+            stream_id: 1,
+            header: vec![1],
+            input_gate: Some(gate.clone()),
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        });
+        queue.push(queued(&[2, 3]), true);
+        queue.push(queued(&[4, 5]), false);
+        let mut cursor = open_stream(&mut queue.clone(), "chatt-live://test");
+        let mut output = [0i8; 64];
+
+        assert_eq!(read_stream(&mut cursor, &mut output), 3);
+        assert_eq!(&output[..3], &[1, 2, 3]);
+        assert_eq!(queue.pending_len(), 1);
+
+        assert!(gate.release());
+        assert_eq!(read_stream(&mut cursor, &mut output), 2);
+        assert_eq!(&output[..2], &[4, 5]);
     }
 
     #[test]
@@ -1356,6 +1513,7 @@ mod tests {
         let queue = NutQueue {
             stream_id: 1,
             header: Vec::new(),
+            input_gate: None,
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         };
@@ -1376,6 +1534,7 @@ mod tests {
         let queue = NutQueue {
             stream_id: 1,
             header: Vec::new(),
+            input_gate: None,
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         };
@@ -1530,6 +1689,7 @@ mod tests {
             control_sender,
             error_sender,
             wakeup_sender,
+            None,
         )
         .unwrap();
         mpv.command("loadfile", &["chatt-live://stream", "replace"])
@@ -1676,6 +1836,7 @@ mod tests {
             control_sender,
             error_sender,
             wakeup_sender,
+            None,
         )
         .unwrap();
         mpv.command("loadfile", &["chatt-live://stream", "replace"])
