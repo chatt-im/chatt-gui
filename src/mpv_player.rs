@@ -39,23 +39,79 @@ pub struct MpvPlayer {
     render_stopping: Arc<AtomicBool>,
     playback: Arc<SharedPlaybackState>,
     errors: mpsc::Receiver<String>,
+    error_sender: mpsc::Sender<String>,
     requested_paused: bool,
     surface: PlatformSurface,
     mpv: Arc<Mpv>,
+    live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
+    live_source: Option<crate::live_stream::LiveStreamSource>,
 }
 
 impl MpvPlayer {
     pub fn new(gpui_wakeup: AsyncSender<()>) -> Result<Self> {
+        Self::new_internal(gpui_wakeup, false)
+    }
+
+    pub fn new_live(
+        gpui_wakeup: AsyncSender<()>,
+        share: rpc::daemon::model::LiveShare,
+        stream: std::os::unix::net::UnixStream,
+    ) -> Result<Self> {
+        let source_wakeup = gpui_wakeup.clone();
+        let mut player = Self::new_internal(gpui_wakeup, true)?;
+        let source = crate::live_stream::LiveStreamSource::start(
+            player.mpv.clone(),
+            share,
+            stream,
+            player
+                .live_diagnostics
+                .as_ref()
+                .expect("live player has latency diagnostics")
+                .clone(),
+            player.control_sender.clone(),
+            player.error_sender.clone(),
+            source_wakeup,
+        )?;
+        player.live_source = Some(source);
+        player.load("chatt-live://stream")?;
+        Ok(player)
+    }
+
+    fn new_internal(gpui_wakeup: AsyncSender<()>, live: bool) -> Result<Self> {
+        let live_diagnostics = live.then(|| Arc::new(crate::live_stream::LiveDiagnostics::new()));
         let mpv = Arc::new(Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "libmpv")?;
             initializer.set_option("keep-open", "no")?;
             initializer.set_option("idle", "yes")?;
             initializer.set_option("osc", "no")?;
-            initializer.set_option("profile", "gpu-hq")?;
+            initializer.set_option("profile", if live { "low-latency" } else { "gpu-hq" })?;
             initializer.set_option("hwdec", "vulkan,auto-safe")?;
             initializer.set_option("sws-allow-zimg", "no")?;
             initializer.set_option("sws-scaler", "bilinear")?;
             initializer.set_option("sws-fast", "yes")?;
+            if live {
+                initializer.set_option("audio", "no")?;
+                initializer.set_option("cache", "no")?;
+                // Damage-tracked streams can be idle indefinitely. Keep the
+                // blocking callback read off mpv's playback/render core; cache
+                // and readahead stay disabled, so this does not add a playout
+                // buffer.
+                initializer.set_option("demuxer-thread", "yes")?;
+                initializer.set_option("demuxer-readahead-secs", "0")?;
+                initializer.set_option("demuxer-lavf-format", "nut")?;
+                initializer.set_option("demuxer-lavf-probe-info", "nostreams")?;
+                initializer.set_option("demuxer-lavf-analyzeduration", "0")?;
+                initializer.set_option("untimed", "yes")?;
+                initializer.set_option("video-latency-hacks", "yes")?;
+                initializer.set_option("swapchain-depth", "1")?;
+                initializer.set_option("vd-lavc-threads", "1")?;
+                // Screen-share encoders emit frames in display order. Avoid
+                // mpv's two-frame hwdec-copy delay queue: with damage-driven
+                // input those retained frames could remain stale indefinitely.
+                initializer.set_option("vd-lavc-low-latency", "yes")?;
+                initializer.set_option("interpolation", "no")?;
+                initializer.set_option("stream-buffer-size", "4k")?;
+            }
             Ok(())
         })?);
 
@@ -73,6 +129,11 @@ impl MpvPlayer {
         mpv.request_log_messages(&mpv_log_level)
             .with_context(|| format!("request native mpv log level {mpv_log_level:?}"))?;
         log::info!("native mpv logging enabled min_level={mpv_log_level:?}");
+        if live {
+            log::info!(
+                "live playback latency mode enabled cache=false demux_readahead_secs=0 hwdec_copy_delay_frames=0 latest_frame=true"
+            );
+        }
 
         let (render_sender, render_messages) = mpsc::channel();
         let resize_sender = render_sender.clone();
@@ -81,9 +142,11 @@ impl MpvPlayer {
         })?;
         let surface = video_surface.platform_surface();
 
-        let mut backend = match create_vulkan_context(&mpv, &video_surface) {
+        let mut backend = match create_vulkan_context(&mpv, &video_surface, live) {
             Ok(context) => {
-                log::info!("video render backend selected backend=vulkan sharing=wgpu-device");
+                log::info!(
+                    "video render backend selected backend=vulkan sharing=wgpu-device latest_frame={live}"
+                );
                 RenderBackend::Vulkan {
                     context,
                     generation: None,
@@ -93,9 +156,11 @@ impl MpvPlayer {
             Err(error) => {
                 log::warn!("Vulkan libmpv interop unavailable, using software fallback: {error:#}");
                 let context = mpv
-                    .create_software_render_context()
+                    .create_software_render_context(live)
                     .context("create libmpv software render context after Vulkan fallback")?;
-                log::info!("video render backend selected backend=software upload=wgpu");
+                log::info!(
+                    "video render backend selected backend=software upload=wgpu latest_frame={live}"
+                );
                 RenderBackend::Software {
                     context,
                     generation: None,
@@ -125,6 +190,7 @@ impl MpvPlayer {
         let (error_sender, errors) = mpsc::channel();
         let render_error_sender = error_sender.clone();
         let render_gpui_wakeup = gpui_wakeup.clone();
+        let render_live_diagnostics = live_diagnostics.clone();
         let render_thread = thread::Builder::new()
             .name("mpv-render".into())
             .spawn(move || {
@@ -135,6 +201,7 @@ impl MpvPlayer {
                     render_messages,
                     render_gpui_wakeup,
                     render_error_sender,
+                    render_live_diagnostics,
                 );
             })
             .context("spawn mpv render thread")?;
@@ -143,6 +210,7 @@ impl MpvPlayer {
         let playback = Arc::new(SharedPlaybackState::default());
         let control_playback = playback.clone();
         let control_mpv = mpv.clone();
+        let control_error_sender = error_sender.clone();
         let control_thread = match thread::Builder::new()
             .name("mpv-control".into())
             .spawn(move || {
@@ -151,7 +219,7 @@ impl MpvPlayer {
                     control_commands,
                     control_playback,
                     gpui_wakeup,
-                    error_sender,
+                    control_error_sender,
                 );
             })
         {
@@ -172,9 +240,12 @@ impl MpvPlayer {
             render_stopping,
             playback,
             errors,
+            error_sender,
             requested_paused: false,
             surface,
             mpv,
+            live_diagnostics,
+            live_source: None,
         })
     }
 
@@ -226,6 +297,7 @@ impl MpvPlayer {
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
         log::debug!("stopping mpv player threads");
+        self.live_source.take();
         self.render_stopping.store(true, Ordering::Release);
         let _ = self.render_sender.send(RenderMessage::Shutdown);
         if let Some(thread) = self.render_thread.take() {
@@ -253,7 +325,11 @@ impl VulkanQueueLock for WgpuQueueLock {
     }
 }
 
-fn create_vulkan_context(mpv: &Arc<Mpv>, surface: &WgpuVideoSurface) -> Result<RenderContext> {
+fn create_vulkan_context(
+    mpv: &Arc<Mpv>,
+    surface: &WgpuVideoSurface,
+    latest_frame: bool,
+) -> Result<RenderContext> {
     let native = surface.vulkan_device()?;
     let has_external_memory_fd = native
         .device_extensions
@@ -315,15 +391,17 @@ fn create_vulkan_context(mpv: &Arc<Mpv>, surface: &WgpuVideoSurface) -> Result<R
         transfer_queue: queue,
         enabled_queue_families: vec![queue],
         queue_lock: Arc::new(WgpuQueueLock(native.queue_lock)),
+        latest_frame,
     })
     .context("import GPUI's Vulkan device into libmpv")
 }
 
-enum ControlCommand {
+pub(crate) enum ControlCommand {
     Load(String),
     SetPause(bool),
     SeekRelative(f64),
     SetVolume(f64),
+    DropBuffers,
     Shutdown,
 }
 
@@ -679,6 +757,10 @@ fn control_worker(
                     log::debug!("setting mpv volume={volume}");
                     mpv.set_property("volume", volume)
                 }
+                ControlCommand::DropBuffers => {
+                    log::debug!("dropping buffered live video at fresh keyframe");
+                    mpv.command("drop-buffers", &[])
+                }
                 ControlCommand::Shutdown => {
                     log::info!("mpv control worker stopped");
                     return;
@@ -828,6 +910,7 @@ fn render_worker(
     messages: mpsc::Receiver<RenderMessage>,
     gpui_wakeup: AsyncSender<()>,
     errors: mpsc::Sender<String>,
+    live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
 ) {
     let backend_name = backend.name();
     log::info!("video render worker started backend={backend_name}");
@@ -840,6 +923,7 @@ fn render_worker(
                 pending.store(false, Ordering::Release);
                 let updates = backend.context().update();
                 let frame_info = backend.context().next_frame_info().ok();
+                let frame_pts = backend.context().next_frame_video_pts().ok();
                 let result = match render_action(updates, frame_info, has_frame) {
                     RenderAction::None => {
                         diagnostics.callbacks_without_frames += 1;
@@ -854,7 +938,14 @@ fn render_worker(
                             .map_err(Into::into)
                     }
                     RenderAction::Render => {
-                        backend.render(&surface, true, &mut diagnostics)
+                        let result = backend.render(&surface, true, &mut diagnostics);
+                        if result.as_ref().is_ok_and(|rendered| *rendered)
+                            && let (Some(diagnostics), Some(pts)) =
+                                (live_diagnostics.as_ref(), frame_pts)
+                        {
+                            diagnostics.record_render(pts);
+                        }
+                        result
                     }
                 };
                 ("update", result)

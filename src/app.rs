@@ -7,9 +7,10 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight, KeyBinding,
-    ListAlignment, ListState, LruImageCache, ObjectFit, PathPromptOptions, Render, ScrollWheelEvent,
-    SharedString, Stateful, Task, Window, actions, div, img, list, prelude::*, px, relative, rgb,
-    rgba, surface,
+    ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathPromptOptions, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, Stateful, Task, Window, actions, div, img, list, point, prelude::*, px, relative,
+    rgb, rgba, surface,
 };
 use markdown::{
     Markdown, MarkdownElement, MarkdownFont, MarkdownSelectionArea, MarkdownSelectionGroup,
@@ -22,7 +23,7 @@ use rpc::{
             AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState,
         },
     },
-    ids::RoomId,
+    ids::{RoomId, StreamId},
 };
 
 use crate::{
@@ -58,6 +59,13 @@ struct EagerImageKey {
 struct EagerImageFetch {
     key: EagerImageKey,
     descriptor: AttachmentDescriptor,
+}
+
+struct LivePlayerView {
+    player: MpvPlayer,
+    zoom: f32,
+    pan: Point<gpui::Pixels>,
+    last_mouse_position: Option<Point<gpui::Pixels>>,
 }
 
 impl EagerImageFetch {
@@ -149,6 +157,11 @@ actions!(
         TogglePlayback,
         SeekBack,
         SeekForward,
+        LiveZoomIn,
+        LiveZoomOut,
+        LiveReset,
+        LivePanUp,
+        LivePanDown,
         ToggleMute,
         ToggleDeafen,
         ToggleVoice
@@ -168,6 +181,11 @@ pub fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new("left", SeekBack, Some("Chatt")),
         KeyBinding::new("right", SeekForward, Some("Chatt")),
+        KeyBinding::new("=", LiveZoomIn, Some("Chatt")),
+        KeyBinding::new("-", LiveZoomOut, Some("Chatt")),
+        KeyBinding::new("home", LiveReset, Some("Chatt")),
+        KeyBinding::new("up", LivePanUp, Some("Chatt")),
+        KeyBinding::new("down", LivePanDown, Some("Chatt")),
     ]);
 }
 
@@ -190,6 +208,8 @@ pub struct ChattView {
     player: Option<MpvPlayer>,
     video_wakeup: async_channel::Sender<()>,
     active_video: Option<u64>,
+    live_players: HashMap<StreamId, LivePlayerView>,
+    fullscreen_share: Option<StreamId>,
     position: f64,
     duration: f64,
     paused: bool,
@@ -263,6 +283,8 @@ impl ChattView {
             player: None,
             video_wakeup,
             active_video: None,
+            live_players: HashMap::new(),
+            fullscreen_share: None,
             position: 0.0,
             duration: 0.0,
             paused: true,
@@ -310,6 +332,255 @@ impl ChattView {
         }
     }
 
+    fn advance_live_video(&mut self) {
+        let mut ended = Vec::new();
+        for (stream_id, view) in &mut self.live_players {
+            match view.player.drain_events() {
+                Ok(playback) if playback.finished => {
+                    ended.push((*stream_id, "Screen share ended".to_string()));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    ended.push((*stream_id, format!("Screen share failed · {error:#}")));
+                }
+            }
+        }
+        for (stream_id, status) in ended {
+            self.live_players.remove(&stream_id);
+            self.send_stop_live_share(stream_id);
+            self.status = status.into();
+        }
+    }
+
+    fn start_live_share(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
+        if self.live_players.contains_key(&stream_id) || !self.model.is_ready() {
+            return;
+        }
+        let request_id = self.request_id();
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::StartLiveShare,
+                room_id: self
+                    .model
+                    .live_shares
+                    .iter()
+                    .find(|share| share.stream_id == stream_id)
+                    .map(|share| share.room_id),
+                draft: None,
+                transfer_id: None,
+            },
+        );
+        if let Err(error) = self.daemon.send(ClientFrame::StartLiveShare {
+            request_id,
+            stream_id,
+        }) {
+            self.model.pending.remove(&request_id);
+            self.status = error.into();
+        } else {
+            self.status = "Starting screen share…".into();
+        }
+        cx.notify();
+    }
+
+    fn stop_live_share(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
+        self.live_players.remove(&stream_id);
+        if self.fullscreen_share == Some(stream_id) {
+            self.fullscreen_share = None;
+        }
+        self.send_stop_live_share(stream_id);
+        self.status = "Stopped screen share".into();
+        cx.notify();
+    }
+
+    fn send_stop_live_share(&mut self, stream_id: StreamId) {
+        let request_id = self.request_id();
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::StopLiveShare,
+                room_id: None,
+                draft: None,
+                transfer_id: None,
+            },
+        );
+        if self
+            .daemon
+            .send(ClientFrame::StopLiveShare {
+                request_id,
+                stream_id,
+            })
+            .is_err()
+        {
+            self.model.pending.remove(&request_id);
+        }
+    }
+
+    fn reset_live_view(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
+        if let Some(view) = self.live_players.get_mut(&stream_id) {
+            view.zoom = 1.0;
+            view.pan = point(px(0.), px(0.));
+            view.last_mouse_position = None;
+            cx.notify();
+        }
+    }
+
+    fn zoom_live_view(&mut self, stream_id: StreamId, factor: f32, cx: &mut Context<Self>) {
+        if let Some(view) = self.live_players.get_mut(&stream_id) {
+            view.zoom = (view.zoom * factor).clamp(1.0, 8.0);
+            if view.zoom == 1.0 {
+                view.pan = point(px(0.), px(0.));
+            }
+            cx.notify();
+        }
+    }
+
+    fn pan_live_view(
+        &mut self,
+        stream_id: StreamId,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.live_players.get_mut(&stream_id) {
+            view.pan += point(px(x), px(y));
+            cx.notify();
+        }
+    }
+
+    fn live_zoom_in_action(
+        &mut self,
+        _: &LiveZoomIn,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.zoom_live_view(stream_id, 1.25, cx);
+        }
+    }
+
+    fn live_zoom_out_action(
+        &mut self,
+        _: &LiveZoomOut,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.zoom_live_view(stream_id, 1.0 / 1.25, cx);
+        }
+    }
+
+    fn live_reset_action(
+        &mut self,
+        _: &LiveReset,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.reset_live_view(stream_id, cx);
+        }
+    }
+
+    fn live_pan_up_action(
+        &mut self,
+        _: &LivePanUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.pan_live_view(stream_id, 0.0, 30.0, cx);
+        }
+    }
+
+    fn live_pan_down_action(
+        &mut self,
+        _: &LivePanDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.pan_live_view(stream_id, 0.0, -30.0, cx);
+        }
+    }
+
+    fn scroll_live_view(
+        &mut self,
+        stream_id: StreamId,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+            ScrollDelta::Lines(delta) => delta.y * 20.0,
+        };
+        let factor = if delta > 0.0 { 1.1 } else { 1.0 / 1.1 };
+        self.zoom_live_view(stream_id, factor, cx);
+    }
+
+    fn live_mouse_down(
+        &mut self,
+        stream_id: StreamId,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if event.click_count == 2 {
+            let factor = if event.modifiers.shift { 0.5 } else { 2.0 };
+            self.zoom_live_view(stream_id, factor, cx);
+            return;
+        }
+        if let Some(view) = self.live_players.get_mut(&stream_id) {
+            view.last_mouse_position = Some(event.position);
+        }
+    }
+
+    fn live_mouse_move(
+        &mut self,
+        stream_id: StreamId,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.live_players.get_mut(&stream_id) else {
+            return;
+        };
+        if let Some(last) = view.last_mouse_position {
+            view.pan += event.position - last;
+            view.last_mouse_position = Some(event.position);
+            cx.notify();
+        }
+    }
+
+    fn live_mouse_up(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
+        if let Some(view) = self.live_players.get_mut(&stream_id) {
+            view.last_mouse_position = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_live_fullscreen(
+        &mut self,
+        stream_id: StreamId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fullscreen_share = if self.fullscreen_share == Some(stream_id) {
+            None
+        } else {
+            Some(stream_id)
+        };
+        window.toggle_fullscreen();
+        cx.notify();
+    }
+
+    fn release_live_players(&mut self, window: &mut Window) {
+        self.live_players.clear();
+        if self.fullscreen_share.take().is_some() && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+    }
+
     fn apply_daemon_event(
         &mut self,
         event: DaemonEvent,
@@ -336,6 +607,7 @@ impl ChattView {
                         Some("Connection changed; pending operations were not replayed".into());
                 }
                 self.status = format!("Offline · {reason}").into();
+                self.release_live_players(window);
             }
             DaemonEvent::Incompatible(details) => {
                 self.model.phase = ConnectionPhase::Incompatible {
@@ -376,6 +648,41 @@ impl ChattView {
             DaemonEvent::Frame(frame) => {
                 self.apply_daemon_state_frame(frame, window, cx);
             }
+            DaemonEvent::LiveShareOpened {
+                request_id,
+                stream_id,
+                stream,
+            } => {
+                self.model.pending.remove(&request_id);
+                let Some(share) = self
+                    .model
+                    .live_shares
+                    .iter()
+                    .find(|share| share.stream_id == stream_id)
+                    .cloned()
+                else {
+                    self.status = "Screen share ended before playback started".into();
+                    return;
+                };
+                match MpvPlayer::new_live(self.video_wakeup.clone(), share, stream) {
+                    Ok(player) => {
+                        self.live_players.insert(
+                            stream_id,
+                            LivePlayerView {
+                                player,
+                                zoom: 1.0,
+                                pan: point(px(0.), px(0.)),
+                                last_mouse_position: None,
+                            },
+                        );
+                        self.status = "Playing live screen share".into();
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not play screen share · {error:#}").into();
+                        self.send_stop_live_share(stream_id);
+                    }
+                }
+            }
         }
     }
 
@@ -394,6 +701,23 @@ impl ChattView {
         let old_len = self.model.messages.len();
         let old_selected_room = self.model.selected_room;
         let effect = reducer::apply(&mut self.model, frame);
+        let available = self
+            .model
+            .live_shares
+            .iter()
+            .map(|share| share.stream_id)
+            .collect::<HashSet<_>>();
+        self.live_players
+            .retain(|stream_id, _| available.contains(stream_id));
+        if self
+            .fullscreen_share
+            .is_some_and(|stream_id| !available.contains(&stream_id))
+        {
+            self.fullscreen_share = None;
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+        }
         if self.model.selected_room != old_selected_room || effect.replace_messages {
             self.timeline_selection.clear();
         } else if !effect.splices.is_empty() {
@@ -1512,14 +1836,202 @@ impl ChattView {
         cx.notify();
     }
     fn seek_back(&mut self, _: &SeekBack, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active_video.is_some() {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.pan_live_view(stream_id, 30.0, 0.0, cx);
+        } else if self.active_video.is_some() {
             self.seek_relative(-10., cx);
         }
     }
     fn seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active_video.is_some() {
+        if let Some(stream_id) = self.fullscreen_share {
+            self.pan_live_view(stream_id, -30.0, 0.0, cx);
+        } else if self.active_video.is_some() {
             self.seek_relative(10., cx);
         }
+    }
+
+    fn render_live_shares(&mut self, cx: &mut Context<Self>) -> Div {
+        let shares = self.model.live_shares.clone();
+        let mut panel = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_b_1()
+            .border_color(rgb(0x272a30))
+            .bg(rgb(0x14161a));
+        for share in shares {
+            panel = panel.child(self.render_live_share_card(share, false, cx));
+        }
+        panel
+    }
+
+    fn render_live_share_card(
+        &mut self,
+        share: rpc::daemon::model::LiveShare,
+        fullscreen: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let stream_id = share.stream_id;
+        let active = self.live_players.get(&stream_id).map(|view| {
+            (
+                view.player.surface(),
+                view.zoom,
+                view.pan,
+                view.last_mouse_position.is_some(),
+            )
+        });
+        let mut card = div()
+            .id(("live-share", stream_id.0 as usize))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .border_1()
+            .border_color(rgb(0x30343b))
+            .bg(rgb(0x111317))
+            .when(fullscreen, |card| card.size_full())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{} is sharing", share.sender_name)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x747a84))
+                            .child(format!(
+                                "{}×{} · {}",
+                                share.coded_width, share.coded_height, share.codec
+                            )),
+                    )
+                    .child(div().flex_1()),
+            );
+        if let Some((video_surface, zoom, pan, dragging)) = active {
+            let stop_id = stream_id;
+            let reset_id = stream_id;
+            let zoom_out_id = stream_id;
+            let zoom_in_id = stream_id;
+            let fullscreen_id = stream_id;
+            card = card
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            mini_button(("live-stop", stream_id.0 as usize), "Stop").on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    if this.fullscreen_share == Some(stop_id)
+                                        && window.is_fullscreen()
+                                    {
+                                        window.toggle_fullscreen();
+                                    }
+                                    this.stop_live_share(stop_id, cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            mini_button(("live-reset", stream_id.0 as usize), "Reset").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.reset_live_view(reset_id, cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            mini_button(("live-zoom-out", stream_id.0 as usize), "−").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.zoom_live_view(zoom_out_id, 1.0 / 1.25, cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x8b929d))
+                                .child(format!("{:.0}%", zoom * 100.0)),
+                        )
+                        .child(
+                            mini_button(("live-zoom-in", stream_id.0 as usize), "+").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.zoom_live_view(zoom_in_id, 1.25, cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            mini_button(
+                                ("live-fullscreen", stream_id.0 as usize),
+                                if fullscreen { "Exit fullscreen" } else { "Fullscreen" },
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.toggle_live_fullscreen(fullscreen_id, window, cx)
+                            })),
+                        ),
+                )
+                .child({
+                    let scroll_id = stream_id;
+                    let down_id = stream_id;
+                    let move_id = stream_id;
+                    let up_id = stream_id;
+                    div()
+                        .relative()
+                        .overflow_hidden()
+                        .w_full()
+                        .when(fullscreen, |viewport| viewport.flex_1().min_h_0())
+                        .when(!fullscreen, |viewport| viewport.h(px(320.)))
+                        .bg(rgb(0x08090b))
+                        .cursor(if dragging {
+                            gpui::CursorStyle::ClosedHand
+                        } else {
+                            gpui::CursorStyle::OpenHand
+                        })
+                        .on_scroll_wheel(cx.listener(
+                            move |this, event: &ScrollWheelEvent, _, cx| {
+                                this.scroll_live_view(scroll_id, event, cx)
+                            },
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.live_mouse_down(down_id, event, cx)
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            move |this, event: &MouseMoveEvent, _, cx| {
+                                this.live_mouse_move(move_id, event, cx)
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                this.live_mouse_up(up_id, cx)
+                            }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(pan.x)
+                                .top(pan.y)
+                                .w(relative(zoom))
+                                .h(relative(zoom))
+                                .child(surface(video_surface).size_full()),
+                        )
+                });
+        } else {
+            card = card.child(
+                mini_button(("live-play", stream_id.0 as usize), "Play").on_click(
+                    cx.listener(move |this, _, _, cx| this.start_live_share(stream_id, cx)),
+                ),
+            );
+        }
+        card
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1761,6 +2273,33 @@ impl Render for ChattView {
         if self.active_video.is_some() {
             self.advance_video(window, cx);
         }
+        if !self.live_players.is_empty() {
+            self.advance_live_video();
+        }
+        if let Some(stream_id) = self.fullscreen_share
+            && let Some(share) = self
+                .model
+                .live_shares
+                .iter()
+                .find(|share| share.stream_id == stream_id)
+                .cloned()
+            && self.live_players.contains_key(&stream_id)
+        {
+            let card = self.render_live_share_card(share, true, cx);
+            return div()
+                .id("chatt-live-fullscreen")
+                .key_context("Chatt")
+                .on_action(cx.listener(Self::seek_back))
+                .on_action(cx.listener(Self::seek_forward))
+                .on_action(cx.listener(Self::live_zoom_in_action))
+                .on_action(cx.listener(Self::live_zoom_out_action))
+                .on_action(cx.listener(Self::live_reset_action))
+                .on_action(cx.listener(Self::live_pan_up_action))
+                .on_action(cx.listener(Self::live_pan_down_action))
+                .size_full()
+                .bg(rgb(0x08090b))
+                .child(card);
+        }
         if self.scroll_animation_active {
             self.advance_timeline_scroll(window);
         }
@@ -1802,6 +2341,8 @@ impl Render for ChattView {
                 view.autoscroll_timeline_selection(distance, cx)
             });
         });
+        let live_panel = (!self.model.live_shares.is_empty())
+            .then(|| self.render_live_shares(cx));
         div()
             .id("chatt")
             .key_context("Chatt")
@@ -1810,6 +2351,11 @@ impl Render for ChattView {
             .on_action(cx.listener(Self::toggle_playback))
             .on_action(cx.listener(Self::seek_back))
             .on_action(cx.listener(Self::seek_forward))
+            .on_action(cx.listener(Self::live_zoom_in_action))
+            .on_action(cx.listener(Self::live_zoom_out_action))
+            .on_action(cx.listener(Self::live_reset_action))
+            .on_action(cx.listener(Self::live_pan_up_action))
+            .on_action(cx.listener(Self::live_pan_down_action))
             .on_action(cx.listener(Self::toggle_mute))
             .on_action(cx.listener(Self::toggle_deafen))
             .on_action(cx.listener(Self::toggle_voice))
@@ -1936,6 +2482,7 @@ impl Render for ChattView {
                                 )),
                             ),
                     )
+                    .when_some(live_panel, |panel, live_panel| panel.child(live_panel))
                     .when(
                         !self.model.at_start && self.model.older_cursor.is_some(),
                         |panel| {
@@ -2068,6 +2615,8 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::JoinVoice => "Voice join",
         Operation::LeaveVoice => "Voice leave",
         Operation::SetOutputVolume => "Volume change",
+        Operation::StartLiveShare => "Screen share playback",
+        Operation::StopLiveShare => "Screen share stop",
         Operation::BeginUpload => "Upload",
         Operation::CancelBulkTransfer => "Attachment cancellation",
         Operation::CancelFileTransfer => "File transfer cancellation",

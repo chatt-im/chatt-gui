@@ -4,6 +4,7 @@ mod daemon;
 mod frame_stats;
 mod fonts;
 mod image_cache;
+mod live_stream;
 mod media_cache;
 mod model;
 mod mpv_player;

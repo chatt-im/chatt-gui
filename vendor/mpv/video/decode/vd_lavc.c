@@ -81,6 +81,7 @@ struct vd_lavc_params {
     int threads;
     bool bitexact;
     bool old_x264;
+    bool low_latency;
     bool apply_cropping;
     bool check_hw_profile;
     char **avopts;
@@ -111,6 +112,7 @@ const struct m_sub_options vd_lavc_conf = {
         {"vd-lavc-threads", OPT_INT(threads), M_RANGE(0, DBL_MAX)},
         {"vd-lavc-bitexact", OPT_BOOL(bitexact)},
         {"vd-lavc-assume-old-x264", OPT_BOOL(old_x264)},
+        {"vd-lavc-low-latency", OPT_BOOL(low_latency)},
         {"vd-lavc-check-hw-profile", OPT_BOOL(check_hw_profile)},
         {"vd-lavc-o", OPT_KEYVALUELIST(avopts)},
         {"vd-lavc-dr", OPT_CHOICE(dr,
@@ -796,7 +798,7 @@ static void init_avctx(struct mp_filter *vd)
             avctx->get_format = get_format_hwdec;
 
         // Some APIs benefit from this, for others it's additional bloat.
-        if (ctx->hwdec.copying)
+        if (ctx->hwdec.copying && !lavc_param->low_latency)
             ctx->max_delay_queue = HWDEC_DELAY_QUEUE_COUNT;
         ctx->hw_probing = true;
 
@@ -817,7 +819,12 @@ static void init_avctx(struct mp_filter *vd)
     }
 
     avctx->flags |= lavc_param->bitexact ? AV_CODEC_FLAG_BITEXACT : 0;
+    avctx->flags |= lavc_param->low_latency ? AV_CODEC_FLAG_LOW_DELAY : 0;
     avctx->flags2 |= lavc_param->fast ? AV_CODEC_FLAG2_FAST : 0;
+
+    if (lavc_param->low_latency) {
+        MP_INFO(vd, "Low-latency decoding enabled; decoder output delay queue disabled.\n");
+    }
 
     if (lavc_param->show_all)
         avctx->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;

@@ -441,6 +441,29 @@ typedef enum mpv_render_param_type {
      * Type: VkImage*
      */
     MPV_RENDER_PARAM_VULKAN_TARGET_REMOVE = 23,
+    /**
+     * Keep only the newest decoded frame at the render API boundary. Valid for
+     * mpv_render_context_create().
+     *
+     * Type: int*: 0 for disable (default), 1 for enable
+     *
+     * Normally the video output waits for the API user to consume each frame.
+     * With this enabled, an unconsumed frame is replaced when a newer decoded
+     * frame arrives, and decoder progress never waits for rendering. The most
+     * recent frame remains available to mpv_render_context_render(), including
+     * when the input then becomes idle. This is intended for untimed,
+     * damage-driven live video where showing an old frame is worse than
+     * dropping intermediate frames.
+     */
+    MPV_RENDER_PARAM_LATEST_FRAME = 24,
+    /**
+     * Return the source PTS, in seconds, of the next video frame. Valid for
+     * mpv_render_context_get_info(). The value is NAN when no video image is
+     * pending.
+     *
+     * Type: double*
+     */
+    MPV_RENDER_PARAM_NEXT_FRAME_VIDEO_PTS = 25,
 } mpv_render_param_type;
 
 /**

@@ -233,3 +233,51 @@ impl<'parent, T: RefUnwindSafe, U: RefUnwindSafe> Protocol<'parent, T, U> {
         }
     }
 }
+
+/// Registers protocol state owned by `mpv` itself. The callbacks remain valid
+/// until the mpv handle is destroyed, which is the lifetime required by
+/// `mpv_stream_cb_add_ro` and avoids self-referential application structs.
+pub unsafe fn register_owned<T, U>(
+    mpv: &Mpv,
+    name: &str,
+    user_data: U,
+    open_fn: StreamOpen<T, U>,
+    close_fn: StreamClose<T>,
+    read_fn: StreamRead<T>,
+    seek_fn: Option<StreamSeek<T>>,
+    size_fn: Option<StreamSize<T>>,
+) -> Result<()>
+where
+    T: Sized + RefUnwindSafe,
+    U: RefUnwindSafe + Send + 'static,
+{
+    let data = Box::into_raw(Box::new(InitProtocolData {
+        user_data,
+        open_fn,
+        close_fn,
+        read_fn,
+        seek_fn,
+        size_fn,
+    }));
+    let protocol = CString::new(name)?;
+    let result = mpv_err(
+        (),
+        unsafe {
+            libmpv2_sys::mpv_stream_cb_add_ro(
+                mpv.ctx.as_ptr(),
+                protocol.as_ptr(),
+                data.cast(),
+                Some(open_wrapper::<T, U>),
+            )
+        },
+    );
+    if result.is_err() {
+        unsafe { drop(Box::from_raw(data)) };
+        return result;
+    }
+    let data_address = data as usize;
+    mpv.protocol_cleanup.lock().unwrap().push(Box::new(move || {
+        unsafe { drop(Box::from_raw(data_address as *mut InitProtocolData<T, U>)) };
+    }));
+    Ok(())
+}

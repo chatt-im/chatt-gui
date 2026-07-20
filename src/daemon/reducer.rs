@@ -65,6 +65,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
             effect.request_result = Some(result);
         }
         DaemonFrame::Pong { .. }
+        | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::BulkStarted(_)
         | DaemonFrame::BulkChunk(_)
         | DaemonFrame::BulkFinished(_)
@@ -107,6 +108,7 @@ fn install_snapshot(model: &mut ChatModel, snapshot: StateSnapshot) {
             )
         })
         .collect();
+    model.live_shares = snapshot.live_shares;
 }
 
 fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffect) {
@@ -247,6 +249,23 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             }
         }
         StateDelta::VoiceStateChanged { voice } => model.voice = voice,
+        StateDelta::LiveShareUpserted { share } => {
+            match model
+                .live_shares
+                .binary_search_by_key(&share.stream_id, |item| item.stream_id)
+            {
+                Ok(index) => model.live_shares[index] = share,
+                Err(index) => model.live_shares.insert(index, share),
+            }
+        }
+        StateDelta::LiveShareRemoved { stream_id } => {
+            if let Ok(index) = model
+                .live_shares
+                .binary_search_by_key(&stream_id, |item| item.stream_id)
+            {
+                model.live_shares.remove(index);
+            }
+        }
         StateDelta::ResyncRequired { .. } => {
             model.phase = ConnectionPhase::Syncing;
             effect.request_resync = !model.resync_requested;
@@ -347,7 +366,7 @@ mod tests {
 
     fn welcome(instance: DaemonInstanceId) -> DaemonFrame {
         DaemonFrame::Welcome(Welcome {
-            version: 1,
+            version: rpc::daemon::PROTOCOL_MAX_VERSION,
             instance_id: instance,
             daemon_build: "test".into(),
             connection: ConnectionState::Online,
@@ -372,6 +391,7 @@ mod tests {
                 joined_room: None,
             },
             transfers: Vec::new(),
+            live_shares: Vec::new(),
         }
     }
 
@@ -390,6 +410,45 @@ mod tests {
             reference: None,
             attachment: None,
         }
+    }
+
+    #[test]
+    fn live_share_deltas_upsert_and_remove_in_stream_order() {
+        let mut model = ChatModel::default();
+        let mut effect = ReduceEffect::default();
+        for stream_id in [9, 3] {
+            apply_delta(
+                &mut model,
+                StateDelta::LiveShareUpserted {
+                    share: rpc::daemon::model::LiveShare {
+                        room_id: RoomId(1),
+                        stream_id: rpc::ids::StreamId(stream_id),
+                        sender_name: "alice".into(),
+                        codec: "avc1.42C00D".into(),
+                        coded_width: 320,
+                        coded_height: 240,
+                        extradata: vec![1],
+                    },
+                },
+                &mut effect,
+            );
+        }
+        assert_eq!(
+            model
+                .live_shares
+                .iter()
+                .map(|share| share.stream_id.0)
+                .collect::<Vec<_>>(),
+            vec![3, 9]
+        );
+        apply_delta(
+            &mut model,
+            StateDelta::LiveShareRemoved {
+                stream_id: rpc::ids::StreamId(3),
+            },
+            &mut effect,
+        );
+        assert_eq!(model.live_shares[0].stream_id.0, 9);
     }
 
     #[test]

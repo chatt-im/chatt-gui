@@ -21,6 +21,8 @@ const PARAM_SW_POINTER: u32 = 20;
 const PARAM_VULKAN_INIT_PARAMS: u32 = 21;
 const PARAM_VULKAN_TARGET: u32 = 22;
 const PARAM_VULKAN_TARGET_REMOVE: u32 = 23;
+const PARAM_LATEST_FRAME: u32 = 24;
+const PARAM_NEXT_FRAME_VIDEO_PTS: u32 = 25;
 
 const API_OPENGL: &[u8] = b"opengl\0";
 const API_SOFTWARE: &[u8] = b"sw\0";
@@ -95,6 +97,9 @@ pub struct VulkanInitParams {
     pub transfer_queue: VulkanQueueFamily,
     pub enabled_queue_families: Vec<VulkanQueueFamily>,
     pub queue_lock: Arc<dyn VulkanQueueLock>,
+    /// Let decoding run ahead of rendering while retaining only the newest
+    /// unconsumed frame. Intended for untimed, damage-driven live video.
+    pub latest_frame: bool,
 }
 
 /// An application-owned Vulkan image used as a render target.
@@ -277,20 +282,27 @@ impl Mpv {
             queue_ctx: (&mut *queue_callback as *mut QueueCallbackContext).cast(),
         };
         let mut advanced = 1_i32;
+        let mut latest_frame = i32::from(params.latest_frame);
         let mut raw_params = [
             raw_param(PARAM_API_TYPE, API_VULKAN.as_ptr().cast_mut().cast()),
             raw_param(PARAM_VULKAN_INIT_PARAMS, (&mut raw_init as *mut RawVulkanInitParams).cast()),
             raw_param(PARAM_ADVANCED_CONTROL, (&mut advanced as *mut i32).cast()),
+            raw_param(PARAM_LATEST_FRAME, (&mut latest_frame as *mut i32).cast()),
             raw_param(PARAM_INVALID, ptr::null_mut()),
         ];
         create_context(self, &mut raw_params, Some(queue_callback), None)
     }
 
-    pub fn create_software_render_context(self: &Arc<Self>) -> Result<RenderContext> {
+    pub fn create_software_render_context(
+        self: &Arc<Self>,
+        latest_frame: bool,
+    ) -> Result<RenderContext> {
         let mut advanced = 1_i32;
+        let mut latest_frame = i32::from(latest_frame);
         let mut params = [
             raw_param(PARAM_API_TYPE, API_SOFTWARE.as_ptr().cast_mut().cast()),
             raw_param(PARAM_ADVANCED_CONTROL, (&mut advanced as *mut i32).cast()),
+            raw_param(PARAM_LATEST_FRAME, (&mut latest_frame as *mut i32).cast()),
             raw_param(PARAM_INVALID, ptr::null_mut()),
         ];
         create_context(self, &mut params, None, None)
@@ -385,6 +397,20 @@ impl RenderContext {
             },
             code,
         )
+    }
+
+    /// Source PTS in seconds for the next pending video image, or NaN if the
+    /// update contains no video image.
+    pub fn next_frame_video_pts(&self) -> Result<f64> {
+        let mut pts = f64::NAN;
+        let parameter = raw_param(
+            PARAM_NEXT_FRAME_VIDEO_PTS,
+            (&mut pts as *mut f64).cast(),
+        );
+        let code = unsafe {
+            libmpv2_sys::mpv_render_context_get_info(self.ctx.as_ptr(), parameter)
+        };
+        mpv_err(pts, code)
     }
 
     pub fn skip_rendering(&self) -> Result<()> {

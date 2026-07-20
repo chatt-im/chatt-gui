@@ -23,6 +23,7 @@ use std::{
     mem::MaybeUninit,
     ops::Deref,
     ptr::{self, NonNull},
+    sync::Mutex,
 };
 
 fn mpv_err<T>(ret: T, err: ctype::c_int) -> Result<T> {
@@ -242,6 +243,7 @@ pub struct Mpv {
     /// The handle to the mpv core
     pub ctx: NonNull<libmpv2_sys::mpv_handle>,
     wakeup_callback_cleanup: Option<Box<dyn FnOnce()>>,
+    pub(crate) protocol_cleanup: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 unsafe impl Send for Mpv {}
@@ -255,6 +257,9 @@ impl Drop for Mpv {
 
         unsafe {
             libmpv2_sys::mpv_destroy(self.ctx.as_ptr());
+        }
+        for cleanup in self.protocol_cleanup.get_mut().unwrap().drain(..) {
+            cleanup();
         }
     }
 }
@@ -355,6 +360,7 @@ impl Mpv {
         Ok(Mpv {
             ctx,
             wakeup_callback_cleanup: None,
+            protocol_cleanup: Mutex::new(Vec::new()),
         })
     }
 
@@ -392,6 +398,7 @@ impl Mpv {
         Ok(Mpv {
             ctx,
             wakeup_callback_cleanup: None,
+            protocol_cleanup: Mutex::new(Vec::new()),
         })
     }
 

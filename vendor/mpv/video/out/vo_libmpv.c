@@ -67,6 +67,7 @@ struct mpv_render_context {
     // --- Immutable after init
     struct mp_dispatch_queue *dispatch;
     bool advanced_control;
+    bool latest_frame;
     struct dr_helper *dr;           // NULL if advanced_control disabled
 
     mp_mutex control_lock;
@@ -183,6 +184,8 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
 
     if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_ADVANCED_CONTROL, int, 0))
         ctx->advanced_control = true;
+    if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_LATEST_FRAME, int, 0))
+        ctx->latest_frame = true;
 
     int err = MPV_ERROR_NOT_IMPLEMENTED;
     for (int n = 0; render_backends[n]; n++) {
@@ -414,7 +417,8 @@ int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params)
     if (frame != &dummy)
         talloc_free(frame);
 
-    if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+    if (!ctx->latest_frame &&
+        GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
                              int, 1))
     {
         mp_mutex_lock(&ctx->lock);
@@ -478,6 +482,15 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
         res = 0;
         break;
     }
+    case MPV_RENDER_PARAM_NEXT_FRAME_VIDEO_PTS: {
+        double *pts = param.data;
+        *pts = NAN;
+        struct vo_frame *frame = ctx->next_frame;
+        if (frame && frame->current)
+            *pts = frame->current->pts;
+        res = 0;
+        break;
+    }
     default:;
     }
 
@@ -491,6 +504,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     struct mpv_render_context *ctx = p->ctx;
 
     mp_mutex_lock(&ctx->lock);
+    if (ctx->latest_frame && ctx->next_frame) {
+        talloc_free(ctx->next_frame);
+        ctx->next_frame = NULL;
+        vo_increment_drop_count(vo, 1);
+    }
     mp_assert(!ctx->next_frame);
     ctx->next_frame = vo_frame_ref(frame);
     ctx->expected_flip_count = ctx->flip_count + 1;
@@ -508,6 +526,17 @@ static void flip_page(struct vo *vo)
     int64_t until = mp_time_ns() + MP_TIME_MS_TO_NS(200);
 
     mp_mutex_lock(&ctx->lock);
+
+    if (ctx->latest_frame) {
+        // draw_frame() leaves the newest frame pending for the API user and
+        // replaces it if decoding gets ahead. Never make decode wait for the
+        // render loop: a damage-tracked stream may not provide another frame
+        // that could otherwise release it.
+        ctx->present_count += 1;
+        mp_cond_broadcast(&ctx->video_wait);
+        mp_mutex_unlock(&ctx->lock);
+        return;
+    }
 
     // Wait until frame was rendered
     while (ctx->next_frame) {

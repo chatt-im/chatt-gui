@@ -5,7 +5,7 @@ use rpc::{
         frame::{NegotiatedLimits, Operation, RequestOutcome},
         model::{
             ConnectionState, DaemonInstanceId, Participant, RequestId, RoomSummary,
-            TransferSummary, VoiceState,
+            LiveShare, TransferSummary, VoiceState,
         },
     },
     ids::RoomId,
@@ -48,6 +48,7 @@ pub struct ChatModel {
     pub at_start: bool,
     pub voice: VoiceState,
     pub transfers: Vec<TransferSummary>,
+    pub live_shares: Vec<LiveShare>,
     pub pending: HashMap<RequestId, PendingRequest>,
     pub last_error: Option<String>,
 }
@@ -76,6 +77,7 @@ impl Default for ChatModel {
                 joined_room: None,
             },
             transfers: Vec::new(),
+            live_shares: Vec::new(),
             pending: HashMap::new(),
             last_error: None,
         }

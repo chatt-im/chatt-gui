@@ -22,6 +22,11 @@ pub enum DaemonEvent {
     Connecting,
     TransportConnected,
     Frame(DaemonFrame),
+    LiveShareOpened {
+        request_id: RequestId,
+        stream_id: rpc::ids::StreamId,
+        stream: std::os::unix::net::UnixStream,
+    },
     Disconnected(String),
     Incompatible(String),
     UploadPreparationFailed {
@@ -234,8 +239,39 @@ fn connection_loop(
                     }
                 };
                 let reason = 'connected: loop {
-                    match reader.recv_daemon() {
-                        Ok(frame) => {
+                    match reader.recv_daemon_with_fds() {
+                        Ok(received) => {
+                            let frame = received.frame;
+                            let mut fds = received.fds;
+                            if let DaemonFrame::LiveShareOpened {
+                                request_id,
+                                stream_id,
+                            } = &frame
+                            {
+                                if fds.len() != 1 {
+                                    break 'connected format!(
+                                        "live share open carried {} descriptors instead of one",
+                                        fds.len()
+                                    );
+                                }
+                                let stream = std::os::unix::net::UnixStream::from(fds.pop().unwrap());
+                                if events
+                                    .send_blocking(DaemonEvent::LiveShareOpened {
+                                        request_id: *request_id,
+                                        stream_id: *stream_id,
+                                        stream,
+                                    })
+                                    .is_err()
+                                {
+                                    let _ = command_tx.send(ConnectorCommand::SessionEnded);
+                                    let _ = writer_thread.join();
+                                    return;
+                                }
+                                continue;
+                            }
+                            if !fds.is_empty() {
+                                break 'connected "unexpected descriptors in daemon frame".into();
+                            }
                             let frame = match handle_bulk_frame(
                                 frame,
                                 &media_cache,
