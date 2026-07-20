@@ -142,6 +142,11 @@ static void forget_frames(struct mpv_render_context *ctx, bool all)
 {
     mp_cond_broadcast(&ctx->video_wait);
     if (all) {
+        // latest-frame mode can leave an unrendered frame pending after the VO
+        // has moved on. It must not survive a reconfig or uninit and reach a
+        // renderer whose source parameters have already been cleared.
+        talloc_free(ctx->next_frame);
+        ctx->next_frame = NULL;
         talloc_free(ctx->cur_frame);
         ctx->cur_frame = NULL;
     }

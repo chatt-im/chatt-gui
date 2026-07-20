@@ -1756,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn live_render_context_keeps_only_the_newest_unconsumed_frame() {
+    fn live_render_context_discards_the_newest_unconsumed_frame_when_source_closes() {
         let encoded = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -1828,7 +1828,7 @@ mod tests {
         let (control_sender, _control_receiver) = mpsc::channel();
         let (error_sender, error_receiver) = mpsc::channel();
         let (wakeup_sender, _wakeup_receiver) = async_channel::bounded(1);
-        let _source = LiveStreamSource::start(
+        let source = LiveStreamSource::start(
             mpv.clone(),
             share,
             gui_stream,
@@ -1884,7 +1884,24 @@ mod tests {
             render.next_frame_info().is_ok_and(|frame| frame.is_present()),
             "the newest frame was not retained for the render loop"
         );
-        render.skip_rendering().unwrap();
+        drop(source);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut frame_discarded = false;
+        while Instant::now() < deadline {
+            render.update();
+            if render
+                .next_frame_info()
+                .is_ok_and(|frame| !frame.is_present())
+            {
+                frame_discarded = true;
+                break;
+            }
+            let _ = mpv.wait_event(0.01);
+        }
+        assert!(
+            frame_discarded,
+            "closing live video left a frame pending after its render configuration was cleared"
+        );
         assert!(
             error_receiver.try_recv().is_err(),
             "live socket reader reported an error"
