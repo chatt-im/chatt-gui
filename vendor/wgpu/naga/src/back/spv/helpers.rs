@@ -142,6 +142,11 @@ pub fn is_uniform_matcx2_struct_member_access(
             ..
         } = ir_module.types[pointer_base_type].inner
         {
+            if ir_module.types[pointer_base_type].name.as_deref()
+                == Some("__naga_glsl_std140_matrix_stride_16")
+            {
+                return false;
+            }
             if let crate::Expression::AccessIndex {
                 base: parent_pointer,
                 ..

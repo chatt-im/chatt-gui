@@ -7,7 +7,9 @@ use super::{
         VariableReference,
     },
     error::{Error, ErrorKind},
-    types::{scalar_components, type_power},
+    types::{
+        scalar_components, type_power, COMBINED_IMAGE_TYPE_PREFIX, COMBINED_SAMPLER_TYPE_NAME,
+    },
     Frontend, Result,
 };
 use crate::{
@@ -300,6 +302,37 @@ impl<'a> Context<'a> {
         })
     }
 
+    pub(crate) fn interrupt_expression(
+        &mut self,
+        expr: Expression,
+        meta: Span,
+    ) -> Handle<Expression> {
+        self.emit_end();
+        let handle = self.expressions.append(expr, meta);
+        self.local_expression_kind_tracker
+            .insert(handle, crate::proc::ExpressionKind::Runtime);
+        self.emit_start();
+        handle
+    }
+
+    pub(crate) fn enable_atomic_access(&mut self, pointer: Handle<Expression>) {
+        let mut current = pointer;
+        loop {
+            current = match self.expressions[current] {
+                Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => base,
+                Expression::GlobalVariable(handle) => {
+                    if let AddressSpace::Storage { ref mut access } =
+                        self.module.global_variables[handle].space
+                    {
+                        *access |= crate::StorageAccess::ATOMIC;
+                    }
+                    break;
+                }
+                _ => break,
+            };
+        }
+    }
+
     /// Add variable to current scope
     ///
     /// Returns a variable if a variable with the same name was already defined,
@@ -329,6 +362,10 @@ impl<'a> Context<'a> {
         qualifier: ParameterQualifier,
     ) -> Result<()> {
         let index = self.arguments.len();
+        let combined_image = self.module.types[ty]
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with(COMBINED_IMAGE_TYPE_PREFIX));
         let mut arg = FunctionArgument {
             name: name_meta.as_ref().map(|&(ref name, _)| name.clone()),
             ty,
@@ -357,6 +394,26 @@ impl<'a> Context<'a> {
 
         self.arguments.push(arg);
 
+        let combined_sampler_ty = if combined_image {
+            let ty = self.module.types.insert(
+                Type {
+                    name: Some(COMBINED_SAMPLER_TYPE_NAME.into()),
+                    inner: TypeInner::Sampler { comparison: false },
+                },
+                Span::default(),
+            );
+            self.arguments.push(FunctionArgument {
+                name: name_meta
+                    .as_ref()
+                    .map(|(name, _)| format!("{name}__naga_sampler")),
+                ty,
+                binding: None,
+            });
+            Some(ty)
+        } else {
+            None
+        };
+
         self.parameters_info.push(ParameterInfo {
             qualifier,
             depth: false,
@@ -364,6 +421,13 @@ impl<'a> Context<'a> {
 
         if let Some((name, meta)) = name_meta {
             let expr = self.add_expression(Expression::FunctionArgument(index as u32), meta)?;
+            if combined_sampler_ty.is_some() {
+                let sampler = self.add_expression(
+                    Expression::FunctionArgument(index as u32 + 1),
+                    meta,
+                )?;
+                self.samplers.insert(expr, sampler);
+            }
             let mutable = qualifier != ParameterQualifier::Const && !opaque;
             let load = qualifier.is_lhs();
 

@@ -781,6 +781,8 @@ struct FunctionArgument {
     /// Actual instruction of the argument.
     instruction: Instruction,
     handle_id: Word,
+    sampled_image_id: Word,
+    emit: bool,
 }
 
 /// Tracks the expressions for which the backend emits the following instructions:

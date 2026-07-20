@@ -434,14 +434,28 @@ impl super::Validator {
                 .with_span_handle(pointer, context.expressions)
                 .into_other());
         };
-        let crate::TypeInner::Atomic(pointer_scalar) = context.types[pointer_base].inner else {
-            log::error!(
-                "Atomic pointer to type {:?}",
-                context.types[pointer_base].inner
-            );
-            return Err(AtomicError::InvalidPointer(pointer)
-                .with_span_handle(pointer, context.expressions)
-                .into_other());
+        let pointer_scalar = match context.types[pointer_base].inner {
+            crate::TypeInner::Atomic(scalar) => scalar,
+            // GLSL represents atomic-capable shared and storage integers with
+            // their ordinary scalar type. SPIR-V has the same representation;
+            // atomicity belongs to the operation, not the pointee type.
+            crate::TypeInner::Scalar(scalar)
+                if matches!(
+                    pointer_space,
+                    crate::AddressSpace::WorkGroup | crate::AddressSpace::Storage { .. }
+                ) =>
+            {
+                scalar
+            }
+            _ => {
+                log::error!(
+                    "Atomic pointer to type {:?}",
+                    context.types[pointer_base].inner
+                );
+                return Err(AtomicError::InvalidPointer(pointer)
+                    .with_span_handle(pointer, context.expressions)
+                    .into_other());
+            }
         };
 
         // The `value` operand must be a scalar of the same type as the atomic.
@@ -718,6 +732,18 @@ impl super::Validator {
         result: Handle<crate::Expression>,
         context: &BlockContext,
     ) -> Result<(), WithSpan<FunctionError>> {
+        let glsl_elect = match context.expressions[result] {
+            crate::Expression::SubgroupOperationResult { ty } => context.types[ty]
+                .name
+                .as_deref()
+                == Some("__naga_glsl_subgroup_elect"),
+            _ => false,
+        };
+        if glsl_elect {
+            self.emit_expression(result, context)?;
+            return Ok(());
+        }
+
         match *mode {
             crate::GatherMode::BroadcastFirst => {}
             crate::GatherMode::Broadcast(index)

@@ -9,9 +9,11 @@ use super::{
     Error, ErrorKind, Frontend, Result,
 };
 use crate::{
-    BinaryOperator, DerivativeAxis as Axis, DerivativeControl as Ctrl, Expression, Handle,
-    ImageClass, ImageDimension as Dim, ImageQuery, MathFunction, Module, RelationalFunction,
-    SampleLevel, Scalar, ScalarKind as Sk, Span, Type, TypeInner, UnaryOperator, VectorSize,
+    AtomicFunction, BinaryOperator, CollectiveOperation, DerivativeAxis as Axis,
+    DerivativeControl as Ctrl, Expression, GatherMode, Handle, ImageClass,
+    ImageDimension as Dim, ImageQuery, MathFunction, Module, RelationalFunction, SampleLevel,
+    Scalar, ScalarKind as Sk, Span, Statement, SubgroupOperation, Type, TypeInner, UnaryOperator,
+    VectorSize,
 };
 
 impl crate::ScalarKind {
@@ -265,6 +267,109 @@ pub fn inject_builtin(
 
             texture_args_generator(TextureArgsOptions::SHADOW | variations.into(), f)
         }
+        "textureGather" | "textureGatherOffset" => {
+            let offset = name == "textureGatherOffset";
+            if variations.contains(BuiltinVariations::STANDARD) {
+                for kind in [Sk::Float, Sk::Uint, Sk::Sint] {
+                    for arrayed in [false, true] {
+                        let image = TypeInner::Image {
+                            dim: Dim::D2,
+                            arrayed,
+                            class: ImageClass::Sampled { kind, multi: false },
+                        };
+                        let coords = make_coords_arg(2 + arrayed as usize, Sk::Float);
+                        for component in [false, true] {
+                            let mut args = vec![image.clone(), coords.clone()];
+                            if offset {
+                                args.push(make_coords_arg(2, Sk::Sint));
+                            }
+                            if component {
+                                args.push(TypeInner::Scalar(Scalar::I32));
+                            }
+                            declaration.overloads.push(module.add_builtin(
+                                args,
+                                MacroCall::TextureGather { offset, component },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        "subgroupAdd" | "subgroupMin" | "subgroupMax" => {
+            if variations.contains(BuiltinVariations::STANDARD) {
+                let op = match name {
+                    "subgroupAdd" => SubgroupOperation::Add,
+                    "subgroupMin" => SubgroupOperation::Min,
+                    "subgroupMax" => SubgroupOperation::Max,
+                    _ => unreachable!(),
+                };
+                for scalar in [Scalar::F32, Scalar::I32, Scalar::U32] {
+                    declaration.overloads.push(module.add_builtin(
+                        vec![TypeInner::Scalar(scalar)],
+                        MacroCall::SubgroupCollective(op),
+                    ));
+                }
+            }
+        }
+        "subgroupAllEqual" => {
+            if variations.contains(BuiltinVariations::STANDARD) {
+                for scalar in [Scalar::BOOL, Scalar::F32, Scalar::I32, Scalar::U32] {
+                    declaration.overloads.push(module.add_builtin(
+                        vec![TypeInner::Scalar(scalar)],
+                        MacroCall::SubgroupAllEqual,
+                    ));
+                }
+            }
+        }
+        "subgroupElect" => {
+            if variations.contains(BuiltinVariations::STANDARD) {
+                declaration
+                    .overloads
+                    .push(module.add_builtin(Vec::new(), MacroCall::SubgroupElect));
+            }
+        }
+        "subgroupBallot" => {
+            if variations.contains(BuiltinVariations::STANDARD) {
+                declaration.overloads.push(module.add_builtin(
+                    vec![TypeInner::Scalar(Scalar::BOOL)],
+                    MacroCall::SubgroupBallot,
+                ));
+            }
+        }
+        "subgroupBallotBitCount" => {
+            if variations.contains(BuiltinVariations::STANDARD) {
+                declaration.overloads.push(module.add_builtin(
+                    vec![TypeInner::Vector {
+                        size: VectorSize::Quad,
+                        scalar: Scalar::U32,
+                    }],
+                    MacroCall::SubgroupBallotBitCount,
+                ));
+            }
+        }
+        "atomicAdd" | "atomicMin" | "atomicMax" | "atomicAnd" | "atomicOr" | "atomicXor"
+        | "atomicExchange" => {
+            if variations.contains(BuiltinVariations::STANDARD) {
+                let fun = match name {
+                    "atomicAdd" => AtomicFunction::Add,
+                    "atomicMin" => AtomicFunction::Min,
+                    "atomicMax" => AtomicFunction::Max,
+                    "atomicAnd" => AtomicFunction::And,
+                    "atomicOr" => AtomicFunction::InclusiveOr,
+                    "atomicXor" => AtomicFunction::ExclusiveOr,
+                    "atomicExchange" => AtomicFunction::Exchange { compare: None },
+                    _ => unreachable!(),
+                };
+                for scalar in [Scalar::I32, Scalar::U32] {
+                    let mut overload = module.add_builtin(
+                        vec![TypeInner::Scalar(scalar), TypeInner::Scalar(scalar)],
+                        MacroCall::Atomic(fun),
+                    );
+                    overload.parameters_info[0].qualifier = ParameterQualifier::InOut;
+                    declaration.overloads.push(overload);
+                }
+            }
+        }
         "textureSize" => {
             let f = |kind, dim, arrayed, multi, shadow| {
                 let class = match shadow {
@@ -292,7 +397,22 @@ pub fn inject_builtin(
             texture_args_generator(
                 TextureArgsOptions::SHADOW | TextureArgsOptions::MULTI | variations.into(),
                 f,
-            )
+            );
+
+            // samplerBuffer has no mip level. Its frontend IR dimension is D1,
+            // with a type marker preserving the SPIR-V Buffer dimension.
+            if variations.contains(BuiltinVariations::STANDARD) {
+                for kind in [Sk::Float, Sk::Uint, Sk::Sint] {
+                    let image = TypeInner::Image {
+                        dim: Dim::D1,
+                        arrayed: false,
+                        class: ImageClass::Sampled { kind, multi: false },
+                    };
+                    declaration.overloads.push(
+                        module.add_builtin(vec![image], MacroCall::TextureSize { arrayed: false }),
+                    );
+                }
+            }
         }
         "textureQueryLevels" => {
             let f = |kind, dim, arrayed, multi, shadow| {
@@ -343,7 +463,21 @@ pub fn inject_builtin(
             };
 
             // Don't generate shadow images since they aren't supported
-            texture_args_generator(TextureArgsOptions::MULTI | variations.into(), f)
+            texture_args_generator(TextureArgsOptions::MULTI | variations.into(), f);
+
+            if name == "texelFetch" && variations.contains(BuiltinVariations::STANDARD) {
+                for kind in [Sk::Float, Sk::Uint, Sk::Sint] {
+                    let image = TypeInner::Image {
+                        dim: Dim::D1,
+                        arrayed: false,
+                        class: ImageClass::Sampled { kind, multi: false },
+                    };
+                    declaration.overloads.push(module.add_builtin(
+                        vec![image, TypeInner::Scalar(Scalar::I32)],
+                        MacroCall::ImageLoad { multi: false },
+                    ));
+                }
+            }
         }
         "imageSize" => {
             let f = |kind: Sk, dim, arrayed, _, _| {
@@ -1551,6 +1685,10 @@ pub enum MacroCall {
         shadow: bool,
         level_type: TextureLevelType,
     },
+    TextureGather {
+        offset: bool,
+        component: bool,
+    },
     TextureSize {
         arrayed: bool,
     },
@@ -1574,6 +1712,12 @@ pub enum MacroCall {
     BitCast(Sk),
     Derivate(Axis, Ctrl),
     Barrier,
+    SubgroupCollective(SubgroupOperation),
+    SubgroupAllEqual,
+    SubgroupElect,
+    SubgroupBallot,
+    SubgroupBallotBitCount,
+    Atomic(AtomicFunction),
     /// SmoothStep needs a separate variant because it might need it's inputs
     /// to be splatted depending on the overload
     SmoothStep {
@@ -1713,7 +1857,51 @@ impl MacroCall {
                         .map_or(SampleLevel::Auto, SampleLevel::Bias);
                 }
 
-                texture_call(ctx, args[0], level, comps, texture_offset, meta)?
+                texture_call(ctx, args[0], None, level, comps, texture_offset, meta)?
+            }
+            MacroCall::TextureGather { offset, component } => {
+                let comps = frontend.coordinate_components(ctx, args[0], args[1], None, meta)?;
+                let mut index = 2;
+                let texture_offset = if offset {
+                    index += 1;
+                    Some(args[2])
+                } else {
+                    None
+                };
+                let gather = if component {
+                    let component = match ctx.expressions[args[index]] {
+                        Expression::Literal(crate::Literal::I32(value)) if (0..=3).contains(&value) => {
+                            value as u32
+                        }
+                        Expression::Literal(crate::Literal::U32(value)) if value <= 3 => value,
+                        _ => {
+                            return Err(Error {
+                                kind: ErrorKind::SemanticError(
+                                    "textureGather component must be a constant from 0 to 3".into(),
+                                ),
+                                meta,
+                            });
+                        }
+                    };
+                    Some(match component {
+                        0 => crate::SwizzleComponent::X,
+                        1 => crate::SwizzleComponent::Y,
+                        2 => crate::SwizzleComponent::Z,
+                        3 => crate::SwizzleComponent::W,
+                        _ => unreachable!(),
+                    })
+                } else {
+                    Some(crate::SwizzleComponent::X)
+                };
+                texture_call(
+                    ctx,
+                    args[0],
+                    gather,
+                    SampleLevel::Zero,
+                    comps,
+                    texture_offset,
+                    meta,
+                )?
             }
 
             MacroCall::TextureSize { arrayed } => {
@@ -1821,7 +2009,7 @@ impl MacroCall {
                 let comps = frontend.coordinate_components(ctx, args[0], args[1], None, meta)?;
                 ctx.emit_restart();
                 ctx.body.push(
-                    crate::Statement::ImageStore {
+                    Statement::ImageStore {
                         image: args[0],
                         coordinate: comps.coordinate,
                         array_index: comps.array_index,
@@ -2033,10 +2221,160 @@ impl MacroCall {
                 },
                 Span::default(),
             )?,
+            MacroCall::Atomic(fun) => {
+                ctx.enable_atomic_access(args[0]);
+                let ty = ctx.resolve_type_handle(args[1], meta)?;
+                let result = ctx.interrupt_expression(
+                    Expression::AtomicResult {
+                        ty,
+                        comparison: false,
+                    },
+                    meta,
+                );
+                ctx.body.push(
+                    Statement::Atomic {
+                        pointer: args[0],
+                        fun,
+                        value: args[1],
+                        result: Some(result),
+                    },
+                    meta,
+                );
+                result
+            }
+            MacroCall::SubgroupCollective(op) => {
+                let ty = ctx.resolve_type_handle(args[0], meta)?;
+                let result = ctx.interrupt_expression(
+                    Expression::SubgroupOperationResult { ty },
+                    meta,
+                );
+                ctx.body.push(
+                    Statement::SubgroupCollectiveOperation {
+                        op,
+                        collective_op: CollectiveOperation::Reduce,
+                        argument: args[0],
+                        result,
+                    },
+                    meta,
+                );
+                result
+            }
+            MacroCall::SubgroupAllEqual => {
+                let ty = ctx.resolve_type_handle(args[0], meta)?;
+                let first = ctx.interrupt_expression(
+                    Expression::SubgroupOperationResult { ty },
+                    meta,
+                );
+                ctx.body.push(
+                    Statement::SubgroupGather {
+                        mode: GatherMode::BroadcastFirst,
+                        argument: args[0],
+                        result: first,
+                    },
+                    meta,
+                );
+                let equal = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::Equal,
+                        left: args[0],
+                        right: first,
+                    },
+                    meta,
+                )?;
+                let bool_ty = ctx.resolve_type_handle(equal, meta)?;
+                let result = ctx.interrupt_expression(
+                    Expression::SubgroupOperationResult { ty: bool_ty },
+                    meta,
+                );
+                ctx.body.push(
+                    Statement::SubgroupCollectiveOperation {
+                        op: SubgroupOperation::All,
+                        collective_op: CollectiveOperation::Reduce,
+                        argument: equal,
+                        result,
+                    },
+                    meta,
+                );
+                result
+            }
+            MacroCall::SubgroupElect => {
+                let argument = ctx.add_expression(
+                    Expression::Literal(crate::Literal::Bool(true)),
+                    meta,
+                )?;
+                let ty = ctx.module.types.insert(
+                    Type {
+                        name: Some("__naga_glsl_subgroup_elect".into()),
+                        inner: TypeInner::Scalar(Scalar::BOOL),
+                    },
+                    meta,
+                );
+                let result = ctx.interrupt_expression(
+                    Expression::SubgroupOperationResult { ty },
+                    meta,
+                );
+                ctx.body.push(
+                    Statement::SubgroupGather {
+                        mode: GatherMode::BroadcastFirst,
+                        argument,
+                        result,
+                    },
+                    meta,
+                );
+                result
+            }
+            MacroCall::SubgroupBallot => {
+                let result = ctx.interrupt_expression(Expression::SubgroupBallotResult, meta);
+                ctx.body.push(
+                    Statement::SubgroupBallot {
+                        result,
+                        predicate: Some(args[0]),
+                    },
+                    meta,
+                );
+                result
+            }
+            MacroCall::SubgroupBallotBitCount => {
+                let counts = ctx.add_expression(
+                    Expression::Math {
+                        fun: MathFunction::CountOneBits,
+                        arg: args[0],
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    },
+                    meta,
+                )?;
+                let mut total = ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: counts,
+                        index: 0,
+                    },
+                    meta,
+                )?;
+                for index in 1..4 {
+                    let component = ctx.add_expression(
+                        Expression::AccessIndex {
+                            base: counts,
+                            index,
+                        },
+                        meta,
+                    )?;
+                    total = ctx.add_expression(
+                        Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: total,
+                            right: component,
+                        },
+                        meta,
+                    )?;
+                }
+                total
+            }
             MacroCall::Barrier => {
                 ctx.emit_restart();
                 ctx.body.push(
-                    crate::Statement::ControlBarrier(crate::Barrier::all()),
+                    Statement::ControlBarrier(crate::Barrier::all()),
                     meta,
                 );
                 return Ok(None);
@@ -2063,6 +2401,7 @@ impl MacroCall {
 fn texture_call(
     ctx: &mut Context,
     image: Handle<Expression>,
+    gather: Option<crate::SwizzleComponent>,
     level: SampleLevel,
     comps: CoordComponents,
     offset: Option<Handle<Expression>>,
@@ -2079,7 +2418,7 @@ fn texture_call(
             Expression::ImageSample {
                 image,
                 sampler,
-                gather: None, //TODO
+                gather,
                 coordinate: comps.coordinate,
                 array_index,
                 offset,

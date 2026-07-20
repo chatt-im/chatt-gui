@@ -629,6 +629,11 @@ impl BlockContext<'_> {
         let crate::TypeInner::Struct { .. } = self.ir_module.types[struct_type].inner else {
             return Ok(None);
         };
+        let Some(std140_type_info) = self.writer.std140_compat_uniform_types.get(&struct_type)
+        else {
+            return Ok(None);
+        };
+        let column0_index = std140_type_info.member_indices[member_index as usize];
 
         let matrix_type_id = self.get_numeric_type_id(NumericType::Matrix {
             columns,
@@ -638,8 +643,6 @@ impl BlockContext<'_> {
         let column_type_id = self.get_numeric_type_id(NumericType::Vector { size: rows, scalar });
         let column_pointer_type_id =
             self.get_pointer_type_id(column_type_id, map_storage_class(space));
-        let column0_index = self.writer.std140_compat_uniform_types[&struct_type].member_indices
-            [member_index as usize];
         let column_indices = (0..columns as u32)
             .map(|c| self.get_index_constant(column0_index + c))
             .collect::<ArrayVec<_, 4>>();
@@ -3835,8 +3838,34 @@ impl BlockContext<'_> {
                 } => {
                     let id = self.gen_id();
                     self.temp_list.clear();
-                    for &argument in arguments {
-                        self.temp_list.push(self.cached[argument]);
+                    for (index, &argument) in arguments.iter().enumerate() {
+                        let target_ty = self.ir_module.functions[local_function].arguments[index].ty;
+                        let target_name = self.ir_module.types[target_ty].name.as_deref();
+                        if target_name == Some("__naga_glsl_combined_sampler") {
+                            continue;
+                        }
+                        if target_name.is_some_and(|name| {
+                            name.starts_with("__naga_glsl_combined_image:")
+                        }) {
+                            let sampled_image_id = match self.ir_function.expressions[argument] {
+                                crate::Expression::GlobalVariable(handle) => {
+                                    self.writer.global_variables[handle].sampled_image_id
+                                }
+                                crate::Expression::FunctionArgument(index) => {
+                                    self.function.parameters[index as usize].sampled_image_id
+                                }
+                                _ => 0,
+                            };
+                            if sampled_image_id != 0 {
+                                self.temp_list.push(sampled_image_id);
+                            } else {
+                                return Err(Error::FeatureNotImplemented(
+                                    "separate image/sampler passed to combined sampler function",
+                                ));
+                            }
+                        } else {
+                            self.temp_list.push(self.cached[argument]);
+                        }
                     }
 
                     let type_id = match result {

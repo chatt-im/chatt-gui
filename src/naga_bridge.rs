@@ -499,6 +499,7 @@ fn dump_shader_if_requested(request: &CompileRequest<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::process::Command;
 
     const VULKAN_1_2: u32 = (1 << 22) | (2 << 12);
@@ -547,6 +548,25 @@ mod tests {
         // SAFETY: `result` was initialized by the bridge and is freed once.
         unsafe { chatt_naga_result_free_v1(&mut result) };
         output
+    }
+
+    fn instructions(words: &[u32]) -> impl Iterator<Item = (u32, &[u32])> {
+        let mut offset = 5;
+        std::iter::from_fn(move || {
+            if offset >= words.len() {
+                return None;
+            }
+            let instruction_len = (words[offset] >> 16) as usize;
+            assert!(instruction_len > 0);
+            let opcode = words[offset] & 0xffff;
+            let operands = &words[offset + 1..offset + instruction_len];
+            offset += instruction_len;
+            Some((opcode, operands))
+        })
+    }
+
+    fn contains_opcode(words: &[u32], opcode: u32) -> bool {
+        instructions(words).any(|(candidate, _)| candidate == opcode)
     }
 
     #[test]
@@ -602,8 +622,16 @@ mod tests {
                 "libplacebo-runtime",
                 include_str!("../tests/shaders/libplacebo_runtime.frag"),
             ),
+            ("polar-gather", include_str!("../tests/shaders/polar_gather.frag")),
+            ("peak-detect", include_str!("../tests/shaders/peak_detect.comp")),
+            ("texel-buffer", include_str!("../tests/shaders/texel_buffer.frag")),
         ] {
-            let words = compile(&request(STAGE_FRAGMENT, source, SPIRV_1_5)).unwrap();
+            let stage = if name == "peak-detect" {
+                STAGE_COMPUTE
+            } else {
+                STAGE_FRAGMENT
+            };
+            let words = compile(&request(stage, source, SPIRV_1_5)).unwrap();
             let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
             let path = directory.path().join(format!("{name}.spv"));
             std::fs::write(&path, bytes).unwrap();
@@ -625,28 +653,90 @@ mod tests {
     fn preserves_libplacebo_block_offsets_and_std140_matrix_stride() {
         let source = include_str!("../tests/shaders/libplacebo_runtime.frag");
         let words = compile(&request(STAGE_FRAGMENT, source, SPIRV_1_5)).unwrap();
+        let mut binding_two = None;
+        let mut variable_types = HashMap::new();
+        let mut pointer_types = HashMap::new();
+        let mut struct_members = HashMap::new();
+        let mut member_decorations = Vec::new();
+
+        for (opcode, operands) in instructions(&words) {
+            match opcode {
+                71 if operands.len() >= 3 && operands[1] == 33 && operands[2] == 2 => {
+                    binding_two = Some(operands[0]);
+                }
+                59 if operands.len() >= 3 => {
+                    variable_types.insert(operands[1], operands[0]);
+                }
+                32 if operands.len() >= 3 => {
+                    pointer_types.insert(operands[0], operands[2]);
+                }
+                30 if !operands.is_empty() => {
+                    struct_members.insert(operands[0], operands[1..].to_vec());
+                }
+                72 if operands.len() >= 4 => member_decorations.push(operands.to_vec()),
+                _ => {}
+            }
+        }
+
+        let variable = binding_two.expect("fixture UBO binding");
+        let pointer = variable_types[&variable];
+        let wrapper = pointer_types[&pointer];
+        let descriptor_struct = struct_members
+            .get(&wrapper)
+            .and_then(|members| members.first())
+            .copied()
+            .unwrap_or(wrapper);
+
         let mut member_offsets = Vec::new();
         let mut matrix_strides = Vec::new();
-        let mut offset = 5;
-        while offset < words.len() {
-            let instruction_len = (words[offset] >> 16) as usize;
-            let opcode = words[offset] & 0xffff;
-            assert!(instruction_len > 0);
-            if opcode == 72 && instruction_len >= 5 {
-                match words[offset + 3] {
-                    7 => matrix_strides.push(words[offset + 4]),
-                    35 => member_offsets.push(words[offset + 4]),
+        for decoration in member_decorations {
+            if decoration[0] == descriptor_struct {
+                match decoration[2] {
+                    7 => matrix_strides.push(decoration[3]),
+                    35 => member_offsets.push(decoration[3]),
                     _ => {}
                 }
             }
-            offset += instruction_len;
         }
 
-        assert!(member_offsets.contains(&0));
-        assert!(member_offsets.contains(&48));
-        assert!(member_offsets.contains(&80));
-        assert!(matrix_strides.len() >= 3);
+        member_offsets.sort_unstable();
+        assert_eq!(member_offsets, [0, 48, 80]);
+        assert_eq!(matrix_strides.len(), 3);
         assert!(matrix_strides.iter().all(|stride| *stride == 16));
+    }
+
+    #[test]
+    fn emits_native_operations_for_libplacebo_accelerated_paths() {
+        let gather = compile(&request(
+            STAGE_FRAGMENT,
+            include_str!("../tests/shaders/polar_gather.frag"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&gather, 96), "missing OpImageGather");
+
+        let peak = compile(&request(
+            STAGE_COMPUTE,
+            include_str!("../tests/shaders/peak_detect.comp"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&peak, 349), "missing OpGroupNonUniformIAdd");
+        assert!(contains_opcode(&peak, 333), "missing OpGroupNonUniformElect");
+        assert!(contains_opcode(&peak, 338), "missing OpGroupNonUniformBroadcastFirst");
+        assert!(contains_opcode(&peak, 339), "missing OpGroupNonUniformBallot");
+        assert!(contains_opcode(&peak, 234), "missing OpAtomicIAdd");
+
+        let texel_buffer = compile(&request(
+            STAGE_FRAGMENT,
+            include_str!("../tests/shaders/texel_buffer.frag"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&texel_buffer, 95), "missing OpImageFetch");
+        assert!(instructions(&texel_buffer).any(|(opcode, operands)| {
+            opcode == 25 && operands.len() >= 3 && operands[2] == 5
+        }), "missing Buffer-dimensional OpTypeImage");
     }
 
     #[test]
@@ -748,6 +838,9 @@ mod tests {
             (STAGE_FRAGMENT, include_str!("../tests/shaders/libplacebo_runtime.frag")),
             (STAGE_FRAGMENT, include_str!("../tests/shaders/crop_flip.frag")),
             (STAGE_FRAGMENT, include_str!("../tests/shaders/channel_reorder.frag")),
+            (STAGE_FRAGMENT, include_str!("../tests/shaders/polar_gather.frag")),
+            (STAGE_COMPUTE, include_str!("../tests/shaders/peak_detect.comp")),
+            (STAGE_FRAGMENT, include_str!("../tests/shaders/texel_buffer.frag")),
         ];
 
         for (stage, source) in fixtures {

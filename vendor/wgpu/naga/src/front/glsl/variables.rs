@@ -39,6 +39,24 @@ pub enum GlobalOrConstant {
     Override(Handle<Override>),
 }
 
+fn mark_workgroup_arrays(
+    types: &mut crate::UniqueArena<Type>,
+    ty: Handle<Type>,
+    meta: Span,
+) -> Handle<Type> {
+    let TypeInner::Array { base, size, stride } = types[ty].inner else {
+        return ty;
+    };
+    let base = mark_workgroup_arrays(types, base, meta);
+    types.insert(
+        Type {
+            name: Some("__naga_glsl_workgroup_array".into()),
+            inner: TypeInner::Array { base, size, stride },
+        },
+        meta,
+    )
+}
+
 impl Frontend {
     /// Adds a builtin and returns a variable reference to it
     fn add_builtin(
@@ -209,6 +227,8 @@ impl Frontend {
                     "gl_VertexIndex" => BuiltIn::VertexIndex,
                     "gl_SampleID" => BuiltIn::SampleIndex,
                     "gl_LocalInvocationIndex" => BuiltIn::LocalInvocationIndex,
+                    "gl_SubgroupSize" => BuiltIn::SubgroupSize,
+                    "gl_SubgroupInvocationID" => BuiltIn::SubgroupInvocationId,
                     "gl_DrawID" => BuiltIn::DrawIndex,
                     _ => return Ok(None),
                 };
@@ -635,6 +655,10 @@ impl Frontend {
                     }
                     _ => None,
                 };
+
+                if space == AddressSpace::WorkGroup {
+                    ty = mark_workgroup_arrays(&mut ctx.module.types, ty, meta);
+                }
 
                 let handle = ctx.module.global_variables.append(
                     GlobalVariable {

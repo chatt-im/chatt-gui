@@ -100,6 +100,8 @@ impl Writer {
             function.parameters.push(FunctionArgument {
                 instruction,
                 handle_id: idx as u32,
+                sampled_image_id: 0,
+                emit: true,
             });
             arg_ids.push(id);
         }

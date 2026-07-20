@@ -821,6 +821,9 @@ impl BlockContext<'_> {
             crate::Expression::GlobalVariable(handle) => {
                 self.writer.global_variables[handle].sampled_image_id
             }
+            crate::Expression::FunctionArgument(index) => {
+                self.function.parameters[index as usize].sampled_image_id
+            }
             _ => 0,
         };
         let image_type = self.fun_info[image].ty.handle().unwrap();
@@ -1144,6 +1147,10 @@ impl BlockContext<'_> {
                 return Err(Error::Validation("image type"));
             }
         };
+        let buffer_image = self.ir_module.types[image_type]
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("__naga_glsl_buffer_image:"));
 
         self.writer
             .require_any("image queries", &[spirv::Capability::ImageQuery])?;
@@ -1173,6 +1180,7 @@ impl BlockContext<'_> {
                 let extended_size_type_id = self.get_numeric_type_id(vector_numeric_type);
 
                 let (query_op, level_id) = match class {
+                    _ if buffer_image => (spirv::Op::ImageQuerySize, None),
                     Ic::Sampled { multi: true, .. }
                     | Ic::Depth { multi: true }
                     | Ic::Storage { .. } => (spirv::Op::ImageQuerySize, None),

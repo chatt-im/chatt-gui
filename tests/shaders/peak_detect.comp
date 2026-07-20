@@ -1,0 +1,32 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) buffer Result {
+    uint value[];
+} result;
+
+shared uint elected[4];
+shared int signed_elected;
+
+void main()
+{
+    uint lane = gl_SubgroupInvocationID;
+    uint sum = subgroupAdd(lane);
+    int signed_sum = subgroupAdd(int(lane));
+    float average = subgroupAdd(float(lane));
+    uint maximum = subgroupMax(lane);
+    bool equal = subgroupAllEqual(sum);
+    uvec4 ballot = subgroupBallot(equal);
+    uint votes = subgroupBallotBitCount(ballot);
+
+    if (subgroupElect())
+        atomicAdd(elected[lane & 3u], 1u);
+    if (subgroupElect())
+        atomicAdd(signed_elected, signed_sum);
+    if (lane == 0u)
+        atomicAdd(result.value[0], sum + maximum + votes + uint(average) + gl_SubgroupSize);
+}

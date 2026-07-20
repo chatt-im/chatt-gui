@@ -36,7 +36,9 @@ impl Function {
     pub(super) fn to_words(&self, sink: &mut impl Extend<Word>) {
         self.signature.as_ref().unwrap().to_words(sink);
         for argument in self.parameters.iter() {
-            argument.instruction.to_words(sink);
+            if argument.emit {
+                argument.instruction.to_words(sink);
+            }
         }
         for (index, block) in self.blocks.iter().enumerate() {
             Instruction::label(block.label_id).to_words(sink);
@@ -66,21 +68,38 @@ impl Function {
 }
 
 impl Writer {
+    fn is_glsl_combined_image_type(ty: &crate::Type) -> bool {
+        ty.name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("__naga_glsl_combined_image:"))
+    }
+
+    fn is_glsl_combined_sampler_type(ty: &crate::Type) -> bool {
+        ty.name.as_deref() == Some("__naga_glsl_combined_sampler")
+    }
+
+    fn is_glsl_std140_matrix(module: &crate::Module, ty: Handle<crate::Type>) -> bool {
+        module.types[ty].name.as_deref() == Some("__naga_glsl_std140_matrix_stride_16")
+    }
+
     fn is_glsl_combined_image(
         ir_module: &crate::Module,
         variable: &crate::GlobalVariable,
     ) -> bool {
-        ir_module.types[variable.ty]
-            .name
-            .as_deref()
-            .is_some_and(|name| name.starts_with("__naga_glsl_combined_image:"))
+        Self::is_glsl_combined_image_type(&ir_module.types[variable.ty])
     }
 
     fn is_glsl_combined_sampler(
         ir_module: &crate::Module,
         variable: &crate::GlobalVariable,
     ) -> bool {
-        ir_module.types[variable.ty].name.as_deref() == Some("__naga_glsl_combined_sampler")
+        Self::is_glsl_combined_sampler_type(&ir_module.types[variable.ty])
+    }
+
+    fn is_glsl_buffer_image_type(ty: &crate::Type) -> bool {
+        ty.name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("__naga_glsl_buffer_image:"))
     }
 
     pub fn new(options: &Options) -> Result<Self, Error> {
@@ -617,12 +636,14 @@ impl Writer {
                             // If the matrix is *not* directly a member of a struct, then
                             // we additionally require a wrapper function to convert from
                             // the std140 compat type to the regular type.
-                            if !is_uniform_matcx2_struct_member_access(
-                                ir_function,
-                                info,
-                                ir_module,
-                                base,
-                            ) {
+                            if !Self::is_glsl_std140_matrix(ir_module, base_type)
+                                && !is_uniform_matcx2_struct_member_access(
+                                    ir_function,
+                                    info,
+                                    ir_module,
+                                    base,
+                                )
+                            {
                                 self.write_wrapped_convert_from_std140_compat_type(
                                     ir_module, base_type,
                                 )?;
@@ -714,6 +735,8 @@ impl Writer {
             function.parameters.push(FunctionArgument {
                 instruction,
                 handle_id: 0,
+                sampled_image_id: 0,
+                emit: true,
             });
         }
 
@@ -869,6 +892,8 @@ impl Writer {
         function.parameters.push(FunctionArgument {
             instruction: Instruction::function_parameter(param_type_id, param_id),
             handle_id: 0,
+            sampled_image_id: 0,
+            emit: true,
         });
 
         let label_id = self.id_gen.next();
@@ -1094,6 +1119,8 @@ impl Writer {
         function.parameters.push(FunctionArgument {
             instruction: Instruction::function_parameter(matrix_type_id, matrix_param_id),
             handle_id: 0,
+            sampled_image_id: 0,
+            emit: true,
         });
         function.parameters.push(FunctionArgument {
             instruction: Instruction::function_parameter(
@@ -1101,6 +1128,8 @@ impl Writer {
                 column_index_param_id,
             ),
             handle_id: 0,
+            sampled_image_id: 0,
+            emit: true,
         });
         let function_type_id = self.get_function_type(LookupFunctionType {
             parameter_type_ids: vec![matrix_type_id, column_index_type_id],
@@ -1235,9 +1264,32 @@ impl Writer {
         let mut local_invocation_index_id = None;
 
         for argument in ir_function.arguments.iter() {
+            let argument_ty = &ir_module.types[argument.ty];
+            let combined_image = Self::is_glsl_combined_image_type(argument_ty);
+            let combined_sampler = Self::is_glsl_combined_sampler_type(argument_ty);
+
+            if combined_sampler && interface.is_none() {
+                let owner = function
+                    .parameters
+                    .last()
+                    .expect("combined sampler argument must follow its image");
+                function.parameters.push(FunctionArgument {
+                    instruction: owner.instruction.clone(),
+                    handle_id: 0,
+                    sampled_image_id: owner.sampled_image_id,
+                    emit: false,
+                });
+                continue;
+            }
+
             let class = spirv::StorageClass::Input;
-            let handle_ty = ir_module.types[argument.ty].inner.is_handle();
-            let argument_type_id = if handle_ty {
+            let handle_ty = argument_ty.inner.is_handle();
+            let argument_type_id = if combined_image {
+                let image_type_id = self.get_handle_type_id(argument.ty);
+                self.get_type_id(LookupType::Local(
+                    LocalType::SampledImage { image_type_id },
+                ))
+            } else if handle_ty {
                 self.get_handle_pointer_type_id(argument.ty, spirv::StorageClass::UniformConstant)
             } else {
                 self.get_handle_type_id(argument.ty)
@@ -1312,20 +1364,33 @@ impl Writer {
                         self.debugs.push(Instruction::name(argument_id, name));
                     }
                 }
+                let (handle_id, sampled_image_id) = if combined_image {
+                    let image_type_id = self.get_handle_type_id(argument.ty);
+                    let image_id = self.id_gen.next();
+                    prelude.body.push(Instruction::unary(
+                        spirv::Op::Image,
+                        image_type_id,
+                        image_id,
+                        argument_id,
+                    ));
+                    (image_id, argument_id)
+                } else if handle_ty {
+                    let id = self.id_gen.next();
+                    prelude.body.push(Instruction::load(
+                        self.get_handle_type_id(argument.ty),
+                        id,
+                        argument_id,
+                        None,
+                    ));
+                    (id, 0)
+                } else {
+                    (0, 0)
+                };
                 function.parameters.push(FunctionArgument {
                     instruction,
-                    handle_id: if handle_ty {
-                        let id = self.id_gen.next();
-                        prelude.body.push(Instruction::load(
-                            self.get_handle_type_id(argument.ty),
-                            id,
-                            argument_id,
-                            None,
-                        ));
-                        id
-                    } else {
-                        0
-                    },
+                    handle_id,
+                    sampled_image_id,
+                    emit: true,
                 });
                 parameter_type_ids.push(argument_type_id);
             };
@@ -2128,8 +2193,27 @@ impl Writer {
         // This needs to happen regardless of the LocalType lookup succeeding,
         // because some types which map to the same LocalType have different
         // capability requirements. See https://github.com/gfx-rs/wgpu/issues/5569
-        self.request_type_capabilities(&ty.inner)?;
-        let id = if let Some(local) = self.localtype_from_inner(&ty.inner) {
+        if Self::is_glsl_buffer_image_type(ty) {
+            self.require_any(
+                "sampled buffer images",
+                &[spirv::Capability::SampledBuffer],
+            )?;
+        } else {
+            self.request_type_capabilities(&ty.inner)?;
+        }
+        let buffer_local = match ty.inner {
+            crate::TypeInner::Image {
+                dim,
+                arrayed,
+                class,
+            } if Self::is_glsl_buffer_image_type(ty) => {
+                let mut image = LocalImageType::from_inner(dim, arrayed, class);
+                image.dim = spirv::Dim::DimBuffer;
+                Some(LocalType::Image(image))
+            }
+            _ => None,
+        };
+        let id = if let Some(local) = buffer_local.or_else(|| self.localtype_from_inner(&ty.inner)) {
             // This type can be represented as a `LocalType`, so check if we've
             // already written an instruction for it. If not, do so now, with
             // `write_type_declaration_local`.
@@ -2153,7 +2237,9 @@ impl Writer {
             let id = self.id_gen.next();
             let instruction = match ty.inner {
                 crate::TypeInner::Array { base, size, stride } => {
-                    self.decorate(id, Decoration::ArrayStride, &[stride]);
+                    if ty.name.as_deref() != Some("__naga_glsl_workgroup_array") {
+                        self.decorate(id, Decoration::ArrayStride, &[stride]);
+                    }
 
                     let type_id = self.get_handle_type_id(base);
                     match size.resolve(module.to_ctx())? {
@@ -2281,6 +2367,16 @@ impl Writer {
             return Ok(Some(std140_type_info.type_id));
         }
 
+        // The GLSL frontend has already recorded the source std140 stride on
+        // these matrices. Keep the native matrix type and decorate it with a
+        // 16-byte MatrixStride instead of decomposing it into tightly-packed
+        // vec2 members. Besides being the correct descriptor layout, this also
+        // avoids the conversion instructions required by the compatibility
+        // representation.
+        if Self::is_glsl_std140_matrix(module, handle) {
+            return Ok(None);
+        }
+
         let type_inner = &module.types[handle].inner;
         let std140_type_id = match *type_inner {
             crate::TypeInner::Matrix {
@@ -2360,7 +2456,9 @@ impl Writer {
                         crate::TypeInner::Matrix {
                             rows: crate::VectorSize::Bi,
                             ..
-                        } => needs_std140_type = true,
+                        } if !Self::is_glsl_std140_matrix(module, member.ty) => {
+                            needs_std140_type = true
+                        }
                         // If an array member needs a std140 type, because it is an array
                         // (of an array, etc) of `matCx2`s, then the struct also needs
                         // a std140 type which uses the std140 type for this member.
@@ -2388,7 +2486,7 @@ impl Writer {
                                 columns,
                                 rows: rows @ crate::VectorSize::Bi,
                                 scalar,
-                            } => {
+                            } if !Self::is_glsl_std140_matrix(module, member.ty) => {
                                 let vector_type_id =
                                     self.get_numeric_type_id(NumericType::Vector {
                                         size: rows,

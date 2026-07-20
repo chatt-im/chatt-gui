@@ -12,6 +12,7 @@ use crate::{
 // OpTypeSampledImage descriptor.
 pub(crate) const COMBINED_IMAGE_TYPE_PREFIX: &str = "__naga_glsl_combined_image:";
 pub(crate) const COMBINED_SAMPLER_TYPE_NAME: &str = "__naga_glsl_combined_sampler";
+pub(crate) const BUFFER_IMAGE_TYPE_PREFIX: &str = "__naga_glsl_buffer_image:";
 
 pub fn parse_type(type_name: &str) -> Option<Type> {
     match type_name {
@@ -160,6 +161,16 @@ pub fn parse_type(type_name: &str) -> Option<Type> {
                     return None;
                 };
                 let (dim, arrayed, multi) = match sampler {
+                    "Buffer" => {
+                        return Some(Type {
+                            name: Some(format!("{BUFFER_IMAGE_TYPE_PREFIX}{word}")),
+                            inner: TypeInner::Image {
+                                dim: ImageDimension::D1,
+                                arrayed: false,
+                                class: ImageClass::Sampled { kind, multi: false },
+                            },
+                        });
+                    }
                     "1D" => (ImageDimension::D1, false, false),
                     "1DArray" => (ImageDimension::D1, true, false),
                     "2D" | "2DRect" => (ImageDimension::D2, false, false),

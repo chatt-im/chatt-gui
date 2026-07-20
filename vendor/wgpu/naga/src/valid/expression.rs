@@ -786,6 +786,10 @@ impl super::Validator {
                 else {
                     return Err(ExpressionError::ExpectedImageType(ty));
                 };
+                let buffer_image = module.types[ty]
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("__naga_glsl_buffer_image:"));
 
                 match resolver[coordinate].image_storage_coordinates() {
                     Some(coord_dim) if coord_dim == dim => {}
@@ -815,7 +819,7 @@ impl super::Validator {
                     }
                 }
 
-                match (level, class.is_mipmapped()) {
+                match (level, class.is_mipmapped() && !buffer_image) {
                     (None, false) => {}
                     (Some(level), true) => match resolver[level] {
                         Ti::Scalar(Sc {

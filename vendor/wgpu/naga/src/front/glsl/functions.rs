@@ -8,10 +8,10 @@ use core::iter;
 
 use super::{
     ast::*,
-    builtins::{inject_builtin, sampled_to_depth},
+    builtins::{inject_builtin, sampled_to_depth, MacroCall},
     context::{Context, ExprPos, StmtContext},
     error::{Error, ErrorKind},
-    types::scalar_components,
+    types::{scalar_components, COMBINED_IMAGE_TYPE_PREFIX, COMBINED_SAMPLER_TYPE_NAME},
     Frontend, Result,
 };
 use crate::{
@@ -780,15 +780,23 @@ impl Frontend {
         let mut proxy_writes = Vec::new();
 
         // Iterate through the function call arguments applying transformations as needed
-        for (((parameter_info, call_argument), expr), parameter) in parameters_info
+        for (index, (((parameter_info, call_argument), expr), parameter)) in parameters_info
             .iter()
             .zip(&args)
             .zip(raw_args)
             .zip(&parameters)
+            .enumerate()
         {
             if parameter_info.qualifier.is_lhs() {
                 // Reprocess argument in LHS position
                 let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
+
+                if index == 0
+                    && matches!(kind, FunctionKind::Macro(MacroCall::Atomic(_)))
+                {
+                    arguments.push(handle);
+                    continue;
+                }
 
                 self.process_lhs_argument(
                     ctx,
@@ -818,6 +826,38 @@ impl Frontend {
 
         match kind {
             FunctionKind::Call(function) => {
+                let target_types: Vec<_> = ctx.module.functions[function]
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.ty)
+                    .collect();
+                let mut source_arguments = arguments.into_iter();
+                let mut expanded_arguments = Vec::with_capacity(target_types.len());
+
+                for target_ty in target_types {
+                    let target_name = ctx.module.types[target_ty].name.as_deref();
+                    if target_name == Some(COMBINED_SAMPLER_TYPE_NAME) {
+                        continue;
+                    }
+
+                    let argument = source_arguments.next().ok_or_else(|| Error {
+                        kind: ErrorKind::SemanticError("Bad call".into()),
+                        meta,
+                    })?;
+                    expanded_arguments.push(argument);
+
+                    if target_name
+                        .is_some_and(|name| name.starts_with(COMBINED_IMAGE_TYPE_PREFIX))
+                    {
+                        let sampler = ctx.samplers.get(&argument).copied().ok_or_else(|| Error {
+                            kind: ErrorKind::SemanticError("Bad combined sampler call".into()),
+                            meta,
+                        })?;
+                        expanded_arguments.push(sampler);
+                    }
+                }
+                arguments = expanded_arguments;
+
                 ctx.emit_end();
 
                 let result = if !is_void {

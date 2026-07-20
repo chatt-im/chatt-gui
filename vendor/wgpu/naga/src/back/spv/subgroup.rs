@@ -125,6 +125,31 @@ impl BlockContext<'_> {
         result: Handle<crate::Expression>,
         block: &mut Block,
     ) -> Result<(), Error> {
+        let elect = match self.ir_function.expressions[result] {
+            crate::Expression::SubgroupOperationResult { ty } => self.ir_module.types[ty]
+                .name
+                .as_deref()
+                == Some("__naga_glsl_subgroup_elect"),
+            _ => false,
+        };
+        if elect {
+            self.writer.require_any(
+                "GroupNonUniform",
+                &[spirv::Capability::GroupNonUniform],
+            )?;
+            let id = self.gen_id();
+            let result_type_id = self.get_expression_type_id(&self.fun_info[result].ty);
+            let exec_scope_id = self.get_index_constant(spirv::Scope::Subgroup as u32);
+            block.body.push(Instruction::unary(
+                spirv::Op::GroupNonUniformElect,
+                result_type_id,
+                id,
+                exec_scope_id,
+            ));
+            self.cached[result] = id;
+            return Ok(());
+        }
+
         match *mode {
             crate::GatherMode::BroadcastFirst => {
                 self.writer.require_any(
