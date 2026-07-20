@@ -11,6 +11,7 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct ReduceEffect {
     pub replace_messages: bool,
+    pub messages_changed: bool,
     pub splices: Vec<(usize, usize, usize)>,
     pub request_resync: bool,
     pub request_result: Option<rpc::daemon::frame::RequestResult>,
@@ -44,6 +45,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
             model.resync_requested = false;
             model.phase = ConnectionPhase::Ready;
             effect.replace_messages = true;
+            effect.messages_changed = true;
         }
         DaemonFrame::Event(event) => {
             if model.resync_requested {
@@ -166,6 +168,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 .map(timeline::from_daemon)
                 .collect();
             effect.replace_messages = true;
+            effect.messages_changed = true;
         }
         StateDelta::MessagesPrepended {
             room_id,
@@ -202,6 +205,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             incoming.append(&mut model.messages);
             model.messages = incoming;
             if added > 0 {
+                effect.messages_changed = true;
                 effect.splices.push((0, 0, added));
             }
         }
@@ -221,6 +225,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 return;
             }
             let message = timeline::from_daemon(message);
+            effect.messages_changed = true;
             match model
                 .messages
                 .binary_search_by_key(&message.id, |item| item.id)
@@ -245,6 +250,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 .ok()
             {
                 model.messages.remove(index);
+                effect.messages_changed = true;
                 effect.splices.push((index, index + 1, 0));
             }
         }
@@ -334,6 +340,7 @@ fn clear_room_state(model: &mut ChatModel, effect: &mut ReduceEffect) {
     model.participants.clear();
     model.transfers.clear();
     effect.replace_messages = true;
+    effect.messages_changed = true;
 }
 
 fn is_active_room(
@@ -465,6 +472,7 @@ mod tests {
             },
         );
         assert!(effect.replace_messages);
+        assert!(effect.messages_changed);
         assert_eq!(model.phase, ConnectionPhase::Ready);
         assert_eq!(model.expected_seq, Some(5));
     }
@@ -536,6 +544,7 @@ mod tests {
             }),
         );
         assert!(effect.replace_messages);
+        assert!(effect.messages_changed);
         assert_eq!(model.selected_room, None);
         assert!(model.at_start);
         assert!(model.participants.is_empty());
@@ -587,7 +596,7 @@ mod tests {
             timeline::from_daemon(message(RoomId(1), 1)),
             timeline::from_daemon(message(RoomId(1), 3)),
         ];
-        apply(
+        let effect = apply(
             &mut model,
             DaemonFrame::Event(StateEvent {
                 instance_id: instance,
@@ -597,6 +606,7 @@ mod tests {
                 },
             }),
         );
+        assert!(effect.messages_changed);
         assert_eq!(
             model
                 .messages

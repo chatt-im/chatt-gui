@@ -10,6 +10,8 @@ mod model;
 mod mpv_player;
 mod scroll_capture;
 mod timeline;
+mod video_manager;
+mod video_thumbnail;
 
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;

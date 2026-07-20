@@ -40,6 +40,8 @@ use crate::{
     mpv_player::MpvPlayer,
     scroll_capture::capture_scroll,
     timeline::{self, Attachment},
+    video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
+    video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
 
 const SIDEBAR_WIDTH: f32 = 232.0;
@@ -47,6 +49,7 @@ const TOP_BAR_HEIGHT: f32 = 52.0;
 const MIN_COMPOSER_HEIGHT: f32 = 82.0;
 const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const VIDEO_THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SCROLL_RESPONSE_SECONDS: f32 = 0.006;
 const SCROLL_SETTLE_THRESHOLD: f32 = 0.50;
 
@@ -256,15 +259,11 @@ pub struct ChattView {
     last_scroll_frame: Option<Instant>,
     message_markdown: HashMap<u64, gpui::Entity<Markdown>>,
     timeline_selection: MarkdownSelectionGroup,
-    player: Option<MpvPlayer>,
+    videos: AttachmentVideoManager,
+    video_thumbnails: VideoThumbnailCache,
     video_wakeup: async_channel::Sender<()>,
-    active_video: Option<u64>,
     live_players: HashMap<StreamId, LivePlayerView>,
     fullscreen_share: Option<StreamId>,
-    position: f64,
-    duration: f64,
-    paused: bool,
-    media_volume: f64,
     status: SharedString,
     _daemon_task: Task<()>,
     _video_task: Task<()>,
@@ -315,6 +314,19 @@ impl ChattView {
                 }
             }
         });
+        let timeline_view = cx.entity().downgrade();
+        list_state.set_visible_range_handler(move |range, _, cx| {
+            let timeline_view = timeline_view.clone();
+            // List invokes this while its state is mutably borrowed.
+            cx.defer(move |cx| {
+                let _ = timeline_view.update(cx, |this, cx| {
+                    this.update_video_visibility(range, cx);
+                });
+            });
+        });
+        let videos = AttachmentVideoManager::new(video_wakeup.clone());
+        let video_thumbnails =
+            VideoThumbnailCache::new(VIDEO_THUMBNAIL_CACHE_BYTES, video_wakeup.clone());
         Self {
             model,
             daemon,
@@ -331,15 +343,11 @@ impl ChattView {
             last_scroll_frame: None,
             message_markdown: HashMap::new(),
             timeline_selection,
-            player: None,
+            videos,
+            video_thumbnails,
             video_wakeup,
-            active_video: None,
             live_players: HashMap::new(),
             fullscreen_share: None,
-            position: 0.0,
-            duration: 0.0,
-            paused: true,
-            media_volume: 100.0,
             status: "Discovering Chatt daemon…".into(),
             _daemon_task: daemon_task,
             _video_task: video_task,
@@ -358,28 +366,39 @@ impl ChattView {
         BulkTransferId(id)
     }
 
-    fn advance_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut terminal_video_status = None;
-        if let Some(player) = self.player.as_mut()
-            && self.active_video.is_some()
-        {
-            match player.drain_events() {
-                Ok(playback) => {
-                    self.position = playback.position;
-                    self.duration = playback.duration;
-                    self.paused = playback.paused;
-                    if playback.finished {
-                        terminal_video_status = Some("Playback finished".into());
-                    }
-                }
-                Err(error) => {
-                    terminal_video_status = Some(format!("Video event failed: {error}"));
-                }
-            }
+    fn advance_video(&mut self, cx: &mut Context<Self>) {
+        let drain = self.videos.drain();
+        let thumbnails_changed = self.video_thumbnails.drain_results();
+        self.apply_video_drain(drain);
+        if thumbnails_changed {
+            cx.notify();
         }
-        if let Some(status) = terminal_video_status {
-            self.release_video(window, cx);
-            self.status = status.into();
+    }
+
+    fn apply_video_drain(&mut self, drain: VideoDrain) {
+        if let Some(error) = drain.errors.last() {
+            self.status = error.clone().into();
+        }
+    }
+
+    fn update_video_visibility(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let visible = self
+            .model
+            .messages
+            .get(range)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(message_video_key)
+            .collect::<HashSet<_>>();
+        let drain = self.videos.update_visibility(&visible);
+        let changed = drain.changed || !drain.errors.is_empty();
+        self.apply_video_drain(drain);
+        if changed {
+            cx.notify();
         }
     }
 
@@ -828,10 +847,19 @@ impl ChattView {
             );
         }
         if self.model.selected_room != old_selected_room {
-            self.release_video(window, cx);
+            self.videos.clear_sessions();
             self.message_markdown.clear();
             self.image_cache
                 .update(cx, |cache, cx| cache.clear(window, cx));
+        } else if effect.messages_changed {
+            let retained = self
+                .model
+                .messages
+                .iter()
+                .filter_map(message_video_key)
+                .collect::<HashSet<_>>();
+            let drain = self.videos.retain_sources(&retained);
+            self.apply_video_drain(drain);
         }
         if effect.replace_messages {
             self.list_state
@@ -1550,35 +1578,80 @@ impl ChattView {
         if attachment.is_video()
             && let Some(path) = cache_path
         {
-            let active = self.active_video == Some(message_id);
-            let video_surface = active
-                .then(|| self.player.as_ref().map(MpvPlayer::surface))
-                .flatten();
-            let progress = if active && self.duration > 0. {
-                (self.position / self.duration).clamp(0., 1.) as f32
+            let key = video_key(room_id, message_id, &descriptor);
+            self.videos.ensure_source(key, path.clone());
+            let video = self.videos.view(key);
+            let thumbnail = self.video_thumbnails.request(
+                ThumbnailKey {
+                    attachment_id: descriptor.id,
+                    digest: descriptor.digest,
+                },
+                path,
+            );
+            let duration = if video.duration > 0.0 {
+                video.duration
             } else {
-                0.
+                thumbnail.duration.unwrap_or(0.0)
             };
-            let play_path = path.clone();
+            let progress = if duration > 0.0 {
+                (video.position / duration).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let engaged = video.surface.is_some()
+                || video.loading
+                || !video.paused
+                || video.position > 0.0
+                || video.finished;
+            let aspect_ratio = match (descriptor.width, descriptor.height) {
+                (Some(width), Some(height)) if width > 0 && height > 0 => {
+                    width as f32 / height as f32
+                }
+                _ => 16.0 / 9.0,
+            };
+            let fallback_label = video
+                .error
+                .clone()
+                .unwrap_or_else(|| descriptor.file_name.clone());
+            let has_thumbnail = thumbnail.image.is_some();
+            let has_surface = video.surface.is_some();
+            let thumbnail_image = thumbnail.image;
+            let video_surface = video.surface;
+            let show_play_overlay = !has_surface && !video.loading;
             return div()
                 .id(("video", message_id as usize))
                 .mt_2()
                 .w_full()
                 .border_1()
-                .border_color(rgb(if active { 0x596a90 } else { 0x292d34 }))
+                .border_color(rgb(if engaged { 0x596a90 } else { 0x292d34 }))
                 .bg(rgb(0x08090b))
                 .child(
                     div()
+                        .relative()
                         .w_full()
-                        .aspect_ratio(16. / 9.)
+                        .aspect_ratio(aspect_ratio)
                         .flex()
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
-                        .when_some(video_surface, |viewport, video_surface| {
-                            viewport.child(surface(video_surface).size_full())
+                        .when_some(thumbnail_image, |viewport, thumbnail| {
+                            viewport.child(
+                                img(thumbnail)
+                                    .absolute()
+                                    .inset_0()
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain),
+                            )
                         })
-                        .when(!active, |viewport| {
+                        .when_some(video_surface, |viewport, video_surface| {
+                            viewport.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .child(surface(video_surface).size_full()),
+                            )
+                        })
+                        .when(!has_thumbnail && !has_surface, |viewport| {
                             viewport.child(
                                 div()
                                     .flex()
@@ -1586,8 +1659,28 @@ impl ChattView {
                                     .items_center()
                                     .gap_2()
                                     .text_color(rgb(0x8d939d))
-                                    .child(div().text_2xl().child("▶"))
-                                    .child(div().text_sm().child(descriptor.file_name.clone())),
+                                    .child(
+                                        div().text_sm().child(if video.loading {
+                                            "Starting video…".to_string()
+                                        } else if thumbnail.failed {
+                                            format!("{} · no preview", fallback_label)
+                                        } else {
+                                            fallback_label.clone()
+                                        }),
+                                    ),
+                            )
+                        })
+                        .when(show_play_overlay, |viewport| {
+                            viewport.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_2xl()
+                                    .text_color(rgba(0xffffffcc))
+                                    .child("▶"),
                             )
                         }),
                 )
@@ -1602,32 +1695,31 @@ impl ChattView {
                         .border_color(rgb(0x24272d))
                         .child(
                             mini_button(("video-back", message_id as usize), "−10").on_click(
-                                cx.listener(|this, _, _, cx| this.seek_relative(-10., cx)),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.seek_video(key, -10.0, cx)
+                                }),
                             ),
                         )
                         .child(
                             mini_button(
                                 ("video-play", message_id as usize),
-                                if active && !self.paused { "Ⅱ" } else { "▶" },
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    if this.active_video == Some(message_id) {
-                                        this.toggle_playback_inner(cx);
-                                    } else {
-                                        this.activate_video(
-                                            message_id,
-                                            play_path.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    }
+                                if video.loading {
+                                    "…"
+                                } else if !video.paused && !video.finished {
+                                    "Ⅱ"
+                                } else {
+                                    "▶"
                                 },
-                            )),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.play_video(key, cx)
+                            })),
                         )
                         .child(
                             mini_button(("video-forward", message_id as usize), "+10").on_click(
-                                cx.listener(|this, _, _, cx| this.seek_relative(10., cx)),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.seek_video(key, 10.0, cx)
+                                }),
                             ),
                         )
                         .child(
@@ -1645,13 +1737,15 @@ impl ChattView {
                                 .text_color(rgb(0x989ea8))
                                 .child(format!(
                                     "{} / {}",
-                                    format_time(if active { self.position } else { 0. }),
-                                    format_time(if active { self.duration } else { 0. })
+                                    format_time(video.position),
+                                    format_time(duration)
                                 )),
                         )
                         .child(
                             mini_button(("volume-down", message_id as usize), "−").on_click(
-                                cx.listener(|this, _, _, cx| this.adjust_media_volume(-5., cx)),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.adjust_video_volume(key, -5.0, cx)
+                                }),
                             ),
                         )
                         .child(
@@ -1660,11 +1754,13 @@ impl ChattView {
                                 .text_center()
                                 .text_xs()
                                 .text_color(rgb(0x989ea8))
-                                .child(self.media_volume.round().to_string()),
+                                .child(video.volume.round().to_string()),
                         )
                         .child(
                             mini_button(("volume-up", message_id as usize), "+").on_click(
-                                cx.listener(|this, _, _, cx| this.adjust_media_volume(5., cx)),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.adjust_video_volume(key, 5.0, cx)
+                                }),
                             ),
                         ),
                 )
@@ -1854,98 +1950,48 @@ impl ChattView {
         Ok(Some(transfer_id))
     }
 
-    fn activate_video(
-        &mut self,
-        message_id: u64,
-        path: PathBuf,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.player.is_none() {
-            match MpvPlayer::new(self.video_wakeup.clone()) {
-                Ok(player) => self.player = Some(player),
-                Err(error) => {
-                    self.status = format!("Video unavailable: {error}").into();
-                    cx.notify();
-                    return;
-                }
-            }
-        }
-        let player = self
-            .player
-            .as_mut()
-            .expect("player was initialized immediately above");
-        let load_result = player
-            .set_volume(self.media_volume)
-            .and_then(|_| player.load(&path.to_string_lossy()));
-        match load_result {
-            Ok(()) => {
-                self.active_video = Some(message_id);
-                self.position = 0.;
-                self.duration = 0.;
-                self.paused = false;
-                self.status = "Playing cached attachment".into();
-            }
-            Err(error) => {
-                self.player = None;
-                self.active_video = None;
-                self.status = format!("Could not open video: {error}").into();
-            }
+    fn play_video(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        match self.videos.play(key) {
+            Ok(()) => self.status = "Starting cached attachment…".into(),
+            Err(error) => self.status = format!("Playback failed: {error}").into(),
         }
         cx.notify();
     }
 
-    fn release_video(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.player = None;
-        self.active_video = None;
-        self.position = 0.;
-        self.duration = 0.;
-        self.paused = true;
+    fn seek_video(&mut self, key: VideoKey, seconds: f64, cx: &mut Context<Self>) {
+        if let Err(error) = self.videos.seek(key, seconds) {
+            self.status = format!("Seek failed: {error}").into();
+        }
+        cx.notify();
     }
 
-    fn toggle_playback_inner(&mut self, cx: &mut Context<Self>) {
-        if let Some(player) = self.player.as_mut() {
-            match player.toggle_pause() {
-                Ok(paused) => self.paused = paused,
-                Err(error) => self.status = format!("Playback failed: {error}").into(),
-            }
-            cx.notify();
-        }
-    }
-    fn adjust_media_volume(&mut self, delta: f64, cx: &mut Context<Self>) {
-        self.media_volume = (self.media_volume + delta).clamp(0., 100.);
-        if let Some(player) = self.player.as_ref()
-            && let Err(error) = player.set_volume(self.media_volume)
-        {
+    fn adjust_video_volume(&mut self, key: VideoKey, delta: f64, cx: &mut Context<Self>) {
+        if let Err(error) = self.videos.adjust_volume(key, delta) {
             self.status = format!("Volume failed: {error}").into();
         }
         cx.notify();
     }
+
     fn toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active_video.is_some() {
-            self.toggle_playback_inner(cx);
-        }
-    }
-    fn seek_relative(&mut self, seconds: f64, cx: &mut Context<Self>) {
-        if let Some(player) = self.player.as_ref()
-            && let Err(error) = player.seek_relative(seconds)
-        {
-            self.status = format!("Seek failed: {error}").into();
+        if let Err(error) = self.videos.toggle_last_visible() {
+            self.status = format!("Playback failed: {error}").into();
         }
         cx.notify();
     }
     fn seek_back(&mut self, _: &SeekBack, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, 30.0, 0.0, cx);
-        } else if self.active_video.is_some() {
-            self.seek_relative(-10., cx);
+        } else if let Err(error) = self.videos.seek_last_visible(-10.0) {
+            self.status = format!("Seek failed: {error}").into();
+            cx.notify();
         }
     }
     fn seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, -30.0, 0.0, cx);
-        } else if self.active_video.is_some() {
-            self.seek_relative(10., cx);
+        } else if let Err(error) = self.videos.seek_last_visible(10.0) {
+            self.status = format!("Seek failed: {error}").into();
+            cx.notify();
         }
     }
 
@@ -2394,9 +2440,7 @@ impl ChattView {
 
 impl Render for ChattView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.active_video.is_some() {
-            self.advance_video(window, cx);
-        }
+        self.advance_video(cx);
         if !self.live_players.is_empty() {
             self.advance_live_video();
         }
@@ -2833,6 +2877,27 @@ fn mini_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<
         .text_xs()
         .child(label)
 }
+
+fn video_key(
+    room_id: RoomId,
+    message_id: u64,
+    descriptor: &AttachmentDescriptor,
+) -> VideoKey {
+    VideoKey {
+        room_id,
+        message_id,
+        attachment_id: descriptor.id,
+        digest: descriptor.digest,
+    }
+}
+
+fn message_video_key(message: &timeline::Message) -> Option<VideoKey> {
+    let attachment = message.attachment.as_ref()?;
+    attachment
+        .is_video()
+        .then(|| video_key(message.room_id, message.id, &attachment.descriptor))
+}
+
 fn format_time(seconds: f64) -> String {
     let seconds = seconds.max(0.).round() as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)

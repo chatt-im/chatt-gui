@@ -14,7 +14,7 @@ use ash::vk;
 use async_channel::Sender as AsyncSender;
 use gpui::PlatformSurface;
 use gpui_wgpu::{
-    VideoTextureGeneration, VulkanVideoTexture, WgpuVideoSurface,
+    VideoTextureGeneration, VulkanVideoDevice, VulkanVideoTexture, WgpuVideoSurface,
     wgpu::hal::vulkan::QueueHostLock,
 };
 use libmpv2::{
@@ -29,6 +29,15 @@ use libmpv2::{
 const FORMAT_RGBA: &CStr = c"rgba";
 const RENDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
 const RENDER_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The render path selected by the first attachment player. Later players can
+/// reuse this decision instead of repeating capability probing and a known-to-
+/// fail Vulkan context import.
+#[derive(Clone)]
+pub(crate) enum AttachmentRenderBackend {
+    Vulkan(Arc<VulkanVideoDevice>),
+    Software,
+}
 
 /// A libmpv client with dedicated control and render threads.
 pub struct MpvPlayer {
@@ -48,8 +57,11 @@ pub struct MpvPlayer {
 }
 
 impl MpvPlayer {
-    pub fn new(gpui_wakeup: AsyncSender<()>) -> Result<Self> {
-        Self::new_internal(gpui_wakeup, false, None)
+    pub(crate) fn new_attachment(
+        gpui_wakeup: AsyncSender<()>,
+        preferred_backend: Option<AttachmentRenderBackend>,
+    ) -> Result<(Self, AttachmentRenderBackend)> {
+        Self::new_internal(gpui_wakeup, false, None, preferred_backend)
     }
 
     pub fn new_live(
@@ -59,7 +71,7 @@ impl MpvPlayer {
     ) -> Result<Self> {
         let source_wakeup = gpui_wakeup.clone();
         let render_size = (share.coded_width, share.coded_height);
-        let mut player = Self::new_internal(gpui_wakeup, true, Some(render_size))?;
+        let (mut player, _) = Self::new_internal(gpui_wakeup, true, Some(render_size), None)?;
         let source = crate::live_stream::LiveStreamSource::start(
             player.mpv.clone(),
             share,
@@ -82,14 +94,15 @@ impl MpvPlayer {
         gpui_wakeup: AsyncSender<()>,
         live: bool,
         fixed_render_size: Option<(u32, u32)>,
-    ) -> Result<Self> {
+        preferred_backend: Option<AttachmentRenderBackend>,
+    ) -> Result<(Self, AttachmentRenderBackend)> {
         let live_diagnostics = live.then(|| Arc::new(crate::live_stream::LiveDiagnostics::new()));
         let mpv = Arc::new(Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "libmpv")?;
             initializer.set_option("keep-open", "no")?;
             initializer.set_option("idle", "yes")?;
             initializer.set_option("osc", "no")?;
-            initializer.set_option("profile", if live { "low-latency" } else { "gpu-hq" })?;
+            initializer.set_option("profile", if live { "low-latency" } else { "fast" })?;
             initializer.set_option("hwdec", "vulkan,auto-safe")?;
             initializer.set_option("sws-allow-zimg", "no")?;
             initializer.set_option("sws-scaler", "bilinear")?;
@@ -146,31 +159,69 @@ impl MpvPlayer {
         let video_surface = WgpuVideoSurface::new(|_, _| {})?;
         let surface = video_surface.platform_surface();
 
-        let mut backend = match create_vulkan_context(&mpv, &video_surface, live) {
-            Ok(context) => {
-                log::info!(
-                    "video render backend selected backend=vulkan sharing=wgpu-device latest_frame={live}"
-                );
-                RenderBackend::Vulkan {
-                    context,
-                    generation: None,
-                    next_texture: 0,
-                }
-            }
-            Err(error) => {
-                log::warn!("Vulkan libmpv interop unavailable, using software fallback: {error:#}");
+        let (mut backend, selected_backend) = match preferred_backend {
+            Some(AttachmentRenderBackend::Software) => {
                 let context = mpv
                     .create_software_render_context(live)
-                    .context("create libmpv software render context after Vulkan fallback")?;
+                    .context("create preferred libmpv software render context")?;
                 log::info!(
-                    "video render backend selected backend=software upload=wgpu latest_frame={live}"
+                    "video render backend selected backend=software upload=wgpu latest_frame={live} cached_decision=true"
                 );
-                RenderBackend::Software {
-                    context,
-                    generation: None,
-                    next_texture: 0,
-                    aligned: Vec::new(),
-                    tight: Vec::new(),
+                (
+                    RenderBackend::Software {
+                        context,
+                        generation: None,
+                        next_texture: 0,
+                        aligned: Vec::new(),
+                        tight: Vec::new(),
+                    },
+                    AttachmentRenderBackend::Software,
+                )
+            }
+            preferred => {
+                let cached_decision = preferred.is_some();
+                let native = match preferred {
+                    Some(AttachmentRenderBackend::Vulkan(native)) => Ok(native),
+                    None => probe_vulkan_device(&video_surface),
+                    Some(AttachmentRenderBackend::Software) => unreachable!(),
+                };
+                match native.and_then(|native| {
+                    create_vulkan_context(&mpv, &native, live).map(|context| (context, native))
+                }) {
+                    Ok((context, native)) => {
+                        log::info!(
+                            "video render backend selected backend=vulkan sharing=wgpu-device latest_frame={live} cached_decision={cached_decision}"
+                        );
+                        (
+                            RenderBackend::Vulkan {
+                                context,
+                                generation: None,
+                                next_texture: 0,
+                            },
+                            AttachmentRenderBackend::Vulkan(native),
+                        )
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Vulkan libmpv interop unavailable, using software fallback: {error:#}"
+                        );
+                        let context = mpv
+                            .create_software_render_context(live)
+                            .context("create libmpv software render context after Vulkan fallback")?;
+                        log::info!(
+                            "video render backend selected backend=software upload=wgpu latest_frame={live}"
+                        );
+                        (
+                            RenderBackend::Software {
+                                context,
+                                generation: None,
+                                next_texture: 0,
+                                aligned: Vec::new(),
+                                tight: Vec::new(),
+                            },
+                            AttachmentRenderBackend::Software,
+                        )
+                    }
                 }
             }
         };
@@ -192,6 +243,8 @@ impl MpvPlayer {
         });
 
         let (error_sender, errors) = mpsc::channel();
+        let playback = Arc::new(SharedPlaybackState::default());
+        let render_playback = playback.clone();
         let render_error_sender = error_sender.clone();
         let render_gpui_wakeup = gpui_wakeup.clone();
         let render_live_diagnostics = live_diagnostics.clone();
@@ -206,6 +259,7 @@ impl MpvPlayer {
                     render_gpui_wakeup,
                     render_error_sender,
                     render_live_diagnostics,
+                    render_playback,
                 );
             })
             .context("spawn mpv render thread")?;
@@ -223,7 +277,6 @@ impl MpvPlayer {
         }
 
         let (control_sender, control_commands) = mpsc::channel();
-        let playback = Arc::new(SharedPlaybackState::default());
         let control_playback = playback.clone();
         let control_mpv = mpv.clone();
         let control_error_sender = error_sender.clone();
@@ -251,7 +304,7 @@ impl MpvPlayer {
             }
         };
 
-        Ok(Self {
+        Ok((Self {
             control_sender,
             control_thread: Some(control_thread),
             render_sender,
@@ -265,7 +318,7 @@ impl MpvPlayer {
             mpv,
             live_diagnostics,
             live_source: None,
-        })
+        }, selected_backend))
     }
 
     pub fn surface(&self) -> PlatformSurface {
@@ -273,28 +326,56 @@ impl MpvPlayer {
     }
 
     pub fn load(&mut self, path: &str) -> Result<()> {
+        self.load_at(path, false, 100.0, 0.0)
+    }
+
+    pub(crate) fn load_at(
+        &mut self,
+        path: &str,
+        paused: bool,
+        volume: f64,
+        position: f64,
+    ) -> Result<()> {
         self.playback.reset();
-        self.requested_paused = false;
+        self.requested_paused = paused;
         self.render_sender
             .send(RenderMessage::Reset)
             .map_err(|_| anyhow!("mpv render thread stopped"))?;
-        self.send_control(ControlCommand::Load(path.to_owned()))
+        self.send_control(ControlCommand::Load {
+            path: path.to_owned(),
+            paused,
+            volume: volume.clamp(0.0, 100.0),
+            position: position.max(0.0),
+        })
     }
 
     pub fn toggle_pause(&mut self) -> Result<bool> {
-        self.requested_paused = !self.requested_paused;
-        let paused = self.requested_paused;
-        self.playback.paused.store(paused, Ordering::Release);
-        self.send_control(ControlCommand::SetPause(paused))?;
+        let paused = !self.requested_paused;
+        self.set_paused(paused)?;
         Ok(paused)
     }
 
-    pub fn seek_relative(&self, seconds: f64) -> Result<()> {
-        self.send_control(ControlCommand::SeekRelative(seconds))
+    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<()> {
+        self.requested_paused = paused;
+        self.playback.paused.store(paused, Ordering::Release);
+        self.send_control(ControlCommand::SetPause(paused))
+    }
+
+    pub(crate) fn seek_absolute(&self, seconds: f64) -> Result<()> {
+        self.send_control(ControlCommand::SeekAbsolute(seconds.max(0.0)))
     }
 
     pub fn set_volume(&self, volume: f64) -> Result<()> {
         self.send_control(ControlCommand::SetVolume(volume.clamp(0.0, 100.0)))
+    }
+
+    pub(crate) fn stop(&mut self) -> Result<()> {
+        self.requested_paused = true;
+        self.playback.reset();
+        self.render_sender
+            .send(RenderMessage::ReleaseResources)
+            .map_err(|_| anyhow!("mpv render thread stopped"))?;
+        self.send_control(ControlCommand::Stop)
     }
 
     pub fn drain_events(&mut self) -> Result<PlaybackState> {
@@ -344,12 +425,8 @@ impl VulkanQueueLock for WgpuQueueLock {
     }
 }
 
-fn create_vulkan_context(
-    mpv: &Arc<Mpv>,
-    surface: &WgpuVideoSurface,
-    latest_frame: bool,
-) -> Result<RenderContext> {
-    let native = surface.vulkan_device()?;
+fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevice>> {
+    let native = Arc::new(surface.vulkan_device()?);
     let has_external_memory_fd = native
         .device_extensions
         .iter()
@@ -393,6 +470,14 @@ fn create_vulkan_context(
             "Vulkan device lacks Linux dma-buf import extensions; hardware-decoded video may round-trip through CPU memory"
         );
     }
+    Ok(native)
+}
+
+fn create_vulkan_context(
+    mpv: &Arc<Mpv>,
+    native: &VulkanVideoDevice,
+    latest_frame: bool,
+) -> Result<RenderContext> {
     let instance_extensions = native
         .instance_extensions
         .iter()
@@ -431,29 +516,37 @@ fn create_vulkan_context(
         compute_queue: queue,
         transfer_queue: queue,
         enabled_queue_families,
-        queue_lock: Arc::new(WgpuQueueLock(native.queue_lock)),
+        queue_lock: Arc::new(WgpuQueueLock(native.queue_lock.clone())),
         latest_frame,
     })
     .context("import GPUI's Vulkan device into libmpv")
 }
 
 pub(crate) enum ControlCommand {
-    Load(String),
+    Load {
+        path: String,
+        paused: bool,
+        volume: f64,
+        position: f64,
+    },
     SetPause(bool),
-    SeekRelative(f64),
+    SeekAbsolute(f64),
     SetVolume(f64),
+    Stop,
     DropBuffers,
     Shutdown,
 }
 
 enum RenderMessage {
     Update,
+    Enable,
     Resize {
         width: u32,
         height: u32,
         redraw: bool,
     },
     Reset,
+    ReleaseResources,
     Shutdown,
 }
 
@@ -562,6 +655,45 @@ impl RenderBackend {
             }
         }
         Ok(true)
+    }
+
+    fn release_resources(&mut self, surface: &WgpuVideoSurface) -> Result<()> {
+        match self {
+            Self::Vulkan {
+                context,
+                generation,
+                next_texture,
+            } => {
+                if let Some(old) = generation.take() {
+                    for texture in &old.textures {
+                        context
+                            .remove_vulkan_target(texture.image())
+                            .context("remove recycled Vulkan render target from libmpv")?;
+                    }
+                    surface
+                        .wait_idle()
+                        .context("wait before releasing recycled Vulkan video textures")?;
+                }
+                *next_texture = 0;
+            }
+            Self::Software {
+                generation,
+                next_texture,
+                aligned,
+                tight,
+                ..
+            } => {
+                if generation.take().is_some() {
+                    surface
+                        .wait_idle()
+                        .context("wait before releasing recycled software video textures")?;
+                }
+                *next_texture = 0;
+                *aligned = Vec::new();
+                *tight = Vec::new();
+            }
+        }
+        Ok(())
     }
 
     fn render(
@@ -784,27 +916,56 @@ fn control_worker(
     log::info!("mpv control worker started");
     let mut state = PlaybackState::default();
     let mut configured_size = initial_render_size;
+    let mut pending_start = None;
     loop {
         while let Ok(command) = commands.try_recv() {
             let result = match command {
-                ControlCommand::Load(path) => {
+                ControlCommand::Load {
+                    path,
+                    paused,
+                    volume,
+                    position,
+                } => {
                     log::info!("loading media path={path:?}");
-                    state = PlaybackState::default();
+                    state = PlaybackState {
+                        paused,
+                        ..PlaybackState::default()
+                    };
                     configured_size = initial_render_size;
+                    pending_start = (position > 0.0).then_some(position);
                     playback.publish(state);
-                    mpv.command("loadfile", &[&path, "replace"])
+                    // `stop` is synchronous. Drain the events it enqueued
+                    // before opening the replacement so a pooled core cannot
+                    // mistake the previous file's FileLoaded/EndFile for the
+                    // new session.
+                    mpv.command("stop", &[])
+                        .map(|()| while mpv.wait_event(0.0).is_some() {})
+                        .and_then(|()| mpv.set_property("pause", paused))
+                        .and_then(|()| mpv.set_property("volume", volume))
+                        .and_then(|()| mpv.command("loadfile", &[&path, "replace"]))
                 }
                 ControlCommand::SetPause(paused) => {
                     log::debug!("setting mpv pause={paused}");
                     mpv.set_property("pause", paused)
                 }
-                ControlCommand::SeekRelative(seconds) => {
-                    log::debug!("seeking mpv relative_seconds={seconds}");
-                    mpv.command("seek", &[&seconds.to_string(), "relative+exact"])
+                ControlCommand::SeekAbsolute(seconds) => {
+                    log::debug!("seeking mpv absolute_seconds={seconds}");
+                    mpv.command("seek", &[&seconds.to_string(), "absolute+exact"])
                 }
                 ControlCommand::SetVolume(volume) => {
                     log::debug!("setting mpv volume={volume}");
                     mpv.set_property("volume", volume)
+                }
+                ControlCommand::Stop => {
+                    log::debug!("stopping media while retaining mpv core");
+                    state = PlaybackState {
+                        paused: true,
+                        ..PlaybackState::default()
+                    };
+                    pending_start = None;
+                    configured_size = initial_render_size;
+                    playback.publish(state);
+                    mpv.command("stop", &[])
                 }
                 ControlCommand::DropBuffers => {
                     log::debug!("dropping buffered live video at fresh keyframe");
@@ -823,8 +984,20 @@ fn control_worker(
         }
 
         if let Some(event) = mpv.wait_event(-1.0) {
-            if matches!(event.as_ref(), Ok(Event::FileLoaded | Event::VideoReconfig))
+            if matches!(event.as_ref(), Ok(Event::FileLoaded))
+                && let Some(position) = pending_start.take()
+                && let Err(error) = mpv.command("seek", &[&position.to_string(), "absolute+exact"])
             {
+                log::warn!("failed to restore retained playback position: {error}");
+            }
+            if matches!(event.as_ref(), Ok(Event::FileLoaded))
+                && render_sender.send(RenderMessage::Enable).is_err()
+            {
+                let message = "mpv render thread stopped while enabling the new media";
+                log::error!("{message}");
+                let _ = errors.send(message.into());
+            }
+            if matches!(event.as_ref(), Ok(Event::FileLoaded | Event::VideoReconfig)) {
                 match video_display_size(&mpv) {
                     Ok(size) if configured_size != Some(size) => {
                         log::info!(
@@ -943,7 +1116,9 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
         }
         Event::StartFile => {
             log::debug!("mpv started opening media");
-            false
+            let was_finished = state.finished;
+            state.finished = false;
+            was_finished
         }
         Event::FileLoaded => {
             log::info!("mpv media loaded");
@@ -1005,44 +1180,63 @@ fn render_worker(
     gpui_wakeup: AsyncSender<()>,
     errors: mpsc::Sender<String>,
     live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
+    playback: Arc<SharedPlaybackState>,
 ) {
     let backend_name = backend.name();
     log::info!("video render worker started backend={backend_name}");
     let mut diagnostics = RenderDiagnostics::new();
     let mut has_frame = false;
+    let mut enabled = false;
     while let Ok(message) = messages.recv() {
         let (operation, result) = match message {
             RenderMessage::Update => {
                 diagnostics.callbacks += 1;
                 pending.store(false, Ordering::Release);
                 let updates = backend.context().update();
-                let frame_info = backend.context().next_frame_info().ok();
-                let frame_pts = backend.context().next_frame_video_pts().ok();
-                let result = match render_action(updates, frame_info, has_frame) {
-                    RenderAction::None => {
-                        diagnostics.callbacks_without_frames += 1;
-                        Ok::<bool, anyhow::Error>(false)
-                    }
-                    RenderAction::Skip => {
-                        diagnostics.repeats += 1;
+                if !enabled {
+                    let result = if updates & u64::from(mpv_render_update::Frame) != 0 {
                         backend
                             .context()
                             .skip_rendering()
                             .map(|()| false)
                             .map_err(Into::into)
-                    }
-                    RenderAction::Render => {
-                        let result = backend.render(&surface, true, &mut diagnostics);
-                        if result.as_ref().is_ok_and(|rendered| *rendered)
-                            && let (Some(diagnostics), Some(pts)) =
-                                (live_diagnostics.as_ref(), frame_pts)
-                        {
-                            diagnostics.record_render(pts);
+                    } else {
+                        Ok(false)
+                    };
+                    ("disabled update", result)
+                } else {
+                    let frame_info = backend.context().next_frame_info().ok();
+                    let frame_pts = backend.context().next_frame_video_pts().ok();
+                    let result = match render_action(updates, frame_info, has_frame) {
+                        RenderAction::None => {
+                            diagnostics.callbacks_without_frames += 1;
+                            Ok::<bool, anyhow::Error>(false)
                         }
-                        result
-                    }
-                };
-                ("update", result)
+                        RenderAction::Skip => {
+                            diagnostics.repeats += 1;
+                            backend
+                                .context()
+                                .skip_rendering()
+                                .map(|()| false)
+                                .map_err(Into::into)
+                        }
+                        RenderAction::Render => {
+                            let result = backend.render(&surface, true, &mut diagnostics);
+                            if result.as_ref().is_ok_and(|rendered| *rendered)
+                                && let (Some(diagnostics), Some(pts)) =
+                                    (live_diagnostics.as_ref(), frame_pts)
+                            {
+                                diagnostics.record_render(pts);
+                            }
+                            result
+                        }
+                    };
+                    ("update", result)
+                }
+            }
+            RenderMessage::Enable => {
+                enabled = true;
+                ("enable", Ok(false))
             }
             RenderMessage::Resize {
                 width,
@@ -1051,7 +1245,7 @@ fn render_worker(
             } => {
                 diagnostics.resizes += 1;
                 let result = backend.resize(&surface, width, height).and_then(|resized| {
-                    if (resized && has_frame) || redraw {
+                    if enabled && ((resized && has_frame) || redraw) {
                         backend.render(&surface, false, &mut diagnostics)
                     } else {
                         Ok(false)
@@ -1061,9 +1255,24 @@ fn render_worker(
             }
             RenderMessage::Reset => {
                 log::debug!("resetting published video frame backend={backend_name}");
+                enabled = false;
                 has_frame = false;
+                playback.frame_ready.store(false, Ordering::Release);
                 surface.clear();
                 ("reset", Ok(false))
+            }
+            RenderMessage::ReleaseResources => {
+                log::debug!("releasing pooled video frame resources backend={backend_name}");
+                enabled = false;
+                has_frame = false;
+                playback.frame_ready.store(false, Ordering::Release);
+                surface.clear();
+                (
+                    "release resources",
+                    backend
+                        .release_resources(&surface)
+                        .map(|()| false),
+                )
             }
             RenderMessage::Shutdown => break,
         };
@@ -1072,6 +1281,7 @@ fn render_worker(
                 if rendered {
                     diagnostics.rendered += 1;
                     has_frame = true;
+                    playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                 }
             }
@@ -1119,6 +1329,7 @@ pub struct PlaybackState {
     pub duration: f64,
     pub paused: bool,
     pub finished: bool,
+    pub frame_ready: bool,
 }
 
 #[derive(Default)]
@@ -1127,6 +1338,7 @@ struct SharedPlaybackState {
     duration: AtomicU64,
     paused: AtomicBool,
     finished: AtomicBool,
+    frame_ready: AtomicBool,
 }
 
 impl SharedPlaybackState {
@@ -1144,11 +1356,13 @@ impl SharedPlaybackState {
             duration: f64::from_bits(self.duration.load(Ordering::Relaxed)),
             paused: self.paused.load(Ordering::Relaxed),
             finished,
+            frame_ready: self.frame_ready.load(Ordering::Acquire),
         }
     }
 
     fn reset(&self) {
         self.publish(PlaybackState::default());
+        self.frame_ready.store(false, Ordering::Release);
     }
 }
 
