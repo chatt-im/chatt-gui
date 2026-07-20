@@ -6,6 +6,7 @@ use super::{
     error::{Error, ErrorKind},
     Frontend, Result, Span,
 };
+use super::types::{COMBINED_IMAGE_TYPE_PREFIX, COMBINED_SAMPLER_TYPE_NAME};
 use crate::{
     AddressSpace, Binding, BuiltIn, Constant, Expression, GlobalVariable, Handle, Interpolation,
     LocalVariable, Override, ResourceBinding, Scalar, ScalarKind, ShaderStage, SwizzleComponent,
@@ -550,6 +551,10 @@ impl Frontend {
                 }
             }
             StorageQualifier::AddressSpace(mut space) => {
+                let combined_sampler = ctx.module.types[ty]
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(COMBINED_IMAGE_TYPE_PREFIX));
                 match space {
                     AddressSpace::Storage { ref mut access } => {
                         if let Some((allowed_access, _)) = qualifiers.storage_access.take() {
@@ -643,8 +648,44 @@ impl Frontend {
                     meta,
                 );
 
+                let kind = if combined_sampler {
+                    if space != AddressSpace::Handle || binding.is_none() {
+                        self.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "combined samplers require a bound uniform global".into(),
+                            ),
+                            meta,
+                        });
+                    }
+                    let sampler_ty = ctx.module.types.insert(
+                        Type {
+                            name: Some(COMBINED_SAMPLER_TYPE_NAME.into()),
+                            inner: TypeInner::Sampler { comparison: false },
+                        },
+                        meta,
+                    );
+                    let sampler = ctx.module.global_variables.append(
+                        GlobalVariable {
+                            name: name.as_ref().map(|name| {
+                                format!("__naga_combined_sampler_{name}")
+                            }),
+                            space: AddressSpace::Handle,
+                            binding: None,
+                            ty: sampler_ty,
+                            init: None,
+                            memory_decorations: crate::MemoryDecorations::empty(),
+                        },
+                        meta,
+                    );
+                    GlobalLookupKind::CombinedSampler {
+                        image: handle,
+                        sampler,
+                    }
+                } else {
+                    GlobalLookupKind::Variable(handle)
+                };
                 let lookup = GlobalLookup {
-                    kind: GlobalLookupKind::Variable(handle),
+                    kind,
                     entry_arg: None,
                     mutable: true,
                 };

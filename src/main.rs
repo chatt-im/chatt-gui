@@ -8,6 +8,7 @@ mod live_stream;
 mod logger;
 mod media_cache;
 mod model;
+mod naga_bridge;
 mod mpv_player;
 mod scroll_capture;
 mod timeline;

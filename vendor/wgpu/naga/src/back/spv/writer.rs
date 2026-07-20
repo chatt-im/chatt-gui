@@ -66,6 +66,23 @@ impl Function {
 }
 
 impl Writer {
+    fn is_glsl_combined_image(
+        ir_module: &crate::Module,
+        variable: &crate::GlobalVariable,
+    ) -> bool {
+        ir_module.types[variable.ty]
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("__naga_glsl_combined_image:"))
+    }
+
+    fn is_glsl_combined_sampler(
+        ir_module: &crate::Module,
+        variable: &crate::GlobalVariable,
+    ) -> bool {
+        ir_module.types[variable.ty].name.as_deref() == Some("__naga_glsl_combined_sampler")
+    }
+
     pub fn new(options: &Options) -> Result<Self, Error> {
         let (major, minor) = options.lang_version;
         if major != 1 {
@@ -1461,6 +1478,13 @@ impl Writer {
                 continue;
             }
 
+            // The matching image global owns the sole OpVariable for a GLSL
+            // combined image sampler. The sampler is only an IR-side handle
+            // used to preserve Naga's ImageSample representation.
+            if Self::is_glsl_combined_sampler(ir_module, var) {
+                continue;
+            }
+
             let mut gv = self.global_variables[handle].clone();
             if let Some(ref mut iface) = interface {
                 // Have to include global variables in the interface
@@ -1476,7 +1500,31 @@ impl Writer {
                 }
                 _ => {
                     // Handle globals are pre-emitted and should be loaded automatically.
-                    if var.space == crate::AddressSpace::Handle {
+                    if var.space == crate::AddressSpace::Handle
+                        && Self::is_glsl_combined_image(ir_module, var)
+                    {
+                        let image_type_id = self.get_handle_type_id(var.ty);
+                        let sampled_type_id = self.get_type_id(LookupType::Local(
+                            LocalType::SampledImage { image_type_id },
+                        ));
+                        let sampled_id = self.id_gen.next();
+                        prelude.body.push(Instruction::load(
+                            sampled_type_id,
+                            sampled_id,
+                            gv.var_id,
+                            None,
+                        ));
+                        let image_id = self.id_gen.next();
+                        prelude.body.push(Instruction::unary(
+                            spirv::Op::Image,
+                            image_type_id,
+                            image_id,
+                            sampled_id,
+                        ));
+                        gv.access_id = gv.var_id;
+                        gv.handle_id = image_id;
+                        gv.sampled_image_id = sampled_id;
+                    } else if var.space == crate::AddressSpace::Handle {
                         let var_type_id = self.get_handle_type_id(var.ty);
                         let id = self.id_gen.next();
                         prelude
@@ -3283,6 +3331,33 @@ impl Writer {
     ) -> Result<Word, Error> {
         use spirv::Decoration;
 
+        if Self::is_glsl_combined_image(ir_module, global_variable) {
+            let id = self.id_gen.next();
+            let resource_binding = global_variable.binding.as_ref().ok_or(
+                Error::Validation("GLSL combined sampler is missing a resource binding"),
+            )?;
+            let bind_target = self.resolve_resource_binding(resource_binding)?;
+            self.decorate(id, Decoration::DescriptorSet, &[bind_target.descriptor_set]);
+            self.decorate(id, Decoration::Binding, &[bind_target.binding]);
+
+            let image_type_id = self.get_handle_type_id(global_variable.ty);
+            let sampled_type_id = self.get_type_id(LookupType::Local(
+                LocalType::SampledImage { image_type_id },
+            ));
+            let pointer_type_id = self.get_type_id(LookupType::Local(LocalType::Pointer {
+                base: sampled_type_id,
+                class: spirv::StorageClass::UniformConstant,
+            }));
+            Instruction::variable(
+                pointer_type_id,
+                id,
+                spirv::StorageClass::UniformConstant,
+                None,
+            )
+            .to_words(&mut self.logical_layout.declarations);
+            return Ok(id);
+        }
+
         let id = self.id_gen.next();
         let class = map_storage_class(global_variable.space);
 
@@ -3478,8 +3553,10 @@ impl Writer {
 
         // Matrices and (potentially nested) arrays of matrices both require decorations,
         // so "see through" any arrays to determine if they're needed.
-        let mut member_array_subty_inner = &arena[member.ty].inner;
+        let mut member_array_subty = member.ty;
+        let mut member_array_subty_inner = &arena[member_array_subty].inner;
         while let crate::TypeInner::Array { base, .. } = *member_array_subty_inner {
+            member_array_subty = base;
             member_array_subty_inner = &arena[base].inner;
         }
 
@@ -3489,7 +3566,13 @@ impl Writer {
             scalar,
         } = *member_array_subty_inner
         {
-            let byte_stride = Alignment::from(rows) * scalar.width as u32;
+            let byte_stride = if arena[member_array_subty].name.as_deref()
+                == Some("__naga_glsl_std140_matrix_stride_16")
+            {
+                16
+            } else {
+                Alignment::from(rows) * scalar.width as u32
+            };
             self.annotations.push(Instruction::member_decorate(
                 struct_id,
                 index as u32,
@@ -3660,13 +3743,17 @@ impl Writer {
             // If a single entry point was specified, only write `OpVariable` instructions
             // for the globals it actually uses. Emit dummies for the others,
             // to preserve the indices in `global_variables`.
-            let gvar = match ep_index {
+            let gvar = if Self::is_glsl_combined_sampler(ir_module, var) {
+                GlobalVariable::dummy()
+            } else {
+                match ep_index {
                 Some(index) if mod_info.get_entry_point(index)[handle].is_empty() => {
                     GlobalVariable::dummy()
                 }
                 _ => {
                     let id = self.write_global_variable(ir_module, var)?;
                     GlobalVariable::new(id)
+                }
                 }
             };
             self.global_variables.insert(handle, gvar);

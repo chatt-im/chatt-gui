@@ -1114,7 +1114,9 @@ impl super::Validator {
             });
         }
 
-        if is_resource != var.binding.is_some() {
+        let glsl_combined_sampler = gctx.types[var.ty].name.as_deref()
+            == Some("__naga_glsl_combined_sampler");
+        if is_resource != var.binding.is_some() && !glsl_combined_sampler {
             if self.flags.contains(super::ValidationFlags::BINDINGS) {
                 return Err(GlobalVariableError::InvalidBinding);
             }

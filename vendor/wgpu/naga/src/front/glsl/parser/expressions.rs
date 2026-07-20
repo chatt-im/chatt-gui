@@ -8,6 +8,7 @@ use crate::{
         error::{ErrorKind, ExpectedToken},
         parser::ParsingContext,
         token::{Token, TokenValue},
+        types::COMBINED_IMAGE_TYPE_PREFIX,
         Error, Frontend, Result, Span,
     },
     ArraySize, BinaryOperator, Handle, Literal, Type, TypeInner, UnaryOperator,
@@ -165,10 +166,16 @@ impl ParsingContext<'_> {
                 )
             }
 
+            let kind = ctx.module.types[handle]
+                .name
+                .as_deref()
+                .and_then(|name| name.strip_prefix(COMBINED_IMAGE_TYPE_PREFIX))
+                .map(|name| FunctionCallKind::Function(name.into()))
+                .unwrap_or(FunctionCallKind::TypeConstructor(handle));
             stmt.hir_exprs.append(
                 HirExpr {
                     kind: HirExprKind::Call(FunctionCall {
-                        kind: FunctionCallKind::TypeConstructor(handle),
+                        kind,
                         args,
                     }),
                     meta,

@@ -1,6 +1,5 @@
 use std::{
     env,
-    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -63,21 +62,48 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         "the vendored libmpv build currently supports native builds only"
     );
 
-    let hardware = build_hardware_loaders(crate_path, out_path);
-    let old_pkg_config_path = env::var_os("PKG_CONFIG_PATH");
-    let mut hardware_pkg_config_path = hardware.pkgconfig.clone().into_os_string();
-    if let Some(old) = old_pkg_config_path.as_ref() {
-        hardware_pkg_config_path.push(OsStr::new(":"));
-        hardware_pkg_config_path.push(old);
-    }
-    env::set_var("PKG_CONFIG_PATH", &hardware_pkg_config_path);
+    let alsa = discover_system_package("alsa");
+    let vulkan = discover_system_package("vulkan");
+    let pkg_config_libdir = out_path.join("isolated-pkgconfig");
+    fs::create_dir_all(&pkg_config_libdir)
+        .expect("could not create isolated pkg-config directory");
+    clear_pkg_config_files(&pkg_config_libdir);
+    write_system_pkg_config(&pkg_config_libdir, &alsa, None);
+
+    let libplacebo_source = crate_path
+        .join("../../libplacebo")
+        .canonicalize()
+        .expect("vendored libplacebo source directory is missing");
+    let vulkan_headers = libplacebo_source.join("3rdparty/Vulkan-Headers/include");
+    write_system_pkg_config(&pkg_config_libdir, &vulkan, Some(&vulkan_headers));
+
+    // PKG_CONFIG_LIBDIR replaces pkg-config's default search graph. Never
+    // append the caller's PKG_CONFIG_PATH: optional host libraries must not
+    // silently become dependencies of this static media stack.
+    env::remove_var("PKG_CONFIG_PATH");
+    env::set_var("PKG_CONFIG_LIBDIR", &pkg_config_libdir);
+
+    let hardware = build_hardware_loaders(crate_path, out_path, &pkg_config_libdir);
+    let libplacebo = build_vendored_libplacebo(&libplacebo_source, out_path);
+    copy_pkg_config_files(
+        &libplacebo.pkgconfig,
+        &pkg_config_libdir,
+        &["libplacebo.pc"],
+    );
 
     let ffmpeg_lib = build_vendored_ffmpeg(crate_path, out_path);
-    let ffmpeg_pc = ffmpeg_lib.join("pkgconfig");
-    let mut pkg_config_path = ffmpeg_pc.into_os_string();
-    pkg_config_path.push(OsStr::new(":"));
-    pkg_config_path.push(&hardware_pkg_config_path);
-    env::set_var("PKG_CONFIG_PATH", &pkg_config_path);
+    copy_pkg_config_files(
+        &ffmpeg_lib.join("pkgconfig"),
+        &pkg_config_libdir,
+        &[
+            "libavcodec.pc",
+            "libavfilter.pc",
+            "libavformat.pc",
+            "libavutil.pc",
+            "libswresample.pc",
+            "libswscale.pc",
+        ],
+    );
 
     let source = crate_path
         .join("../../mpv")
@@ -120,6 +146,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         .arg("-Dgl=disabled")
         .arg("-Dlibass=disabled")
         .arg("-Dlua=disabled")
+        .arg("-Dshaderc=disabled")
         .arg("-Dvulkan=enabled")
         .arg("-Dcuda-hwaccel=enabled")
         .arg("-Dcuda-interop=enabled")
@@ -147,16 +174,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     assert!(archive.is_file(), "Meson did not produce {}", archive.display());
 
     let pc_dir = build.join("meson-private");
-    let mut pkg_config_path = pc_dir.into_os_string();
-    pkg_config_path.push(OsStr::new(":"));
-    pkg_config_path.push(ffmpeg_lib.join("pkgconfig"));
-    pkg_config_path.push(OsStr::new(":"));
-    pkg_config_path.push(&hardware.pkgconfig);
-    if let Some(old) = old_pkg_config_path {
-        pkg_config_path.push(OsStr::new(":"));
-        pkg_config_path.push(old);
-    }
-    env::set_var("PKG_CONFIG_PATH", pkg_config_path);
+    copy_pkg_config_files(&pc_dir, &pkg_config_libdir, &["mpv.pc"]);
 
     let dependencies = pkg_config::Config::new()
         .cargo_metadata(false)
@@ -165,6 +183,10 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         .expect("could not resolve vendored libmpv's system dependencies");
 
     println!("cargo:rustc-link-search=native={}", build.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        libplacebo.library.display()
+    );
     println!("cargo:rustc-link-search=native={}", ffmpeg_lib.display());
     println!(
         "cargo:rustc-link-search=native={}",
@@ -176,18 +198,26 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
             println!("cargo:rustc-link-search=native={}", path.display());
         }
     }
+    let mut linked_placebo = false;
     for library in dependencies.libs {
-        if library != "mpv" && library != "chatt_vaapi_loader" {
-            if matches!(
-                library.as_str(),
-                "avcodec" | "avfilter" | "avformat" | "avutil" | "swresample" | "swscale"
-            ) {
+        match library.as_str() {
+            "mpv" | "chatt_vaapi_loader" => {}
+            "avcodec" | "avfilter" | "avformat" | "avutil" | "swresample" | "swscale" => {
                 println!("cargo:rustc-link-lib=static={library}");
-            } else {
+            }
+            "placebo" => {
+                println!("cargo:rustc-link-lib=static=placebo");
+                linked_placebo = true;
+            }
+            "asound" | "vulkan" | "dl" | "m" | "pthread" | "rt" | "atomic" => {
                 println!("cargo:rustc-link-lib=dylib={library}");
             }
+            unexpected => panic!(
+                "isolated vendored libmpv graph exposed unexpected native library {unexpected:?}"
+            ),
         }
     }
+    assert!(linked_placebo, "vendored mpv did not resolve static libplacebo");
     for path in dependencies.framework_paths {
         println!("cargo:rustc-link-search=framework={}", path.display());
     }
@@ -195,17 +225,226 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-lib=static=chatt_vaapi_loader");
+    link_static_cxx_runtime();
     println!("cargo:rustc-link-lib=dylib=dl");
 }
 
 #[cfg(feature = "vendored")]
 struct HardwareBuild {
     library: PathBuf,
+}
+
+#[cfg(feature = "vendored")]
+struct LibplaceboBuild {
+    library: PathBuf,
     pkgconfig: PathBuf,
 }
 
 #[cfg(feature = "vendored")]
-fn build_hardware_loaders(crate_path: &Path, out_path: &Path) -> HardwareBuild {
+struct SystemPackage {
+    name: &'static str,
+    version: String,
+    libdir: PathBuf,
+    includedir: PathBuf,
+}
+
+#[cfg(feature = "vendored")]
+fn discover_system_package(name: &'static str) -> SystemPackage {
+    let query = |argument: &str| {
+        let output = Command::new("pkg-config")
+            .env_remove("PKG_CONFIG_PATH")
+            .env_remove("PKG_CONFIG_LIBDIR")
+            .arg(argument)
+            .arg(name)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to query system {name}.pc: {error}"));
+        assert!(
+            output.status.success(),
+            "required system package {name} is unavailable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("pkg-config returned non-UTF-8 output")
+            .trim()
+            .to_owned()
+    };
+
+    SystemPackage {
+        name,
+        version: query("--modversion"),
+        libdir: query("--variable=libdir").into(),
+        includedir: query("--variable=includedir").into(),
+    }
+}
+
+#[cfg(feature = "vendored")]
+fn write_system_pkg_config(
+    pkgconfig: &Path,
+    package: &SystemPackage,
+    include_override: Option<&Path>,
+) {
+    let includedir = include_override.unwrap_or(&package.includedir);
+    let library = match package.name {
+        "alsa" => "asound",
+        "vulkan" => "vulkan",
+        _ => unreachable!("only approved system packages may enter the isolated graph"),
+    };
+    write_pkg_config(
+        &pkgconfig.join(format!("{}.pc", package.name)),
+        package.name,
+        &package.version,
+        includedir,
+        &format!("-I{}", includedir.display()),
+        &format!("-L{} -l{library}", package.libdir.display()),
+        None,
+    );
+}
+
+#[cfg(feature = "vendored")]
+fn copy_pkg_config_files(source: &Path, destination: &Path, filenames: &[&str]) {
+    for filename in filenames {
+        let path = source.join(filename);
+        let output = destination.join(filename);
+        fs::copy(&path, &output).unwrap_or_else(|error| {
+            panic!(
+                "could not copy {} to {}: {error}",
+                path.display(),
+                output.display()
+            )
+        });
+    }
+}
+
+#[cfg(feature = "vendored")]
+fn clear_pkg_config_files(directory: &Path) {
+    let entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()));
+    for entry in entries {
+        let path = entry.expect("could not read isolated pkg-config entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("pc") {
+            fs::remove_file(&path).unwrap_or_else(|error| {
+                panic!("could not clear stale metadata {}: {error}", path.display())
+            });
+        }
+    }
+}
+
+#[cfg(feature = "vendored")]
+fn build_vendored_libplacebo(source: &Path, out_path: &Path) -> LibplaceboBuild {
+    let build = out_path.join("libplacebo-build");
+    let install = out_path.join("libplacebo-install");
+    emit_rerun_tree(source);
+
+    let reconfigure = build.join("build.ninja").exists();
+    if reconfigure {
+        run(
+            Command::new("meson")
+                .arg("setup")
+                .arg(&build)
+                .arg(source)
+                .arg("--reconfigure"),
+            "refresh vendored libplacebo configuration",
+        );
+    }
+
+    let mut setup = Command::new("meson");
+    setup
+        .arg("setup")
+        .arg(&build)
+        .arg(source)
+        .arg(format!("--prefix={}", install.display()))
+        .arg("--libdir=lib")
+        .arg("--wrap-mode=nofallback")
+        .arg("--default-library=static")
+        .arg("--buildtype=release")
+        .arg("-Dauto_features=disabled")
+        .arg("-Dprefer_static=true")
+        .arg("-Db_staticpic=true")
+        .arg("-Dc_args=-ffunction-sections -fdata-sections")
+        .arg("-Dcpp_args=-ffunction-sections -fdata-sections")
+        .arg("-Dvulkan=enabled")
+        .arg("-Dvk-proc-addr=disabled")
+        .arg("-Dnaga=enabled")
+        .arg("-Dopengl=disabled")
+        .arg("-Dd3d11=disabled")
+        .arg("-Dshaderc=disabled")
+        .arg("-Dglslang=disabled")
+        .arg("-Dlcms=disabled")
+        .arg("-Ddovi=disabled")
+        .arg("-Dlibdovi=disabled")
+        .arg("-Dunwind=disabled")
+        .arg("-Dxxhash=disabled")
+        .arg("-Ddemos=false")
+        .arg("-Dtests=false")
+        .arg("-Dbench=false")
+        .arg("-Dfuzz=false")
+        .arg("-Ddebug-abort=false");
+    if reconfigure {
+        setup.arg("--reconfigure");
+    }
+    run(&mut setup, "configure vendored libplacebo");
+
+    let mut compile = Command::new("meson");
+    compile.arg("compile").arg("-C").arg(&build);
+    if let Some(jobs) = env::var_os("NUM_JOBS") {
+        compile.arg("-j").arg(jobs);
+    }
+    run(&mut compile, "compile vendored libplacebo");
+    run(
+        Command::new("meson").arg("install").arg("-C").arg(&build),
+        "install vendored libplacebo",
+    );
+
+    let library = install.join("lib");
+    let archive = library.join("libplacebo.a");
+    assert!(
+        archive.is_file(),
+        "Meson did not produce {}",
+        archive.display()
+    );
+    LibplaceboBuild {
+        pkgconfig: library.join("pkgconfig"),
+        library,
+    }
+}
+
+#[cfg(feature = "vendored")]
+fn link_static_cxx_runtime() {
+    let compiler = env::var_os("CXX").unwrap_or_else(|| "c++".into());
+    let output = Command::new(&compiler)
+        .arg("-print-file-name=libstdc++.a")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to locate static libstdc++ with {compiler:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "C++ compiler failed while locating static libstdc++: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("C++ compiler returned a non-UTF-8 archive path")
+            .trim(),
+    );
+    assert!(
+        archive.is_absolute() && archive.is_file(),
+        "a usable static libstdc++.a is required, got {}",
+        archive.display()
+    );
+    let directory = archive
+        .parent()
+        .expect("static libstdc++ archive has no parent directory");
+    println!("cargo:rustc-link-search=native={}", directory.display());
+    // Normal static archive linking extracts only members needed by
+    // libplacebo's convert.cc; whole-archive is intentionally not used.
+    println!("cargo:rustc-link-lib=static=stdc++");
+}
+
+#[cfg(feature = "vendored")]
+fn build_hardware_loaders(
+    crate_path: &Path,
+    out_path: &Path,
+    pkgconfig: &Path,
+) -> HardwareBuild {
     let vendor = crate_path
         .join("../../hw-headers")
         .canonicalize()
@@ -214,8 +453,6 @@ fn build_hardware_loaders(crate_path: &Path, out_path: &Path) -> HardwareBuild {
     let nv_include = vendor.join("nv-codec/include");
     let loader = crate_path.join("loader");
     let library = out_path.join("hardware-loader");
-    let pkgconfig = library.join("pkgconfig");
-    fs::create_dir_all(&pkgconfig).expect("could not create hardware pkg-config directory");
     emit_rerun_tree(&vendor);
     emit_rerun_tree(&loader);
 
@@ -260,7 +497,7 @@ fn build_hardware_loaders(crate_path: &Path, out_path: &Path) -> HardwareBuild {
         None,
     );
 
-    HardwareBuild { library, pkgconfig }
+    HardwareBuild { library }
 }
 
 #[cfg(feature = "vendored")]

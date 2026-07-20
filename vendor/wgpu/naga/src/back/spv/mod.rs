@@ -730,6 +730,10 @@ struct GlobalVariable {
     /// It is then used for all operations on the global, such as `OpImageSample`.
     handle_id: Word,
 
+    /// Loaded OpTypeSampledImage value for a GLSL combined sampler. This is
+    /// zero for ordinary Naga resources.
+    sampled_image_id: Word,
+
     /// The SPIR-V id of a pointer to this variable's Naga IR value.
     ///
     /// If the current function uses this global variable, and it has been
@@ -751,6 +755,7 @@ impl GlobalVariable {
         Self {
             var_id: 0,
             handle_id: 0,
+            sampled_image_id: 0,
             access_id: 0,
         }
     }
@@ -759,6 +764,7 @@ impl GlobalVariable {
         Self {
             var_id: id,
             handle_id: 0,
+            sampled_image_id: 0,
             access_id: 0,
         }
     }
@@ -766,6 +772,7 @@ impl GlobalVariable {
     /// Prepare `self` for use within a single function.
     const fn reset_for_function(&mut self) {
         self.handle_id = 0;
+        self.sampled_image_id = 0;
         self.access_id = 0;
     }
 }

@@ -121,26 +121,16 @@ pub fn calculate_offset(
                 align = align.max(Alignment::MIN_UNIFORM);
             }
 
-            // See comment on the error kind
-            if StructLayout::Std140 == layout {
-                // Do the f16 test first, as it's more specific
-                if scalar == Scalar::F16 {
-                    errors.push(Error {
-                        kind: ErrorKind::UnsupportedF16MatrixInStd140 {
-                            columns: columns as u8,
-                            rows: rows as u8,
-                        },
-                        meta,
-                    });
-                }
-                if rows == crate::VectorSize::Bi {
-                    errors.push(Error {
-                        kind: ErrorKind::UnsupportedMatrixWithTwoRowsInStd140 {
-                            columns: columns as u8,
-                        },
-                        meta,
-                    });
-                }
+            let natural_stride = Alignment::from(rows) * scalar.width as u32;
+            if StructLayout::Std140 == layout && natural_stride < 16 {
+                let type_span = types.get_span(ty);
+                ty = types.insert(
+                    Type {
+                        name: Some("__naga_glsl_std140_matrix_stride_16".into()),
+                        inner: types[ty].inner.clone(),
+                    },
+                    type_span,
+                );
             }
 
             (align, align * columns as u32)

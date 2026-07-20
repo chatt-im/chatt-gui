@@ -817,6 +817,12 @@ impl BlockContext<'_> {
         use super::instructions::SampleLod;
         // image
         let image_id = self.get_handle_id(image);
+        let combined_sampled_image_id = match self.ir_function.expressions[image] {
+            crate::Expression::GlobalVariable(handle) => {
+                self.writer.global_variables[handle].sampled_image_id
+            }
+            _ => 0,
+        };
         let image_type = self.fun_info[image].ty.handle().unwrap();
         // SPIR-V doesn't know about our `Depth` class, and it returns
         // `vec4<f32>`, so we need to grab the first component out of it.
@@ -840,8 +846,6 @@ impl BlockContext<'_> {
         let image_type_id = self.get_handle_type_id(image_type);
         let sampled_image_type_id =
             self.get_type_id(LookupType::Local(LocalType::SampledImage { image_type_id }));
-
-        let sampler_id = self.get_handle_id(sampler);
 
         let coordinates = self.write_image_coordinates(coordinate, array_index, block)?;
         let coordinates_id = if clamp_to_edge {
@@ -936,13 +940,19 @@ impl BlockContext<'_> {
             coordinates.value_id
         };
 
-        let sampled_image_id = self.gen_id();
-        block.body.push(Instruction::sampled_image(
-            sampled_image_type_id,
-            sampled_image_id,
-            image_id,
-            sampler_id,
-        ));
+        let sampled_image_id = if combined_sampled_image_id != 0 {
+            combined_sampled_image_id
+        } else {
+            let sampler_id = self.get_handle_id(sampler);
+            let sampled_image_id = self.gen_id();
+            block.body.push(Instruction::sampled_image(
+                sampled_image_type_id,
+                sampled_image_id,
+                image_id,
+                sampler_id,
+            ));
+            sampled_image_id
+        };
         let id = self.gen_id();
 
         let depth_id = depth_ref.map(|handle| self.cached[handle]);

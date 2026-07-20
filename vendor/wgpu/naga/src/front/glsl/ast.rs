@@ -10,6 +10,10 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub enum GlobalLookupKind {
     Variable(Handle<GlobalVariable>),
+    CombinedSampler {
+        image: Handle<GlobalVariable>,
+        sampler: Handle<GlobalVariable>,
+    },
     Constant(Handle<Constant>, Handle<Type>),
     Override(Handle<Override>, Handle<Type>),
     BlockSelect(Handle<GlobalVariable>, u32),

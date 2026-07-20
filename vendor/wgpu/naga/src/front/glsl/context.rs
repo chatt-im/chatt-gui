@@ -175,6 +175,15 @@ impl<'a> Context<'a> {
                     None,
                 )
             }
+            GlobalLookupKind::CombinedSampler { image, sampler } => {
+                let span = self.module.global_variables.get_span(image);
+                let image_expr =
+                    self.add_expression(Expression::GlobalVariable(image), span)?;
+                let sampler_expr =
+                    self.add_expression(Expression::GlobalVariable(sampler), span)?;
+                self.samplers.insert(image_expr, sampler_expr);
+                (image_expr, false, None)
+            }
             GlobalLookupKind::BlockSelect(handle, index) => {
                 let span = self.module.global_variables.get_span(handle);
                 let base = self.add_expression(Expression::GlobalVariable(handle), span)?;

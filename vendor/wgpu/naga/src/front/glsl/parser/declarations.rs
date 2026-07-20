@@ -1,4 +1,4 @@
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
 
 use super::{DeclarationContext, ParsingContext, Result};
 use crate::{
@@ -621,7 +621,6 @@ impl ParsingContext<'_> {
         Ok(meta)
     }
 
-    // TODO: Accept layout arguments
     pub fn parse_struct_declaration_list(
         &mut self,
         frontend: &mut Frontend,
@@ -633,7 +632,10 @@ impl ParsingContext<'_> {
         let mut align = Alignment::ONE;
 
         loop {
-            // TODO: type_qualifier
+            let mut qualifiers = self.parse_type_qualifiers(frontend, ctx)?;
+            let mut explicit_offset =
+                qualifiers.uint_layout_qualifier("offset", &mut frontend.errors);
+            qualifiers.unused_errors(&mut frontend.errors);
 
             let (base_ty, mut meta) = self.parse_type_non_void(frontend, ctx)?;
 
@@ -653,17 +655,40 @@ impl ParsingContext<'_> {
                 );
 
                 let member_alignment = info.align;
-                span = member_alignment.round_up(span);
+                let natural_offset = member_alignment.round_up(span);
+                let member_offset = explicit_offset.take().unwrap_or(natural_offset);
+                if !member_alignment.is_aligned(member_offset) {
+                    frontend.errors.push(Error {
+                        kind: ErrorKind::SemanticError(
+                            format!(
+                                "block member offset {member_offset} is not aligned to {member_alignment} bytes"
+                            )
+                            .into(),
+                        ),
+                        meta,
+                    });
+                }
+                if member_offset < span {
+                    frontend.errors.push(Error {
+                        kind: ErrorKind::SemanticError(
+                            format!(
+                                "block member offset {member_offset} overlaps the previous member ending at {span}"
+                            )
+                            .into(),
+                        ),
+                        meta,
+                    });
+                }
                 align = member_alignment.max(align);
 
                 members.push(StructMember {
                     name: Some(name),
                     ty: info.ty,
                     binding: None,
-                    offset: span,
+                    offset: member_offset,
                 });
 
-                span += info.span;
+                span = member_offset.saturating_add(info.span).max(span);
 
                 if self.bump_if(frontend, TokenValue::Comma).is_none() {
                     break;

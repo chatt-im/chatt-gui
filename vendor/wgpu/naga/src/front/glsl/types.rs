@@ -6,6 +6,13 @@ use crate::{
     TypeInner, VectorSize,
 };
 
+// Marker names used by the GLSL frontend and SPIR-V backend for Vulkan GLSL
+// combined image/sampler descriptors. Naga's IR keeps the image and sampler as
+// separate globals, while the SPIR-V writer folds them back into one
+// OpTypeSampledImage descriptor.
+pub(crate) const COMBINED_IMAGE_TYPE_PREFIX: &str = "__naga_glsl_combined_image:";
+pub(crate) const COMBINED_SAMPLER_TYPE_NAME: &str = "__naga_glsl_combined_sampler";
+
 pub fn parse_type(type_name: &str) -> Option<Type> {
     match type_name {
         "bool" => Some(Type {
@@ -142,6 +149,38 @@ pub fn parse_type(type_name: &str) -> Option<Type> {
                 })
             };
 
+            let combined_sampler_parse = |word: &str| {
+                let (kind, sampler) = if let Some(rest) = word.strip_prefix("sampler") {
+                    (ScalarKind::Float, rest)
+                } else if let Some(rest) = word.strip_prefix("isampler") {
+                    (ScalarKind::Sint, rest)
+                } else if let Some(rest) = word.strip_prefix("usampler") {
+                    (ScalarKind::Uint, rest)
+                } else {
+                    return None;
+                };
+                let (dim, arrayed, multi) = match sampler {
+                    "1D" => (ImageDimension::D1, false, false),
+                    "1DArray" => (ImageDimension::D1, true, false),
+                    "2D" | "2DRect" => (ImageDimension::D2, false, false),
+                    "2DArray" => (ImageDimension::D2, true, false),
+                    "2DMS" => (ImageDimension::D2, false, true),
+                    "2DMSArray" => (ImageDimension::D2, true, true),
+                    "3D" => (ImageDimension::D3, false, false),
+                    "Cube" => (ImageDimension::Cube, false, false),
+                    "CubeArray" => (ImageDimension::Cube, true, false),
+                    _ => return None,
+                };
+                Some(Type {
+                    name: Some(format!("{COMBINED_IMAGE_TYPE_PREFIX}{word}")),
+                    inner: TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class: ImageClass::Sampled { kind, multi },
+                    },
+                })
+            };
+
             let image_parse = |word: &str| {
                 let mut iter = word.split("image");
 
@@ -190,6 +229,7 @@ pub fn parse_type(type_name: &str) -> Option<Type> {
 
             vec_parse(word)
                 .or_else(|| mat_parse(word))
+                .or_else(|| combined_sampler_parse(word))
                 .or_else(|| texture_parse(word))
                 .or_else(|| image_parse(word))
         }
