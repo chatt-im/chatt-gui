@@ -1,5 +1,7 @@
 use std::{
     ffi::{CStr, CString},
+    fs::OpenOptions,
+    os::unix::fs::OpenOptionsExt as _,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -37,6 +39,15 @@ const RENDER_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) enum AttachmentRenderBackend {
     Vulkan(Arc<VulkanVideoDevice>),
     Software,
+}
+
+impl AttachmentRenderBackend {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Vulkan(_) => "vulkan",
+            Self::Software => "software",
+        }
+    }
 }
 
 /// A libmpv client with dedicated control and render threads.
@@ -96,52 +107,111 @@ impl MpvPlayer {
         fixed_render_size: Option<(u32, u32)>,
         preferred_backend: Option<AttachmentRenderBackend>,
     ) -> Result<(Self, AttachmentRenderBackend)> {
+        let preferred_backend_name = match preferred_backend.as_ref() {
+            Some(AttachmentRenderBackend::Vulkan(_)) => "vulkan",
+            Some(AttachmentRenderBackend::Software) => "software",
+            None => "probe",
+        };
+        log::info!(
+            "video player construction started live={live} preferred_backend={preferred_backend_name}"
+        );
         let live_diagnostics = live.then(|| Arc::new(crate::live_stream::LiveDiagnostics::new()));
-        let mpv = Arc::new(Mpv::with_initializer(|initializer| {
-            initializer.set_option("vo", "libmpv")?;
-            initializer.set_option("keep-open", "no")?;
-            initializer.set_option("idle", "yes")?;
-            initializer.set_option("osc", "no")?;
-            initializer.set_option("profile", if live { "low-latency" } else { "fast" })?;
-            initializer.set_option("hwdec", "vulkan,auto-safe")?;
-            initializer.set_option("sws-allow-zimg", "no")?;
-            initializer.set_option("sws-scaler", "bilinear")?;
-            initializer.set_option("sws-fast", "yes")?;
+        // The texture size is intrinsic to the media, not the element displaying
+        // it. GPUI scales this persistent surface when its viewport changes.
+        let video_surface = WgpuVideoSurface::new(|_, _| {})?;
+        let surface = video_surface.platform_surface();
+        let native_candidate = match preferred_backend.as_ref() {
+            Some(AttachmentRenderBackend::Software) => None,
+            Some(AttachmentRenderBackend::Vulkan(native)) => Some(Ok(native.clone())),
+            None => Some(probe_vulkan_device(&video_surface)),
+        };
+        let vaapi_device = native_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.as_ref().ok())
+            .and_then(|native| native.drm_render_node.as_ref())
+            .and_then(|path| path.to_str())
+            .map(str::to_owned);
+        log::info!(
+            "initializing embedded libmpv live={live} hwdec=vulkan,auto-safe vaapi_device={}",
+            vaapi_device.as_deref().unwrap_or("none")
+        );
+        let mpv = Mpv::with_initializer(|initializer| {
+            macro_rules! set_option {
+                ($name:literal, $value:expr) => {
+                    if let Err(error) = initializer.set_option($name, $value) {
+                        log::error!(
+                            "libmpv option rejected name={} value={:?}: {error}",
+                            $name,
+                            $value
+                        );
+                        return Err(error);
+                    }
+                };
+            }
+            set_option!("vo", "libmpv");
+            set_option!("keep-open", "no");
+            set_option!("idle", "yes");
+            // The vendored libmpv has Lua disabled, so it has no `osc`
+            // option. Embedded rendering does not use mpv's OSC anyway.
+            set_option!("profile", if live { "low-latency" } else { "fast" });
+            set_option!("hwdec", "vulkan,auto-safe");
+            if let Some(device) = vaapi_device.as_deref() {
+                set_option!("vaapi-device", device);
+            }
+            set_option!("sws-allow-zimg", "no");
+            set_option!("sws-scaler", "bilinear");
+            set_option!("sws-fast", "yes");
             if live {
-                initializer.set_option("audio", "no")?;
-                initializer.set_option("cache", "no")?;
+                set_option!("audio", "no");
+                set_option!("cache", "no");
                 // Damage-tracked streams can be idle indefinitely. Keep the
                 // blocking callback read off mpv's playback/render core; cache
                 // and readahead stay disabled, so this does not add a playout
                 // buffer.
-                initializer.set_option("demuxer-thread", "yes")?;
-                initializer.set_option("demuxer-readahead-secs", "0")?;
-                initializer.set_option("demuxer-lavf-format", "nut")?;
-                initializer.set_option("demuxer-lavf-probe-info", "nostreams")?;
-                initializer.set_option("demuxer-lavf-analyzeduration", "0")?;
-                initializer.set_option("untimed", "yes")?;
-                initializer.set_option("video-latency-hacks", "yes")?;
-                initializer.set_option("swapchain-depth", "1")?;
-                initializer.set_option("vd-lavc-threads", "1")?;
+                set_option!("demuxer-thread", "yes");
+                set_option!("demuxer-readahead-secs", "0");
+                set_option!("demuxer-lavf-format", "nut");
+                set_option!("demuxer-lavf-probe-info", "nostreams");
+                set_option!("demuxer-lavf-analyzeduration", "0");
+                set_option!("untimed", "yes");
+                set_option!("video-latency-hacks", "yes");
+                set_option!("swapchain-depth", "1");
+                set_option!("vd-lavc-threads", "1");
                 // Screen-share encoders emit frames in display order. Avoid
                 // mpv's two-frame hwdec-copy delay queue: with damage-driven
                 // input those retained frames could remain stale indefinitely.
-                initializer.set_option("vd-lavc-low-latency", "yes")?;
-                initializer.set_option("interpolation", "no")?;
-                initializer.set_option("stream-buffer-size", "4k")?;
+                set_option!("vd-lavc-low-latency", "yes");
+                set_option!("interpolation", "no");
+                set_option!("stream-buffer-size", "4k");
             }
             Ok(())
-        })?);
+        })
+        .map_err(|error| {
+            log::error!("embedded libmpv initialization failed live={live}: {error}");
+            error
+        })?;
+        log::info!("embedded libmpv initialized live={live}");
+        let mpv = Arc::new(mpv);
 
-        mpv.observe_property("time-pos", Format::Double, 1)?;
-        mpv.observe_property("duration", Format::Double, 2)?;
-        mpv.observe_property("pause", Format::Flag, 3)?;
-        mpv.observe_property("eof-reached", Format::Flag, 4)?;
-        mpv.observe_property("idle-active", Format::Flag, 5)?;
-        mpv.observe_property("hwdec-current", Format::String, 6)?;
-        mpv.observe_property("video-codec", Format::String, 7)?;
-        mpv.observe_property("current-vo", Format::String, 8)?;
-        mpv.observe_property("hwdec-interop", Format::String, 9)?;
+        mpv.observe_property("time-pos", Format::Double, 1)
+            .context("observe mpv property time-pos")?;
+        mpv.observe_property("duration", Format::Double, 2)
+            .context("observe mpv property duration")?;
+        mpv.observe_property("pause", Format::Flag, 3)
+            .context("observe mpv property pause")?;
+        mpv.observe_property("eof-reached", Format::Flag, 4)
+            .context("observe mpv property eof-reached")?;
+        mpv.observe_property("idle-active", Format::Flag, 5)
+            .context("observe mpv property idle-active")?;
+        mpv.observe_property("hwdec-current", Format::String, 6)
+            .context("observe mpv property hwdec-current")?;
+        mpv.observe_property("video-codec", Format::String, 7)
+            .context("observe mpv property video-codec")?;
+        mpv.observe_property("current-vo", Format::String, 8)
+            .context("observe mpv property current-vo")?;
+        mpv.observe_property("hwdec-interop", Format::String, 9)
+            .context("observe mpv property hwdec-interop")?;
+        log::info!("libmpv playback properties registered live={live}");
 
         let mpv_log_level = std::env::var("CHATT_MPV_LOG").unwrap_or_else(|_| "warn".into());
         mpv.request_log_messages(&mpv_log_level)
@@ -154,10 +224,6 @@ impl MpvPlayer {
         }
 
         let (render_sender, render_messages) = mpsc::channel();
-        // The texture size is intrinsic to the media, not the element displaying
-        // it. GPUI scales this persistent surface when its viewport changes.
-        let video_surface = WgpuVideoSurface::new(|_, _| {})?;
-        let surface = video_surface.platform_surface();
 
         let (mut backend, selected_backend) = match preferred_backend {
             Some(AttachmentRenderBackend::Software) => {
@@ -180,11 +246,11 @@ impl MpvPlayer {
             }
             preferred => {
                 let cached_decision = preferred.is_some();
-                let native = match preferred {
-                    Some(AttachmentRenderBackend::Vulkan(native)) => Ok(native),
-                    None => probe_vulkan_device(&video_surface),
-                    Some(AttachmentRenderBackend::Software) => unreachable!(),
-                };
+                let native = native_candidate
+                    .expect("non-software render preference must have a Vulkan probe result");
+                log::info!(
+                    "creating libmpv Vulkan render context live={live} cached_decision={cached_decision}"
+                );
                 match native.and_then(|native| {
                     create_vulkan_context(&mpv, &native, live).map(|context| (context, native))
                 }) {
@@ -303,6 +369,11 @@ impl MpvPlayer {
                 return Err(error).context("spawn mpv control thread");
             }
         };
+
+        log::info!(
+            "video player construction completed live={live} backend={}",
+            selected_backend.name()
+        );
 
         Ok((Self {
             control_sender,
@@ -439,10 +510,9 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_EXT_image_drm_format_modifier");
-    let has_vulkan_video = [
+    let has_vulkan_video_core = [
         c"VK_KHR_video_queue",
         c"VK_KHR_video_decode_queue",
-        c"VK_KHR_video_decode_h264",
     ]
     .iter()
     .all(|required| {
@@ -451,8 +521,24 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
             .iter()
             .any(|extension| extension == required)
     });
+    let has_vulkan_video_h264 = native
+        .device_extensions
+        .iter()
+        .any(|extension| *extension == c"VK_KHR_video_decode_h264");
+    let has_vulkan_video_h265 = native
+        .device_extensions
+        .iter()
+        .any(|extension| *extension == c"VK_KHR_video_decode_h265");
+    let has_vulkan_video_av1 = native
+        .device_extensions
+        .iter()
+        .any(|extension| *extension == c"VK_KHR_video_decode_av1");
+    let drm_render_node = native
+        .drm_render_node
+        .as_deref()
+        .map_or_else(|| "none".into(), |path| path.display().to_string());
     log::info!(
-        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} enabled_queue_families={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} vulkan_video_h264={}",
+        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} enabled_queue_families={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} drm_render_node={} vulkan_video_core={} vulkan_video_h264={} vulkan_video_h265={} vulkan_video_av1={}",
         native.queue_family,
         native.queue_index,
         native.enabled_queue_families.len(),
@@ -461,7 +547,11 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         has_external_memory_fd,
         has_dma_buf,
         has_drm_modifiers,
-        has_vulkan_video,
+        drm_render_node,
+        has_vulkan_video_core,
+        has_vulkan_video_h264,
+        has_vulkan_video_h265,
+        has_vulkan_video_av1,
     );
     if cfg!(target_os = "linux")
         && !(has_external_memory_fd && has_dma_buf && has_drm_modifiers)
@@ -500,6 +590,23 @@ fn create_vulkan_context(
             count: *count,
         })
         .collect();
+    let drm_render_fd = native.drm_render_node.as_ref().and_then(|path| {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => Some(file.into()),
+            Err(error) => {
+                log::warn!(
+                    "Could not open matching DRM render node {} for VAAPI interop; continuing without it: {error}",
+                    path.display()
+                );
+                None
+            }
+        }
+    });
     mpv.create_vulkan_render_context(VulkanInitParams {
         instance: native.instance.handle(),
         physical_device: native.physical_device,
@@ -517,6 +624,7 @@ fn create_vulkan_context(
         transfer_queue: queue,
         enabled_queue_families,
         queue_lock: Arc::new(WgpuQueueLock(native.queue_lock.clone())),
+        drm_render_fd,
         latest_frame,
     })
     .context("import GPUI's Vulkan device into libmpv")
@@ -938,11 +1046,17 @@ fn control_worker(
                     // before opening the replacement so a pooled core cannot
                     // mistake the previous file's FileLoaded/EndFile for the
                     // new session.
-                    mpv.command("stop", &[])
+                    let result = mpv.command("stop", &[])
                         .map(|()| while mpv.wait_event(0.0).is_some() {})
                         .and_then(|()| mpv.set_property("pause", paused))
                         .and_then(|()| mpv.set_property("volume", volume))
-                        .and_then(|()| mpv.command("loadfile", &[&path, "replace"]))
+                        .and_then(|()| mpv.command("loadfile", &[&path, "replace"]));
+                    if result.is_ok() {
+                        log::info!(
+                            "mpv accepted loadfile paused={paused} volume={volume:.1} start_position={position:.3}"
+                        );
+                    }
+                    result
                 }
                 ControlCommand::SetPause(paused) => {
                     log::debug!("setting mpv pause={paused}");
@@ -1115,7 +1229,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             false
         }
         Event::StartFile => {
-            log::debug!("mpv started opening media");
+            log::info!("mpv started opening media");
             let was_finished = state.finished;
             state.finished = false;
             was_finished
@@ -1125,7 +1239,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             false
         }
         Event::VideoReconfig => {
-            log::debug!("mpv video output reconfigured");
+            log::info!("mpv video output reconfigured");
             false
         }
         Event::AudioReconfig => {
@@ -1137,7 +1251,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             false
         }
         Event::PlaybackRestart => {
-            log::debug!("mpv playback restarted");
+            log::info!("mpv playback restarted");
             false
         }
         Event::EndFile(reason) => {
@@ -1370,6 +1484,8 @@ impl SharedPlaybackState {
 mod tests {
     use super::*;
 
+    const VAAPI_DISABLED_CHILD: &str = "CHATT_TEST_VAAPI_DISABLED_CHILD";
+
     fn info(flags: u64) -> libmpv2::render::RenderFrameInfo {
         libmpv2::render::RenderFrameInfo {
             flags,
@@ -1383,6 +1499,33 @@ mod tests {
         assert_eq!(checked_video_size(0, 240), None);
         assert_eq!(checked_video_size(320, -1), None);
         assert_eq!(checked_video_size(i64::from(u32::MAX) + 1, 240), None);
+    }
+
+    #[test]
+    fn vaapi_loader_can_be_disabled_without_preventing_startup() {
+        if std::env::var_os(VAAPI_DISABLED_CHILD).is_some() {
+            assert!(!libmpv2::vaapi_runtime_available());
+            println!("VAAPI lazy-loader disable path reached");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mpv_player::tests::vaapi_loader_can_be_disabled_without_preventing_startup",
+                "--nocapture",
+            ])
+            .env(VAAPI_DISABLED_CHILD, "1")
+            .env("CHATT_DISABLE_VAAPI", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("VAAPI lazy-loader disable path reached"),
+            "disabled VAAPI child failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
     }
 
     #[test]

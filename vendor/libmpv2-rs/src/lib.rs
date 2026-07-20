@@ -31,6 +31,8 @@ mod mpv;
 mod tests;
 
 pub use crate::mpv::*;
+#[cfg(feature = "vendored")]
+pub use libmpv2_sys::vaapi_runtime_available;
 
 /// A format mpv can use.
 pub use libmpv2_sys::mpv_format as MpvFormat;

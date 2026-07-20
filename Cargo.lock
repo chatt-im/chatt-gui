@@ -2036,6 +2036,7 @@ dependencies = [
  "gpui_util",
  "itertools 0.14.0",
  "js-sys",
+ "libc",
  "log",
  "parking_lot",
  "pollster 0.4.0",
@@ -2628,6 +2629,7 @@ dependencies = [
 name = "libmpv2-sys"
 version = "4.0.1"
 dependencies = [
+ "cc",
  "pkg-config",
 ]
 

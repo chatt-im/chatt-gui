@@ -6,7 +6,11 @@
 
 #include "config.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "common/common.h"
+#include "mpv/render_gl.h"
 #include "mpv/render_vk.h"
 #include "video/out/gpu/libmpv_gpu.h"
 #include "video/out/gpu/context.h"
@@ -28,6 +32,7 @@ struct priv {
     struct vk_target *targets;
     int num_targets;
     struct vk_target *active;
+    struct mpv_opengl_drm_params_v2 drm_params;
 };
 
 static bool valid_queue(struct mpv_vulkan_queue_family queue)
@@ -62,6 +67,8 @@ static int init(struct libmpv_gpu_context *ctx, mpv_render_param *params)
 
     ctx->priv = talloc_zero(NULL, struct priv);
     struct priv *p = ctx->priv;
+    p->drm_params.fd = -1;
+    p->drm_params.render_fd = -1;
     p->vk.pllog = mppl_log_create(p, ctx->log);
     if (!p->vk.pllog)
         return MPV_ERROR_NOMEM;
@@ -122,6 +129,16 @@ static int init(struct libmpv_gpu_context *ctx, mpv_render_param *params)
     if (!p->ra_ctx->ra)
         return MPV_ERROR_UNSUPPORTED;
     ra_add_native_resource(p->ra_ctx->ra, "mpvk_ctx", &p->vk);
+    if (init_params->drm_render_fd >= 0) {
+        p->drm_params.render_fd =
+            fcntl(init_params->drm_render_fd, F_DUPFD_CLOEXEC, 0);
+        if (p->drm_params.render_fd >= 0) {
+            ra_add_native_resource(p->ra_ctx->ra, "drm_params_v2",
+                                   &p->drm_params);
+        } else {
+            MP_WARN(ctx, "Could not duplicate the DRM render fd; VAAPI interop is unavailable.\n");
+        }
+    }
     ctx->ra_ctx = p->ra_ctx;
     MP_VERBOSE(ctx, "Imported application Vulkan device with %d device extensions.\n",
                init_params->num_device_extensions);
@@ -296,6 +313,10 @@ static void destroy(struct libmpv_gpu_context *ctx)
     }
     if (p->vk.vulkan)
         pl_vulkan_destroy(&p->vk.vulkan);
+    if (p->drm_params.render_fd >= 0) {
+        close(p->drm_params.render_fd);
+        p->drm_params.render_fd = -1;
+    }
 }
 
 const struct libmpv_gpu_context_fns libmpv_gpu_context_vk = {

@@ -441,8 +441,18 @@ impl AttachmentVideoManager {
         if let Err(error) = thread::Builder::new()
             .name("mpv-builder".into())
             .spawn(move || {
+                log::info!(
+                    "asynchronous video player build started cached_backend={}",
+                    preferred_backend.is_some()
+                );
                 let result = MpvPlayer::new_attachment(wakeup.clone(), preferred_backend)
                     .map_err(|error| format!("{error:#}"));
+                match &result {
+                    Ok(_) => log::info!("asynchronous video player build completed"),
+                    Err(error) => {
+                        log::error!("asynchronous video player build failed: {error}")
+                    }
+                }
                 let _ = sender.send(BuildResult(result));
                 let _ = wakeup.try_send(());
             })

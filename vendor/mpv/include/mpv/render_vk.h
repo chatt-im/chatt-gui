@@ -58,6 +58,13 @@ typedef struct mpv_vulkan_init_params {
     mpv_vulkan_lock_queue_fn lock_queue;
     mpv_vulkan_lock_queue_fn unlock_queue;
     void *queue_ctx;
+
+    /**
+     * DRM render-node fd for the imported physical device, or -1 if unknown.
+     * mpv duplicates this fd before mpv_render_context_create() returns. A
+     * missing or unusable fd only disables DRM-backed hardware interop.
+     */
+    int drm_render_fd;
 } mpv_vulkan_init_params;
 
 /**

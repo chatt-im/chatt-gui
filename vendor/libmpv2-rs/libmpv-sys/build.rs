@@ -63,14 +63,20 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         "the vendored libmpv build currently supports native builds only"
     );
 
+    let hardware = build_hardware_loaders(crate_path, out_path);
+    let old_pkg_config_path = env::var_os("PKG_CONFIG_PATH");
+    let mut hardware_pkg_config_path = hardware.pkgconfig.clone().into_os_string();
+    if let Some(old) = old_pkg_config_path.as_ref() {
+        hardware_pkg_config_path.push(OsStr::new(":"));
+        hardware_pkg_config_path.push(old);
+    }
+    env::set_var("PKG_CONFIG_PATH", &hardware_pkg_config_path);
+
     let ffmpeg_lib = build_vendored_ffmpeg(crate_path, out_path);
     let ffmpeg_pc = ffmpeg_lib.join("pkgconfig");
-    let old_pkg_config_path = env::var_os("PKG_CONFIG_PATH");
     let mut pkg_config_path = ffmpeg_pc.into_os_string();
-    if let Some(old) = old_pkg_config_path.as_ref() {
-        pkg_config_path.push(OsStr::new(":"));
-        pkg_config_path.push(old);
-    }
+    pkg_config_path.push(OsStr::new(":"));
+    pkg_config_path.push(&hardware_pkg_config_path);
     env::set_var("PKG_CONFIG_PATH", &pkg_config_path);
 
     let source = crate_path
@@ -99,6 +105,10 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         .arg("-Dgl=disabled")
         .arg("-Dlua=disabled")
         .arg("-Dvulkan=enabled")
+        .arg("-Dcuda-hwaccel=enabled")
+        .arg("-Dcuda-interop=enabled")
+        .arg("-Dvaapi=enabled")
+        .arg("-Dvaapi-drm=enabled")
         // Keep one broadly supported Linux audio path for attachment playback.
         // Desktop sound servers expose ALSA devices without adding their full
         // client and codec stacks to this binary's ELF dependencies.
@@ -124,6 +134,8 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     let mut pkg_config_path = pc_dir.into_os_string();
     pkg_config_path.push(OsStr::new(":"));
     pkg_config_path.push(ffmpeg_lib.join("pkgconfig"));
+    pkg_config_path.push(OsStr::new(":"));
+    pkg_config_path.push(&hardware.pkgconfig);
     if let Some(old) = old_pkg_config_path {
         pkg_config_path.push(OsStr::new(":"));
         pkg_config_path.push(old);
@@ -138,6 +150,10 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
 
     println!("cargo:rustc-link-search=native={}", build.display());
     println!("cargo:rustc-link-search=native={}", ffmpeg_lib.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        hardware.library.display()
+    );
     println!("cargo:rustc-link-lib=static=mpv");
     for path in dependencies.link_paths {
         if path.is_dir() {
@@ -145,7 +161,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         }
     }
     for library in dependencies.libs {
-        if library != "mpv" {
+        if library != "mpv" && library != "chatt_vaapi_loader" {
             if matches!(
                 library.as_str(),
                 "avcodec" | "avfilter" | "avformat" | "avutil" | "swresample" | "swscale"
@@ -162,6 +178,96 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     for framework in dependencies.frameworks {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
+    println!("cargo:rustc-link-lib=static=chatt_vaapi_loader");
+    println!("cargo:rustc-link-lib=dylib=dl");
+}
+
+#[cfg(feature = "vendored")]
+struct HardwareBuild {
+    library: PathBuf,
+    pkgconfig: PathBuf,
+}
+
+#[cfg(feature = "vendored")]
+fn build_hardware_loaders(crate_path: &Path, out_path: &Path) -> HardwareBuild {
+    let vendor = crate_path
+        .join("../../hw-headers")
+        .canonicalize()
+        .expect("vendored hardware headers are missing");
+    let va_include = vendor.join("libva/include");
+    let nv_include = vendor.join("nv-codec/include");
+    let loader = crate_path.join("loader");
+    let library = out_path.join("hardware-loader");
+    let pkgconfig = library.join("pkgconfig");
+    fs::create_dir_all(&pkgconfig).expect("could not create hardware pkg-config directory");
+    emit_rerun_tree(&vendor);
+    emit_rerun_tree(&loader);
+
+    cc::Build::new()
+        .cargo_metadata(false)
+        .file(loader.join("vaapi_loader.c"))
+        .include(&va_include)
+        .include(&loader)
+        .out_dir(&library)
+        .flag_if_supported("-std=c11")
+        .compile("chatt_vaapi_loader");
+
+    write_pkg_config(
+        &pkgconfig.join("libva.pc"),
+        "libva",
+        "1.24.0",
+        &va_include,
+        &format!(
+            "-I{} -I{} -DCHATT_VAAPI_LAZY_LOADER=1",
+            va_include.display(),
+            loader.display()
+        ),
+        &format!("-L{} -lchatt_vaapi_loader -ldl", library.display()),
+        None,
+    );
+    write_pkg_config(
+        &pkgconfig.join("libva-drm.pc"),
+        "libva-drm",
+        "1.24.0",
+        &va_include,
+        &format!("-I{}", va_include.display()),
+        "",
+        Some("libva"),
+    );
+    write_pkg_config(
+        &pkgconfig.join("ffnvcodec.pc"),
+        "ffnvcodec",
+        "12.2.72.0",
+        &nv_include,
+        &format!("-I{}", nv_include.display()),
+        "",
+        None,
+    );
+
+    HardwareBuild { library, pkgconfig }
+}
+
+#[cfg(feature = "vendored")]
+fn write_pkg_config(
+    path: &Path,
+    name: &str,
+    version: &str,
+    includedir: &Path,
+    cflags: &str,
+    libs: &str,
+    requires: Option<&str>,
+) {
+    let requires = requires
+        .map(|value| format!("Requires: {value}\n"))
+        .unwrap_or_default();
+    fs::write(
+        path,
+        format!(
+            "prefix=/\nincludedir={}\nName: {name}\nDescription: chatt-gui build-only {name}\nVersion: {version}\n{requires}Cflags: {cflags}\nLibs: {libs}\n",
+            includedir.display()
+        ),
+    )
+    .unwrap_or_else(|error| panic!("could not write {}: {error}", path.display()));
 }
 
 #[cfg(feature = "vendored")]
@@ -193,7 +299,13 @@ fn build_vendored_ffmpeg(crate_path: &Path, out_path: &Path) -> PathBuf {
         .arg("--enable-avformat")
         .arg("--enable-swresample")
         .arg("--enable-swscale")
+        .arg("--enable-vulkan")
+        .arg("--enable-ffnvcodec")
+        .arg("--enable-cuda")
+        .arg("--enable-nvdec")
+        .arg("--enable-vaapi")
         .arg("--enable-decoder=aac,aac_fixed,aac_latm,ac3,alac,ass,av1,dca,eac3,ffv1,flac,gif,h264,hevc,mjpeg,mp3,mp3float,opus,pcm_alaw,pcm_f32le,pcm_f64le,pcm_mulaw,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32be,pcm_s32le,pcm_u8,png,ssa,subrip,vorbis,vp8,vp9,webp,webvtt")
+        .arg("--enable-hwaccel=av1_nvdec,av1_vaapi,av1_vulkan,h264_nvdec,h264_vaapi,h264_vulkan,hevc_nvdec,hevc_vaapi,hevc_vulkan,mjpeg_nvdec,mjpeg_vaapi,vp8_nvdec,vp8_vaapi,vp9_nvdec,vp9_vaapi,vp9_vulkan")
         .arg("--enable-demuxer=aac,ac3,aiff,ape,asf,avi,eac3,flac,flv,h264,hevc,image2,matroska,mov,mp3,mpegps,mpegts,mpegvideo,nut,ogg,rm,wav")
         .arg("--enable-parser=aac,aac_latm,ac3,av1,dca,flac,h264,hevc,mpegaudio,opus,vorbis,vp8,vp9")
         .arg("--enable-bsf=aac_adtstoasc,av1_frame_merge,extract_extradata,h264_mp4toannexb,hevc_mp4toannexb,null,opus_metadata,vp9_superframe")

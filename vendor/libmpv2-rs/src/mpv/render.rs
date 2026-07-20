@@ -2,6 +2,7 @@ use crate::{Error, Mpv, Result, mpv::mpv_err};
 use ash::vk;
 use std::{
     ffi::{CStr, CString, c_char, c_void},
+    os::fd::{AsRawFd as _, OwnedFd},
     ptr::{self, NonNull},
     sync::Arc,
 };
@@ -97,6 +98,9 @@ pub struct VulkanInitParams {
     pub transfer_queue: VulkanQueueFamily,
     pub enabled_queue_families: Vec<VulkanQueueFamily>,
     pub queue_lock: Arc<dyn VulkanQueueLock>,
+    /// Matching DRM render node. libmpv duplicates the fd during context
+    /// creation, so this handle may be dropped when the call returns.
+    pub drm_render_fd: Option<OwnedFd>,
     /// Let decoding run ahead of rendering while retaining only the newest
     /// unconsumed frame. Intended for untimed, damage-driven live video.
     pub latest_frame: bool,
@@ -167,6 +171,7 @@ struct RawVulkanInitParams {
     lock_queue: Option<RawQueueCallback>,
     unlock_queue: Option<RawQueueCallback>,
     queue_ctx: *mut c_void,
+    drm_render_fd: i32,
 }
 
 #[repr(C)]
@@ -280,6 +285,10 @@ impl Mpv {
             lock_queue: Some(lock_queue),
             unlock_queue: Some(unlock_queue),
             queue_ctx: (&mut *queue_callback as *mut QueueCallbackContext).cast(),
+            drm_render_fd: params
+                .drm_render_fd
+                .as_ref()
+                .map_or(-1, |fd| fd.as_raw_fd()),
         };
         let mut advanced = 1_i32;
         let mut latest_frame = i32::from(params.latest_frame);

@@ -269,6 +269,10 @@ impl super::Instance {
             not(target_vendor = "apple"),
             not(target_family = "wasm")
         )) {
+            // Exposes the DRM major/minor numbers for the selected physical
+            // device. Embedded video clients use this to open the matching
+            // render node without linking libdrm.
+            extensions.push(ext::physical_device_drm::NAME);
             // VK_EXT_acquire_drm_display -> VK_EXT_direct_mode_display -> VK_KHR_display
             extensions.push(ext::acquire_drm_display::NAME);
             extensions.push(ext::direct_mode_display::NAME);

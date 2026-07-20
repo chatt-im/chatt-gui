@@ -1469,7 +1469,7 @@ endif
 libva = dependency('libva', version: '>= 1.1.0', required: get_option('vaapi'))
 
 vaapi_drm = dependency('libva-drm', version: '>= 1.1.0', required:
-    get_option('vaapi-drm').require(libva.found() and features['drm']))
+    get_option('vaapi-drm').require(libva.found()))
 features += {'vaapi-drm': vaapi_drm.found()}
 if features['vaapi-drm']
     dependencies += vaapi_drm
