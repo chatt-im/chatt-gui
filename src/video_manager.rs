@@ -13,7 +13,7 @@ use rpc::{
     ids::RoomId,
 };
 
-use crate::mpv_player::{AttachmentRenderBackend, MpvPlayer};
+use crate::mpv_player::{AttachmentRenderBackend, MpvPlayer, SeekMode};
 
 const WARM_PLAYER_TARGET: usize = 2;
 const RETAINED_OFFSCREEN_LIMIT: usize = 4;
@@ -218,8 +218,55 @@ impl AttachmentVideoManager {
         };
         let position = (session.position + seconds).clamp(0.0, session.duration.max(0.0));
         session.position = position;
+        session.finished = false;
         if let Some(player) = session.player.as_ref() {
             player.seek_absolute(position)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scrub(
+        &mut self,
+        key: VideoKey,
+        fraction: f64,
+        duration_hint: f64,
+        mode: SeekMode,
+    ) -> Result<()> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        let already_queued = self.queued_keys.contains(&key);
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return Ok(());
+        };
+        let duration = if session.duration > 0.0 {
+            session.duration
+        } else {
+            duration_hint.max(0.0)
+        };
+        if duration <= 0.0 {
+            return Ok(());
+        }
+
+        let fraction = fraction.clamp(0.0, 1.0);
+        let position = duration * fraction;
+        session.position = position;
+        session.finished = false;
+        session.error = None;
+        if let Some(player) = session.player.as_ref() {
+            player.seek_percent(fraction * 100.0, position, mode)?;
+            return Ok(());
+        }
+
+        if !already_queued {
+            session.paused = true;
+            if self.queued_keys.insert(key) {
+                self.queued.push_back(key);
+            }
+        }
+        let mut drain = VideoDrain::default();
+        self.pump_builds(&mut drain);
+        if let Some(error) = drain.errors.pop() {
+            return Err(anyhow!(error));
         }
         Ok(())
     }
@@ -677,5 +724,39 @@ mod tests {
 
         assert_eq!(videos.sessions.len(), MAX_SESSION_ENTRIES);
         assert!(videos.sessions.contains_key(&key(MAX_SESSION_ENTRIES as u64 + 19)));
+    }
+
+    #[test]
+    fn scrubbing_unstarted_video_queues_paused_player_at_target() {
+        let (wakeup, _) = async_channel::bounded(1);
+        let mut videos = AttachmentVideoManager::new(wakeup);
+        let key = key(3);
+        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        videos.build_in_flight = true;
+        videos.sessions.get_mut(&key).unwrap().finished = true;
+
+        videos.scrub(key, 0.25, 120.0, SeekMode::Exact).unwrap();
+
+        let session = &videos.sessions[&key];
+        assert_eq!(session.position, 30.0);
+        assert!(session.paused);
+        assert!(!session.finished);
+        assert!(videos.queued_keys.contains(&key));
+        assert_eq!(videos.queued.front(), Some(&key));
+    }
+
+    #[test]
+    fn scrub_clamps_thumbnail_duration_target_to_timeline_edges() {
+        let (wakeup, _) = async_channel::bounded(1);
+        let mut videos = AttachmentVideoManager::new(wakeup);
+        let key = key(4);
+        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        videos.build_in_flight = true;
+
+        videos.scrub(key, 1.5, 80.0, SeekMode::Keyframes).unwrap();
+        assert_eq!(videos.sessions[&key].position, 80.0);
+
+        videos.scrub(key, -0.5, 80.0, SeekMode::Keyframes).unwrap();
+        assert_eq!(videos.sessions[&key].position, 0.0);
     }
 }

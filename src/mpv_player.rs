@@ -433,7 +433,28 @@ impl MpvPlayer {
     }
 
     pub(crate) fn seek_absolute(&self, seconds: f64) -> Result<()> {
-        self.send_control(ControlCommand::SeekAbsolute(seconds.max(0.0)))
+        let seconds = seconds.max(0.0);
+        self.playback.seek_to(seconds);
+        self.send_control(ControlCommand::SeekAbsolute {
+            seconds,
+            mode: SeekMode::Exact,
+        })
+    }
+
+    pub(crate) fn seek_percent(
+        &self,
+        percent: f64,
+        position: f64,
+        mode: SeekMode,
+    ) -> Result<()> {
+        let percent = percent.clamp(0.0, 100.0);
+        let position = position.max(0.0);
+        self.playback.seek_to(position);
+        self.send_control(ControlCommand::SeekPercent {
+            percent,
+            position,
+            mode,
+        })
     }
 
     pub fn set_volume(&self, volume: f64) -> Result<()> {
@@ -630,6 +651,30 @@ fn create_vulkan_context(
     .context("import GPUI's Vulkan device into libmpv")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeekMode {
+    Exact,
+    Keyframes,
+}
+
+impl SeekMode {
+    fn absolute_flag(self) -> &'static str {
+        match self {
+            Self::Exact => "absolute+exact",
+            Self::Keyframes => "absolute+keyframes",
+        }
+    }
+
+    fn absolute_percent_flag(self) -> &'static str {
+        match self {
+            Self::Exact => "absolute-percent+exact",
+            // MPV's OSC leaves drag precision at the player's default so its
+            // keyframe/exact heuristics remain available.
+            Self::Keyframes => "absolute-percent",
+        }
+    }
+}
+
 pub(crate) enum ControlCommand {
     Load {
         path: String,
@@ -638,7 +683,15 @@ pub(crate) enum ControlCommand {
         position: f64,
     },
     SetPause(bool),
-    SeekAbsolute(f64),
+    SeekAbsolute {
+        seconds: f64,
+        mode: SeekMode,
+    },
+    SeekPercent {
+        percent: f64,
+        position: f64,
+        mode: SeekMode,
+    },
     SetVolume(f64),
     Stop,
     DropBuffers,
@@ -1062,9 +1115,28 @@ fn control_worker(
                     log::debug!("setting mpv pause={paused}");
                     mpv.set_property("pause", paused)
                 }
-                ControlCommand::SeekAbsolute(seconds) => {
-                    log::debug!("seeking mpv absolute_seconds={seconds}");
-                    mpv.command("seek", &[&seconds.to_string(), "absolute+exact"])
+                ControlCommand::SeekAbsolute { seconds, mode } => {
+                    log::debug!("seeking mpv absolute_seconds={seconds} mode={mode:?}");
+                    state.position = seconds;
+                    state.finished = false;
+                    playback.publish(state);
+                    mpv.command("seek", &[&seconds.to_string(), mode.absolute_flag()])
+                }
+                ControlCommand::SeekPercent {
+                    percent,
+                    position,
+                    mode,
+                } => {
+                    log::debug!(
+                        "seeking mpv absolute_percent={percent} expected_seconds={position} mode={mode:?}"
+                    );
+                    state.position = position;
+                    state.finished = false;
+                    playback.publish(state);
+                    mpv.command(
+                        "seek",
+                        &[&percent.to_string(), mode.absolute_percent_flag()],
+                    )
                 }
                 ControlCommand::SetVolume(volume) => {
                     log::debug!("setting mpv volume={volume}");
@@ -1187,8 +1259,9 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
                 true
             }
             ("eof-reached", PropertyData::Flag(value)) => {
-                state.finished |= value;
-                value
+                let changed = state.finished != value;
+                state.finished = value;
+                changed
             }
             ("idle-active", PropertyData::Flag(value)) => {
                 let finished = value && state.duration > 0.0;
@@ -1251,7 +1324,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             false
         }
         Event::PlaybackRestart => {
-            log::info!("mpv playback restarted");
+            log::debug!("mpv playback resumed after load, seek, or discontinuity");
             false
         }
         Event::EndFile(reason) => {
@@ -1474,6 +1547,11 @@ impl SharedPlaybackState {
         }
     }
 
+    fn seek_to(&self, position: f64) {
+        self.position.store(position.to_bits(), Ordering::Relaxed);
+        self.finished.store(false, Ordering::Release);
+    }
+
     fn reset(&self) {
         self.publish(PlaybackState::default());
         self.frame_ready.store(false, Ordering::Release);
@@ -1584,6 +1662,47 @@ mod tests {
     }
 
     #[test]
+    fn libmpv_absolute_percent_seek_reaches_requested_attachment_position() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/libmpv2-rs/test-data/jellyfish.mp4");
+        let mpv = Mpv::with_initializer(|initializer| {
+            initializer.set_option("vo", "null")?;
+            initializer.set_option("audio", "no")?;
+            initializer.set_option("pause", "yes")?;
+            Ok(())
+        })
+        .unwrap();
+        mpv.command("loadfile", &[&path.to_string_lossy(), "replace"])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let duration = loop {
+            assert!(Instant::now() < deadline, "timed out opening seek fixture");
+            match mpv.wait_event(0.1) {
+                Some(Ok(Event::FileLoaded)) => {
+                    break mpv.get_property::<f64>("duration").unwrap();
+                }
+                Some(Err(error)) => panic!("libmpv event failed: {error}"),
+                _ => {}
+            }
+        };
+
+        mpv.command("seek", &["50", "absolute-percent+exact"])
+            .unwrap();
+        let target = duration * 0.5;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(Instant::now() < deadline, "timed out seeking attachment");
+            let _ = mpv.wait_event(0.05);
+            let position = mpv.get_property::<f64>("time-pos").unwrap_or_default();
+            if position >= target - 0.25 {
+                assert!(position <= target + 0.25, "seek landed at {position}");
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn ignores_callback_without_frame_update() {
         assert_eq!(render_action(0, None, true), RenderAction::None);
     }
@@ -1621,6 +1740,15 @@ mod tests {
                 true,
             ),
             RenderAction::Render
+        );
+    }
+
+    #[test]
+    fn attachment_scrub_seek_modes_match_native_mpv_flags() {
+        assert_eq!(SeekMode::Exact.absolute_percent_flag(), "absolute-percent+exact");
+        assert_eq!(
+            SeekMode::Keyframes.absolute_percent_flag(),
+            "absolute-percent"
         );
     }
 

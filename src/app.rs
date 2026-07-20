@@ -37,7 +37,7 @@ use crate::{
     image_cache::TimelineImageLoader,
     media_cache::MediaCache,
     model::{ChatModel, ConnectionPhase, PendingRequest},
-    mpv_player::MpvPlayer,
+    mpv_player::{MpvPlayer, SeekMode},
     scroll_capture::capture_scroll,
     timeline::{self, Attachment},
     video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
@@ -79,6 +79,20 @@ struct LivePlayerView {
     last_mouse_position: Option<Point<Pixels>>,
     coded_size: (u32, u32),
     viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoScrub {
+    key: VideoKey,
+    bounds: Bounds<Pixels>,
+    duration: f64,
+    last_fraction: f64,
+}
+
+impl VideoScrub {
+    fn position(self) -> f64 {
+        self.duration * self.last_fraction
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +367,7 @@ pub struct ChattView {
     timeline_selection: MarkdownSelectionGroup,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
+    video_scrub: Option<VideoScrub>,
     video_wakeup: async_channel::Sender<()>,
     live_players: HashMap<StreamId, LivePlayerView>,
     fullscreen_share: Option<StreamId>,
@@ -440,6 +455,7 @@ impl ChattView {
             timeline_selection,
             videos,
             video_thumbnails,
+            video_scrub: None,
             video_wakeup,
             live_players: HashMap::new(),
             fullscreen_share: None,
@@ -1756,8 +1772,12 @@ impl ChattView {
             } else {
                 thumbnail.duration.unwrap_or(0.0)
             };
+            let display_position = self
+                .video_scrub
+                .filter(|scrub| scrub.key == key)
+                .map_or(video.position, VideoScrub::position);
             let progress = if duration > 0.0 {
-                (video.position / duration).clamp(0.0, 1.0) as f32
+                (display_position / duration).clamp(0.0, 1.0) as f32
             } else {
                 0.0
             };
@@ -1781,6 +1801,8 @@ impl ChattView {
             let thumbnail_image = thumbnail.image;
             let video_surface = video.surface;
             let show_play_overlay = !has_surface && !video.loading;
+            let scrub_bounds = Rc::new(Cell::new(None));
+            let measured_scrub_bounds = scrub_bounds.clone();
             return div()
                 .id(("video", message_id as usize))
                 .mt_2()
@@ -1887,10 +1909,46 @@ impl ChattView {
                         )
                         .child(
                             div()
+                                .id(("video-timeline", message_id as usize))
+                                .relative()
                                 .flex_1()
-                                .h(px(4.))
-                                .bg(rgb(0x30343b))
-                                .child(div().h_full().w(relative(progress)).bg(rgb(0x748bbd))),
+                                .h(px(16.))
+                                .flex()
+                                .items_center()
+                                .when(duration > 0.0, |timeline| {
+                                    timeline.cursor_pointer().on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            if let Some(bounds) = scrub_bounds.get() {
+                                                this.begin_video_scrub(
+                                                    key, duration, bounds, event, cx,
+                                                );
+                                            }
+                                        }),
+                                    )
+                                })
+                                .child(
+                                    canvas(
+                                        move |bounds, _, _| {
+                                            measured_scrub_bounds.set(Some(bounds));
+                                        },
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .size_full(),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(4.))
+                                        .bg(rgb(0x30343b))
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(relative(progress))
+                                                .bg(rgb(0x748bbd)),
+                                        ),
+                                ),
                         )
                         .child(
                             div()
@@ -1900,7 +1958,7 @@ impl ChattView {
                                 .text_color(rgb(0x989ea8))
                                 .child(format!(
                                     "{} / {}",
-                                    format_time(video.position),
+                                    format_time(display_position),
                                     format_time(duration)
                                 )),
                         )
@@ -2123,6 +2181,77 @@ impl ChattView {
 
     fn seek_video(&mut self, key: VideoKey, seconds: f64, cx: &mut Context<Self>) {
         if let Err(error) = self.videos.seek(key, seconds) {
+            self.status = format!("Seek failed: {error}").into();
+        }
+        cx.notify();
+    }
+
+    fn begin_video_scrub(
+        &mut self,
+        key: VideoKey,
+        duration: f64,
+        bounds: Bounds<Pixels>,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fraction) = video_scrub_fraction(bounds, event.position.x, duration) else {
+            return;
+        };
+        self.video_scrub = Some(VideoScrub {
+            key,
+            bounds,
+            duration,
+            last_fraction: fraction,
+        });
+        if let Err(error) = self.videos.scrub(key, fraction, duration, SeekMode::Exact) {
+            self.status = format!("Seek failed: {error}").into();
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn drag_video_scrub(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mut scrub) = self.video_scrub else {
+            return false;
+        };
+        if !event.dragging() {
+            self.finish_video_scrub(cx);
+            return true;
+        }
+        let Some(fraction) = video_scrub_fraction(scrub.bounds, event.position.x, scrub.duration)
+        else {
+            self.finish_video_scrub(cx);
+            return true;
+        };
+        if fraction != scrub.last_fraction {
+            scrub.last_fraction = fraction;
+            self.video_scrub = Some(scrub);
+            if let Err(error) =
+                self.videos
+                    .scrub(scrub.key, fraction, scrub.duration, SeekMode::Keyframes)
+            {
+                self.status = format!("Seek failed: {error}").into();
+            }
+            cx.notify();
+        }
+        cx.stop_propagation();
+        true
+    }
+
+    fn finish_video_scrub(&mut self, cx: &mut Context<Self>) {
+        let Some(scrub) = self.video_scrub.take() else {
+            return;
+        };
+        if let Err(error) = self.videos.scrub(
+            scrub.key,
+            scrub.last_fraction,
+            scrub.duration,
+            SeekMode::Exact,
+        ) {
             self.status = format!("Seek failed: {error}").into();
         }
         cx.notify();
@@ -2747,12 +2876,15 @@ impl Render for ChattView {
             }))
             .on_mouse_move(cx.listener(
                 |this, event: &MouseMoveEvent, window, cx| {
-                    this.drag_live_pane(event, window, cx)
+                    if !this.drag_video_scrub(event, cx) {
+                        this.drag_live_pane(event, window, cx)
+                    }
                 },
             ))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_video_scrub(cx);
                     this.finish_live_pane_resize(cx)
                 }),
             )
@@ -3141,6 +3273,20 @@ fn format_time(seconds: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
+fn video_scrub_fraction(
+    bounds: Bounds<Pixels>,
+    pointer_x: Pixels,
+    duration: f64,
+) -> Option<f64> {
+    let width = bounds.size.width.as_f32();
+    if duration <= 0.0 || width <= 0.0 {
+        return None;
+    }
+    Some(
+        ((pointer_x - bounds.origin.x).as_f32() / width).clamp(0.0, 1.0) as f64,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3293,6 +3439,35 @@ mod tests {
         assert_eq!(geometry.scale, 0.625);
         assert_eq!(geometry.bounds.size, gpui::size(px(1000.0), px(562.5)));
         assert_eq!(geometry.bounds.origin, point(px(100.0), px(268.75)));
+    }
+
+    #[test]
+    fn video_scrub_fraction_maps_and_clamps_timeline_coordinates() {
+        let bounds = Bounds {
+            origin: point(px(100.0), px(20.0)),
+            size: gpui::size(px(400.0), px(16.0)),
+        };
+
+        assert_eq!(video_scrub_fraction(bounds, px(100.0), 60.0), Some(0.0));
+        assert_eq!(video_scrub_fraction(bounds, px(300.0), 60.0), Some(0.5));
+        assert_eq!(video_scrub_fraction(bounds, px(500.0), 60.0), Some(1.0));
+        assert_eq!(video_scrub_fraction(bounds, px(20.0), 60.0), Some(0.0));
+        assert_eq!(video_scrub_fraction(bounds, px(900.0), 60.0), Some(1.0));
+    }
+
+    #[test]
+    fn video_scrub_fraction_rejects_unavailable_timeline() {
+        let zero_width = Bounds {
+            origin: point(px(100.0), px(20.0)),
+            size: gpui::size(px(0.0), px(16.0)),
+        };
+        let valid = Bounds {
+            origin: point(px(100.0), px(20.0)),
+            size: gpui::size(px(400.0), px(16.0)),
+        };
+
+        assert_eq!(video_scrub_fraction(zero_width, px(100.0), 60.0), None);
+        assert_eq!(video_scrub_fraction(valid, px(100.0), 0.0), None);
     }
 
     #[test]
