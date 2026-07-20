@@ -343,15 +343,29 @@ fn create_vulkan_context(
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_EXT_image_drm_format_modifier");
+    let has_vulkan_video = [
+        c"VK_KHR_video_queue",
+        c"VK_KHR_video_decode_queue",
+        c"VK_KHR_video_decode_h264",
+    ]
+    .iter()
+    .all(|required| {
+        native
+            .device_extensions
+            .iter()
+            .any(|extension| extension == required)
+    });
     log::info!(
-        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={}",
+        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} enabled_queue_families={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} vulkan_video_h264={}",
         native.queue_family,
         native.queue_index,
+        native.enabled_queue_families.len(),
         native.instance_extensions.len(),
         native.device_extensions.len(),
         has_external_memory_fd,
         has_dma_buf,
         has_drm_modifiers,
+        has_vulkan_video,
     );
     if cfg!(target_os = "linux")
         && !(has_external_memory_fd && has_dma_buf && has_drm_modifiers)
@@ -374,6 +388,14 @@ fn create_vulkan_context(
         index: native.queue_family,
         count: 1,
     };
+    let enabled_queue_families = native
+        .enabled_queue_families
+        .iter()
+        .map(|(index, count)| VulkanQueueFamily {
+            index: *index,
+            count: *count,
+        })
+        .collect();
     mpv.create_vulkan_render_context(VulkanInitParams {
         instance: native.instance.handle(),
         physical_device: native.physical_device,
@@ -389,7 +411,7 @@ fn create_vulkan_context(
         graphics_queue: queue,
         compute_queue: queue,
         transfer_queue: queue,
-        enabled_queue_families: vec![queue],
+        enabled_queue_families,
         queue_lock: Arc::new(WgpuQueueLock(native.queue_lock)),
         latest_frame,
     })

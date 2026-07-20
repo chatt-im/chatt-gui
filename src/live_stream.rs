@@ -49,12 +49,15 @@ pub(crate) struct LiveDiagnostics {
 
 #[derive(Default)]
 struct LiveDiagnosticState {
-    inputs: VecDeque<(u64, u64)>,
+    inputs: VecDeque<(u64, u64, Instant)>,
     latest_input: Option<(u64, u64)>,
-    latest_render: Option<(u64, u64)>,
+    latest_render: Option<(u64, u64, u64)>,
     rendered_outputs: u64,
     input_queue_depth: usize,
     last_report: Option<Instant>,
+    latency_window_us: Vec<u64>,
+    total_latency_us: u128,
+    max_latency_us: u64,
 }
 
 impl LiveDiagnostics {
@@ -64,15 +67,20 @@ impl LiveDiagnostics {
         }
     }
 
-    fn record_input(&self, sequence: u64, pts_ms: u64, input_queue_depth: usize) {
+    fn record_input(
+        &self,
+        sequence: u64,
+        pts_ms: u64,
+        received_at: Instant,
+        input_queue_depth: usize,
+    ) {
         let mut state = self.state.lock().unwrap();
-        state.inputs.push_back((sequence, pts_ms));
+        state.inputs.push_back((sequence, pts_ms, received_at));
         if state.inputs.len() > LIVE_DIAGNOSTIC_HISTORY {
             state.inputs.pop_front();
         }
         state.latest_input = Some((sequence, pts_ms));
         state.input_queue_depth = input_queue_depth;
-        Self::maybe_report(&mut state, false);
     }
 
     pub(crate) fn record_render(&self, pts_seconds: f64) {
@@ -80,21 +88,29 @@ impl LiveDiagnostics {
             return;
         }
         let pts_ms = (pts_seconds * 1_000.0).round() as u64;
+        let rendered_at = Instant::now();
         let mut state = self.state.lock().unwrap();
-        let sequence = state
+        let (sequence, received_at) = state
             .inputs
             .iter()
-            .min_by_key(|(_, input_pts)| input_pts.abs_diff(pts_ms))
-            .map(|(sequence, _)| *sequence)
-            .unwrap_or(0);
-        state.latest_render = Some((sequence, pts_ms));
+            .min_by_key(|(_, input_pts, _)| input_pts.abs_diff(pts_ms))
+            .map(|(sequence, _, received_at)| (*sequence, *received_at))
+            .unwrap_or((0, rendered_at));
+        let latency_us = rendered_at
+            .duration_since(received_at)
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        state.latest_render = Some((sequence, pts_ms, latency_us));
         state.rendered_outputs += 1;
+        state.latency_window_us.push(latency_us);
+        state.total_latency_us += u128::from(latency_us);
+        state.max_latency_us = state.max_latency_us.max(latency_us);
         let first_render = state.rendered_outputs == 1;
         Self::maybe_report(&mut state, first_render);
     }
 
     fn maybe_report(state: &mut LiveDiagnosticState, force: bool) {
-        let (Some((input_sequence, input_pts)), Some((render_sequence, render_pts))) =
+        let (Some((input_sequence, input_pts)), Some((render_sequence, render_pts, latency_us))) =
             (state.latest_input, state.latest_render)
         else {
             return;
@@ -108,24 +124,59 @@ impl LiveDiagnostics {
             return;
         }
         state.last_report = Some(now);
+        state.latency_window_us.sort_unstable();
+        let latency_p50_us = percentile(&state.latency_window_us, 50);
+        let latency_p95_us = percentile(&state.latency_window_us, 95);
+        let latency_max_us = state.latency_window_us.last().copied().unwrap_or(0);
         log::info!(
-            "live latency input_frame={} input_pts_ms={} rendered_input_frame={} rendered_pts_ms={} lag_frames={} lag_ms={} render_outputs={} input_queue={}",
+            "live latency input_frame={} input_pts_ms={} rendered_input_frame={} rendered_pts_ms={} pending_frames={} pending_pts_delta_ms={} receive_to_render_ms={:.3} receive_to_render_p50_ms={:.3} receive_to_render_p95_ms={:.3} receive_to_render_max_ms={:.3} render_outputs={} input_queue={}",
             input_sequence,
             input_pts,
             render_sequence,
             render_pts,
             input_sequence.saturating_sub(render_sequence),
             input_pts.saturating_sub(render_pts),
+            latency_us as f64 / 1_000.0,
+            latency_p50_us as f64 / 1_000.0,
+            latency_p95_us as f64 / 1_000.0,
+            latency_max_us as f64 / 1_000.0,
             state.rendered_outputs,
             state.input_queue_depth,
+        );
+        state.latency_window_us.clear();
+    }
+}
+
+impl Drop for LiveDiagnostics {
+    fn drop(&mut self) {
+        let state = self.state.lock().unwrap();
+        let average_ms = if state.rendered_outputs == 0 {
+            0.0
+        } else {
+            state.total_latency_us as f64 / state.rendered_outputs as f64 / 1_000.0
+        };
+        log::info!(
+            "live latency summary input_frames={} render_outputs={} receive_to_render_avg_ms={average_ms:.3} receive_to_render_max_ms={:.3}",
+            state.latest_input.map_or(0, |(sequence, _)| sequence),
+            state.rendered_outputs,
+            state.max_latency_us as f64 / 1_000.0,
         );
     }
 }
 
+fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = (sorted.len() - 1) * percentile / 100;
+    sorted[index]
+}
+
 /// A self-contained capture of the decrypted video RPC boundary. The header
-/// retains the decoder description and dimensions; every following record is
-/// an untouched video RPC frame, including its source timestamp and key flag.
-/// This deliberately records before the NUT bridge so playback experiments can
+/// retains the decoder description, dimensions, and wall-clock start. Every
+/// following record contains a monotonic receive offset followed by an
+/// untouched video RPC frame, including its source timestamp and key flag. This
+/// deliberately records before the NUT bridge so playback experiments can
 /// distinguish transport, demuxer, decoder, and renderer behavior.
 struct LiveRecordingWriter {
     path: PathBuf,
@@ -442,7 +493,7 @@ fn read_frames(
             nut_frame(pts, is_key, initial_syncpoint, &annex_b),
             is_key,
         );
-        diagnostics.record_input(received_frames, pts, queue.pending_len());
+        diagnostics.record_input(received_frames, pts, received_at, queue.pending_len());
         if initial_syncpoint {
             wrote_initial_syncpoint = true;
         }
@@ -912,6 +963,113 @@ mod tests {
         assert_eq!(
             i64::from_le_bytes(recording.frames[1].wire[4..12].try_into().unwrap()),
             9_100
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CHATT_LIVE_REPLAY=/path/to/chatt-live.rpc"]
+    fn replays_external_live_rpc_recording_through_libmpv() {
+        let path = std::env::var_os("CHATT_LIVE_REPLAY")
+            .map(PathBuf::from)
+            .expect("set CHATT_LIVE_REPLAY to a live RPC recording");
+        let recording = read_live_recording(&path).unwrap();
+        assert!(!recording.frames.is_empty(), "recording has no video frames");
+        let first_pts = i64::from_le_bytes(
+            recording.frames[0].wire[4..12].try_into().unwrap(),
+        );
+        let final_pts = i64::from_le_bytes(
+            recording.frames.last().unwrap().wire[4..12]
+                .try_into()
+                .unwrap(),
+        );
+        let expected_position = (final_pts - first_pts).max(0) as f64 / 1_000.0;
+        let frame_count = recording.frames.len();
+        let share = LiveShare {
+            room_id: RoomId(1),
+            stream_id: StreamId(recording.stream_id),
+            sender_name: "recording".into(),
+            codec: recording.codec,
+            coded_width: recording.coded_width,
+            coded_height: recording.coded_height,
+            extradata: recording.extradata,
+        };
+        let (mut daemon_stream, gui_stream) = UnixStream::pair().unwrap();
+        let mpv = Arc::new(
+            Mpv::with_initializer(|initializer| {
+                initializer.set_option("vo", "libmpv")?;
+                initializer.set_option("profile", "low-latency")?;
+                initializer.set_option("audio", "no")?;
+                initializer.set_option("cache", "no")?;
+                initializer.set_option("demuxer-thread", "yes")?;
+                initializer.set_option("demuxer-readahead-secs", "0")?;
+                initializer.set_option("demuxer-lavf-format", "nut")?;
+                initializer.set_option("demuxer-lavf-probe-info", "nostreams")?;
+                initializer.set_option("demuxer-lavf-analyzeduration", "0")?;
+                initializer.set_option("untimed", "yes")?;
+                initializer.set_option("video-latency-hacks", "yes")?;
+                initializer.set_option("vd-lavc-threads", "1")?;
+                initializer.set_option("vd-lavc-low-latency", "yes")?;
+                initializer.set_option("stream-buffer-size", "4k")?;
+                Ok(())
+            })
+            .unwrap(),
+        );
+        let mut render = mpv.create_software_render_context(true).unwrap();
+        render.set_update_callback(|| {});
+        let diagnostics = Arc::new(LiveDiagnostics::new());
+        let (control_sender, _control_receiver) = mpsc::channel();
+        let (error_sender, error_receiver) = mpsc::channel();
+        let (wakeup_sender, _wakeup_receiver) = async_channel::bounded(1);
+        let _source = LiveStreamSource::start(
+            mpv.clone(),
+            share,
+            gui_stream,
+            diagnostics,
+            control_sender,
+            error_sender,
+            wakeup_sender,
+        )
+        .unwrap();
+        mpv.command("loadfile", &["chatt-live://stream", "replace"])
+            .unwrap();
+
+        // Preserve ordering and burst structure but compress wall-clock gaps so
+        // long damage-idle periods do not make an experimental test take as
+        // long as the original recording.
+        let replay_started = Instant::now();
+        let receive_origin = recording.frames[0].received_ns;
+        for frame in &recording.frames {
+            let target = Duration::from_nanos((frame.received_ns - receive_origin) / 10);
+            if let Some(wait) = target.checked_sub(replay_started.elapsed()) {
+                std::thread::sleep(wait);
+            }
+            daemon_stream.write_all(&frame.wire).unwrap();
+            render.update();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reached_final_frame = false;
+        while Instant::now() < deadline {
+            render.update();
+            if render.next_frame_video_pts().is_ok_and(|pts| {
+                pts.is_finite() && pts + 0.001 >= expected_position
+            }) {
+                reached_final_frame = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reached_final_frame,
+            "libmpv did not retain the recording's final frame at {expected_position:.3}s"
+        );
+        eprintln!(
+            "replayed {frame_count} frames spanning {expected_position:.3}s in {:.3}s",
+            replay_started.elapsed().as_secs_f64()
+        );
+        assert!(
+            error_receiver.try_recv().is_err(),
+            "live socket reader reported an error"
         );
     }
 
