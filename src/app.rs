@@ -52,6 +52,12 @@ const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const VIDEO_THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SCROLL_RESPONSE_SECONDS: f32 = 0.006;
 const SCROLL_SETTLE_THRESHOLD: f32 = 0.50;
+const MIN_LIVE_ZOOM: f32 = 1.0;
+const MAX_LIVE_ZOOM: f32 = 20.0;
+const MIN_LIVE_PANE_HEIGHT: f32 = 160.0;
+const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
+const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
+const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct EagerImageKey {
@@ -73,6 +79,63 @@ struct LivePlayerView {
     last_mouse_position: Option<Point<Pixels>>,
     coded_size: (u32, u32),
     viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LivePaneResize {
+    start_y: Pixels,
+    start_height: Pixels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LiveVideoGeometry {
+    bounds: Bounds<Pixels>,
+    scale: f32,
+}
+
+impl LiveVideoGeometry {
+    fn new(
+        coded_size: (u32, u32),
+        viewport: Bounds<Pixels>,
+        zoom: f32,
+        pan: Point<Pixels>,
+    ) -> Option<Self> {
+        let (coded_width, coded_height) = coded_size;
+        let viewport_width = viewport.size.width.as_f32();
+        let viewport_height = viewport.size.height.as_f32();
+        if coded_width == 0 || coded_height == 0 || viewport_width <= 0.0 || viewport_height <= 0.0
+        {
+            return None;
+        }
+
+        let scale = (viewport_width / coded_width as f32)
+            .min(viewport_height / coded_height as f32)
+            * zoom;
+        let width = px(coded_width as f32 * scale);
+        let height = px(coded_height as f32 * scale);
+        let center = viewport.center() + pan;
+        Some(Self {
+            bounds: Bounds {
+                origin: point(center.x - width / 2.0, center.y - height / 2.0),
+                size: gpui::size(width, height),
+            },
+            scale,
+        })
+    }
+
+    fn source_pixel_at(self, position: Point<Pixels>) -> Point<f32> {
+        point(
+            (position.x - self.bounds.origin.x).as_f32() / self.scale,
+            (position.y - self.bounds.origin.y).as_f32() / self.scale,
+        )
+    }
+
+    fn position_of_source_pixel(self, source: Point<f32>) -> Point<Pixels> {
+        point(
+            self.bounds.origin.x + px(source.x * self.scale),
+            self.bounds.origin.y + px(source.y * self.scale),
+        )
+    }
 }
 
 fn live_pan_limits(
@@ -112,14 +175,43 @@ fn clamp_live_pan(
 
 fn zoom_live_pan(
     pan: Point<Pixels>,
+    coded_size: (u32, u32),
     old_zoom: f32,
     new_zoom: f32,
     viewport: Bounds<Pixels>,
     focal_point: Point<Pixels>,
 ) -> Point<Pixels> {
-    let focal_from_center = focal_point - viewport.center();
-    let ratio = new_zoom / old_zoom;
-    focal_from_center - (focal_from_center - pan) * ratio
+    let old_pan = clamp_live_pan(pan, coded_size, viewport, old_zoom);
+    let Some(old_geometry) = LiveVideoGeometry::new(coded_size, viewport, old_zoom, old_pan)
+    else {
+        return point(px(0.0), px(0.0));
+    };
+    let source = old_geometry.source_pixel_at(focal_point);
+    let Some(new_geometry) = LiveVideoGeometry::new(
+        coded_size,
+        viewport,
+        new_zoom,
+        point(px(0.0), px(0.0)),
+    ) else {
+        return point(px(0.0), px(0.0));
+    };
+    let source_without_pan = new_geometry.position_of_source_pixel(source);
+    clamp_live_pan(
+        focal_point - source_without_pan,
+        coded_size,
+        viewport,
+        new_zoom,
+    )
+}
+
+fn clamp_live_pane_height(height: Pixels, window_height: Pixels) -> Pixels {
+    let available = window_height
+        - px(TOP_BAR_HEIGHT)
+        - px(MIN_CHAT_PANE_HEIGHT)
+        - px(LIVE_PANE_DIVIDER_SIZE);
+    let min_height = px(MIN_LIVE_PANE_HEIGHT)
+        .min(available.max(px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT)));
+    height.clamp(min_height, available.max(min_height))
 }
 
 impl EagerImageFetch {
@@ -264,6 +356,9 @@ pub struct ChattView {
     video_wakeup: async_channel::Sender<()>,
     live_players: HashMap<StreamId, LivePlayerView>,
     fullscreen_share: Option<StreamId>,
+    live_pane_height: Option<Pixels>,
+    live_pane_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    live_pane_resize: Option<LivePaneResize>,
     status: SharedString,
     _daemon_task: Task<()>,
     _video_task: Task<()>,
@@ -348,6 +443,9 @@ impl ChattView {
             video_wakeup,
             live_players: HashMap::new(),
             fullscreen_share: None,
+            live_pane_height: None,
+            live_pane_bounds: Rc::new(Cell::new(None)),
+            live_pane_resize: None,
             status: "Discovering Chatt daemon…".into(),
             _daemon_task: daemon_task,
             _video_task: video_task,
@@ -420,6 +518,9 @@ impl ChattView {
             self.send_stop_live_share(stream_id);
             self.status = status.into();
         }
+        if self.live_players.is_empty() {
+            self.live_pane_resize = None;
+        }
     }
 
     fn start_live_share(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
@@ -455,6 +556,9 @@ impl ChattView {
 
     fn stop_live_share(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
         self.live_players.remove(&stream_id);
+        if self.live_players.is_empty() {
+            self.live_pane_resize = None;
+        }
         if self.fullscreen_share == Some(stream_id) {
             self.fullscreen_share = None;
         }
@@ -488,7 +592,7 @@ impl ChattView {
 
     fn reset_live_view(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
         if let Some(view) = self.live_players.get_mut(&stream_id) {
-            view.zoom = 1.0;
+            view.zoom = MIN_LIVE_ZOOM;
             view.pan = point(px(0.), px(0.));
             view.last_mouse_position = None;
             cx.notify();
@@ -504,12 +608,18 @@ impl ChattView {
     ) {
         if let Some(view) = self.live_players.get_mut(&stream_id) {
             let old_zoom = view.zoom;
-            let new_zoom = (old_zoom * factor).clamp(1.0, 8.0);
+            let new_zoom = (old_zoom * factor).clamp(MIN_LIVE_ZOOM, MAX_LIVE_ZOOM);
             if let Some(viewport) = view.viewport_bounds.get() {
                 let focal_point = focal_point.unwrap_or_else(|| viewport.center());
-                view.pan = zoom_live_pan(view.pan, old_zoom, new_zoom, viewport, focal_point);
-                view.pan = clamp_live_pan(view.pan, view.coded_size, viewport, new_zoom);
-            } else if new_zoom == 1.0 {
+                view.pan = zoom_live_pan(
+                    view.pan,
+                    view.coded_size,
+                    old_zoom,
+                    new_zoom,
+                    viewport,
+                    focal_point,
+                );
+            } else if new_zoom == MIN_LIVE_ZOOM {
                 view.pan = point(px(0.), px(0.));
             }
             view.zoom = new_zoom;
@@ -674,6 +784,58 @@ impl ChattView {
         }
     }
 
+    fn begin_live_pane_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.live_pane_bounds.get() else {
+            return;
+        };
+        let start_height = clamp_live_pane_height(bounds.size.height, window.viewport_size().height);
+        self.live_pane_height = Some(start_height);
+        self.live_pane_resize = Some(LivePaneResize {
+            start_y: event.position.y,
+            start_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn drag_live_pane(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.live_pane_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.finish_live_pane_resize(cx);
+            return;
+        }
+        self.live_pane_height = Some(clamp_live_pane_height(
+            resize.start_height + event.position.y - resize.start_y,
+            window.viewport_size().height,
+        ));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn finish_live_pane_resize(&mut self, cx: &mut Context<Self>) {
+        if self.live_pane_resize.take().is_none() {
+            return;
+        }
+        for view in self.live_players.values_mut() {
+            if let Some(viewport) = view.viewport_bounds.get() {
+                view.pan = clamp_live_pan(view.pan, view.coded_size, viewport, view.zoom);
+            }
+        }
+        cx.notify();
+    }
+
     fn toggle_live_fullscreen(
         &mut self,
         stream_id: StreamId,
@@ -691,6 +853,7 @@ impl ChattView {
 
     fn release_live_players(&mut self, window: &mut Window) {
         self.live_players.clear();
+        self.live_pane_resize = None;
         if self.fullscreen_share.take().is_some() && window.is_fullscreen() {
             window.toggle_fullscreen();
         }
@@ -1995,19 +2158,72 @@ impl ChattView {
         }
     }
 
-    fn render_live_shares(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_live_shares(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let shares = self.model.live_shares.clone();
+        let resizable = !self.live_players.is_empty();
+        let pane_height = resizable
+            .then_some(self.live_pane_height)
+            .flatten()
+            .map(|height| clamp_live_pane_height(height, window.viewport_size().height));
+        if resizable {
+            self.live_pane_height = pane_height;
+        }
+        let constrained = pane_height.is_some();
+        let pane_bounds = self.live_pane_bounds.clone();
         let mut panel = div()
+            .relative()
             .flex_none()
             .flex()
             .flex_col()
+            .min_h_0()
+            .overflow_hidden()
             .gap_2()
             .p_3()
             .border_b_1()
             .border_color(rgb(0x272a30))
-            .bg(rgb(0x14161a));
+            .bg(rgb(0x14161a))
+            .when_some(pane_height, |panel, height| panel.h(height))
+            .child(
+                canvas(
+                    move |bounds, _, _| pane_bounds.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
         for share in shares {
-            panel = panel.child(self.render_live_share_card(share, false, cx));
+            panel = panel.child(self.render_live_share_card(share, false, constrained, cx));
+        }
+        if resizable {
+            panel = panel.child(
+                div()
+                    .id("live-pane-resize")
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(LIVE_PANE_DIVIDER_SIZE))
+                    .cursor_row_resize()
+                    .hover(|handle| handle.bg(rgba(0x53698766)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.begin_live_pane_resize(event, window, cx)
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            this.finish_live_pane_resize(cx)
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            this.finish_live_pane_resize(cx)
+                        }),
+                    ),
+            );
         }
         panel
     }
@@ -2016,23 +2232,22 @@ impl ChattView {
         &mut self,
         share: rpc::daemon::model::LiveShare,
         fullscreen: bool,
+        constrained: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let stream_id = share.stream_id;
         let active = self.live_players.get(&stream_id).map(|view| {
             let viewport_bounds = view.viewport_bounds.clone();
-            let pan = viewport_bounds
-                .get()
-                .map(|bounds| clamp_live_pan(view.pan, view.coded_size, bounds, view.zoom))
-                .unwrap_or(view.pan);
             (
                 view.player.surface(),
                 view.zoom,
-                pan,
+                view.pan,
                 view.last_mouse_position.is_some(),
                 viewport_bounds,
+                view.coded_size,
             )
         });
+        let active_share = active.is_some();
         let mut card = div()
             .id(("live-share", stream_id.0 as usize))
             .flex()
@@ -2043,6 +2258,8 @@ impl ChattView {
             .border_color(rgb(0x30343b))
             .bg(rgb(0x111317))
             .when(fullscreen, |card| card.size_full())
+            .when(constrained && active_share, |card| card.flex_1().min_h_0())
+            .when(constrained && !active_share, |card| card.flex_none())
             .child(
                 div()
                     .flex()
@@ -2065,7 +2282,7 @@ impl ChattView {
                     )
                     .child(div().flex_1()),
             );
-        if let Some((video_surface, zoom, pan, dragging, viewport_bounds)) = active {
+        if let Some((video_surface, zoom, pan, dragging, viewport_bounds, coded_size)) = active {
             let stop_id = stream_id;
             let reset_id = stream_id;
             let zoom_out_id = stream_id;
@@ -2136,8 +2353,10 @@ impl ChattView {
                         .relative()
                         .overflow_hidden()
                         .w_full()
-                        .when(fullscreen, |viewport| viewport.flex_1().min_h_0())
-                        .when(!fullscreen, |viewport| viewport.h(px(320.)))
+                        .when(fullscreen || constrained, |viewport| {
+                            viewport.flex_1().min_h_0()
+                        })
+                        .when(!fullscreen && !constrained, |viewport| viewport.h(px(320.)))
                         .bg(rgb(0x08090b))
                         .cursor(if dragging {
                             gpui::CursorStyle::ClosedHand
@@ -2171,27 +2390,22 @@ impl ChattView {
                         )
                         .child(
                             canvas(
-                                move |bounds, _, _| viewport_bounds.set(Some(bounds)),
-                                |_, _, _, _| {},
+                                move |bounds, _, _| {
+                                    viewport_bounds.set(Some(bounds));
+                                    let pan = clamp_live_pan(pan, coded_size, bounds, zoom);
+                                    LiveVideoGeometry::new(coded_size, bounds, zoom, pan)
+                                },
+                                move |_, geometry, window, _| {
+                                    if let Some(geometry) = geometry {
+                                        window.paint_platform_surface(
+                                            geometry.bounds,
+                                            video_surface,
+                                        );
+                                    }
+                                },
                             )
                             .absolute()
                             .size_full(),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .left(pan.x)
-                                .top(pan.y)
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .w(relative(zoom))
-                                        .h(relative(zoom))
-                                        .child(surface(video_surface).size_full()),
-                                ),
                         )
                 });
         } else {
@@ -2453,7 +2667,7 @@ impl Render for ChattView {
                 .cloned()
             && self.live_players.contains_key(&stream_id)
         {
-            let card = self.render_live_share_card(share, true, cx);
+            let card = self.render_live_share_card(share, true, false, cx);
             return div()
                 .id("chatt-live-fullscreen")
                 .key_context("Chatt")
@@ -2510,7 +2724,8 @@ impl Render for ChattView {
             });
         });
         let live_panel = (!self.model.live_shares.is_empty())
-            .then(|| self.render_live_shares(cx));
+            .then(|| self.render_live_shares(window, cx));
+        let resizing_live_pane = self.live_pane_resize.is_some();
         div()
             .id("chatt")
             .key_context("Chatt")
@@ -2530,10 +2745,33 @@ impl Render for ChattView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.queue_uploads(paths.0.to_vec(), cx)
             }))
+            .on_mouse_move(cx.listener(
+                |this, event: &MouseMoveEvent, window, cx| {
+                    this.drag_live_pane(event, window, cx)
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_live_pane_resize(cx)
+                }),
+            )
             .size_full()
             .flex()
             .bg(rgb(0x111317))
             .text_color(rgb(0xd9dbe0))
+            .when(resizing_live_pane, |root| {
+                root.child(
+                    canvas(
+                        |_, _, _| {},
+                        |_, _, window, _| {
+                            window.set_window_cursor_style(gpui::CursorStyle::ResizeRow)
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -2996,10 +3234,80 @@ mod tests {
             size: gpui::size(px(1000.0), px(600.0)),
         };
         let focal = viewport.center() + point(px(100.0), px(-50.0));
+        let coded_size = (1600, 900);
+        let old_pan = point(px(0.0), px(0.0));
+        let source = LiveVideoGeometry::new(coded_size, viewport, 1.0, old_pan)
+            .unwrap()
+            .source_pixel_at(focal);
+        let new_pan = zoom_live_pan(old_pan, coded_size, 1.0, 2.0, viewport, focal);
 
+        assert_eq!(new_pan, point(px(-100.0), px(50.0)));
+        let mapped = LiveVideoGeometry::new(coded_size, viewport, 2.0, new_pan)
+            .unwrap()
+            .position_of_source_pixel(source);
+        assert!((mapped.x - focal.x).as_f32().abs() < 0.01);
+        assert!((mapped.y - focal.y).as_f32().abs() < 0.01);
+    }
+
+    #[test]
+    fn live_zoom_keeps_the_focal_pixel_stationary_after_panning() {
+        let viewport = Bounds {
+            origin: point(px(75.0), px(125.0)),
+            size: gpui::size(px(1100.0), px(700.0)),
+        };
+        let coded_size = (2560, 1440);
+        let focal = viewport.center() + point(px(-170.0), px(90.0));
+        let old_pan = point(px(130.0), px(-45.0));
+        let old_zoom = 2.0;
+        let new_zoom = 3.25;
+        let source = LiveVideoGeometry::new(coded_size, viewport, old_zoom, old_pan)
+            .unwrap()
+            .source_pixel_at(focal);
+
+        let new_pan = zoom_live_pan(
+            old_pan, coded_size, old_zoom, new_zoom, viewport, focal,
+        );
+        let mapped = LiveVideoGeometry::new(coded_size, viewport, new_zoom, new_pan)
+            .unwrap()
+            .position_of_source_pixel(source);
+
+        assert!((mapped.x - focal.x).as_f32().abs() < 0.01);
+        assert!((mapped.y - focal.y).as_f32().abs() < 0.01);
+    }
+
+    #[test]
+    fn live_video_geometry_fits_the_coded_resolution_into_the_viewport() {
+        let viewport = Bounds {
+            origin: point(px(100.0), px(50.0)),
+            size: gpui::size(px(1000.0), px(1000.0)),
+        };
+
+        let geometry = LiveVideoGeometry::new(
+            (1600, 900),
+            viewport,
+            1.0,
+            point(px(0.0), px(0.0)),
+        )
+        .unwrap();
+
+        assert_eq!(geometry.scale, 0.625);
+        assert_eq!(geometry.bounds.size, gpui::size(px(1000.0), px(562.5)));
+        assert_eq!(geometry.bounds.origin, point(px(100.0), px(268.75)));
+    }
+
+    #[test]
+    fn live_pane_height_preserves_both_video_and_chat() {
         assert_eq!(
-            zoom_live_pan(point(px(0.0), px(0.0)), 1.0, 2.0, viewport, focal),
-            point(px(-100.0), px(50.0)),
+            clamp_live_pane_height(px(100.0), px(900.0)),
+            px(MIN_LIVE_PANE_HEIGHT),
+        );
+        assert_eq!(
+            clamp_live_pane_height(px(900.0), px(900.0)),
+            px(699.0),
+        );
+        assert_eq!(
+            clamp_live_pane_height(px(900.0), px(300.0)),
+            px(99.0),
         );
     }
 }
