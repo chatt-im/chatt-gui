@@ -24,15 +24,19 @@
 
 #include "config.h"
 
+#if HAVE_LIBASS
 #include <ass/ass.h>
 #include <ass/ass_types.h>
+#endif
 
 struct sub_bitmaps;
 struct mp_sub_packer;
 struct mp_sub_packer *mp_sub_packer_alloc(void *ta_parent);
+#if HAVE_LIBASS
 void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
                             int num_image_lists, bool changed, bool video_color_space,
                             int preferred_osd_format, struct sub_bitmaps *out);
+#endif
 
 #if HAVE_SUBRANDR
 struct sbr_instanced_raster_pass;

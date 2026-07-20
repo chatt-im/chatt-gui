@@ -205,6 +205,9 @@ impl MpvPlayer {
             set_option!("vo", "libmpv");
             set_option!("keep-open", "no");
             set_option!("idle", "yes");
+            set_option!("sub", "no");
+            set_option!("sub-auto", "no");
+            set_option!("osd-level", "0");
             // The vendored libmpv has Lua disabled, so it has no `osc`
             // option. Embedded rendering does not use mpv's OSC anyway.
             set_option!("profile", if live { "low-latency" } else { "fast" });
@@ -1876,6 +1879,89 @@ mod tests {
         }
 
         assert_eq!(display_size, Some((320, 180)));
+    }
+
+    #[test]
+    fn libmpv_plays_audio_video_file_with_unsupported_subtitle_track() {
+        let directory = tempfile::tempdir().unwrap();
+        let subtitles = directory.path().join("unsupported.srt");
+        std::fs::write(
+            &subtitles,
+            "1\n00:00:00,000 --> 00:00:00,750\nnot rendered by embedded mpv\n",
+        )
+        .unwrap();
+        let path = directory.path().join("audio-video-subtitle.mkv");
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x180:d=1:r=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-i",
+            ])
+            .arg(&subtitles)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:s:0",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+                "-c:s",
+                "srt",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg is available with the required libmpv dependency");
+        assert!(
+            output.status.success(),
+            "ffmpeg could not create the subtitle-track fixture: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let mpv = Mpv::with_initializer(|initializer| {
+            initializer.set_option("vo", "null")?;
+            initializer.set_option("audio", "no")?;
+            initializer.set_option("sub", "no")?;
+            initializer.set_option("sub-auto", "no")?;
+            initializer.set_option("pause", "no")?;
+            Ok(())
+        })
+        .unwrap();
+        mpv.command("loadfile", &[&path.to_string_lossy(), "replace"])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut file_loaded = false;
+        let mut video_reconfigured = false;
+        let mut playback_restarted = false;
+        while Instant::now() < deadline
+            && !(file_loaded && video_reconfigured && playback_restarted)
+        {
+            match mpv.wait_event(0.1) {
+                Some(Ok(Event::FileLoaded)) => file_loaded = true,
+                Some(Ok(Event::VideoReconfig)) => video_reconfigured = true,
+                Some(Ok(Event::PlaybackRestart)) => playback_restarted = true,
+                Some(Err(error)) => panic!("libmpv event failed: {error}"),
+                _ => {}
+            }
+        }
+
+        assert!(file_loaded, "subtitle-track fixture did not load");
+        assert!(video_reconfigured, "video track was not configured");
+        assert!(playback_restarted, "audio/video playback did not start");
+        assert_eq!(mpv.get_property::<i64>("track-list/count").unwrap(), 3);
     }
 
     #[test]

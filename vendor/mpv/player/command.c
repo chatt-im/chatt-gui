@@ -3955,7 +3955,11 @@ static int mp_property_ffmpeg(void *ctx, struct m_property *prop,
 static int mp_property_libass_version(void *ctx, struct m_property *prop,
                                       int action, void *arg)
 {
+#if HAVE_LIBASS
     return m_property_int64_ro(action, arg, ass_library_version());
+#else
+    return M_PROPERTY_UNAVAILABLE;
+#endif
 }
 
 static int mp_property_libplacebo_version(void *ctx, struct m_property *prop,

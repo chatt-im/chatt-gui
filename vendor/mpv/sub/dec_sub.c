@@ -34,7 +34,9 @@
 #include "misc/dispatch.h"
 #include "osdep/threads.h"
 
+#if HAVE_LIBASS
 extern const struct sd_functions sd_ass;
+#endif
 extern const struct sd_functions sd_lavc;
 #if HAVE_SUBRANDR
 extern const struct sd_functions sd_sbr;
@@ -45,7 +47,9 @@ static const struct sd_functions *const sd_list[] = {
 #if HAVE_SUBRANDR
     &sd_sbr,
 #endif
+#if HAVE_LIBASS
     &sd_ass,
+#endif
     NULL
 };
 

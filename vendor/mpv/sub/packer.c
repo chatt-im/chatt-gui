@@ -24,8 +24,10 @@
 
 #include "config.h"
 
+#if HAVE_LIBASS
 #include <ass/ass.h>
 #include <ass/ass_types.h>
+#endif
 #if HAVE_SUBRANDR
 #include <subrandr/subrandr.h>
 #endif
@@ -103,6 +105,7 @@ static bool pack(struct mp_sub_packer *p, struct sub_bitmaps *res, int imgfmt)
     return true;
 }
 
+#if HAVE_LIBASS
 static void fill_padding_1(uint8_t *base, int w, int h, int stride, int padding)
 {
     for (int row = 0; row < h; ++row) {
@@ -126,6 +129,7 @@ static void fill_padding_1(uint8_t *base, int w, int h, int stride, int padding)
     for (int i = 0; i < padding; ++i)
         memcpy(base + (h + i) * stride - padding, last_row, row_bytes);
 }
+#endif
 
 static void fill_padding_4(uint8_t *base, int w, int h, int stride, int padding)
 {
@@ -151,6 +155,7 @@ static void fill_padding_4(uint8_t *base, int w, int h, int stride, int padding)
         memcpy(base + (h + i) * stride - padding * 4, last_row, row_bytes);
 }
 
+#if HAVE_LIBASS
 static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
                           int src_stride, unsigned char *dst, size_t dst_stride,
                           int dst_x, int dst_y, uint32_t color)
@@ -325,6 +330,7 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
     p->cached_subs.change_id = 0;
     p->cached_subs_valid = true;
 }
+#endif
 
 #if HAVE_SUBRANDR
 // Pack the images in `res` into a BGRA8 atlas and populate `res->parts`

@@ -86,6 +86,21 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     let build = out_path.join("mpv-build");
     emit_rerun_tree(&source);
 
+    let reconfigure = build.join("build.ninja").exists();
+    if reconfigure {
+        // Refresh Meson's project-option registry before setting newly added
+        // options. Meson otherwise rejects a new -D option against an older
+        // existing build directory before it has reread meson.options.
+        run(
+            Command::new("meson")
+                .arg("setup")
+                .arg(&build)
+                .arg(&source)
+                .arg("--reconfigure"),
+            "refresh vendored libmpv configuration",
+        );
+    }
+
     let mut setup = Command::new("meson");
     setup
         .arg("setup")
@@ -103,6 +118,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         .arg("-Dbuild-date=false")
         .arg("-Dmanpage-build=disabled")
         .arg("-Dgl=disabled")
+        .arg("-Dlibass=disabled")
         .arg("-Dlua=disabled")
         .arg("-Dvulkan=enabled")
         .arg("-Dcuda-hwaccel=enabled")
@@ -114,7 +130,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         // client and codec stacks to this binary's ELF dependencies.
         .arg("-Dalsa=enabled")
         .arg("-Dpulse=disabled");
-    if build.join("build.ninja").exists() {
+    if reconfigure {
         setup.arg("--reconfigure");
     }
     run(&mut setup, "configure vendored libmpv");
@@ -304,7 +320,7 @@ fn build_vendored_ffmpeg(crate_path: &Path, out_path: &Path) -> PathBuf {
         .arg("--enable-cuda")
         .arg("--enable-nvdec")
         .arg("--enable-vaapi")
-        .arg("--enable-decoder=aac,aac_fixed,aac_latm,ac3,alac,ass,av1,dca,eac3,ffv1,flac,gif,h264,hevc,mjpeg,mp3,mp3float,opus,pcm_alaw,pcm_f32le,pcm_f64le,pcm_mulaw,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32be,pcm_s32le,pcm_u8,png,ssa,subrip,vorbis,vp8,vp9,webp,webvtt")
+        .arg("--enable-decoder=aac,aac_fixed,aac_latm,ac3,alac,av1,dca,eac3,ffv1,flac,gif,h264,hevc,mjpeg,mp3,mp3float,opus,pcm_alaw,pcm_f32le,pcm_f64le,pcm_mulaw,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32be,pcm_s32le,pcm_u8,png,vorbis,vp8,vp9,webp")
         .arg("--enable-hwaccel=av1_nvdec,av1_vaapi,av1_vulkan,h264_nvdec,h264_vaapi,h264_vulkan,hevc_nvdec,hevc_vaapi,hevc_vulkan,mjpeg_nvdec,mjpeg_vaapi,vp8_nvdec,vp8_vaapi,vp9_nvdec,vp9_vaapi,vp9_vulkan")
         .arg("--enable-demuxer=aac,ac3,aiff,ape,asf,avi,eac3,flac,flv,h264,hevc,image2,matroska,mov,mp3,mpegps,mpegts,mpegvideo,nut,ogg,rm,wav")
         .arg("--enable-parser=aac,aac_latm,ac3,av1,dca,flac,h264,hevc,mpegaudio,opus,vorbis,vp8,vp9")

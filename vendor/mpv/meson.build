@@ -30,25 +30,26 @@ libswscale = dependency('libswscale', version: '>= 7.5.100')
 libplacebo = dependency('libplacebo', version: '>=7.360.1',
                 default_options: ['default_library=static', 'demos=false'])
 
-libass = dependency('libass', version: '>= 0.12.2')
+libass = dependency('libass', version: '>= 0.12.2', required: get_option('libass'))
 
-# the dependency order of libass -> ffmpeg is necessary due to
-# static linking symbol resolution between fontconfig and MinGW
-dependencies = [libass,
-                libavcodec,
+dependencies = [libavcodec,
                 libavfilter,
                 libavformat,
                 libavutil,
                 libplacebo,
                 libswresample,
                 libswscale]
+if libass.found()
+    # Keep libass before FFmpeg for static symbol resolution on MinGW.
+    dependencies = [libass] + dependencies
+endif
 
 # Keeps track of all enabled/disabled features
 features = {
     'debug': get_option('debug'),
     'ffmpeg': true,
     'gpl': get_option('gpl'),
-    'libass': true,
+    'libass': libass.found(),
     'libplacebo': true,
 }
 
@@ -204,16 +205,11 @@ sources = files(
     'stream/stream_env.c',
 
     ## Subtitles
-    'sub/ass_mp.c',
     'sub/dec_sub.c',
     'sub/draw_bmp.c',
-    'sub/filter_sdh.c',
+    'sub/filter.c',
     'sub/img_convert.c',
-    'sub/lavc_conv.c',
     'sub/osd.c',
-    'sub/osd_libass.c',
-    'sub/packer.c',
-    'sub/sd_ass.c',
     'sub/sd_lavc.c',
 
     ## Video
@@ -276,6 +272,16 @@ sources = files(
     'ta/ta_talloc.c',
     'ta/ta_utils.c',
 )
+
+if features['libass']
+    sources += files('sub/ass_mp.c',
+                     'sub/filter_sdh.c',
+                     'sub/lavc_conv.c',
+                     'sub/osd_libass.c',
+                     'sub/sd_ass.c')
+else
+    sources += files('sub/osd_dummy.c')
+endif
 
 
 # compiler stuff
@@ -371,6 +377,9 @@ if features['subrandr']
     sources += files('demux/demux_sbr.c', 'sub/sd_sbr.c')
     dependencies += subrandr
 endif
+if features['libass'] or features['subrandr']
+    sources += files('sub/packer.c')
+endif
 
 # C11 atomics are mandatory but linking to the library is not always required.
 dependencies += cc.find_library('atomic', required: false)
@@ -446,8 +455,10 @@ if posix
     endif
     sources += files('input/ipc-unix.c',
                      'osdep/poll_wrapper.c',
-                     'osdep/terminal-unix.c',
-                     'sub/filter_regex.c')
+                     'osdep/terminal-unix.c')
+    if features['libass']
+        sources += files('sub/filter_regex.c')
+    endif
 endif
 
 if posix and not features['cocoa']
@@ -681,8 +692,10 @@ javascript = dependency('mujs', version: '>= 1.0.0', required: get_option('javas
 features += {'javascript': javascript.found()}
 if features['javascript']
     dependencies += javascript
-    sources += files('player/javascript.c',
-                     'sub/filter_jsre.c')
+    sources += files('player/javascript.c')
+    if features['libass']
+        sources += files('sub/filter_jsre.c')
+    endif
 endif
 
 lcms2 = dependency('lcms2', version: '>= 2.6', required: get_option('lcms2'))
