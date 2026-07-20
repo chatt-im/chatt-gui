@@ -1107,6 +1107,7 @@ dependencies = [
  "gpui_platform",
  "gpui_wgpu",
  "image",
+ "libc",
  "libmpv2",
  "log",
  "markdown",

@@ -1,8 +1,9 @@
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{BufWriter, Read, Write},
+    io::{self, BufWriter, Read, Write},
     net::Shutdown,
+    os::fd::AsRawFd,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
@@ -34,6 +35,9 @@ const FLAG_CHECKSUM: u64 = 64;
 const FLAG_CODED: u64 = 4096;
 const PTS_SHIFT: u64 = 14;
 const MAX_PENDING_FRAMES: usize = 2;
+const NUT_FRAME_OVERHEAD_BUDGET: usize = 4096;
+const MAX_PENDING_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN + NUT_FRAME_OVERHEAD_BUDGET;
+const MAX_RECYCLED_BYTES: usize = MAX_PENDING_BYTES;
 // A late viewer may receive the web-equivalent cached GOP as a burst. Let mpv
 // consume that burst untimed, then return to the two-frame live queue as soon
 // as it drains once.
@@ -241,14 +245,25 @@ impl LiveRecordingWriter {
         })
     }
 
-    fn write_frame(&mut self, received_at: Instant, frame: &[u8]) -> Result<()> {
+    fn write_frame_parts(
+        &mut self,
+        received_at: Instant,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
         let received_ns = u64::try_from(received_at.duration_since(self.started).as_nanos())
             .context("live recording receive timestamp exceeds u64")?;
         self.output.write_all(&received_ns.to_le_bytes())?;
-        self.output.write_all(frame)?;
+        self.output.write_all(header)?;
+        self.output.write_all(payload)?;
         self.frames += 1;
-        self.bytes += frame.len() as u64;
+        self.bytes += (header.len() + payload.len()) as u64;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn write_frame(&mut self, received_at: Instant, frame: &[u8]) -> Result<()> {
+        self.write_frame_parts(received_at, frame, &[])
     }
 }
 
@@ -292,7 +307,10 @@ struct NutQueue {
 
 #[derive(Default)]
 struct QueueState {
-    frames: VecDeque<Vec<u8>>,
+    frames: VecDeque<NutFrame>,
+    pending_bytes: usize,
+    recycled: Vec<Vec<u8>>,
+    recycled_bytes: usize,
     seen_keyframe: bool,
     awaiting_keyframe: bool,
     bootstrapping: bool,
@@ -301,10 +319,20 @@ struct QueueState {
     overflow_count: u64,
 }
 
+struct NutFrame {
+    bytes: Vec<u8>,
+}
+
+impl NutFrame {
+    fn retained_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+}
+
 struct NutCursor {
     queue: Arc<NutQueue>,
     header_offset: usize,
-    current: Vec<u8>,
+    current: Option<NutFrame>,
     current_offset: usize,
     logged_first_read: bool,
     logged_first_frame: bool,
@@ -420,39 +448,51 @@ fn read_frames(
     let mut saw_keyframe = false;
     let mut wrote_initial_syncpoint = false;
     loop {
-        let mut prefix = [0u8; 4];
-        match stream.read_exact(&mut prefix) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                log::info!(
-                    "live video socket closed stream_id={} frames={} bytes={} saw_keyframe={}",
-                    expected_stream_id,
-                    received_frames,
-                    received_bytes,
-                    saw_keyframe
-                );
-                return Ok(());
-            }
-            Err(error) => return Err(error).context("read live video frame length"),
+        let mut wire_header = [0u8; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        if !read_frame_header(&mut stream, &mut wire_header)
+            .context("read live video frame header")?
+        {
+            log::info!(
+                "live video socket closed stream_id={} frames={} bytes={} saw_keyframe={}",
+                expected_stream_id,
+                received_frames,
+                received_bytes,
+                saw_keyframe
+            );
+            return Ok(());
         }
-        let size = u32::from_le_bytes(prefix) as usize;
-        if !(rpc::video::VIDEO_FRAME_HEADER_LEN..=rpc::video::MAX_VIDEO_FRAME_LEN).contains(&size) {
-            bail!("invalid live video frame length {size}")
+        let header = rpc::video::parse_video_frame_header(&wire_header)
+            .map_err(|error| anyhow!("invalid live video frame header: {error:?}"))?
+            .expect("fixed-size video header is complete");
+        if header.stream_id != expected_stream_id {
+            bail!(
+                "live video frame belongs to stream {}, expected {expected_stream_id}",
+                header.stream_id
+            )
         }
-        let mut frame = vec![0u8; size];
-        frame[..4].copy_from_slice(&prefix);
-        stream
-            .read_exact(&mut frame[4..])
-            .context("read live video frame")?;
+        let payload_len = header.size - rpc::video::VIDEO_FRAME_HEADER_LEN;
+        let base = *base_timestamp.get_or_insert(header.ts_ms);
+        let pts = header.ts_ms.saturating_sub(base).max(0) as u64;
+        let initial_syncpoint = header.is_key && !wrote_initial_syncpoint;
+        let mut nut_bytes = queue.take_buffer(payload_len + NUT_FRAME_OVERHEAD_BUDGET);
+        let payload_offset = start_nut_frame(
+            &mut nut_bytes,
+            pts,
+            header.is_key,
+            initial_syncpoint,
+            payload_len,
+        );
+        if let Err(error) = read_exact_append(&stream, &mut nut_bytes, payload_len) {
+            queue.recycle_buffer(nut_bytes);
+            return Err(error).context("read live video frame payload");
+        }
         let received_at = Instant::now();
-        let timestamp = i64::from_le_bytes(frame[4..12].try_into().unwrap());
-        let is_key = frame[12] == 1;
-        let stream_id = u32::from_le_bytes(frame[13..17].try_into().unwrap());
-        if stream_id != expected_stream_id {
-            bail!("live video frame belongs to stream {stream_id}, expected {expected_stream_id}")
-        }
         if let Some(active) = recorder.as_mut()
-            && let Err(error) = active.write_frame(received_at, &frame)
+            && let Err(error) = active.write_frame_parts(
+                received_at,
+                &wire_header,
+                &nut_bytes[payload_offset..],
+            )
         {
             log::error!(
                 "live video recording failed; disabling recording path={:?}: {error:#}",
@@ -460,39 +500,35 @@ fn read_frames(
             );
             recorder = None;
         }
-        let annex_b = bitstream::length_prefixed_to_annex_b(
-            &frame[rpc::video::VIDEO_FRAME_HEADER_LEN..],
-        )
-        .map_err(|error| anyhow!(error))?;
+        if let Err(error) =
+            bitstream::length_prefixed_to_annex_b_in_place(&mut nut_bytes[payload_offset..])
+        {
+            queue.recycle_buffer(nut_bytes);
+            return Err(anyhow!(error));
+        }
         received_frames += 1;
-        received_bytes += size as u64;
+        received_bytes += header.size as u64;
         if received_frames == 1 {
             log::info!(
                 "live video first socket frame stream_id={} keyframe={} timestamp_ms={} frame_bytes={} bitstream_bytes={}",
-                stream_id,
-                is_key,
-                timestamp,
-                size,
-                annex_b.len()
+                header.stream_id,
+                header.is_key,
+                header.ts_ms,
+                header.size,
+                payload_len
             );
         }
-        if is_key && !saw_keyframe {
+        if header.is_key && !saw_keyframe {
             saw_keyframe = true;
             log::info!(
                 "live video first keyframe received stream_id={} frame_number={} timestamp_ms={} bitstream_bytes={}",
-                stream_id,
+                header.stream_id,
                 received_frames,
-                timestamp,
-                annex_b.len()
+                header.ts_ms,
+                payload_len
             );
         }
-        let base = *base_timestamp.get_or_insert(timestamp);
-        let pts = timestamp.saturating_sub(base).max(0) as u64;
-        let initial_syncpoint = is_key && !wrote_initial_syncpoint;
-        let caught_up = queue.push(
-            nut_frame(pts, is_key, initial_syncpoint, &annex_b),
-            is_key,
-        );
+        let caught_up = queue.push(NutFrame { bytes: nut_bytes }, header.is_key);
         diagnostics.record_input(received_frames, pts, received_at, queue.pending_len());
         if initial_syncpoint {
             wrote_initial_syncpoint = true;
@@ -504,8 +540,99 @@ fn read_frames(
     }
 }
 
+fn read_frame_header(
+    stream: &mut UnixStream,
+    header: &mut [u8; rpc::video::VIDEO_FRAME_HEADER_LEN],
+) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < header.len() {
+        match stream.read(&mut header[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "live video socket closed during a frame header",
+                ));
+            }
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+fn read_exact_append(stream: &UnixStream, output: &mut Vec<u8>, len: usize) -> io::Result<()> {
+    let final_len = output
+        .len()
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "video frame is too large"))?;
+    output.reserve_exact(len);
+    while output.len() < final_len {
+        let remaining = final_len - output.len();
+        let result = unsafe {
+            libc::read(
+                stream.as_raw_fd(),
+                output.as_mut_ptr().add(output.len()).cast(),
+                remaining,
+            )
+        };
+        if result > 0 {
+            unsafe {
+                output.set_len(output.len() + result as usize);
+            }
+        } else if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "live video socket closed during a frame payload",
+            ));
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl NutQueue {
-    fn push(&self, frame: Vec<u8>, is_key: bool) -> bool {
+    fn take_buffer(&self, min_capacity: usize) -> Vec<u8> {
+        let recycled = {
+            let mut state = self.state.lock().unwrap();
+            let index = state
+                .recycled
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| buffer.capacity() >= min_capacity)
+                .min_by_key(|(_, buffer)| buffer.capacity())
+                .map(|(index, _)| index)
+                .or_else(|| {
+                    state
+                        .recycled
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, buffer)| buffer.capacity())
+                        .map(|(index, _)| index)
+                });
+            index.map(|index| {
+                let mut buffer = state.recycled.swap_remove(index);
+                state.recycled_bytes -= buffer.capacity();
+                buffer.clear();
+                buffer
+            })
+        };
+        recycled.unwrap_or_else(|| Vec::with_capacity(min_capacity))
+    }
+
+    fn recycle_buffer(&self, buffer: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        if !state.closed {
+            state.recycle_buffer(buffer);
+        }
+    }
+
+    fn push(&self, frame: NutFrame, is_key: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return false;
@@ -519,6 +646,7 @@ impl NutQueue {
                         self.stream_id
                     );
                 }
+                state.recycle_frame(frame);
                 return false;
             }
             state.seen_keyframe = true;
@@ -526,9 +654,10 @@ impl NutQueue {
         let mut caught_up = false;
         if state.awaiting_keyframe {
             if !is_key {
+                state.recycle_frame(frame);
                 return false;
             }
-            state.frames.clear();
+            state.clear_frames();
             state.awaiting_keyframe = false;
             caught_up = true;
             log::info!(
@@ -536,41 +665,53 @@ impl NutQueue {
                 self.stream_id,
                 state.overflow_count
             );
-        } else if state.frames.len()
-            >= if state.bootstrapping {
+        } else {
+            let frame_limit = if state.bootstrapping {
                 MAX_BOOTSTRAP_FRAMES
             } else {
                 MAX_PENDING_FRAMES
-            }
-        {
-            if is_key {
-                state.frames.clear();
-                caught_up = true;
-            } else {
-                state.awaiting_keyframe = true;
-                state.bootstrapping = false;
-                state.overflow_count += 1;
-                log::warn!(
-                    "live video decoder input queue full; waiting for keyframe stream_id={} pending_frames={} overflow_count={}",
-                    self.stream_id,
-                    state.frames.len(),
-                    state.overflow_count
-                );
-                return false;
+            };
+            let over_limit = state.frames.len() >= frame_limit
+                || state
+                    .pending_bytes
+                    .saturating_add(frame.retained_bytes())
+                    > MAX_PENDING_BYTES;
+            if over_limit {
+                if is_key {
+                    state.clear_frames();
+                    caught_up = true;
+                } else {
+                    state.awaiting_keyframe = true;
+                    state.bootstrapping = false;
+                    state.overflow_count += 1;
+                    log::warn!(
+                        "live video decoder input queue full; waiting for keyframe stream_id={} pending_frames={} pending_bytes={} overflow_count={}",
+                        self.stream_id,
+                        state.frames.len(),
+                        state.pending_bytes,
+                        state.overflow_count
+                    );
+                    state.recycle_frame(frame);
+                    return false;
+                }
             }
         }
+        if frame.retained_bytes() > MAX_PENDING_BYTES {
+            state.awaiting_keyframe = true;
+            state.bootstrapping = false;
+            state.recycle_frame(frame);
+            return false;
+        }
+        state.pending_bytes += frame.retained_bytes();
         state.frames.push_back(frame);
         self.ready.notify_one();
         caught_up
     }
 
-    fn pop(&self) -> Option<Vec<u8>> {
+    fn pop(&self) -> Option<NutFrame> {
         let mut state = self.state.lock().unwrap();
         loop {
-            if let Some(frame) = state.frames.pop_front() {
-                if state.frames.is_empty() {
-                    state.bootstrapping = false;
-                }
+            if let Some(frame) = state.pop_frame() {
                 return Some(frame);
             }
             if state.closed {
@@ -580,8 +721,8 @@ impl NutQueue {
         }
     }
 
-    fn try_pop(&self) -> Option<Vec<u8>> {
-        self.state.lock().unwrap().frames.pop_front()
+    fn try_pop(&self) -> Option<NutFrame> {
+        self.state.lock().unwrap().pop_frame()
     }
 
     fn pending_len(&self) -> usize {
@@ -591,8 +732,48 @@ impl NutQueue {
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;
-        state.frames.clear();
+        state.clear_frames();
+        state.recycled.clear();
+        state.recycled_bytes = 0;
         self.ready.notify_all();
+    }
+}
+
+impl QueueState {
+    fn pop_frame(&mut self) -> Option<NutFrame> {
+        let frame = self.frames.pop_front()?;
+        self.pending_bytes -= frame.retained_bytes();
+        if self.frames.is_empty() {
+            self.bootstrapping = false;
+        }
+        Some(frame)
+    }
+
+    fn clear_frames(&mut self) {
+        self.pending_bytes = 0;
+        while let Some(frame) = self.frames.pop_front() {
+            self.recycle_frame(frame);
+        }
+    }
+
+    fn recycle_frame(&mut self, frame: NutFrame) {
+        self.recycle_buffer(frame.bytes);
+    }
+
+    fn recycle_buffer(&mut self, mut buffer: Vec<u8>) {
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > MAX_RECYCLED_BYTES {
+            return;
+        }
+        while self.recycled_bytes.saturating_add(capacity) > MAX_RECYCLED_BYTES {
+            let Some(discarded) = self.recycled.pop() else {
+                return;
+            };
+            self.recycled_bytes -= discarded.capacity();
+        }
+        buffer.clear();
+        self.recycled_bytes += capacity;
+        self.recycled.push(buffer);
     }
 }
 
@@ -605,14 +786,17 @@ fn open_stream(queue: &mut Arc<NutQueue>, _uri: &str) -> NutCursor {
     NutCursor {
         queue: queue.clone(),
         header_offset: 0,
-        current: Vec::new(),
+        current: None,
         current_offset: 0,
         logged_first_read: false,
         logged_first_frame: false,
     }
 }
 
-fn close_stream(cursor: Box<NutCursor>) {
+fn close_stream(mut cursor: Box<NutCursor>) {
+    if let Some(frame) = cursor.current.take() {
+        cursor.queue.recycle_buffer(frame.bytes);
+    }
     log::info!(
         "mpv closed live NUT stream stream_id={} header_bytes_read={} had_frame={}",
         cursor.queue.stream_id,
@@ -645,7 +829,7 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
             written += count;
             continue;
         }
-        if cursor.current_offset == cursor.current.len() {
+        if cursor.current.is_none() {
             let frame = if written == 0 {
                 cursor.queue.pop()
             } else {
@@ -659,17 +843,23 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
                 log::info!(
                     "mpv received first live NUT frame stream_id={} nut_frame_bytes={}",
                     cursor.queue.stream_id,
-                    frame.len()
+                    frame.bytes.len()
                 );
             }
-            cursor.current = frame;
+            cursor.current = Some(frame);
             cursor.current_offset = 0;
         }
-        let count = (output.len() - written).min(cursor.current.len() - cursor.current_offset);
+        let current = &cursor.current.as_ref().unwrap().bytes;
+        let count = (output.len() - written).min(current.len() - cursor.current_offset);
         output[written..written + count]
-            .copy_from_slice(&cursor.current[cursor.current_offset..cursor.current_offset + count]);
+            .copy_from_slice(&current[cursor.current_offset..cursor.current_offset + count]);
         cursor.current_offset += count;
         written += count;
+        if cursor.current_offset == current.len() {
+            let frame = cursor.current.take().unwrap();
+            cursor.queue.recycle_buffer(frame.bytes);
+            cursor.current_offset = 0;
+        }
     }
     written as i64
 }
@@ -725,39 +915,65 @@ fn stream_header(codec: Codec, width: u32, height: u32, extradata: &[u8]) -> Vec
     packet(STREAM_STARTCODE, &payload)
 }
 
-fn nut_frame(pts: u64, is_key: bool, initial_syncpoint: bool, payload: &[u8]) -> Vec<u8> {
-    let mut out = if initial_syncpoint {
+fn start_nut_frame(
+    out: &mut Vec<u8>,
+    pts: u64,
+    is_key: bool,
+    initial_syncpoint: bool,
+    payload_len: usize,
+) -> usize {
+    out.clear();
+    if initial_syncpoint {
         let mut sync = Vec::new();
         put_v(&mut sync, pts);
         put_v(&mut sync, 0);
-        packet(SYNCPOINT_STARTCODE, &sync)
-    } else {
-        Vec::new()
-    };
-    let mut frame_header = vec![0];
+        append_packet(out, SYNCPOINT_STARTCODE, &sync);
+    }
+    let frame_header_start = out.len();
+    out.push(0);
     let flags = (if is_key { FLAG_KEY } else { 0 })
         | FLAG_CODED_PTS
         | FLAG_SIZE_MSB
         | FLAG_CHECKSUM;
-    put_v(&mut frame_header, FLAG_CODED ^ flags);
-    put_v(&mut frame_header, pts + (1 << PTS_SHIFT));
-    put_v(&mut frame_header, payload.len() as u64);
-    frame_header.extend_from_slice(&nut_crc(&frame_header).to_le_bytes());
-    out.extend_from_slice(&frame_header);
+    put_v(out, FLAG_CODED ^ flags);
+    put_v(out, pts + (1 << PTS_SHIFT));
+    put_v(out, payload_len as u64);
+    let checksum = nut_crc(&out[frame_header_start..]);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.reserve_exact(payload_len);
+    out.len()
+}
+
+#[cfg(test)]
+fn nut_frame(pts: u64, is_key: bool, initial_syncpoint: bool, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + NUT_FRAME_OVERHEAD_BUDGET);
+    start_nut_frame(
+        &mut out,
+        pts,
+        is_key,
+        initial_syncpoint,
+        payload.len(),
+    );
     out.extend_from_slice(payload);
     out
 }
 
 fn packet(startcode: u64, payload: &[u8]) -> Vec<u8> {
-    let mut prefix = startcode.to_be_bytes().to_vec();
-    put_v(&mut prefix, payload.len() as u64 + 4);
-    let mut out = prefix.clone();
+    let mut out = Vec::with_capacity(payload.len() + 16);
+    append_packet(&mut out, startcode, payload);
+    out
+}
+
+fn append_packet(out: &mut Vec<u8>, startcode: u64, payload: &[u8]) {
+    let prefix_start = out.len();
+    out.extend_from_slice(&startcode.to_be_bytes());
+    put_v(out, payload.len() as u64 + 4);
     if payload.len() + 4 > 4096 {
-        out.extend_from_slice(&nut_crc(&prefix).to_le_bytes());
+        let checksum = nut_crc(&out[prefix_start..]);
+        out.extend_from_slice(&checksum.to_le_bytes());
     }
     out.extend_from_slice(payload);
     out.extend_from_slice(&nut_crc(payload).to_le_bytes());
-    out
 }
 
 fn nut_crc(bytes: &[u8]) -> u32 {
@@ -915,6 +1131,12 @@ mod tests {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
+
+    fn queued(bytes: &[u8]) -> NutFrame {
+        NutFrame {
+            bytes: bytes.to_vec(),
+        }
+    }
 
     #[test]
     fn crc_matches_ffmpeg_nut_polynomial_vector() {
@@ -1081,14 +1303,14 @@ mod tests {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         };
-        assert!(!queue.push(vec![0], false));
+        assert!(!queue.push(queued(&[0]), false));
         assert!(queue.state.lock().unwrap().frames.is_empty());
-        assert!(!queue.push(vec![1], true));
+        assert!(!queue.push(queued(&[1]), true));
         for marker in 0..MAX_PENDING_FRAMES {
-            assert!(!queue.push(vec![marker as u8], false));
+            assert!(!queue.push(queued(&[marker as u8]), false));
         }
-        assert!(queue.push(vec![4], true));
-        assert_eq!(queue.pop(), Some(vec![4]));
+        assert!(queue.push(queued(&[4]), true));
+        assert_eq!(queue.pop().unwrap().bytes, [4]);
     }
 
     #[test]
@@ -1099,11 +1321,76 @@ mod tests {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         });
-        queue.push(vec![2, 3, 4], true);
+        queue.push(queued(&[2, 3, 4]), true);
         let mut cursor = open_stream(&mut queue.clone(), "chatt-live://test");
         let mut output = [0i8; 64];
         assert_eq!(read_stream(&mut cursor, &mut output), 4);
         assert_eq!(&output[..4], &[1, 2, 3, 4]);
+        assert_eq!(queue.state.lock().unwrap().recycled.len(), 1);
+    }
+
+    #[test]
+    fn socket_payload_is_appended_and_converted_in_the_final_nut_buffer() {
+        let body = [0, 0, 0, 2, 0x65, 0x88];
+        let wire = rpc::video::encode_video_frame(40, true, 7, &body);
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(&wire).unwrap();
+
+        let mut header_bytes = [0; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        assert!(read_frame_header(&mut reader, &mut header_bytes).unwrap());
+        let header = rpc::video::parse_video_frame_header(&header_bytes)
+            .unwrap()
+            .unwrap();
+        let mut output = Vec::with_capacity(body.len() + NUT_FRAME_OVERHEAD_BUDGET);
+        let payload_offset = start_nut_frame(&mut output, 0, true, true, body.len());
+        let allocation = output.as_ptr();
+        read_exact_append(&reader, &mut output, body.len()).unwrap();
+        assert_eq!(allocation, output.as_ptr());
+        bitstream::length_prefixed_to_annex_b_in_place(&mut output[payload_offset..]).unwrap();
+        assert_eq!(&output[payload_offset..], [0, 0, 0, 1, 0x65, 0x88]);
+        assert_eq!(header.size, wire.len());
+    }
+
+    #[test]
+    fn consumed_nut_buffers_are_reused() {
+        let queue = NutQueue {
+            stream_id: 1,
+            header: Vec::new(),
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let allocation = bytes.as_ptr();
+        queue.push(NutFrame { bytes }, true);
+        let consumed = queue.pop().unwrap();
+        queue.recycle_buffer(consumed.bytes);
+
+        let reused = queue.take_buffer(1024);
+        assert_eq!(reused.as_ptr(), allocation);
+        assert!(reused.is_empty());
+    }
+
+    #[test]
+    fn queue_byte_overflow_waits_for_a_fresh_keyframe() {
+        let queue = NutQueue {
+            stream_id: 1,
+            header: Vec::new(),
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let key = Vec::with_capacity(MAX_PENDING_BYTES / 2 + 1);
+        queue.push(NutFrame { bytes: key }, true);
+        let delta = Vec::with_capacity(MAX_PENDING_BYTES / 2 + 1);
+        queue.push(NutFrame { bytes: delta }, false);
+        {
+            let state = queue.state.lock().unwrap();
+            assert!(state.awaiting_keyframe);
+            assert_eq!(state.frames.len(), 1);
+            assert!(state.pending_bytes <= MAX_PENDING_BYTES);
+        }
+        assert!(queue.push(queued(&[9]), true));
+        assert_eq!(queue.pop().unwrap().bytes, [9]);
     }
 
     #[test]
