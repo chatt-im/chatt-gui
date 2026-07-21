@@ -17,9 +17,9 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use libmpv2::{Mpv, protocol};
-use rpc::{
+use local_rpc::{
     bitstream::{self, Codec},
-    daemon::model::LiveShare,
+    model::LiveShare,
 };
 
 use crate::mpv_player::ControlCommand;
@@ -40,7 +40,7 @@ const FLAG_CODED: u64 = 4096;
 const PTS_SHIFT: u64 = 14;
 const MAX_PENDING_FRAMES: usize = 2;
 const NUT_FRAME_OVERHEAD_BUDGET: usize = 4096;
-const MAX_PENDING_BYTES: usize = rpc::video::MAX_VIDEO_FRAME_LEN + NUT_FRAME_OVERHEAD_BUDGET;
+const MAX_PENDING_BYTES: usize = local_rpc::video::MAX_VIDEO_FRAME_LEN + NUT_FRAME_OVERHEAD_BUDGET;
 const MAX_RECYCLED_BYTES: usize = MAX_PENDING_BYTES;
 // A late viewer may receive the web-equivalent cached GOP as a burst. Let mpv
 // consume that burst untimed, then return to the two-frame live queue as soon
@@ -487,7 +487,7 @@ fn read_frames(
     let mut saw_keyframe = false;
     let mut wrote_initial_syncpoint = false;
     loop {
-        let mut wire_header = [0u8; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        let mut wire_header = [0u8; local_rpc::video::VIDEO_FRAME_HEADER_LEN];
         if !read_frame_header(&mut stream, &mut wire_header)
             .context("read live video frame header")?
         {
@@ -500,7 +500,7 @@ fn read_frames(
             );
             return Ok(());
         }
-        let header = rpc::video::parse_video_frame_header(&wire_header)
+        let header = local_rpc::video::parse_video_frame_header(&wire_header)
             .map_err(|error| anyhow!("invalid live video frame header: {error:?}"))?
             .expect("fixed-size video header is complete");
         if header.stream_id != expected_stream_id {
@@ -518,7 +518,7 @@ fn read_frames(
             );
             continue;
         }
-        let payload_len = header.size - rpc::video::VIDEO_FRAME_HEADER_LEN;
+        let payload_len = header.size - local_rpc::video::VIDEO_FRAME_HEADER_LEN;
         let base = *base_timestamp.get_or_insert(header.ts_ms);
         let pts = header.ts_ms.saturating_sub(base).max(0) as u64;
         let initial_syncpoint = header.is_key && !wrote_initial_syncpoint;
@@ -536,11 +536,8 @@ fn read_frames(
         }
         let received_at = Instant::now();
         if let Some(active) = recorder.as_mut()
-            && let Err(error) = active.write_frame_parts(
-                received_at,
-                &wire_header,
-                &nut_bytes[payload_offset..],
-            )
+            && let Err(error) =
+                active.write_frame_parts(received_at, &wire_header, &nut_bytes[payload_offset..])
         {
             log::error!(
                 "live video recording failed; disabling recording path={:?}: {error:#}",
@@ -590,7 +587,7 @@ fn read_frames(
 
 fn read_frame_header(
     stream: &mut UnixStream,
-    header: &mut [u8; rpc::video::VIDEO_FRAME_HEADER_LEN],
+    header: &mut [u8; local_rpc::video::VIDEO_FRAME_HEADER_LEN],
 ) -> io::Result<bool> {
     let mut filled = 0;
     while filled < header.len() {
@@ -720,10 +717,7 @@ impl NutQueue {
                 MAX_PENDING_FRAMES
             };
             let over_limit = state.frames.len() >= frame_limit
-                || state
-                    .pending_bytes
-                    .saturating_add(frame.retained_bytes())
-                    > MAX_PENDING_BYTES;
+                || state.pending_bytes.saturating_add(frame.retained_bytes()) > MAX_PENDING_BYTES;
             if over_limit {
                 if is_key {
                     state.clear_frames();
@@ -869,9 +863,8 @@ fn close_stream(mut cursor: Box<NutCursor>) {
 }
 
 fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i64 {
-    let output = unsafe {
-        std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), output.len())
-    };
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), output.len()) };
     if !cursor.logged_first_read {
         cursor.logged_first_read = true;
         log::info!(
@@ -883,8 +876,8 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
     let mut written = 0usize;
     while written < output.len() {
         if cursor.header_offset < cursor.queue.header.len() {
-            let count = (output.len() - written)
-                .min(cursor.queue.header.len() - cursor.header_offset);
+            let count =
+                (output.len() - written).min(cursor.queue.header.len() - cursor.header_offset);
             output[written..written + count].copy_from_slice(
                 &cursor.queue.header[cursor.header_offset..cursor.header_offset + count],
             );
@@ -1015,10 +1008,8 @@ fn start_nut_frame(
     }
     let frame_header_start = out.len();
     out.push(0);
-    let flags = (if is_key { FLAG_KEY } else { 0 })
-        | FLAG_CODED_PTS
-        | FLAG_SIZE_MSB
-        | FLAG_CHECKSUM;
+    let flags =
+        (if is_key { FLAG_KEY } else { 0 }) | FLAG_CODED_PTS | FLAG_SIZE_MSB | FLAG_CHECKSUM;
     put_v(out, FLAG_CODED ^ flags);
     put_v(out, pts + (1 << PTS_SHIFT));
     put_v(out, payload_len as u64);
@@ -1031,13 +1022,7 @@ fn start_nut_frame(
 #[cfg(test)]
 fn nut_frame(pts: u64, is_key: bool, initial_syncpoint: bool, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + NUT_FRAME_OVERHEAD_BUDGET);
-    start_nut_frame(
-        &mut out,
-        pts,
-        is_key,
-        initial_syncpoint,
-        payload.len(),
-    );
+    start_nut_frame(&mut out, pts, is_key, initial_syncpoint, payload.len());
     out.extend_from_slice(payload);
     out
 }
@@ -1158,7 +1143,9 @@ fn read_live_recording(path: &Path) -> Result<LiveRecording> {
             .read_exact(&mut prefix)
             .context("read recorded video frame length")?;
         let size = u32::from_le_bytes(prefix) as usize;
-        if !(rpc::video::VIDEO_FRAME_HEADER_LEN..=rpc::video::MAX_VIDEO_FRAME_LEN).contains(&size) {
+        if !(local_rpc::video::VIDEO_FRAME_HEADER_LEN..=local_rpc::video::MAX_VIDEO_FRAME_LEN)
+            .contains(&size)
+        {
             bail!("invalid recorded video frame length {size}")
         }
         let mut frame = vec![0; size];
@@ -1197,7 +1184,7 @@ fn read_recording_u64(input: &mut impl Read) -> Result<u64> {
 #[cfg(test)]
 fn read_recording_bytes(input: &mut impl Read) -> Result<Vec<u8>> {
     let len = read_recording_u32(input)? as usize;
-    if len > rpc::video::MAX_VIDEO_FRAME_LEN {
+    if len > local_rpc::video::MAX_VIDEO_FRAME_LEN {
         bail!("live recording metadata field is too large: {len}")
     }
     let mut bytes = vec![0; len];
@@ -1209,7 +1196,7 @@ fn read_recording_bytes(input: &mut impl Read) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use libmpv2::events::Event;
-    use rpc::ids::{RoomId, StreamId};
+    use local_rpc::ids::{RoomId, StreamId};
     use std::{
         io::Write,
         process::{Command, Stdio},
@@ -1241,9 +1228,9 @@ mod tests {
             extradata: vec![1, 2, 3, 4],
         };
         let mut first = Vec::new();
-        rpc::video::write_video_frame(&mut first, 100, true, 42, &[5, 6, 7]);
+        local_rpc::video::write_video_frame(&mut first, 100, true, 42, &[5, 6, 7]);
         let mut second = Vec::new();
-        rpc::video::write_video_frame(&mut second, 9_100, false, 42, &[8, 9]);
+        local_rpc::video::write_video_frame(&mut second, 9_100, false, 42, &[8, 9]);
         {
             let mut recording = LiveRecordingWriter::create(&path, &share).unwrap();
             let started = recording.started;
@@ -1279,10 +1266,11 @@ mod tests {
             .map(PathBuf::from)
             .expect("set CHATT_LIVE_REPLAY to a live RPC recording");
         let recording = read_live_recording(&path).unwrap();
-        assert!(!recording.frames.is_empty(), "recording has no video frames");
-        let first_pts = i64::from_le_bytes(
-            recording.frames[0].wire[4..12].try_into().unwrap(),
+        assert!(
+            !recording.frames.is_empty(),
+            "recording has no video frames"
         );
+        let first_pts = i64::from_le_bytes(recording.frames[0].wire[4..12].try_into().unwrap());
         let final_pts = i64::from_le_bytes(
             recording.frames.last().unwrap().wire[4..12]
                 .try_into()
@@ -1358,9 +1346,10 @@ mod tests {
         let mut reached_final_frame = false;
         while Instant::now() < deadline {
             render.update();
-            if render.next_frame_video_pts().is_ok_and(|pts| {
-                pts.is_finite() && pts + 0.001 >= expected_position
-            }) {
+            if render
+                .next_frame_video_pts()
+                .is_ok_and(|pts| pts.is_finite() && pts + 0.001 >= expected_position)
+            {
                 reached_final_frame = true;
                 break;
             }
@@ -1489,13 +1478,13 @@ mod tests {
     #[test]
     fn socket_payload_is_appended_and_converted_in_the_final_nut_buffer() {
         let body = [0, 0, 0, 2, 0x65, 0x88];
-        let wire = rpc::video::encode_video_frame(40, true, 7, &body);
+        let wire = local_rpc::video::encode_video_frame(40, true, 7, &body);
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(&wire).unwrap();
 
-        let mut header_bytes = [0; rpc::video::VIDEO_FRAME_HEADER_LEN];
+        let mut header_bytes = [0; local_rpc::video::VIDEO_FRAME_HEADER_LEN];
         assert!(read_frame_header(&mut reader, &mut header_bytes).unwrap());
-        let header = rpc::video::parse_video_frame_header(&header_bytes)
+        let header = local_rpc::video::parse_video_frame_header(&header_bytes)
             .unwrap()
             .unwrap();
         let mut output = Vec::with_capacity(body.len() + NUT_FRAME_OVERHEAD_BUDGET);
@@ -1555,22 +1544,17 @@ mod tests {
     #[test]
     fn ffprobe_accepts_large_sparse_frames_in_nut_pipe_mode() {
         let sps = [
-            0x67, 0x42, 0xc0, 0x0d, 0xda, 0x05, 0x07, 0xec, 0x04, 0x40, 0x00, 0x00, 0x03,
-            0x00, 0x40, 0x00, 0x00, 0x0f, 0x03, 0xc5, 0x0a, 0xa8,
+            0x67, 0x42, 0xc0, 0x0d, 0xda, 0x05, 0x07, 0xec, 0x04, 0x40, 0x00, 0x00, 0x03, 0x00,
+            0x40, 0x00, 0x00, 0x0f, 0x03, 0xc5, 0x0a, 0xa8,
         ];
         let pps = [0x68, 0xce, 0x0f, 0xc8];
-        let avcc = rpc::bitstream::h264::build_avcc_extra_data(&sps, &pps);
-        let extradata = rpc::bitstream::configuration_to_annex_b(Codec::H264, &avcc).unwrap();
+        let avcc = local_rpc::bitstream::h264::build_avcc_extra_data(&sps, &pps);
+        let extradata = local_rpc::bitstream::configuration_to_annex_b(Codec::H264, &avcc).unwrap();
         let mut nut = nut_header(Codec::H264, 320, 240, &extradata);
         let mut keyframe = vec![0x88; 140_000];
         keyframe[..5].copy_from_slice(&[0, 0, 0, 1, 0x65]);
         nut.extend_from_slice(&nut_frame(0, true, true, &keyframe));
-        nut.extend_from_slice(&nut_frame(
-            30_000,
-            false,
-            false,
-            &[0, 0, 0, 1, 0x41, 0x9a],
-        ));
+        nut.extend_from_slice(&nut_frame(30_000, false, false, &[0, 0, 0, 1, 0x41, 0x9a]));
 
         let mut child = Command::new("ffprobe")
             .args([
@@ -1696,7 +1680,7 @@ mod tests {
             .unwrap();
 
         let mut wire = Vec::new();
-        rpc::video::write_video_frame(&mut wire, 0, true, 7, &body);
+        local_rpc::video::write_video_frame(&mut wire, 0, true, 7, &body);
         daemon_stream.write_all(&wire).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1723,7 +1707,7 @@ mod tests {
         assert!(opened, "libmpv did not open the live NUT stream:\n{logs}");
 
         wire.clear();
-        rpc::video::write_video_frame(&mut wire, 30_000, true, 7, &body);
+        local_rpc::video::write_video_frame(&mut wire, 30_000, true, 7, &body);
         daemon_stream.write_all(&wire).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut advanced = false;
@@ -1844,13 +1828,7 @@ mod tests {
 
         let mut wire = Vec::new();
         for timestamp_ms in 0..8 {
-            rpc::video::write_video_frame(
-                &mut wire,
-                timestamp_ms * 1_000,
-                true,
-                8,
-                &body,
-            );
+            local_rpc::video::write_video_frame(&mut wire, timestamp_ms * 1_000, true, 8, &body);
         }
         daemon_stream.write_all(&wire).unwrap();
 
@@ -1881,7 +1859,9 @@ mod tests {
             "render output held decoder progress behind unconsumed frames:\n{logs}"
         );
         assert!(
-            render.next_frame_info().is_ok_and(|frame| frame.is_present()),
+            render
+                .next_frame_info()
+                .is_ok_and(|frame| frame.is_present()),
             "the newest frame was not retained for the render loop"
         );
         drop(source);

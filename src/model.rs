@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 
-use rpc::{
-    daemon::{
-        frame::{NegotiatedLimits, Operation, RequestOutcome},
-        model::{
-            ConnectionState, DaemonInstanceId, Participant, RequestId, RoomSummary,
-            LiveShare, TransferSummary, VoiceState,
-        },
-    },
+use local_rpc::{
+    frame::{NegotiatedLimits, Operation, RequestOutcome},
     ids::RoomId,
+    model::{
+        ConnectionState, DaemonInstanceId, LiveShare, Participant, RequestId, RoomSummary,
+        TransferSummary, VoiceState,
+    },
 };
 
 use crate::timeline::Message;
@@ -28,7 +26,7 @@ pub struct PendingRequest {
     pub operation: Operation,
     pub room_id: Option<RoomId>,
     pub draft: Option<String>,
-    pub transfer_id: Option<rpc::daemon::model::BulkTransferId>,
+    pub transfer_id: Option<local_rpc::model::BulkTransferId>,
 }
 
 pub struct ChatModel {
@@ -44,7 +42,7 @@ pub struct ChatModel {
     pub selected_room: Option<RoomId>,
     pub messages: Vec<Message>,
     pub participants: Vec<Participant>,
-    pub older_cursor: Option<rpc::ids::MessageId>,
+    pub older_cursor: Option<local_rpc::ids::MessageId>,
     pub at_start: bool,
     pub voice: VoiceState,
     pub transfers: Vec<TransferSummary>,
@@ -96,7 +94,7 @@ impl ChatModel {
 
     pub fn record_result(
         &mut self,
-        result: &rpc::daemon::frame::RequestResult,
+        result: &local_rpc::frame::RequestResult,
     ) -> Option<PendingRequest> {
         let pending = self.pending.remove(&result.request_id);
         if let RequestOutcome::Rejected { message, .. } = &result.outcome {

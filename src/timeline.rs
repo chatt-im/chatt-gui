@@ -3,13 +3,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rpc::daemon::model::{AttachmentDescriptor, MediaKind};
+use local_rpc::model::{AttachmentDescriptor, MediaKind};
 
 const GROUP_WINDOW_MS: u64 = 7 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct Message {
-    pub room_id: rpc::ids::RoomId,
+    pub room_id: local_rpc::ids::RoomId,
     pub id: u64,
     pub sender: String,
     pub body: String,
@@ -45,7 +45,7 @@ impl Attachment {
     }
 }
 
-pub fn from_daemon(message: rpc::daemon::model::Message) -> Message {
+pub fn from_daemon(message: local_rpc::model::Message) -> Message {
     Message {
         id: message.message_id.0,
         room_id: message.room_id,
@@ -115,9 +115,9 @@ mod tests {
     fn attachment(file_name: &str, media_kind: MediaKind, content_type: &str) -> Attachment {
         Attachment {
             descriptor: AttachmentDescriptor {
-                id: rpc::daemon::model::AttachmentId {
-                    room_id: rpc::ids::RoomId(1),
-                    message_id: rpc::ids::MessageId(1),
+                id: local_rpc::model::AttachmentId {
+                    room_id: local_rpc::ids::RoomId(1),
+                    message_id: local_rpc::ids::MessageId(1),
                 },
                 file_name: file_name.into(),
                 media_kind,
@@ -131,7 +131,7 @@ mod tests {
 
     fn message(sender: &str, timestamp_ms: u64) -> Message {
         Message {
-            room_id: rpc::ids::RoomId(1),
+            room_id: local_rpc::ids::RoomId(1),
             id: timestamp_ms,
             sender: sender.into(),
             body: String::new(),

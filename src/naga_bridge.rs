@@ -11,8 +11,7 @@ use std::{
     mem,
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
-    ptr,
-    slice,
+    ptr, slice,
 };
 
 use naga::{
@@ -155,8 +154,7 @@ pub unsafe extern "C" fn chatt_naga_result_free_v1(result: *mut ChattNagaResultV
         unsafe { drop(Box::from_raw(words)) };
     }
     if !result.diagnostic.is_null() {
-        let diagnostic =
-            ptr::slice_from_raw_parts_mut(result.diagnostic, result.diagnostic_len);
+        let diagnostic = ptr::slice_from_raw_parts_mut(result.diagnostic, result.diagnostic_len);
         // SAFETY: Failure results originate in `Box<[u8]>` above.
         unsafe { drop(Box::from_raw(diagnostic)) };
     }
@@ -267,9 +265,7 @@ unsafe fn utf8_field<'a>(
         return Err(format!("{stage_name} shader: {field_name} is too large"));
     }
     if len != 0 && bytes.is_null() {
-        return Err(format!(
-            "{stage_name} shader: {field_name} pointer is null"
-        ));
+        return Err(format!("{stage_name} shader: {field_name} pointer is null"));
     }
     let bytes = if len == 0 {
         &[]
@@ -287,7 +283,9 @@ fn stage_from_abi(stage: u32) -> Result<(ShaderStage, &'static str), String> {
         STAGE_VERTEX => Ok((ShaderStage::Vertex, "vertex")),
         STAGE_FRAGMENT => Ok((ShaderStage::Fragment, "fragment")),
         STAGE_COMPUTE => Ok((ShaderStage::Compute, "compute")),
-        _ => Err(format!("invalid shader stage {stage}: Naga compilation rejected")),
+        _ => Err(format!(
+            "invalid shader stage {stage}: Naga compilation rejected"
+        )),
     }
 }
 
@@ -342,10 +340,7 @@ fn compile_glsl(request: CompileRequest<'_>) -> Result<Vec<u32>, String> {
 
     enforce_compute_limits(&module, &request)?;
 
-    let mut validator = Validator::new(
-        ValidationFlags::all(),
-        spv::supported_capabilities(),
-    );
+    let mut validator = Validator::new(ValidationFlags::all(), spv::supported_capabilities());
     validator.allow_glsl_scalar_atomics(true);
     validator.allow_glsl_write_only_storage_buffers(true);
     let info = validator.validate(&module).map_err(|error| {
@@ -587,9 +582,7 @@ mod tests {
             Ok(unsafe { slice::from_raw_parts(result.words, result.word_count) }.to_vec())
         } else {
             // SAFETY: A failed bridge result owns `diagnostic_len` bytes.
-            let bytes = unsafe {
-                slice::from_raw_parts(result.diagnostic, result.diagnostic_len)
-            };
+            let bytes = unsafe { slice::from_raw_parts(result.diagnostic, result.diagnostic_len) };
             Err(String::from_utf8(bytes.to_vec()).expect("diagnostic is UTF-8"))
         };
         // SAFETY: `result` was initialized by the bridge and is freed once.
@@ -635,7 +628,10 @@ mod tests {
 
         assert!(compile(&request(STAGE_VERTEX, vertex, SPIRV_1_5)).is_ok());
         assert!(compile(&request(STAGE_FRAGMENT, fragment, SPIRV_1_5)).is_ok());
-        assert!(matches!(promote_vulkan_glsl_version(VERTEX), Cow::Borrowed(_)));
+        assert!(matches!(
+            promote_vulkan_glsl_version(VERTEX),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -822,9 +818,18 @@ mod tests {
         ))
         .unwrap();
         assert!(contains_opcode(&peak, 349), "missing OpGroupNonUniformIAdd");
-        assert!(contains_opcode(&peak, 333), "missing OpGroupNonUniformElect");
-        assert!(contains_opcode(&peak, 336), "missing OpGroupNonUniformAllEqual");
-        assert!(contains_opcode(&peak, 339), "missing OpGroupNonUniformBallot");
+        assert!(
+            contains_opcode(&peak, 333),
+            "missing OpGroupNonUniformElect"
+        );
+        assert!(
+            contains_opcode(&peak, 336),
+            "missing OpGroupNonUniformAllEqual"
+        );
+        assert!(
+            contains_opcode(&peak, 339),
+            "missing OpGroupNonUniformBallot"
+        );
         assert!(
             contains_opcode(&peak, 342),
             "missing OpGroupNonUniformBallotBitCount"
@@ -842,12 +847,17 @@ mod tests {
         ))
         .unwrap();
         assert!(contains_opcode(&texel_buffer, 95), "missing OpImageFetch");
-        assert!(instructions(&texel_buffer).any(|(opcode, operands)| {
-            opcode == 25 && operands.len() >= 3 && operands[2] == 5
-        }), "missing Buffer-dimensional OpTypeImage");
-        assert!(instructions(&texel_buffer).any(|(opcode, operands)| {
-            opcode == 17 && operands.first() == Some(&46)
-        }), "missing SampledBuffer capability");
+        assert!(
+            instructions(&texel_buffer).any(|(opcode, operands)| {
+                opcode == 25 && operands.len() >= 3 && operands[2] == 5
+            }),
+            "missing Buffer-dimensional OpTypeImage"
+        );
+        assert!(
+            instructions(&texel_buffer)
+                .any(|(opcode, operands)| { opcode == 17 && operands.first() == Some(&46) }),
+            "missing SampledBuffer capability"
+        );
 
         let storage_texel_buffer = compile(&request(
             STAGE_COMPUTE,
@@ -855,17 +865,25 @@ mod tests {
             SPIRV_1_5,
         ))
         .unwrap();
-        assert!(contains_opcode(&storage_texel_buffer, 98), "missing OpImageRead");
-        assert!(contains_opcode(&storage_texel_buffer, 99), "missing OpImageWrite");
-        assert!(instructions(&storage_texel_buffer).any(|(opcode, operands)| {
-            opcode == 25
-                && operands.len() >= 7
-                && operands[2] == 5
-                && operands[6] == 2
-        }), "missing storage Buffer-dimensional OpTypeImage");
-        assert!(instructions(&storage_texel_buffer).any(|(opcode, operands)| {
-            opcode == 17 && operands.first() == Some(&47)
-        }), "missing ImageBuffer capability");
+        assert!(
+            contains_opcode(&storage_texel_buffer, 98),
+            "missing OpImageRead"
+        );
+        assert!(
+            contains_opcode(&storage_texel_buffer, 99),
+            "missing OpImageWrite"
+        );
+        assert!(
+            instructions(&storage_texel_buffer).any(|(opcode, operands)| {
+                opcode == 25 && operands.len() >= 7 && operands[2] == 5 && operands[6] == 2
+            }),
+            "missing storage Buffer-dimensional OpTypeImage"
+        );
+        assert!(
+            instructions(&storage_texel_buffer)
+                .any(|(opcode, operands)| { opcode == 17 && operands.first() == Some(&47) }),
+            "missing ImageBuffer capability"
+        );
 
         let write_only_storage = compile(&request(
             STAGE_COMPUTE,
@@ -873,16 +891,27 @@ mod tests {
             SPIRV_1_5,
         ))
         .unwrap();
-        assert!(contains_opcode(&write_only_storage, 50), "missing OpSpecConstant");
-        assert!(instructions(&write_only_storage).any(|(opcode, operands)| {
-            opcode == 71 && operands.get(1) == Some(&1) && operands.get(2) == Some(&0)
-        }), "missing SpecId 0 decoration");
-        assert!(instructions(&write_only_storage).any(|(opcode, operands)| {
-            opcode == 71 && operands.get(1) == Some(&1) && operands.get(2) == Some(&1)
-        }), "missing SpecId 1 decoration");
-        assert!(instructions(&write_only_storage).any(|(opcode, operands)| {
-            opcode == 71 && operands.get(1) == Some(&25)
-        }), "missing NonReadable decoration for write-only storage buffer");
+        assert!(
+            contains_opcode(&write_only_storage, 50),
+            "missing OpSpecConstant"
+        );
+        assert!(
+            instructions(&write_only_storage).any(|(opcode, operands)| {
+                opcode == 71 && operands.get(1) == Some(&1) && operands.get(2) == Some(&0)
+            }),
+            "missing SpecId 0 decoration"
+        );
+        assert!(
+            instructions(&write_only_storage).any(|(opcode, operands)| {
+                opcode == 71 && operands.get(1) == Some(&1) && operands.get(2) == Some(&1)
+            }),
+            "missing SpecId 1 decoration"
+        );
+        assert!(
+            instructions(&write_only_storage)
+                .any(|(opcode, operands)| { opcode == 71 && operands.get(1) == Some(&25) }),
+            "missing NonReadable decoration for write-only storage buffer"
+        );
 
         let formatless_storage = compile(&request(
             STAGE_COMPUTE,
@@ -890,18 +919,29 @@ mod tests {
             SPIRV_1_5,
         ))
         .unwrap();
-        assert!(contains_opcode(&formatless_storage, 98), "missing OpImageRead");
-        assert!(contains_opcode(&formatless_storage, 99), "missing OpImageWrite");
-        assert!(instructions(&formatless_storage).any(|(opcode, operands)| {
-            opcode == 25
-                && operands.len() >= 8
-                && operands[2] == 5
-                && operands[6] == 2
-                && operands[7] == 0
-        }), "missing unknown-format storage Buffer OpTypeImage");
-        assert!(instructions(&formatless_storage).any(|(opcode, operands)| {
-            opcode == 17 && operands.first() == Some(&55)
-        }), "missing StorageImageReadWithoutFormat capability");
+        assert!(
+            contains_opcode(&formatless_storage, 98),
+            "missing OpImageRead"
+        );
+        assert!(
+            contains_opcode(&formatless_storage, 99),
+            "missing OpImageWrite"
+        );
+        assert!(
+            instructions(&formatless_storage).any(|(opcode, operands)| {
+                opcode == 25
+                    && operands.len() >= 8
+                    && operands[2] == 5
+                    && operands[6] == 2
+                    && operands[7] == 0
+            }),
+            "missing unknown-format storage Buffer OpTypeImage"
+        );
+        assert!(
+            instructions(&formatless_storage)
+                .any(|(opcode, operands)| { opcode == 17 && operands.first() == Some(&55) }),
+            "missing StorageImageReadWithoutFormat capability"
+        );
 
         let specialized_shared = compile(&request(
             STAGE_COMPUTE,
@@ -912,9 +952,12 @@ mod tests {
         let spec_constant = instructions(&specialized_shared)
             .find_map(|(opcode, operands)| (opcode == 52).then(|| operands[1]))
             .expect("missing derived specialized shared-array length");
-        assert!(instructions(&specialized_shared).any(|(opcode, operands)| {
-            opcode == 28 && operands.get(2) == Some(&spec_constant)
-        }), "OpTypeArray does not use the specialization constant length");
+        assert!(
+            instructions(&specialized_shared).any(|(opcode, operands)| {
+                opcode == 28 && operands.get(2) == Some(&spec_constant)
+            }),
+            "OpTypeArray does not use the specialization constant length"
+        );
 
         let compute_texture = compile(&request(
             STAGE_COMPUTE,
@@ -922,8 +965,14 @@ mod tests {
             SPIRV_1_5,
         ))
         .unwrap();
-        assert!(contains_opcode(&compute_texture, 88), "missing explicit-LOD sample");
-        assert!(!contains_opcode(&compute_texture, 87), "compute texture() used implicit LOD");
+        assert!(
+            contains_opcode(&compute_texture, 88),
+            "missing explicit-LOD sample"
+        );
+        assert!(
+            !contains_opcode(&compute_texture, 87),
+            "compute texture() used implicit LOD"
+        );
 
         let coherent_storage = compile(&request(
             STAGE_FRAGMENT,
@@ -933,9 +982,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             instructions(&coherent_storage)
-                .filter(|(opcode, operands)| {
-                    *opcode == 71 && operands.get(1) == Some(&23)
-                })
+                .filter(|(opcode, operands)| { *opcode == 71 && operands.get(1) == Some(&23) })
                 .count(),
             2,
             "missing Coherent decorations for storage image and buffer"
@@ -950,16 +997,10 @@ mod tests {
             .parse(&glsl::Options::from(ShaderStage::Compute), source)
             .unwrap();
 
-        let mut portable = Validator::new(
-            ValidationFlags::all(),
-            spv::supported_capabilities(),
-        );
+        let mut portable = Validator::new(ValidationFlags::all(), spv::supported_capabilities());
         assert!(portable.validate(&module).is_err());
 
-        let mut glsl_spirv = Validator::new(
-            ValidationFlags::all(),
-            spv::supported_capabilities(),
-        );
+        let mut glsl_spirv = Validator::new(ValidationFlags::all(), spv::supported_capabilities());
         glsl_spirv.allow_glsl_scalar_atomics(true);
         assert!(glsl_spirv.validate(&module).is_ok());
 
@@ -969,16 +1010,10 @@ mod tests {
             .parse(&glsl::Options::from(ShaderStage::Compute), source)
             .unwrap();
 
-        let mut portable = Validator::new(
-            ValidationFlags::all(),
-            spv::supported_capabilities(),
-        );
+        let mut portable = Validator::new(ValidationFlags::all(), spv::supported_capabilities());
         assert!(portable.validate(&module).is_err());
 
-        let mut glsl_spirv = Validator::new(
-            ValidationFlags::all(),
-            spv::supported_capabilities(),
-        );
+        let mut glsl_spirv = Validator::new(ValidationFlags::all(), spv::supported_capabilities());
         glsl_spirv.allow_glsl_write_only_storage_buffers(true);
         assert!(glsl_spirv.validate(&module).is_ok());
     }
@@ -1066,26 +1101,86 @@ mod tests {
     #[test]
     fn compatibility_corpus_parses_validates_and_emits_spirv() {
         let fixtures = [
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/packed_rgb.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/packed_bgra.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/planar_yuv.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/nv12_8bit.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/p010_10bit.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/chroma_reconstruction.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/fragment_scaling.frag")),
-            (STAGE_COMPUTE, include_str!("../tests/shaders/compute_scaling.comp")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/sdr_tone_map.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/hdr10_tone_map.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/hlg_tone_map.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/software_upload.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/hardware_frame.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/libplacebo_runtime.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/crop_flip.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/channel_reorder.frag")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/polar_gather.frag")),
-            (STAGE_COMPUTE, include_str!("../tests/shaders/peak_detect.comp")),
-            (STAGE_FRAGMENT, include_str!("../tests/shaders/texel_buffer.frag")),
-            (STAGE_COMPUTE, include_str!("../tests/shaders/storage_texel_buffer.comp")),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/packed_rgb.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/packed_bgra.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/planar_yuv.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/nv12_8bit.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/p010_10bit.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/chroma_reconstruction.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/fragment_scaling.frag"),
+            ),
+            (
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/compute_scaling.comp"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/sdr_tone_map.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/hdr10_tone_map.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/hlg_tone_map.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/software_upload.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/hardware_frame.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/libplacebo_runtime.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/crop_flip.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/channel_reorder.frag"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/polar_gather.frag"),
+            ),
+            (
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/peak_detect.comp"),
+            ),
+            (
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/texel_buffer.frag"),
+            ),
+            (
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/storage_texel_buffer.comp"),
+            ),
         ];
 
         for (stage, source) in fixtures {

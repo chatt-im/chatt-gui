@@ -1,15 +1,15 @@
 mod app;
 mod composer;
 mod daemon;
-mod frame_stats;
 mod fonts;
+mod frame_stats;
 mod image_cache;
 mod live_stream;
 mod logger;
 mod media_cache;
 mod model;
-mod naga_bridge;
 mod mpv_player;
+mod naga_bridge;
 mod scroll_capture;
 mod timeline;
 mod video_manager;

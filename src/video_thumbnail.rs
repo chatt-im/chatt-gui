@@ -15,7 +15,7 @@ use libmpv2::{
     events::Event,
     render::{SoftwareRenderTarget, mpv_render_update},
 };
-use rpc::daemon::model::AttachmentId;
+use local_rpc::model::AttachmentId;
 
 const FORMAT_RGBA: &std::ffi::CStr = c"rgba";
 const MAX_WIDTH: u32 = 1_360;
@@ -149,7 +149,11 @@ impl VideoThumbnailCache {
 
         if let Err(error) = self.start_worker() {
             self.record_failure(key, error);
-            return self.entries.get(&key).map(view_for_entry).unwrap_or_default();
+            return self
+                .entries
+                .get(&key)
+                .map(view_for_entry)
+                .unwrap_or_default();
         }
         match self.enqueue(ThumbnailJob {
             key,
@@ -164,7 +168,10 @@ impl VideoThumbnailCache {
             Err(error) => self.record_failure(key, error),
         }
         self.evict();
-        self.entries.get(&key).map(view_for_entry).unwrap_or_default()
+        self.entries
+            .get(&key)
+            .map(view_for_entry)
+            .unwrap_or_default()
     }
 
     pub(crate) fn drain_results(&mut self) -> bool {
@@ -348,7 +355,9 @@ fn thumbnail_worker(
             };
         }
         let result = match extractor.as_mut() {
-            Some(extractor) => extractor.extract(&job.path).map_err(|error| format!("{error:#}")),
+            Some(extractor) => extractor
+                .extract(&job.path)
+                .map_err(|error| format!("{error:#}")),
             None => Err("initialize thumbnail libmpv core".into()),
         };
         if result.is_err() {
@@ -377,24 +386,26 @@ struct ThumbnailExtractor {
 
 impl ThumbnailExtractor {
     fn new() -> Result<Self> {
-        let mpv = Arc::new(Mpv::with_initializer(|initializer| {
-            initializer.set_option("vo", "libmpv")?;
-            initializer.set_option("idle", "yes")?;
-            initializer.set_option("keep-open", "no")?;
-            initializer.set_option("pause", "no")?;
-            initializer.set_option("audio", "no")?;
-            initializer.set_option("sub", "no")?;
-            initializer.set_option("hwdec", "no")?;
-            initializer.set_option("profile", "fast")?;
-            initializer.set_option("untimed", "yes")?;
-            initializer.set_option("video-sync", "display-desync")?;
-            initializer.set_option("cache", "no")?;
-            initializer.set_option("sws-allow-zimg", "no")?;
-            initializer.set_option("sws-scaler", "bilinear")?;
-            initializer.set_option("sws-fast", "yes")?;
-            Ok(())
-        })
-        .context("initialize thumbnail libmpv core")?);
+        let mpv = Arc::new(
+            Mpv::with_initializer(|initializer| {
+                initializer.set_option("vo", "libmpv")?;
+                initializer.set_option("idle", "yes")?;
+                initializer.set_option("keep-open", "no")?;
+                initializer.set_option("pause", "no")?;
+                initializer.set_option("audio", "no")?;
+                initializer.set_option("sub", "no")?;
+                initializer.set_option("hwdec", "no")?;
+                initializer.set_option("profile", "fast")?;
+                initializer.set_option("untimed", "yes")?;
+                initializer.set_option("video-sync", "display-desync")?;
+                initializer.set_option("cache", "no")?;
+                initializer.set_option("sws-allow-zimg", "no")?;
+                initializer.set_option("sws-scaler", "bilinear")?;
+                initializer.set_option("sws-fast", "yes")?;
+                Ok(())
+            })
+            .context("initialize thumbnail libmpv core")?,
+        );
         mpv.observe_property("duration", Format::Double, 1)?;
         let render = mpv
             .create_software_render_context(false)
@@ -553,8 +564,8 @@ mod tests {
     fn key(value: u8) -> ThumbnailKey {
         ThumbnailKey {
             attachment_id: AttachmentId {
-                room_id: rpc::ids::RoomId(1),
-                message_id: rpc::ids::MessageId(value as u64),
+                room_id: local_rpc::ids::RoomId(1),
+                message_id: local_rpc::ids::MessageId(value as u64),
             },
         }
     }
@@ -641,8 +652,8 @@ mod tests {
             cache.entries.insert(
                 ThumbnailKey {
                     attachment_id: AttachmentId {
-                        room_id: rpc::ids::RoomId(1),
-                        message_id: rpc::ids::MessageId(value as u64),
+                        room_id: local_rpc::ids::RoomId(1),
+                        message_id: local_rpc::ids::MessageId(value as u64),
                     },
                 },
                 CacheEntry {

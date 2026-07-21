@@ -10,8 +10,7 @@ const IBM_PLEX_SANS_SEMIBOLD: &[u8] =
     include_bytes!("../../ref/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
 const IBM_PLEX_SANS_SEMIBOLD_ITALIC: &[u8] =
     include_bytes!("../../ref/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
-const LILEX_REGULAR: &[u8] =
-    include_bytes!("../../ref/zed/assets/fonts/lilex/Lilex-Regular.ttf");
+const LILEX_REGULAR: &[u8] = include_bytes!("../../ref/zed/assets/fonts/lilex/Lilex-Regular.ttf");
 const LILEX_ITALIC: &[u8] = include_bytes!("../../ref/zed/assets/fonts/lilex/Lilex-Italic.ttf");
 const LILEX_BOLD: &[u8] = include_bytes!("../../ref/zed/assets/fonts/lilex/Lilex-Bold.ttf");
 const LILEX_BOLD_ITALIC: &[u8] =
@@ -53,9 +52,7 @@ mod tests {
         text.add_fonts(embedded_fonts()).unwrap();
 
         let regular = text.font_id(&font("IBM Plex Sans")).unwrap();
-        let italic = text
-            .font_id(&font("IBM Plex Sans").italic())
-            .unwrap();
+        let italic = text.font_id(&font("IBM Plex Sans").italic()).unwrap();
         let semibold = text
             .font_id(&gpui::Font {
                 weight: FontWeight::SEMIBOLD,
@@ -136,8 +133,12 @@ mod tests {
         );
         let missing_index = missing_sample.find('\u{10ffff}').unwrap();
         assert!(missing_layout.width > px(0.));
-        assert!(missing_layout.runs.iter().flat_map(|run| &run.glyphs).any(
-            |glyph| glyph.index == missing_index && glyph.id.0 == 0
-        ));
+        assert!(
+            missing_layout
+                .runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .any(|glyph| glyph.index == missing_index && glyph.id.0 == 0)
+        );
     }
 }

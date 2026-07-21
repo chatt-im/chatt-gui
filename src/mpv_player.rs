@@ -107,7 +107,7 @@ impl MpvPlayer {
 
     pub fn new_live(
         gpui_wakeup: AsyncSender<()>,
-        share: rpc::daemon::model::LiveShare,
+        share: local_rpc::model::LiveShare,
         stream: std::os::unix::net::UnixStream,
     ) -> Result<Self> {
         let source_wakeup = gpui_wakeup.clone();
@@ -355,9 +355,9 @@ impl MpvPlayer {
                         log::warn!(
                             "Vulkan libmpv interop unavailable, using software fallback: {error:#}"
                         );
-                        let context = mpv
-                            .create_software_render_context(live)
-                            .context("create libmpv software render context after Vulkan fallback")?;
+                        let context = mpv.create_software_render_context(live).context(
+                            "create libmpv software render context after Vulkan fallback",
+                        )?;
                         log::info!(
                             "video render backend selected backend=software upload=wgpu latest_frame={live}"
                         );
@@ -437,51 +437,54 @@ impl MpvPlayer {
         let control_mpv = mpv.clone();
         let control_error_sender = error_sender.clone();
         let control_render_sender = render_sender.clone();
-        let control_thread = match thread::Builder::new()
-            .name("mpv-control".into())
-            .spawn(move || {
-                control_worker(
-                    control_mpv,
-                    control_commands,
-                    control_playback,
-                    gpui_wakeup,
-                    control_error_sender,
-                    control_render_sender,
-                    fixed_render_size,
-                    control_frame_invalidated,
-                );
-            })
-        {
-            Ok(thread) => thread,
-            Err(error) => {
-                render_stopping.store(true, Ordering::Release);
-                let _ = render_sender.send(RenderMessage::Shutdown);
-                let _ = render_thread.join();
-                return Err(error).context("spawn mpv control thread");
-            }
-        };
+        let control_thread =
+            match thread::Builder::new()
+                .name("mpv-control".into())
+                .spawn(move || {
+                    control_worker(
+                        control_mpv,
+                        control_commands,
+                        control_playback,
+                        gpui_wakeup,
+                        control_error_sender,
+                        control_render_sender,
+                        fixed_render_size,
+                        control_frame_invalidated,
+                    );
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    render_stopping.store(true, Ordering::Release);
+                    let _ = render_sender.send(RenderMessage::Shutdown);
+                    let _ = render_thread.join();
+                    return Err(error).context("spawn mpv control thread");
+                }
+            };
 
         log::info!(
             "video player construction completed live={live} backend={}",
             selected_backend.name()
         );
 
-        Ok((Self {
-            control_sender,
-            control_thread: Some(control_thread),
-            render_sender,
-            render_thread: Some(render_thread),
-            render_stopping,
-            playback,
-            errors,
-            error_sender,
-            requested_paused: false,
-            surface,
-            mpv,
-            live_diagnostics,
-            live_input_gate,
-            live_source: None,
-        }, selected_backend))
+        Ok((
+            Self {
+                control_sender,
+                control_thread: Some(control_thread),
+                render_sender,
+                render_thread: Some(render_thread),
+                render_stopping,
+                playback,
+                errors,
+                error_sender,
+                requested_paused: false,
+                surface,
+                mpv,
+                live_diagnostics,
+                live_input_gate,
+                live_source: None,
+            },
+            selected_backend,
+        ))
     }
 
     pub fn surface(&self) -> PlatformSurface {
@@ -533,12 +536,7 @@ impl MpvPlayer {
         })
     }
 
-    pub(crate) fn seek_percent(
-        &self,
-        percent: f64,
-        position: f64,
-        mode: SeekMode,
-    ) -> Result<()> {
+    pub(crate) fn seek_percent(&self, percent: f64, position: f64, mode: SeekMode) -> Result<()> {
         let percent = percent.clamp(0.0, 100.0);
         let position = position.max(0.0);
         self.playback.seek_to(position);
@@ -662,17 +660,14 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_EXT_image_drm_format_modifier");
-    let has_vulkan_video_core = [
-        c"VK_KHR_video_queue",
-        c"VK_KHR_video_decode_queue",
-    ]
-    .iter()
-    .all(|required| {
-        native
-            .device_extensions
-            .iter()
-            .any(|extension| extension == required)
-    });
+    let has_vulkan_video_core = [c"VK_KHR_video_queue", c"VK_KHR_video_decode_queue"]
+        .iter()
+        .all(|required| {
+            native
+                .device_extensions
+                .iter()
+                .any(|extension| extension == required)
+        });
     let has_vulkan_video_h264 = native
         .device_extensions
         .iter()
@@ -709,9 +704,7 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         has_vulkan_video_h265,
         has_vulkan_video_av1,
     );
-    if cfg!(target_os = "linux")
-        && !(has_external_memory_fd && has_dma_buf && has_drm_modifiers)
-    {
+    if cfg!(target_os = "linux") && !(has_external_memory_fd && has_dma_buf && has_drm_modifiers) {
         log::warn!(
             "Vulkan device lacks Linux dma-buf import extensions; hardware-decoded video may round-trip through CPU memory"
         );
@@ -1181,9 +1174,10 @@ impl RenderDiagnostics {
     fn note_ring_busy(&mut self, backend: &str, generation: u64) {
         self.ring_busy += 1;
         let now = Instant::now();
-        if self.last_pressure_log.is_none_or(|last| {
-            now.duration_since(last) >= RENDER_PRESSURE_LOG_INTERVAL
-        }) {
+        if self
+            .last_pressure_log
+            .is_none_or(|last| now.duration_since(last) >= RENDER_PRESSURE_LOG_INTERVAL)
+        {
             self.last_pressure_log = Some(now);
             log::warn!(
                 "all video textures are still in use; deferring render request backend={backend} generation={generation} busy_total={}",
@@ -1266,7 +1260,8 @@ fn control_worker(
                     // before opening the replacement so a pooled core cannot
                     // mistake the previous file's FileLoaded/EndFile for the
                     // new session.
-                    let result = mpv.command("stop", &[])
+                    let result = mpv
+                        .command("stop", &[])
                         .map(|()| while mpv.wait_event(0.0).is_some() {})
                         .and_then(|()| mpv.set_property("pause", paused))
                         .and_then(|()| mpv.set_property("volume", volume))
@@ -1588,10 +1583,7 @@ fn render_worker(
                     redraw_pending = false;
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
-                    if live_input_gate
-                        .as_ref()
-                        .is_some_and(|gate| gate.release())
-                    {
+                    if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
                         log::info!(
                             "released live decoder input after first rendered output backend={backend_name}"
                         );
@@ -1663,10 +1655,7 @@ fn render_worker(
                         }
                         RenderAction::Skip => {
                             diagnostics.repeats += 1;
-                            backend
-                                .skip_rendering()
-                                .map(|()| false)
-                                .map_err(Into::into)
+                            backend.skip_rendering().map(|()| false).map_err(Into::into)
                         }
                         RenderAction::Render => {
                             let result = backend.render(&surface, true, &mut diagnostics);
@@ -1721,9 +1710,7 @@ fn render_worker(
                 surface.clear();
                 (
                     "release resources",
-                    backend
-                        .release_resources(&surface)
-                        .map(|()| false),
+                    backend.release_resources(&surface).map(|()| false),
                 )
             }
             RenderMessage::Shutdown => break,
@@ -1736,10 +1723,7 @@ fn render_worker(
                     redraw_pending = false;
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
-                    if live_input_gate
-                        .as_ref()
-                        .is_some_and(|gate| gate.release())
-                    {
+                    if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
                         log::info!(
                             "released live decoder input after first rendered output backend={backend_name}"
                         );
@@ -1814,8 +1798,10 @@ struct SharedPlaybackState {
 
 impl SharedPlaybackState {
     fn publish(&self, state: PlaybackState) {
-        self.position.store(state.position.to_bits(), Ordering::Relaxed);
-        self.duration.store(state.duration.to_bits(), Ordering::Relaxed);
+        self.position
+            .store(state.position.to_bits(), Ordering::Relaxed);
+        self.duration
+            .store(state.duration.to_bits(), Ordering::Relaxed);
         self.paused.store(state.paused, Ordering::Relaxed);
         self.finished.store(state.finished, Ordering::Release);
     }
@@ -1884,8 +1870,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            output.status.success()
-                && stdout.contains("VAAPI lazy-loader disable path reached"),
+            output.status.success() && stdout.contains("VAAPI lazy-loader disable path reached"),
             "disabled VAAPI child failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
         );
     }
@@ -2106,11 +2091,7 @@ mod tests {
     #[test]
     fn skips_exact_repeat_when_previous_frame_exists() {
         assert_eq!(
-            render_action(
-                u64::from(mpv_render_update::Frame),
-                Some(info(4)),
-                true,
-            ),
+            render_action(u64::from(mpv_render_update::Frame), Some(info(4)), true,),
             RenderAction::Skip
         );
     }
@@ -2118,11 +2099,7 @@ mod tests {
     #[test]
     fn renders_repeat_when_surface_has_no_previous_frame() {
         assert_eq!(
-            render_action(
-                u64::from(mpv_render_update::Frame),
-                Some(info(4)),
-                false,
-            ),
+            render_action(u64::from(mpv_render_update::Frame), Some(info(4)), false,),
             RenderAction::Render
         );
     }
@@ -2164,22 +2141,20 @@ mod tests {
     #[test]
     fn redraw_is_not_discarded_as_repeat() {
         assert_eq!(
-            render_action(
-                u64::from(mpv_render_update::Frame),
-                Some(info(4 | 2)),
-                true,
-            ),
+            render_action(u64::from(mpv_render_update::Frame), Some(info(4 | 2)), true,),
             RenderAction::Render
         );
     }
 
     #[test]
     fn attachment_scrub_seek_modes_match_native_mpv_flags() {
-        assert_eq!(SeekMode::Exact.absolute_percent_flag(), "absolute-percent+exact");
+        assert_eq!(
+            SeekMode::Exact.absolute_percent_flag(),
+            "absolute-percent+exact"
+        );
         assert_eq!(
             SeekMode::Keyframes.absolute_percent_flag(),
             "absolute-percent"
         );
     }
-
 }

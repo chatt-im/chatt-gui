@@ -76,17 +76,15 @@ where
             .handler
             .take()
             .expect("scroll capture painted more than once");
-        window.on_mouse_event(
-            move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture
-                    && bounds.contains(&event.position)
-                    && event.delta.pixel_delta(gpui::px(1.)).y != gpui::px(0.)
-                    && handler(event, window, cx)
-                {
-                    cx.stop_propagation();
-                }
-            },
-        );
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture
+                && bounds.contains(&event.position)
+                && event.delta.pixel_delta(gpui::px(1.)).y != gpui::px(0.)
+                && handler(event, window, cx)
+            {
+                cx.stop_propagation();
+            }
+        });
 
         self.inner.paint(
             id,

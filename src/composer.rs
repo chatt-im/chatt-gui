@@ -197,9 +197,7 @@ impl Composer {
             .count()
     }
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.normalize_range(
-            self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end),
-        )
+        self.normalize_range(self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end))
     }
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         let range = self.normalize_range(range.clone());
@@ -215,8 +213,8 @@ impl Composer {
     fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
         let local = self.last_bounds?.localize(&point)?;
         let line_height = self.last_line_height?;
-        let line_index = ((local.y / line_height).floor() as usize)
-            .min(self.last_layout.len().checked_sub(1)?);
+        let line_index =
+            ((local.y / line_height).floor() as usize).min(self.last_layout.len().checked_sub(1)?);
         let line = &self.last_layout[line_index];
         let offset = line.layout.closest_index_for_x(local.x);
         Some(line.range.start + offset)
@@ -260,13 +258,12 @@ fn range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
 
 fn logical_lines(text: &str) -> impl Iterator<Item = (Range<usize>, &str)> {
     let mut start = 0;
-    text.split('\n')
-        .map(move |line| {
-            let end = start + line.len();
-            let range = start..end;
-            start = end + 1;
-            (range, line)
-        })
+    text.split('\n').map(move |line| {
+        let end = start + line.len();
+        let range = start..end;
+        start = end + 1;
+        (range, line)
+    })
 }
 
 fn line_for_offset(lines: &[ComposerLine], offset: usize) -> Option<&ComposerLine> {
@@ -530,10 +527,7 @@ impl Element for ComposerElement {
                         right += px(4.);
                     }
                     Some(fill(
-                        Bounds::from_corners(
-                            point(left, top),
-                            point(right, top + line_height),
-                        ),
+                        Bounds::from_corners(point(left, top), point(right, top + line_height)),
                         rgba(0x6f8fc044),
                     ))
                 })
@@ -636,9 +630,7 @@ impl Focusable for Composer {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16,
-    };
+    use super::{ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16};
 
     #[test]
     fn splits_multiline_content_before_single_line_shaping() {
@@ -652,9 +644,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0..5, 6..6, 7..12, 13..13]
         );
-        assert!(lines
-            .iter()
-            .all(|(_, line)| !line.contains('\n')));
+        assert!(lines.iter().all(|(_, line)| !line.contains('\n')));
     }
 
     #[test]

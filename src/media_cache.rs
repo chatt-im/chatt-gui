@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-use rpc::daemon::{
+use local_rpc::{
     bulk::{BulkChunk, BulkFinished},
     model::{AttachmentDescriptor, AttachmentId, BulkTransferId},
 };
@@ -64,7 +64,7 @@ impl MediaCache {
     }
 
     pub fn available_transfer_slots(&self) -> usize {
-        rpc::daemon::MAX_CONCURRENT_TRANSFERS.saturating_sub(self.partial.len())
+        local_rpc::MAX_CONCURRENT_TRANSFERS.saturating_sub(self.partial.len())
     }
 
     pub fn reserve(
@@ -72,7 +72,7 @@ impl MediaCache {
         transfer_id: BulkTransferId,
         descriptor: &AttachmentDescriptor,
     ) -> Result<(), String> {
-        if self.partial.len() >= rpc::daemon::MAX_CONCURRENT_TRANSFERS {
+        if self.partial.len() >= local_rpc::MAX_CONCURRENT_TRANSFERS {
             return Err("too many media transfers".into());
         }
         if self.partial.contains_key(&transfer_id) {
@@ -90,10 +90,7 @@ impl MediaCache {
         {
             return Err("attachment exceeds the available media cache budget".into());
         }
-        let path = self
-            .root
-            .path()
-            .join(format!("{}.part", transfer_id.0));
+        let path = self.root.path().join(format!("{}.part", transfer_id.0));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -118,9 +115,7 @@ impl MediaCache {
             .partial
             .get_mut(&chunk.transfer_id)
             .ok_or_else(|| "bulk chunk has no active transfer".to_string())?;
-        if partial.received.saturating_add(chunk.bytes.len() as u64)
-            > partial.descriptor.byte_len
-        {
+        if partial.received.saturating_add(chunk.bytes.len() as u64) > partial.descriptor.byte_len {
             self.cancel(chunk.transfer_id);
             return Err("bulk chunk exceeds declared attachment length".into());
         }
@@ -235,9 +230,9 @@ impl MediaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::{
-        daemon::model::MediaKind,
+    use local_rpc::{
         ids::{MessageId, RoomId},
+        model::MediaKind,
     };
 
     fn descriptor(room: u32, message: u64, byte_len: u64) -> AttachmentDescriptor {
@@ -292,9 +287,9 @@ mod tests {
         let mut cache = MediaCache::new(1024).unwrap();
         assert_eq!(
             cache.available_transfer_slots(),
-            rpc::daemon::MAX_CONCURRENT_TRANSFERS
+            local_rpc::MAX_CONCURRENT_TRANSFERS
         );
-        for index in 0..rpc::daemon::MAX_CONCURRENT_TRANSFERS {
+        for index in 0..local_rpc::MAX_CONCURRENT_TRANSFERS {
             let descriptor = descriptor(1, (index + 1) as u64, 0);
             cache
                 .reserve(BulkTransferId((index + 1) as u64), &descriptor)

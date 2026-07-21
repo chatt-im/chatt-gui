@@ -1,4 +1,4 @@
-use rpc::daemon::{
+use local_rpc::{
     frame::{DaemonFrame, StateDelta},
     model::StateSnapshot,
 };
@@ -14,7 +14,7 @@ pub struct ReduceEffect {
     pub messages_changed: bool,
     pub splices: Vec<(usize, usize, usize)>,
     pub request_resync: bool,
-    pub request_result: Option<rpc::daemon::frame::RequestResult>,
+    pub request_result: Option<local_rpc::frame::RequestResult>,
 }
 
 pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
@@ -103,9 +103,9 @@ fn install_snapshot(model: &mut ChatModel, snapshot: StateSnapshot) {
         .filter(|transfer| {
             !matches!(
                 transfer.status,
-                rpc::daemon::model::TransferStatus::Complete
-                    | rpc::daemon::model::TransferStatus::Canceled
-                    | rpc::daemon::model::TransferStatus::Failed
+                local_rpc::model::TransferStatus::Complete
+                    | local_rpc::model::TransferStatus::Canceled
+                    | local_rpc::model::TransferStatus::Failed
             )
         })
         .collect();
@@ -299,9 +299,9 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             }
             if matches!(
                 transfer.status,
-                rpc::daemon::model::TransferStatus::Complete
-                    | rpc::daemon::model::TransferStatus::Canceled
-                    | rpc::daemon::model::TransferStatus::Failed
+                local_rpc::model::TransferStatus::Complete
+                    | local_rpc::model::TransferStatus::Canceled
+                    | local_rpc::model::TransferStatus::Failed
             ) {
                 model
                     .transfers
@@ -344,7 +344,7 @@ fn clear_room_state(model: &mut ChatModel, effect: &mut ReduceEffect) {
 
 fn is_active_room(
     model: &mut ChatModel,
-    room_id: rpc::ids::RoomId,
+    room_id: local_rpc::ids::RoomId,
     effect: &mut ReduceEffect,
 ) -> bool {
     if model.selected_room == Some(room_id) {
@@ -364,15 +364,15 @@ fn request_resync(model: &mut ChatModel, effect: &mut ReduceEffect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::daemon::{
+    use local_rpc::ids::{RoomId, UserId};
+    use local_rpc::{
         frame::{NegotiatedLimits, StateEvent, Welcome},
         model::{ConnectionState, DaemonInstanceId, Participant, VoiceState},
     };
-    use rpc::ids::{RoomId, UserId};
 
     fn welcome(instance: DaemonInstanceId) -> DaemonFrame {
         DaemonFrame::Welcome(Welcome {
-            version: rpc::daemon::PROTOCOL_MAX_VERSION,
+            version: local_rpc::PROTOCOL_MAX_VERSION,
             instance_id: instance,
             daemon_build: "test".into(),
             connection: ConnectionState::Online,
@@ -401,10 +401,10 @@ mod tests {
         }
     }
 
-    fn message(room_id: RoomId, message_id: u64) -> rpc::daemon::model::Message {
-        rpc::daemon::model::Message {
+    fn message(room_id: RoomId, message_id: u64) -> local_rpc::model::Message {
+        local_rpc::model::Message {
             room_id,
-            message_id: rpc::ids::MessageId(message_id),
+            message_id: local_rpc::ids::MessageId(message_id),
             sender_id: UserId(1),
             sender_name: "alice".into(),
             body: message_id.to_string(),
@@ -426,9 +426,9 @@ mod tests {
             apply_delta(
                 &mut model,
                 StateDelta::LiveShareUpserted {
-                    share: rpc::daemon::model::LiveShare {
+                    share: local_rpc::model::LiveShare {
                         room_id: RoomId(1),
-                        stream_id: rpc::ids::StreamId(stream_id),
+                        stream_id: local_rpc::ids::StreamId(stream_id),
                         sender_name: "alice".into(),
                         codec: "avc1.42C00D".into(),
                         coded_width: 320,
@@ -450,7 +450,7 @@ mod tests {
         apply_delta(
             &mut model,
             StateDelta::LiveShareRemoved {
-                stream_id: rpc::ids::StreamId(3),
+                stream_id: local_rpc::ids::StreamId(3),
             },
             &mut effect,
         );

@@ -11,21 +11,17 @@ use gpui::{
     AnyElement, App, Bounds, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight,
     KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
-    list, point, prelude::*, px, relative, rgb, rgba, surface, Resource,
+    Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas,
+    div, img, list, point, prelude::*, px, relative, rgb, rgba, surface,
+};
+use local_rpc::{
+    frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
+    ids::{RoomId, StreamId},
+    model::{AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState},
 };
 use markdown::{
     Markdown, MarkdownElement, MarkdownSelectionArea, MarkdownSelectionGroup, MarkdownSelectionKey,
     MarkdownStyle,
-};
-use rpc::{
-    daemon::{
-        frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
-        model::{
-            AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState,
-        },
-    },
-    ids::{RoomId, StreamId},
 };
 
 use crate::{
@@ -117,9 +113,8 @@ impl LiveVideoGeometry {
             return None;
         }
 
-        let scale = (viewport_width / coded_width as f32)
-            .min(viewport_height / coded_height as f32)
-            * zoom;
+        let scale =
+            (viewport_width / coded_width as f32).min(viewport_height / coded_height as f32) * zoom;
         let width = px(coded_width as f32 * scale);
         let height = px(coded_height as f32 * scale);
         let center = viewport.center() + pan;
@@ -147,11 +142,7 @@ impl LiveVideoGeometry {
     }
 }
 
-fn live_pan_limits(
-    coded_size: (u32, u32),
-    viewport: Bounds<Pixels>,
-    zoom: f32,
-) -> Point<Pixels> {
+fn live_pan_limits(coded_size: (u32, u32), viewport: Bounds<Pixels>, zoom: f32) -> Point<Pixels> {
     let (coded_width, coded_height) = coded_size;
     let viewport_width = viewport.size.width.as_f32();
     let viewport_height = viewport.size.height.as_f32();
@@ -159,8 +150,8 @@ fn live_pan_limits(
         return point(px(0.0), px(0.0));
     }
 
-    let fit_scale = (viewport_width / coded_width as f32)
-        .min(viewport_height / coded_height as f32);
+    let fit_scale =
+        (viewport_width / coded_width as f32).min(viewport_height / coded_height as f32);
     let scaled_width = coded_width as f32 * fit_scale * zoom;
     let scaled_height = coded_height as f32 * fit_scale * zoom;
     point(
@@ -191,17 +182,13 @@ fn zoom_live_pan(
     focal_point: Point<Pixels>,
 ) -> Point<Pixels> {
     let old_pan = clamp_live_pan(pan, coded_size, viewport, old_zoom);
-    let Some(old_geometry) = LiveVideoGeometry::new(coded_size, viewport, old_zoom, old_pan)
-    else {
+    let Some(old_geometry) = LiveVideoGeometry::new(coded_size, viewport, old_zoom, old_pan) else {
         return point(px(0.0), px(0.0));
     };
     let source = old_geometry.source_pixel_at(focal_point);
-    let Some(new_geometry) = LiveVideoGeometry::new(
-        coded_size,
-        viewport,
-        new_zoom,
-        point(px(0.0), px(0.0)),
-    ) else {
+    let Some(new_geometry) =
+        LiveVideoGeometry::new(coded_size, viewport, new_zoom, point(px(0.0), px(0.0)))
+    else {
         return point(px(0.0), px(0.0));
     };
     let source_without_pan = new_geometry.position_of_source_pixel(source);
@@ -214,12 +201,10 @@ fn zoom_live_pan(
 }
 
 fn clamp_live_pane_height(height: Pixels, window_height: Pixels) -> Pixels {
-    let available = window_height
-        - px(TOP_BAR_HEIGHT)
-        - px(MIN_CHAT_PANE_HEIGHT)
-        - px(LIVE_PANE_DIVIDER_SIZE);
-    let min_height = px(MIN_LIVE_PANE_HEIGHT)
-        .min(available.max(px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT)));
+    let available =
+        window_height - px(TOP_BAR_HEIGHT) - px(MIN_CHAT_PANE_HEIGHT) - px(LIVE_PANE_DIVIDER_SIZE);
+    let min_height =
+        px(MIN_LIVE_PANE_HEIGHT).min(available.max(px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT)));
     height.clamp(min_height, available.max(min_height))
 }
 
@@ -327,11 +312,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", markdown::Copy, Some("Markdown")),
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
         KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
-        KeyBinding::new(
-            "space",
-            TogglePlayback,
-            Some("Chatt && !ChattComposer"),
-        ),
+        KeyBinding::new("space", TogglePlayback, Some("Chatt && !ChattComposer")),
         KeyBinding::new("left", SeekBack, Some("Chatt")),
         KeyBinding::new("right", SeekForward, Some("Chatt")),
         KeyBinding::new("=", LiveZoomIn, Some("Chatt")),
@@ -347,7 +328,7 @@ pub struct ChattView {
     daemon: DaemonClient,
     next_request_id: u64,
     next_transfer_id: u64,
-    editing: Option<(RoomId, rpc::ids::MessageId, String)>,
+    editing: Option<(RoomId, local_rpc::ids::MessageId, String)>,
     composer: gpui::Entity<Composer>,
     media_cache: Arc<Mutex<MediaCache>>,
     image_cache: gpui::Entity<LruImageCache<TimelineImageLoader>>,
@@ -383,8 +364,7 @@ impl ChattView {
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let composer = cx.new(Composer::new);
         let timeline_selection = MarkdownSelectionGroup::new(cx.focus_handle());
-        let image_cache =
-            LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
+        let image_cache = LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         window.focus(&composer.focus_handle(cx), cx);
         let daemon_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(first_event) = daemon_events.recv().await {
@@ -409,10 +389,7 @@ impl ChattView {
         let video_task = cx.spawn_in(window, async move |this, cx| {
             while video_updates.recv().await.is_ok() {
                 while video_updates.try_recv().is_ok() {}
-                if this
-                    .update_in(cx, |_, window, _| window.refresh())
-                    .is_err()
-                {
+                if this.update_in(cx, |_, window, _| window.refresh()).is_err() {
                     return;
                 }
             }
@@ -491,11 +468,7 @@ impl ChattView {
         }
     }
 
-    fn update_video_visibility(
-        &mut self,
-        range: std::ops::Range<usize>,
-        cx: &mut Context<Self>,
-    ) {
+    fn update_video_visibility(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
         let visible = self
             .model
             .messages
@@ -521,7 +494,10 @@ impl ChattView {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    log::error!("screen-share playback failed stream_id={}: {error:#}", stream_id.0);
+                    log::error!(
+                        "screen-share playback failed stream_id={}: {error:#}",
+                        stream_id.0
+                    );
                     ended.push((*stream_id, format!("Screen share failed · {error:#}")));
                 }
             }
@@ -644,13 +620,7 @@ impl ChattView {
         self.zoom_live_view_at(stream_id, factor, None, cx);
     }
 
-    fn pan_live_view(
-        &mut self,
-        stream_id: StreamId,
-        x: f32,
-        y: f32,
-        cx: &mut Context<Self>,
-    ) {
+    fn pan_live_view(&mut self, stream_id: StreamId, x: f32, y: f32, cx: &mut Context<Self>) {
         if let Some(view) = self.live_players.get_mut(&stream_id) {
             view.pan += point(px(x), px(y));
             if let Some(viewport) = view.viewport_bounds.get() {
@@ -660,56 +630,31 @@ impl ChattView {
         }
     }
 
-    fn live_zoom_in_action(
-        &mut self,
-        _: &LiveZoomIn,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn live_zoom_in_action(&mut self, _: &LiveZoomIn, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.zoom_live_view(stream_id, 1.25, cx);
         }
     }
 
-    fn live_zoom_out_action(
-        &mut self,
-        _: &LiveZoomOut,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn live_zoom_out_action(&mut self, _: &LiveZoomOut, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.zoom_live_view(stream_id, 1.0 / 1.25, cx);
         }
     }
 
-    fn live_reset_action(
-        &mut self,
-        _: &LiveReset,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn live_reset_action(&mut self, _: &LiveReset, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.reset_live_view(stream_id, cx);
         }
     }
 
-    fn live_pan_up_action(
-        &mut self,
-        _: &LivePanUp,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn live_pan_up_action(&mut self, _: &LivePanUp, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, 0.0, 30.0, cx);
         }
     }
 
-    fn live_pan_down_action(
-        &mut self,
-        _: &LivePanDown,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn live_pan_down_action(&mut self, _: &LivePanDown, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, 0.0, -30.0, cx);
         }
@@ -737,12 +682,7 @@ impl ChattView {
         cx.stop_propagation();
     }
 
-    fn pinch_live_view(
-        &mut self,
-        stream_id: StreamId,
-        event: &PinchEvent,
-        cx: &mut Context<Self>,
-    ) {
+    fn pinch_live_view(&mut self, stream_id: StreamId, event: &PinchEvent, cx: &mut Context<Self>) {
         self.zoom_live_view_at(
             stream_id,
             (1.0 + event.delta).max(0.01),
@@ -806,7 +746,8 @@ impl ChattView {
         let Some(bounds) = self.live_pane_bounds.get() else {
             return;
         };
-        let start_height = clamp_live_pane_height(bounds.size.height, window.viewport_size().height);
+        let start_height =
+            clamp_live_pane_height(bounds.size.height, window.viewport_size().height);
         self.live_pane_height = Some(start_height);
         self.live_pane_resize = Some(LivePaneResize {
             start_y: event.position.y,
@@ -931,7 +872,7 @@ impl ChattView {
                     descriptor.byte_len,
                 );
                 self.status = format!("Cached {}", descriptor.file_name).into();
-                if descriptor.media_kind == rpc::daemon::model::MediaKind::Image
+                if descriptor.media_kind == local_rpc::model::MediaKind::Image
                     && let Some(path) = self
                         .media_cache
                         .lock()
@@ -958,8 +899,7 @@ impl ChattView {
                     .lock()
                     .expect("media cache lock poisoned")
                     .cancel(transfer_id);
-                self.eager_image_fetches
-                    .failed(transfer_id, reason.clone());
+                self.eager_image_fetches.failed(transfer_id, reason.clone());
                 self.status = reason.into();
                 self.pump_eager_image_fetches(cx);
             }
@@ -1211,7 +1151,7 @@ impl ChattView {
     fn begin_edit(
         &mut self,
         room_id: RoomId,
-        message_id: rpc::ids::MessageId,
+        message_id: local_rpc::ids::MessageId,
         body: String,
         cx: &mut Context<Self>,
     ) {
@@ -1228,7 +1168,7 @@ impl ChattView {
     fn delete_message(
         &mut self,
         room_id: RoomId,
-        message_id: rpc::ids::MessageId,
+        message_id: local_rpc::ids::MessageId,
         cx: &mut Context<Self>,
     ) {
         if !self.model.is_ready() {
@@ -1475,7 +1415,7 @@ impl ChattView {
         }
         let request_id = self.request_id();
         let volume = (self.model.voice.output_volume + delta)
-            .clamp(0., rpc::daemon::MAX_OUTPUT_VOLUME_PERCENT);
+            .clamp(0., local_rpc::MAX_OUTPUT_VOLUME_PERCENT);
         self.model.pending.insert(
             request_id,
             PendingRequest {
@@ -1497,7 +1437,7 @@ impl ChattView {
 
     fn cancel_file_transfer(
         &mut self,
-        transfer_id: rpc::ids::FileTransferId,
+        transfer_id: local_rpc::ids::FileTransferId,
         cx: &mut Context<Self>,
     ) {
         if !self.model.is_ready() {
@@ -1572,9 +1512,8 @@ impl ChattView {
                 markdown.clone()
             }
             _ => {
-                let markdown = cx.new(|cx| {
-                    Markdown::new(message.body.clone().into(), None, None, cx)
-                });
+                let markdown =
+                    cx.new(|cx| Markdown::new(message.body.clone().into(), None, None, cx));
                 self.message_markdown.insert(message.id, markdown.clone());
                 markdown
             }
@@ -1589,7 +1528,7 @@ impl ChattView {
         let edit = (message.local && !message.notice).then(|| {
             (
                 message.room_id,
-                rpc::ids::MessageId(message.id),
+                local_rpc::ids::MessageId(message.id),
                 message.body.clone(),
             )
         });
@@ -1678,10 +1617,7 @@ impl ChattView {
                                                 )
                                         })
                                         .child(div().text_xs().text_color(rgb(0x777d87)).child(
-                                            timeline::format_age(
-                                                timestamp_ms,
-                                                timeline::now_ms(),
-                                            ),
+                                            timeline::format_age(timestamp_ms, timeline::now_ms()),
                                         )),
                                 )
                             })
@@ -1693,13 +1629,11 @@ impl ChattView {
                                     ),
                             )
                             .when_some(attachment, |content, attachment| {
-                                content.child(self.render_attachment(
-                                    room_id,
-                                    message_id,
-                                    attachment,
-                                    window,
-                                    cx,
-                                ))
+                                content.child(
+                                    self.render_attachment(
+                                        room_id, message_id, attachment, window, cx,
+                                    ),
+                                )
                             }),
                     ),
             )
@@ -1742,14 +1676,11 @@ impl ChattView {
         if attachment.is_image() {
             let fetch = EagerImageFetch::new(descriptor.clone());
             if let Some(transfer_id) = active_transfer {
-                let action = mini_button(
-                    ("cancel-image-read", transfer_id.0 as usize),
-                    "Cancel",
-                )
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.cancel_bulk_read(transfer_id, cx)),
-                )
-                .into_any_element();
+                let action = mini_button(("cancel-image-read", transfer_id.0 as usize), "Cancel")
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.cancel_bulk_read(transfer_id, cx)),
+                    )
+                    .into_any_element();
                 return Self::render_image_status(
                     message_id,
                     &descriptor,
@@ -1894,15 +1825,13 @@ impl ChattView {
                                     .items_center()
                                     .gap_2()
                                     .text_color(rgb(0x8d939d))
-                                    .child(
-                                        div().text_sm().child(if video.loading {
-                                            "Starting video…".to_string()
-                                        } else if thumbnail.failed {
-                                            format!("{} · no preview", fallback_label)
-                                        } else {
-                                            fallback_label.clone()
-                                        }),
-                                    ),
+                                    .child(div().text_sm().child(if video.loading {
+                                        "Starting video…".to_string()
+                                    } else if thumbnail.failed {
+                                        format!("{} · no preview", fallback_label)
+                                    } else {
+                                        fallback_label.clone()
+                                    })),
                             )
                         })
                         .when(show_play_overlay, |viewport| {
@@ -1930,9 +1859,7 @@ impl ChattView {
                         .border_color(rgb(0x24272d))
                         .child(
                             mini_button(("video-back", message_id as usize), "−10").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.seek_video(key, -10.0, cx)
-                                }),
+                                cx.listener(move |this, _, _, cx| this.seek_video(key, -10.0, cx)),
                             ),
                         )
                         .child(
@@ -1946,15 +1873,11 @@ impl ChattView {
                                     "▶"
                                 },
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.play_video(key, cx)
-                            })),
+                            .on_click(cx.listener(move |this, _, _, cx| this.play_video(key, cx))),
                         )
                         .child(
                             mini_button(("video-forward", message_id as usize), "+10").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.seek_video(key, 10.0, cx)
-                                }),
+                                cx.listener(move |this, _, _, cx| this.seek_video(key, 10.0, cx)),
                             ),
                         )
                         .child(
@@ -1988,16 +1911,9 @@ impl ChattView {
                                     .size_full(),
                                 )
                                 .child(
-                                    div()
-                                        .w_full()
-                                        .h(px(4.))
-                                        .bg(rgb(0x30343b))
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(progress))
-                                                .bg(rgb(0x748bbd)),
-                                        ),
+                                    div().w_full().h(px(4.)).bg(rgb(0x30343b)).child(
+                                        div().h_full().w(relative(progress)).bg(rgb(0x748bbd)),
+                                    ),
                                 ),
                         )
                         .child(
@@ -2181,11 +2097,7 @@ impl ChattView {
         cx.notify();
     }
 
-    fn fetch_attachment(
-        &mut self,
-        descriptor: AttachmentDescriptor,
-        cx: &mut Context<Self>,
-    ) {
+    fn fetch_attachment(&mut self, descriptor: AttachmentDescriptor, cx: &mut Context<Self>) {
         if !self.model.is_ready() {
             return;
         }
@@ -2219,8 +2131,7 @@ impl ChattView {
         let transfer_id = self.transfer_id();
         {
             let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
-            if cache.path_for(&descriptor).is_some()
-                || cache.active_transfer(&descriptor).is_some()
+            if cache.path_for(&descriptor).is_some() || cache.active_transfer(&descriptor).is_some()
             {
                 return Ok(None);
             }
@@ -2235,7 +2146,7 @@ impl ChattView {
                 transfer_id: Some(transfer_id),
             },
         );
-        let read = rpc::daemon::bulk::BeginAttachmentRead {
+        let read = local_rpc::bulk::BeginAttachmentRead {
             transfer_id,
             room_id,
             attachment_id: descriptor.id,
@@ -2313,11 +2224,7 @@ impl ChattView {
         cx.notify();
     }
 
-    fn drag_video_scrub(
-        &mut self,
-        event: &MouseMoveEvent,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn drag_video_scrub(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
         let Some(mut scrub) = self.video_scrub else {
             return false;
         };
@@ -2475,7 +2382,7 @@ impl ChattView {
 
     fn render_live_share_card(
         &mut self,
-        share: rpc::daemon::model::LiveShare,
+        share: local_rpc::model::LiveShare,
         fullscreen: bool,
         constrained: bool,
         cx: &mut Context<Self>,
@@ -2516,15 +2423,10 @@ impl ChattView {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("{} is sharing", share.sender_name)),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x747a84))
-                            .child(format!(
-                                "{}×{} · {}",
-                                share.coded_width, share.coded_height, share.codec
-                            )),
-                    )
+                    .child(div().text_xs().text_color(rgb(0x747a84)).child(format!(
+                        "{}×{} · {}",
+                        share.coded_width, share.coded_height, share.codec
+                    )))
                     .child(div().flex_1()),
             );
         if let Some((video_surface, zoom, pan, dragging, viewport_bounds, coded_size)) = active {
@@ -2581,11 +2483,17 @@ impl ChattView {
                         .child(
                             mini_button(
                                 ("live-fullscreen", stream_id.0 as usize),
-                                if fullscreen { "Exit fullscreen" } else { "Fullscreen" },
+                                if fullscreen {
+                                    "Exit fullscreen"
+                                } else {
+                                    "Fullscreen"
+                                },
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.toggle_live_fullscreen(fullscreen_id, window, cx)
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.toggle_live_fullscreen(fullscreen_id, window, cx)
+                                },
+                            )),
                         ),
                 )
                 .child({
@@ -2622,11 +2530,9 @@ impl ChattView {
                                 this.live_mouse_down(down_id, event, cx)
                             }),
                         )
-                        .on_mouse_move(cx.listener(
-                            move |this, event: &MouseMoveEvent, _, cx| {
-                                this.live_mouse_move(move_id, event, cx)
-                            },
-                        ))
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            this.live_mouse_move(move_id, event, cx)
+                        }))
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseUpEvent, _, cx| {
@@ -2642,10 +2548,8 @@ impl ChattView {
                                 },
                                 move |_, geometry, window, _| {
                                     if let Some(geometry) = geometry {
-                                        window.paint_platform_surface(
-                                            geometry.bounds,
-                                            video_surface,
-                                        );
+                                        window
+                                            .paint_platform_surface(geometry.bounds, video_surface);
                                     }
                                 },
                             )
@@ -2838,11 +2742,7 @@ impl ChattView {
         true
     }
 
-    fn autoscroll_timeline_selection(
-        &mut self,
-        distance: gpui::Pixels,
-        cx: &mut Context<Self>,
-    ) {
+    fn autoscroll_timeline_selection(&mut self, distance: gpui::Pixels, cx: &mut Context<Self>) {
         self.pending_scroll = px(0.);
         self.scroll_animation_active = false;
         self.last_scroll_frame = None;
@@ -2968,8 +2868,8 @@ impl Render for ChattView {
                 view.autoscroll_timeline_selection(distance, cx)
             });
         });
-        let live_panel = (!self.model.live_shares.is_empty())
-            .then(|| self.render_live_shares(window, cx));
+        let live_panel =
+            (!self.model.live_shares.is_empty()).then(|| self.render_live_shares(window, cx));
         let resizing_live_pane = self.live_pane_resize.is_some();
         div()
             .id("chatt")
@@ -2990,13 +2890,11 @@ impl Render for ChattView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.queue_uploads(paths.0.to_vec(), cx)
             }))
-            .on_mouse_move(cx.listener(
-                |this, event: &MouseMoveEvent, window, cx| {
-                    if !this.drag_video_scrub(event, cx) {
-                        this.drag_live_pane(event, window, cx)
-                    }
-                },
-            ))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if !this.drag_video_scrub(event, cx) {
+                    this.drag_live_pane(event, window, cx)
+                }
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
@@ -3226,16 +3124,14 @@ fn connection_label(model: &ChatModel) -> String {
         ConnectionPhase::Connecting => "Connecting…".into(),
         ConnectionPhase::Syncing => "Syncing…".into(),
         ConnectionPhase::Ready => match model.server_connection {
-            rpc::daemon::model::ConnectionState::Online => {
-                model.active_server.as_ref().map_or_else(
-                    || "Connected".into(),
-                    |server| format!("Connected · {server}"),
-                )
-            }
-            rpc::daemon::model::ConnectionState::Connecting => {
+            local_rpc::model::ConnectionState::Online => model.active_server.as_ref().map_or_else(
+                || "Connected".into(),
+                |server| format!("Connected · {server}"),
+            ),
+            local_rpc::model::ConnectionState::Connecting => {
                 "Daemon ready · server connecting…".into()
             }
-            rpc::daemon::model::ConnectionState::Offline => "Daemon ready · server offline".into(),
+            local_rpc::model::ConnectionState::Offline => "Daemon ready · server offline".into(),
         },
         ConnectionPhase::Disconnected { .. } => "Daemon offline".into(),
         ConnectionPhase::Incompatible { .. } => "Daemon incompatible".into(),
@@ -3364,11 +3260,7 @@ fn mini_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<
         .child(label)
 }
 
-fn video_key(
-    room_id: RoomId,
-    message_id: u64,
-    descriptor: &AttachmentDescriptor,
-) -> VideoKey {
+fn video_key(room_id: RoomId, message_id: u64, descriptor: &AttachmentDescriptor) -> VideoKey {
     VideoKey {
         room_id,
         message_id,
@@ -3388,40 +3280,32 @@ fn format_time(seconds: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-fn video_scrub_fraction(
-    bounds: Bounds<Pixels>,
-    pointer_x: Pixels,
-    duration: f64,
-) -> Option<f64> {
+fn video_scrub_fraction(bounds: Bounds<Pixels>, pointer_x: Pixels, duration: f64) -> Option<f64> {
     let width = bounds.size.width.as_f32();
     if duration <= 0.0 || width <= 0.0 {
         return None;
     }
-    Some(
-        ((pointer_x - bounds.origin.x).as_f32() / width).clamp(0.0, 1.0) as f64,
-    )
+    Some(((pointer_x - bounds.origin.x).as_f32() / width).clamp(0.0, 1.0) as f64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::daemon::model::MediaKind;
+    use local_rpc::model::MediaKind;
 
     fn image_fetch(room_id: RoomId, marker: u8) -> EagerImageFetch {
-        EagerImageFetch::new(
-            AttachmentDescriptor {
-                id: AttachmentId {
-                    room_id,
-                    message_id: rpc::ids::MessageId(marker as u64),
-                },
-                file_name: format!("image-{marker}.png"),
-                media_kind: MediaKind::Image,
-                content_type: "image/png".into(),
-                byte_len: 10,
-                width: Some(400),
-                height: Some(300),
+        EagerImageFetch::new(AttachmentDescriptor {
+            id: AttachmentId {
+                room_id,
+                message_id: local_rpc::ids::MessageId(marker as u64),
             },
-        )
+            file_name: format!("image-{marker}.png"),
+            media_kind: MediaKind::Image,
+            content_type: "image/png".into(),
+            byte_len: 10,
+            width: Some(400),
+            height: Some(300),
+        })
     }
 
     #[test]
@@ -3526,9 +3410,7 @@ mod tests {
             .unwrap()
             .source_pixel_at(focal);
 
-        let new_pan = zoom_live_pan(
-            old_pan, coded_size, old_zoom, new_zoom, viewport, focal,
-        );
+        let new_pan = zoom_live_pan(old_pan, coded_size, old_zoom, new_zoom, viewport, focal);
         let mapped = LiveVideoGeometry::new(coded_size, viewport, new_zoom, new_pan)
             .unwrap()
             .position_of_source_pixel(source);
@@ -3544,13 +3426,8 @@ mod tests {
             size: gpui::size(px(1000.0), px(1000.0)),
         };
 
-        let geometry = LiveVideoGeometry::new(
-            (1600, 900),
-            viewport,
-            1.0,
-            point(px(0.0), px(0.0)),
-        )
-        .unwrap();
+        let geometry =
+            LiveVideoGeometry::new((1600, 900), viewport, 1.0, point(px(0.0), px(0.0))).unwrap();
 
         assert_eq!(geometry.scale, 0.625);
         assert_eq!(geometry.bounds.size, gpui::size(px(1000.0), px(562.5)));
@@ -3592,13 +3469,7 @@ mod tests {
             clamp_live_pane_height(px(100.0), px(900.0)),
             px(MIN_LIVE_PANE_HEIGHT),
         );
-        assert_eq!(
-            clamp_live_pane_height(px(900.0), px(900.0)),
-            px(699.0),
-        );
-        assert_eq!(
-            clamp_live_pane_height(px(900.0), px(300.0)),
-            px(99.0),
-        );
+        assert_eq!(clamp_live_pane_height(px(900.0), px(900.0)), px(699.0),);
+        assert_eq!(clamp_live_pane_height(px(900.0), px(300.0)), px(99.0),);
     }
 }

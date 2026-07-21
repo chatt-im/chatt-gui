@@ -16,7 +16,7 @@ libmpv2 = { path = "vendor/libmpv2-rs", default-features = false, features = ["r
 log = "0.4"
 markdown = { path = "/code/ref/zed/crates/markdown", default-features = false }
 naga = { path = "vendor/wgpu/naga", features = ["glsl-in", "spv-out"] }
-rpc = { package = "chatt-rpc", path = "crates/chatt_rpc" }
+local_rpc = { package = "chatt-local-rpc", path = "/code/chatt/crates/local-rpc" }
 theme = { path = "/code/ref/zed/crates/theme" }
 unicode-segmentation = "1"
 tempfile = "3"

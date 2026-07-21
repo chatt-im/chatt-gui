@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_channel::{Receiver as EventReceiver, Sender as EventSender};
-use rpc::daemon::{
+use local_rpc::{
     bulk::{BeginUpload, BulkChunk, BulkFinished},
     frame::{ClientFrame, ClientHello, DaemonFrame, Operation, RequestOutcome},
     model::{AttachmentDescriptor, BulkTransferId, RequestId},
@@ -24,7 +24,7 @@ pub enum DaemonEvent {
     Frame(DaemonFrame),
     LiveShareOpened {
         request_id: RequestId,
-        stream_id: rpc::ids::StreamId,
+        stream_id: local_rpc::ids::StreamId,
         stream: std::os::unix::net::UnixStream,
     },
     Disconnected(String),
@@ -50,7 +50,7 @@ pub struct DaemonClient {
 enum ConnectorCommand {
     Frame(ClientFrame),
     PreparedUpload(PreparedUpload),
-    BeginUploadResult(rpc::daemon::frame::RequestResult),
+    BeginUploadResult(local_rpc::frame::RequestResult),
     ChunkBytes(usize),
     CancelBulk(BulkTransferId),
     SessionEnded,
@@ -118,7 +118,7 @@ impl DaemonClient {
     pub fn upload_file(
         &self,
         path: PathBuf,
-        room_id: rpc::ids::RoomId,
+        room_id: local_rpc::ids::RoomId,
         transfer_id: BulkTransferId,
         begin_request: RequestId,
         finish_request: RequestId,
@@ -215,7 +215,7 @@ fn connection_loop(
         let _ = events.try_send(DaemonEvent::Discovering);
         let hello = ClientHello::current(env!("CARGO_PKG_VERSION"));
         let _ = events.try_send(DaemonEvent::Connecting);
-        match rpc::daemon::unix::connect(&hello) {
+        match local_rpc::unix::connect(&hello) {
             Ok(stream) => {
                 delay = Duration::from_millis(250);
                 let _ = events.try_send(DaemonEvent::TransportConnected);
@@ -261,7 +261,8 @@ fn connection_loop(
                                         fds.len()
                                     );
                                 }
-                                let stream = std::os::unix::net::UnixStream::from(fds.pop().unwrap());
+                                let stream =
+                                    std::os::unix::net::UnixStream::from(fds.pop().unwrap());
                                 if events
                                     .send_blocking(DaemonEvent::LiveShareOpened {
                                         request_id: *request_id,
@@ -290,8 +291,8 @@ fn connection_loop(
                             };
                             if let DaemonFrame::Welcome(welcome) = &frame {
                                 let chunk_bytes = usize::try_from(welcome.limits.chunk_bytes)
-                                    .unwrap_or(rpc::daemon::MAX_CHUNK_BYTES)
-                                    .min(rpc::daemon::MAX_CHUNK_BYTES)
+                                    .unwrap_or(local_rpc::MAX_CHUNK_BYTES)
+                                    .min(local_rpc::MAX_CHUNK_BYTES)
                                     .max(1);
                                 if command_tx
                                     .send(ConnectorCommand::ChunkBytes(chunk_bytes))
@@ -457,16 +458,22 @@ fn cancel_failed_download(
         "attachment transfer failed transfer_id={}: {reason}",
         transfer_id.0,
     );
-    if commands.send(ConnectorCommand::CancelBulk(transfer_id)).is_err() {
+    if commands
+        .send(ConnectorCommand::CancelBulk(transfer_id))
+        .is_err()
+    {
         log::error!(
             "could not enqueue attachment cancellation transfer_id={}",
             transfer_id.0,
         );
     }
-    if events.send_blocking(DaemonEvent::MediaTransferFailed {
-        transfer_id,
-        reason,
-    }).is_err() {
+    if events
+        .send_blocking(DaemonEvent::MediaTransferFailed {
+            transfer_id,
+            reason,
+        })
+        .is_err()
+    {
         log::error!(
             "could not deliver attachment-failure event transfer_id={}",
             transfer_id.0,
@@ -482,7 +489,7 @@ fn writer_loop(
     let mut writer = FrameWriter::new(stream);
     let mut prepared = HashMap::<RequestId, PreparedUpload>::new();
     let mut active = VecDeque::<ActiveUpload>::new();
-    let mut chunk_bytes = rpc::daemon::MAX_CHUNK_BYTES;
+    let mut chunk_bytes = local_rpc::MAX_CHUNK_BYTES;
     let mut internal_request_id = 1u64 << 63;
     loop {
         let command = match commands.try_recv() {
@@ -502,11 +509,9 @@ fn writer_loop(
                         active.retain(|upload| upload.prepared.upload.transfer_id != *transfer_id);
                     }
                     let attachment_request = match &frame {
-                        ClientFrame::BeginAttachmentRead { request_id, read } => Some((
-                            request_id.0,
-                            read.transfer_id.0,
-                            read.room_id.0,
-                        )),
+                        ClientFrame::BeginAttachmentRead { request_id, read } => {
+                            Some((request_id.0, read.transfer_id.0, read.room_id.0))
+                        }
                         _ => None,
                     };
                     if let Err(error) = writer.send_client(&frame) {
@@ -675,11 +680,14 @@ fn report_upload_error(
         begin_request.0,
         finish_request.0,
     );
-    if events.send_blocking(DaemonEvent::UploadPreparationFailed {
-        begin_request,
-        finish_request,
-        reason,
-    }).is_err() {
+    if events
+        .send_blocking(DaemonEvent::UploadPreparationFailed {
+            begin_request,
+            finish_request,
+            reason,
+        })
+        .is_err()
+    {
         log::error!(
             "could not deliver upload-failure event begin_request={} finish_request={}",
             begin_request.0,

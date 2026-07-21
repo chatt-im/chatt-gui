@@ -8,10 +8,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use async_channel::Sender as AsyncSender;
 use gpui::PlatformSurface;
-use rpc::{
-    daemon::model::AttachmentId,
-    ids::RoomId,
-};
+use local_rpc::{ids::RoomId, model::AttachmentId};
 
 use crate::mpv_player::{AttachmentRenderBackend, MpvPlayer, SeekMode};
 
@@ -401,7 +398,10 @@ impl AttachmentVideoManager {
         let mut drain = VideoDrain::default();
         self.queued_keys.retain(|key| retained.contains(key));
         self.queued.retain(|key| self.queued_keys.contains(key));
-        if self.last_interacted.is_some_and(|key| !retained.contains(&key)) {
+        if self
+            .last_interacted
+            .is_some_and(|key| !retained.contains(&key))
+        {
             self.last_interacted = None;
         }
         let removed = self
@@ -453,7 +453,10 @@ impl AttachmentVideoManager {
     fn pop_queued(&mut self) -> Option<VideoKey> {
         while let Some(key) = self.queued.pop_front() {
             if self.queued_keys.remove(&key)
-                && self.sessions.get(&key).is_some_and(|session| session.player.is_none())
+                && self
+                    .sessions
+                    .get(&key)
+                    .is_some_and(|session| session.player.is_none())
             {
                 return Some(key);
             }
@@ -504,9 +507,9 @@ impl AttachmentVideoManager {
             })
         {
             self.build_in_flight = false;
-            let _ = self
-                .build_result_sender
-                .send(BuildResult(Err(format!("could not start mpv builder: {error}"))));
+            let _ = self.build_result_sender.send(BuildResult(Err(format!(
+                "could not start mpv builder: {error}"
+            ))));
             let _ = self.wakeup.try_send(());
         }
     }
@@ -636,7 +639,7 @@ mod tests {
             message_id,
             attachment_id: AttachmentId {
                 room_id: RoomId(1),
-                message_id: rpc::ids::MessageId(message_id),
+                message_id: local_rpc::ids::MessageId(message_id),
             },
         }
     }
@@ -724,7 +727,11 @@ mod tests {
         }
 
         assert_eq!(videos.sessions.len(), MAX_SESSION_ENTRIES);
-        assert!(videos.sessions.contains_key(&key(MAX_SESSION_ENTRIES as u64 + 19)));
+        assert!(
+            videos
+                .sessions
+                .contains_key(&key(MAX_SESSION_ENTRIES as u64 + 19))
+        );
     }
 
     #[test]
