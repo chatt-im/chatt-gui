@@ -1342,6 +1342,7 @@ fn control_worker(
             }
             let file_loaded = matches!(event.as_ref(), Ok(Event::FileLoaded));
             let video_reconfigured = matches!(event.as_ref(), Ok(Event::VideoReconfig));
+            let mut display_size_changed = false;
             if file_loaded || video_reconfigured {
                 match video_display_size(&mpv) {
                     Ok(size) => {
@@ -1354,6 +1355,8 @@ fn control_worker(
                             );
                         }
                         configured_size = Some(size);
+                        display_size_changed = state.display_size != Some(size);
+                        state.display_size = Some(size);
                         if resized
                             && render_sender
                                 .send(RenderMessage::Resize {
@@ -1402,7 +1405,7 @@ fn control_worker(
                     let _ = errors.send(format!("{error:#}"));
                     true
                 }
-            };
+            } || display_size_changed;
             playback.publish(state);
             if notify_gpui {
                 let _ = gpui_wakeup.try_send(());
@@ -1791,6 +1794,7 @@ pub struct PlaybackState {
     pub paused: bool,
     pub finished: bool,
     pub frame_ready: bool,
+    pub display_size: Option<(u32, u32)>,
 }
 
 #[derive(Default)]
@@ -1800,6 +1804,7 @@ struct SharedPlaybackState {
     paused: AtomicBool,
     finished: AtomicBool,
     frame_ready: AtomicBool,
+    display_size: AtomicU64,
 }
 
 impl SharedPlaybackState {
@@ -1810,16 +1815,23 @@ impl SharedPlaybackState {
             .store(state.duration.to_bits(), Ordering::Relaxed);
         self.paused.store(state.paused, Ordering::Relaxed);
         self.finished.store(state.finished, Ordering::Release);
+        let display_size = state
+            .display_size
+            .map_or(0, |(width, height)| (u64::from(width) << 32) | u64::from(height));
+        self.display_size.store(display_size, Ordering::Release);
     }
 
     fn snapshot(&self) -> PlaybackState {
         let finished = self.finished.load(Ordering::Acquire);
+        let packed_size = self.display_size.load(Ordering::Acquire);
         PlaybackState {
             position: f64::from_bits(self.position.load(Ordering::Relaxed)),
             duration: f64::from_bits(self.duration.load(Ordering::Relaxed)),
             paused: self.paused.load(Ordering::Relaxed),
             finished,
             frame_ready: self.frame_ready.load(Ordering::Acquire),
+            display_size: (packed_size != 0)
+                .then_some(((packed_size >> 32) as u32, packed_size as u32)),
         }
     }
 
@@ -1853,6 +1865,19 @@ mod tests {
         assert_eq!(checked_video_size(0, 240), None);
         assert_eq!(checked_video_size(320, -1), None);
         assert_eq!(checked_video_size(i64::from(u32::MAX) + 1, 240), None);
+    }
+
+    #[test]
+    fn shared_playback_publishes_decoded_display_size() {
+        let shared = SharedPlaybackState::default();
+        shared.publish(PlaybackState {
+            display_size: Some((1_080, 1_920)),
+            ..PlaybackState::default()
+        });
+
+        assert_eq!(shared.snapshot().display_size, Some((1_080, 1_920)));
+        shared.reset();
+        assert_eq!(shared.snapshot().display_size, None);
     }
 
     #[test]

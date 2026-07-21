@@ -33,6 +33,7 @@ pub(crate) struct VideoView {
     pub volume: f64,
     pub loading: bool,
     pub error: Option<String>,
+    pub display_size: Option<(u32, u32)>,
 }
 
 impl Default for VideoView {
@@ -46,6 +47,7 @@ impl Default for VideoView {
             volume: 100.0,
             loading: false,
             error: None,
+            display_size: None,
         }
     }
 }
@@ -58,10 +60,10 @@ struct VideoSession {
     paused: bool,
     finished: bool,
     frame_ready: bool,
-    volume: f64,
     visible: bool,
     touched: u64,
     error: Option<String>,
+    display_size: Option<(u32, u32)>,
 }
 
 impl VideoSession {
@@ -74,10 +76,10 @@ impl VideoSession {
             paused: true,
             finished: false,
             frame_ready: false,
-            volume: 100.0,
             visible: false,
             touched,
             error: None,
+            display_size: None,
         }
     }
 }
@@ -105,6 +107,8 @@ pub(crate) struct AttachmentVideoManager {
     reaper: mpsc::Sender<MpvPlayer>,
     wakeup: AsyncSender<()>,
     last_interacted: Option<VideoKey>,
+    volume: f64,
+    last_audible_volume: f64,
     clock: u64,
 }
 
@@ -135,6 +139,8 @@ impl AttachmentVideoManager {
             reaper,
             wakeup,
             last_interacted: None,
+            volume: 100.0,
+            last_audible_volume: 100.0,
             clock: 0,
         }
     }
@@ -154,7 +160,10 @@ impl AttachmentVideoManager {
 
     pub(crate) fn view(&self, key: VideoKey) -> VideoView {
         let Some(session) = self.sessions.get(&key) else {
-            return VideoView::default();
+            return VideoView {
+                volume: self.volume,
+                ..VideoView::default()
+            };
         };
         VideoView {
             surface: session
@@ -165,23 +174,25 @@ impl AttachmentVideoManager {
             duration: session.duration,
             paused: session.paused,
             finished: session.finished,
-            volume: session.volume,
+            volume: self.volume,
             loading: self.queued_keys.contains(&key)
                 || (session.player.is_some() && !session.frame_ready && !session.paused),
             error: session.error.clone(),
+            display_size: session.display_size,
         }
     }
 
     pub(crate) fn play(&mut self, key: VideoKey) -> Result<()> {
         self.touch(key);
         self.last_interacted = Some(key);
+        let volume = self.volume;
         let Some(session) = self.sessions.get_mut(&key) else {
             return Err(anyhow!("video source is no longer cached"));
         };
         session.error = None;
         if let Some(player) = session.player.as_mut() {
             if session.finished {
-                player.load_at(&session.path.to_string_lossy(), false, session.volume, 0.0)?;
+                player.load_at(&session.path.to_string_lossy(), false, volume, 0.0)?;
                 session.position = 0.0;
                 session.duration = 0.0;
                 session.paused = false;
@@ -270,30 +281,48 @@ impl AttachmentVideoManager {
     pub(crate) fn adjust_volume(&mut self, key: VideoKey, delta: f64) -> Result<()> {
         self.touch(key);
         self.last_interacted = Some(key);
-        let Some(session) = self.sessions.get_mut(&key) else {
-            return Ok(());
-        };
-        session.volume = (session.volume + delta).clamp(0.0, 100.0);
-        if let Some(player) = session.player.as_ref() {
-            player.set_volume(session.volume)?;
+        self.set_volume(self.volume + delta)
+    }
+
+    pub(crate) fn set_volume_for(&mut self, key: VideoKey, volume: f64) -> Result<()> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        self.set_volume(volume)
+    }
+
+    pub(crate) fn toggle_mute(&mut self, key: VideoKey) -> Result<()> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        if self.volume > 0.0 {
+            self.last_audible_volume = self.volume;
+            self.set_volume(0.0)
+        } else {
+            self.set_volume(self.last_audible_volume.max(1.0))
         }
-        Ok(())
     }
 
-    pub(crate) fn toggle_last_visible(&mut self) -> Result<bool> {
-        let Some(key) = self.last_visible_interaction() else {
-            return Ok(false);
-        };
-        self.play(key)?;
-        Ok(true)
+    fn set_volume(&mut self, volume: f64) -> Result<()> {
+        let volume = volume.clamp(0.0, 100.0);
+        self.volume = volume;
+        if volume > 0.0 {
+            self.last_audible_volume = volume;
+        }
+        let mut first_error = None;
+        for session in self.sessions.values() {
+            let Some(player) = session.player.as_ref() else {
+                continue;
+            };
+            if let Err(error) = player.set_volume(volume)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
-    pub(crate) fn seek_last_visible(&mut self, seconds: f64) -> Result<bool> {
-        let Some(key) = self.last_visible_interaction() else {
-            return Ok(false);
-        };
-        self.seek(key, seconds)?;
-        Ok(true)
+    pub(crate) fn last_visible_key(&self) -> Option<VideoKey> {
+        self.last_visible_interaction()
     }
 
     pub(crate) fn update_visibility(&mut self, visible: &HashSet<VideoKey>) -> VideoDrain {
@@ -366,12 +395,14 @@ impl AttachmentVideoManager {
                         || session.duration != playback.duration
                         || session.paused != playback.paused
                         || session.finished != playback.finished
-                        || session.frame_ready != playback.frame_ready;
+                        || session.frame_ready != playback.frame_ready
+                        || session.display_size != playback.display_size;
                     session.position = playback.position;
                     session.duration = playback.duration;
                     session.paused = playback.paused;
                     session.finished = playback.finished;
                     session.frame_ready = playback.frame_ready;
+                    session.display_size = playback.display_size;
                     drain.changed |= changed;
                 }
                 Err(error) => failed.push((*key, format!("Video event failed: {error}"))),
@@ -384,6 +415,7 @@ impl AttachmentVideoManager {
                 }
                 session.paused = true;
                 session.frame_ready = false;
+                session.display_size = None;
                 session.error = Some(error.clone());
             }
             drain.errors.push(error);
@@ -527,7 +559,7 @@ impl AttachmentVideoManager {
         if let Err(error) = player.load_at(
             &session.path.to_string_lossy(),
             session.paused,
-            session.volume,
+            self.volume,
             session.position,
         ) {
             let error = format!("Could not open video: {error}");
@@ -539,6 +571,7 @@ impl AttachmentVideoManager {
         }
         session.frame_ready = false;
         session.finished = false;
+        session.display_size = None;
         session.player = Some(player);
         drain.changed = true;
     }
@@ -560,6 +593,7 @@ impl AttachmentVideoManager {
                 continue;
             };
             session.frame_ready = false;
+            session.display_size = None;
             self.recycle(player);
             drain.changed = true;
         }
@@ -650,6 +684,48 @@ mod tests {
         assert!(view.paused);
         assert_eq!(view.volume, 100.0);
         assert!(!view.loading);
+    }
+
+    #[test]
+    fn volume_is_shared_by_existing_and_future_video_sessions() {
+        let (wakeup, _) = async_channel::bounded(1);
+        let mut videos = AttachmentVideoManager::new(wakeup);
+        let first = key(10);
+        let second = key(11);
+        videos.ensure_source(first, PathBuf::from("first.mp4"));
+
+        videos.set_volume_for(first, 37.0).unwrap();
+        videos.ensure_source(second, PathBuf::from("second.mp4"));
+
+        assert_eq!(videos.view(first).volume, 37.0);
+        assert_eq!(videos.view(second).volume, 37.0);
+    }
+
+    #[test]
+    fn mute_restores_the_last_audible_shared_volume() {
+        let (wakeup, _) = async_channel::bounded(1);
+        let mut videos = AttachmentVideoManager::new(wakeup);
+        let key = key(12);
+        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        videos.set_volume_for(key, 64.0).unwrap();
+
+        videos.toggle_mute(key).unwrap();
+        assert_eq!(videos.view(key).volume, 0.0);
+        videos.toggle_mute(key).unwrap();
+        assert_eq!(videos.view(key).volume, 64.0);
+    }
+
+    #[test]
+    fn shared_volume_is_clamped_to_mpv_range() {
+        let (wakeup, _) = async_channel::bounded(1);
+        let mut videos = AttachmentVideoManager::new(wakeup);
+        let key = key(13);
+        videos.ensure_source(key, PathBuf::from("video.mp4"));
+
+        videos.set_volume_for(key, 180.0).unwrap();
+        assert_eq!(videos.view(key).volume, 100.0);
+        videos.set_volume_for(key, -20.0).unwrap();
+        assert_eq!(videos.view(key).volume, 0.0);
     }
 
     #[test]

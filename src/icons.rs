@@ -12,12 +12,16 @@ pub(crate) enum IconName {
     Mic,
     MicOff,
     Minimize,
+    Pause,
     Pencil,
     Play,
     Plus,
     RotateCcw,
     Stop,
     Trash,
+    VolumeHigh,
+    VolumeLow,
+    VolumeMuted,
     ZoomIn,
     ZoomOut,
 }
@@ -33,12 +37,16 @@ impl IconName {
             Self::Mic => "icons/mic.svg",
             Self::MicOff => "icons/mic-off.svg",
             Self::Minimize => "icons/minimize.svg",
+            Self::Pause => "icons/pause.svg",
             Self::Pencil => "icons/pencil.svg",
             Self::Play => "icons/play.svg",
             Self::Plus => "icons/plus.svg",
             Self::RotateCcw => "icons/rotate-ccw.svg",
             Self::Stop => "icons/stop.svg",
             Self::Trash => "icons/trash.svg",
+            Self::VolumeHigh => "icons/volume-high.svg",
+            Self::VolumeLow => "icons/volume-low.svg",
+            Self::VolumeMuted => "icons/volume-muted.svg",
             Self::ZoomIn => "icons/zoom-in.svg",
             Self::ZoomOut => "icons/zoom-out.svg",
         }
@@ -84,12 +92,16 @@ const ICON_PATHS: &[&str] = &[
     "icons/mic.svg",
     "icons/mic-off.svg",
     "icons/minimize.svg",
+    "icons/pause.svg",
     "icons/pencil.svg",
     "icons/play.svg",
     "icons/plus.svg",
     "icons/rotate-ccw.svg",
     "icons/stop.svg",
     "icons/trash.svg",
+    "icons/volume-high.svg",
+    "icons/volume-low.svg",
+    "icons/volume-muted.svg",
     "icons/zoom-in.svg",
     "icons/zoom-out.svg",
 ];
@@ -118,6 +130,9 @@ fn icon_svg(path: &str) -> Option<String> {
         "icons/minimize.svg" => {
             r#"<path d="m14 10 7-7"/><path d="M20 10h-6V4"/><path d="m3 21 7-7"/><path d="M4 14h6v6"/>"#
         }
+        "icons/pause.svg" => {
+            r#"<rect x="14" y="3" width="5" height="18" rx="1"/><rect x="5" y="3" width="5" height="18" rx="1"/>"#
+        }
         "icons/pencil.svg" => {
             r#"<path d="M21.17 6.81a1 1 0 0 0-3.98-3.98L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.36a.5.5 0 0 0 .62.62L7 20.66a2 2 0 0 0 .83-.5z"/><path d="m15 5 4 4"/>"#
         }
@@ -129,6 +144,15 @@ fn icon_svg(path: &str) -> Option<String> {
         "icons/stop.svg" => r#"<rect x="4" y="4" width="16" height="16" rx="2"/>"#,
         "icons/trash.svg" => {
             r#"<path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>"#
+        }
+        "icons/volume-high.svg" => {
+            r#"<path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6a1.4 1.4 0 0 1-1 .4H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.4 18.4a9 9 0 0 0 0-12.8"/>"#
+        }
+        "icons/volume-low.svg" => {
+            r#"<path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6a1.4 1.4 0 0 1-1 .4H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5z"/><path d="M16 9a5 5 0 0 1 0 6"/>"#
+        }
+        "icons/volume-muted.svg" => {
+            r#"<path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6a1.4 1.4 0 0 1-1 .4H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/>"#
         }
         "icons/zoom-in.svg" => {
             r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/><path d="M11 8v6"/><path d="M8 11h6"/>"#

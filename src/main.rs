@@ -14,7 +14,9 @@ mod naga_bridge;
 mod preview;
 mod scroll_capture;
 mod timeline;
+mod video_controls;
 mod video_manager;
+mod video_player;
 mod video_thumbnail;
 
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
@@ -30,7 +32,7 @@ fn main() {
     application()
         .with_assets(icons::IconAssets)
         .run(move |cx: &mut App| {
-            fonts::load(cx);
+            fonts::init(cx);
             theme::init(theme::LoadThemes::JustBase, cx);
             app::bind_keys(cx);
             frame_stats::start(cx);

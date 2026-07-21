@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -13,7 +13,7 @@ use gpui::{
     KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
-    list, point, prelude::*, px, relative, rgb, rgba, surface,
+    list, point, prelude::*, px, rgb, rgba,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
@@ -42,7 +42,15 @@ use crate::{
     },
     scroll_capture::capture_scroll,
     timeline::{self, Attachment},
+    video_controls::{
+        CONTROLS_ANIMATION_DURATION, CONTROLS_HIDE_DELAY, VideoControlsState, VideoScrub,
+        VideoVolumeDrag, horizontal_fraction, vertical_fraction, volume_scroll_delta,
+    },
     video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
+    video_player::{
+        VideoPlayerConfig, VideoPlayerEvent, VideoPlayerHandler, aspect_ratio,
+        render_video_player,
+    },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
 
@@ -79,18 +87,11 @@ struct LivePlayerView {
     viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VideoScrub {
+#[derive(Clone, Debug)]
+struct TheaterVideo {
     key: VideoKey,
-    bounds: Bounds<Pixels>,
-    duration: f64,
-    last_fraction: f64,
-}
-
-impl VideoScrub {
-    fn position(self) -> f64 {
-        self.duration * self.last_fraction
-    }
+    descriptor: AttachmentDescriptor,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -365,6 +366,15 @@ pub struct ChattView {
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
     video_scrub: Option<VideoScrub>,
+    video_volume_drag: Option<VideoVolumeDrag>,
+    video_controls: VideoControlsState,
+    video_volume_popup_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    video_volume_button_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    theater_video: Option<TheaterVideo>,
+    video_controls_animation_task: Option<Task<()>>,
+    video_controls_hide_task: Option<Task<()>>,
+    video_volume_hide_task: Option<Task<()>>,
+    video_surface_click_task: Option<Task<()>>,
     video_wakeup: async_channel::Sender<()>,
     live_players: HashMap<StreamId, LivePlayerView>,
     fullscreen_share: Option<StreamId>,
@@ -459,6 +469,15 @@ impl ChattView {
             videos,
             video_thumbnails,
             video_scrub: None,
+            video_volume_drag: None,
+            video_controls: VideoControlsState::default(),
+            video_volume_popup_bounds: Rc::new(Cell::new(None)),
+            video_volume_button_bounds: Rc::new(Cell::new(None)),
+            theater_video: None,
+            video_controls_animation_task: None,
+            video_controls_hide_task: None,
+            video_volume_hide_task: None,
+            video_surface_click_task: None,
             video_wakeup,
             live_players: HashMap::new(),
             fullscreen_share: None,
@@ -501,8 +520,21 @@ impl ChattView {
         }
     }
 
+    fn clear_video_interactions(&mut self) {
+        self.video_scrub = None;
+        self.video_volume_drag = None;
+        self.video_controls.clear();
+        self.theater_video = None;
+        self.video_controls_animation_task.take();
+        self.video_controls_hide_task.take();
+        self.video_volume_hide_task.take();
+        self.video_surface_click_task.take();
+        self.video_volume_popup_bounds.set(None);
+        self.video_volume_button_bounds.set(None);
+    }
+
     fn update_video_visibility(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
-        let visible = self
+        let mut visible = self
             .model
             .messages
             .get(range)
@@ -510,6 +542,9 @@ impl ChattView {
             .iter()
             .filter_map(message_video_key)
             .collect::<HashSet<_>>();
+        if let Some(theater) = self.theater_video.as_ref() {
+            visible.insert(theater.key);
+        }
         let drain = self.videos.update_visibility(&visible);
         let changed = drain.changed || !drain.errors.is_empty();
         self.apply_video_drain(drain);
@@ -1005,6 +1040,7 @@ impl ChattView {
             self.preview_pane_resize = None;
             self.videos.clear_sessions();
             self.video_thumbnails.clear();
+            self.clear_video_interactions();
         }
         let available = self
             .model
@@ -1035,6 +1071,7 @@ impl ChattView {
         }
         if self.model.selected_room != old_selected_room {
             self.videos.clear_sessions();
+            self.clear_video_interactions();
             self.message_markdown.clear();
             self.eager_image_fetches.reset_transient();
         } else if effect.messages_changed {
@@ -1046,6 +1083,13 @@ impl ChattView {
                 .collect::<HashSet<_>>();
             let drain = self.videos.retain_sources(&retained);
             self.apply_video_drain(drain);
+            if self
+                .theater_video
+                .as_ref()
+                .is_some_and(|theater| !retained.contains(&theater.key))
+            {
+                self.clear_video_interactions();
+            }
         }
         if effect.replace_messages {
             self.list_state
@@ -1563,6 +1607,9 @@ impl ChattView {
     }
 
     fn close_preview_action(&mut self, _: &ClosePreview, _: &mut Window, cx: &mut Context<Self>) {
+        if self.exit_video_theater(cx) {
+            return;
+        }
         self.close_preview(cx);
     }
 
@@ -2010,210 +2057,7 @@ impl ChattView {
         {
             let key = video_key(room_id, message_id, &descriptor);
             self.videos.ensure_source(key, path.clone());
-            let video = self.videos.view(key);
-            let thumbnail = self.video_thumbnails.request(
-                ThumbnailKey {
-                    attachment_id: descriptor.id,
-                },
-                path,
-            );
-            let duration = if video.duration > 0.0 {
-                video.duration
-            } else {
-                thumbnail.duration.unwrap_or(0.0)
-            };
-            let display_position = self
-                .video_scrub
-                .filter(|scrub| scrub.key == key)
-                .map_or(video.position, VideoScrub::position);
-            let progress = if duration > 0.0 {
-                (display_position / duration).clamp(0.0, 1.0) as f32
-            } else {
-                0.0
-            };
-            let aspect_ratio = match (descriptor.width, descriptor.height) {
-                (Some(width), Some(height)) if width > 0 && height > 0 => {
-                    width as f32 / height as f32
-                }
-                _ => 16.0 / 9.0,
-            };
-            let fallback_label = video
-                .error
-                .clone()
-                .unwrap_or_else(|| descriptor.file_name.clone());
-            let has_thumbnail = thumbnail.image.is_some();
-            let has_surface = video.surface.is_some();
-            let thumbnail_image = thumbnail.image;
-            let video_surface = video.surface;
-            let show_play_overlay = !has_surface && !video.loading;
-            let scrub_bounds = Rc::new(Cell::new(None));
-            let measured_scrub_bounds = scrub_bounds.clone();
-            return div()
-                .id(("video", message_id as usize))
-                .mt_2()
-                .w_full()
-                .bg(rgb(0x08090b))
-                .child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .aspect_ratio(aspect_ratio)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .overflow_hidden()
-                        .when_some(thumbnail_image, |viewport, thumbnail| {
-                            viewport.child(
-                                img(thumbnail)
-                                    .absolute()
-                                    .inset_0()
-                                    .size_full()
-                                    .object_fit(ObjectFit::Contain),
-                            )
-                        })
-                        .when_some(video_surface, |viewport, video_surface| {
-                            viewport.child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .child(surface(video_surface).size_full()),
-                            )
-                        })
-                        .when(!has_thumbnail && !has_surface, |viewport| {
-                            viewport.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_color(rgb(0x8d939d))
-                                    .child(div().text_sm().child(if video.loading {
-                                        "Starting video…".to_string()
-                                    } else if thumbnail.failed {
-                                        format!("{} · no preview", fallback_label)
-                                    } else {
-                                        fallback_label.clone()
-                                    })),
-                            )
-                        })
-                        .when(show_play_overlay, |viewport| {
-                            viewport.child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_2xl()
-                                    .text_color(rgba(0xffffffcc))
-                                    .child("▶"),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .h(px(48.))
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .border_t_1()
-                        .border_color(rgb(0x24272d))
-                        .child(
-                            mini_button(("video-back", message_id as usize), "−10").on_click(
-                                cx.listener(move |this, _, _, cx| this.seek_video(key, -10.0, cx)),
-                            ),
-                        )
-                        .child(
-                            mini_button(
-                                ("video-play", message_id as usize),
-                                if video.loading {
-                                    "…"
-                                } else if !video.paused && !video.finished {
-                                    "Ⅱ"
-                                } else {
-                                    "▶"
-                                },
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| this.play_video(key, cx))),
-                        )
-                        .child(
-                            mini_button(("video-forward", message_id as usize), "+10").on_click(
-                                cx.listener(move |this, _, _, cx| this.seek_video(key, 10.0, cx)),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .id(("video-timeline", message_id as usize))
-                                .relative()
-                                .flex_1()
-                                .h(px(16.))
-                                .flex()
-                                .items_center()
-                                .when(duration > 0.0, |timeline| {
-                                    timeline.cursor_pointer().on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            if let Some(bounds) = scrub_bounds.get() {
-                                                this.begin_video_scrub(
-                                                    key, duration, bounds, event, cx,
-                                                );
-                                            }
-                                        }),
-                                    )
-                                })
-                                .child(
-                                    canvas(
-                                        move |bounds, _, _| {
-                                            measured_scrub_bounds.set(Some(bounds));
-                                        },
-                                        |_, _, _, _| {},
-                                    )
-                                    .absolute()
-                                    .size_full(),
-                                )
-                                .child(
-                                    div().w_full().h(px(4.)).bg(rgb(0x30343b)).child(
-                                        div().h_full().w(relative(progress)).bg(rgb(0x748bbd)),
-                                    ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w(px(94.))
-                                .text_right()
-                                .text_xs()
-                                .text_color(rgb(0x989ea8))
-                                .child(format!(
-                                    "{} / {}",
-                                    format_time(display_position),
-                                    format_time(duration)
-                                )),
-                        )
-                        .child(
-                            mini_button(("volume-down", message_id as usize), "−").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.adjust_video_volume(key, -5.0, cx)
-                                }),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .w(px(34.))
-                                .text_center()
-                                .text_xs()
-                                .text_color(rgb(0x989ea8))
-                                .child(video.volume.round().to_string()),
-                        )
-                        .child(
-                            mini_button(("volume-up", message_id as usize), "+").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.adjust_video_volume(key, 5.0, cx)
-                                }),
-                            ),
-                        ),
-                )
-                .into_any_element();
+            return self.render_attachment_video(key, descriptor, path, false, cx);
         }
         let fetch = descriptor.clone();
         div()
@@ -2732,7 +2576,127 @@ impl ChattView {
             .child(viewport_element)
     }
 
+    fn render_attachment_video(
+        &mut self,
+        key: VideoKey,
+        descriptor: AttachmentDescriptor,
+        path: PathBuf,
+        theater: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.videos.ensure_source(key, path.clone());
+        let video = self.videos.view(key);
+        let thumbnail = self.video_thumbnails.request(
+            ThumbnailKey {
+                attachment_id: descriptor.id,
+            },
+            path.clone(),
+        );
+        let duration = if video.duration > 0.0 {
+            video.duration
+        } else {
+            thumbnail.duration.unwrap_or(0.0)
+        };
+        let active_scrub = self.video_scrub.filter(|scrub| scrub.key == key);
+        let display_position = active_scrub.map_or(video.position, VideoScrub::position);
+        let active_controls = self.video_controls.active_key == Some(key);
+        let controls_phase = active_controls
+            .then_some(self.video_controls.phase)
+            .unwrap_or_default();
+        let controls_pinned = video.paused
+            || video.finished
+            || active_scrub.is_some()
+            || self.video_volume_drag.is_some_and(|drag| drag.key == key)
+            || (active_controls
+                && (self.video_controls.bar_hovered || self.video_controls.volume_open));
+        let scrub_hover_fraction = active_controls.then(|| {
+            active_scrub
+                .map(|scrub| scrub.last_fraction)
+                .or(self.video_controls.scrub_hover_fraction)
+        }).flatten();
+        let source = TheaterVideo {
+            key,
+            descriptor: descriptor.clone(),
+            path,
+        };
+        let view = cx.entity().downgrade();
+        let event_source = source.clone();
+        let handler: VideoPlayerHandler = Rc::new(move |event, _, cx| {
+            let source = event_source.clone();
+            let _ = view.update(cx, |this, cx| {
+                this.handle_video_player_event(source, duration, event, cx)
+            });
+        });
+        let fallback_label = video
+            .error
+            .clone()
+            .unwrap_or_else(|| descriptor.file_name.clone());
+        let aspect_ratio = aspect_ratio(&video, (descriptor.width, descriptor.height));
+        render_video_player(
+            VideoPlayerConfig {
+                key,
+                theater,
+                video,
+                thumbnail,
+                duration,
+                display_position,
+                aspect_ratio,
+                fallback_label,
+                controls_phase,
+                controls_pinned,
+                scrub_hover_fraction,
+                volume_open: active_controls && self.video_controls.volume_open,
+                measure_volume_bounds: active_controls,
+            },
+            handler,
+            self.video_volume_popup_bounds.clone(),
+            self.video_volume_button_bounds.clone(),
+        )
+    }
+
+    fn handle_video_player_event(
+        &mut self,
+        source: TheaterVideo,
+        duration: f64,
+        event: VideoPlayerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let key = source.key;
+        match event {
+            VideoPlayerEvent::PlayerHovered(hovered) => {
+                self.hover_video_player(key, hovered, cx)
+            }
+            VideoPlayerEvent::PointerMoved => self.video_pointer_moved(key, cx),
+            VideoPlayerEvent::SurfaceClicked(click_count) => {
+                self.click_video_surface(source, click_count, cx)
+            }
+            VideoPlayerEvent::Play => self.play_video(key, cx),
+            VideoPlayerEvent::ScrubHovered(fraction) => {
+                self.hover_video_scrub(key, fraction, cx)
+            }
+            VideoPlayerEvent::ScrubHoverCleared => self.clear_video_scrub_hover(key, cx),
+            VideoPlayerEvent::ScrubPressed { bounds, event } => {
+                self.begin_video_scrub(key, duration, bounds, &event, cx)
+            }
+            VideoPlayerEvent::ControlsHovered(hovered) => {
+                self.hover_video_controls(key, hovered, cx)
+            }
+            VideoPlayerEvent::VolumeHovered(hovered) => {
+                self.hover_video_volume(key, hovered, cx)
+            }
+            VideoPlayerEvent::VolumePopupHovered(hovered) => {
+                self.hover_video_volume_popup(key, hovered, cx)
+            }
+            VideoPlayerEvent::ToggleMute => self.toggle_video_mute(key, cx),
+            VideoPlayerEvent::VolumePressed { bounds, event } => {
+                self.begin_video_volume_drag(key, bounds, &event, cx)
+            }
+            VideoPlayerEvent::ToggleTheater => self.toggle_video_theater(source, cx),
+        }
+    }
+
     fn play_video(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.show_video_controls(key, cx);
         match self.videos.play(key) {
             Ok(()) => self.status = "Starting cached attachment…".into(),
             Err(error) => {
@@ -2740,6 +2704,7 @@ impl ChattView {
                 self.status = format!("Playback failed: {error}").into();
             }
         }
+        self.schedule_video_controls_hide(key, cx);
         cx.notify();
     }
 
@@ -2748,7 +2713,189 @@ impl ChattView {
             log::error!("embedded video seek failed key={key:?} seconds={seconds}: {error:#}");
             self.status = format!("Seek failed: {error}").into();
         }
+        self.show_video_controls(key, cx);
+        self.schedule_video_controls_hide(key, cx);
         cx.notify();
+    }
+
+    fn show_video_controls(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        if self.video_controls.active_key != Some(key) {
+            self.video_controls_hide_task.take();
+            self.video_volume_hide_task.take();
+            self.video_volume_popup_bounds.set(None);
+            self.video_volume_button_bounds.set(None);
+        }
+        let Some(serial) = self.video_controls.show(key) else {
+            return;
+        };
+        self.video_controls_animation_task.take();
+        self.video_controls_animation_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CONTROLS_ANIMATION_DURATION)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_controls_animation_task.take();
+                if this.video_controls.finish_animation(serial) {
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn hide_video_controls(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        let Some(serial) = self.video_controls.hide(key) else {
+            return;
+        };
+        self.video_controls_hide_task.take();
+        self.video_volume_hide_task.take();
+        self.video_volume_popup_bounds.set(None);
+        self.video_controls_animation_task.take();
+        self.video_controls_animation_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CONTROLS_ANIMATION_DURATION)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_controls_animation_task.take();
+                if this.video_controls.finish_animation(serial) {
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn video_controls_pinned(&self, key: VideoKey) -> bool {
+        let video = self.videos.view(key);
+        let dragging = self.video_scrub.is_some_and(|scrub| scrub.key == key)
+            || self.video_volume_drag.is_some_and(|drag| drag.key == key);
+        self.video_controls
+            .pinned(key, video.paused, video.finished, dragging)
+    }
+
+    fn schedule_video_controls_hide(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.video_controls_hide_task.take();
+        if self.video_controls.active_key != Some(key) || self.video_controls_pinned(key) {
+            return;
+        }
+        if !self.video_controls.player_hovered {
+            self.hide_video_controls(key, cx);
+            return;
+        }
+        self.video_controls_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONTROLS_HIDE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_controls_hide_task.take();
+                if this.video_controls.active_key == Some(key)
+                    && !this.video_controls_pinned(key)
+                {
+                    this.hide_video_controls(key, cx);
+                }
+            });
+        }));
+    }
+
+    fn hover_video_player(&mut self, key: VideoKey, hovered: bool, cx: &mut Context<Self>) {
+        self.show_video_controls(key, cx);
+        self.video_controls.player_hovered = hovered;
+        if hovered {
+            self.schedule_video_controls_hide(key, cx);
+        } else {
+            self.video_controls.scrub_hover_fraction = None;
+            self.schedule_video_controls_hide(key, cx);
+        }
+        cx.notify();
+    }
+
+    fn video_pointer_moved(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.show_video_controls(key, cx);
+        self.video_controls.player_hovered = true;
+        self.schedule_video_controls_hide(key, cx);
+    }
+
+    fn hover_video_controls(&mut self, key: VideoKey, hovered: bool, cx: &mut Context<Self>) {
+        self.show_video_controls(key, cx);
+        self.video_controls.bar_hovered = hovered;
+        if hovered {
+            self.video_controls_hide_task.take();
+        } else {
+            self.schedule_video_controls_hide(key, cx);
+        }
+        cx.notify();
+    }
+
+    fn click_video_surface(
+        &mut self,
+        source: TheaterVideo,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if click_count >= 2 {
+            self.video_surface_click_task.take();
+            self.toggle_video_theater(source, cx);
+            return;
+        }
+        if click_count != 1 {
+            return;
+        }
+        self.video_surface_click_task.take();
+        let key = source.key;
+        self.video_surface_click_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(220))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_surface_click_task.take();
+                this.play_video(key, cx);
+            });
+        }));
+    }
+
+    fn toggle_video_theater(&mut self, source: TheaterVideo, cx: &mut Context<Self>) {
+        if self.theater_video.as_ref().is_some_and(|active| active.key == source.key) {
+            self.exit_video_theater(cx);
+            return;
+        }
+        self.theater_video = Some(source.clone());
+        self.show_video_controls(source.key, cx);
+        self.video_surface_click_task.take();
+        cx.notify();
+    }
+
+    fn exit_video_theater(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(theater) = self.theater_video.take() else {
+            return false;
+        };
+        self.video_surface_click_task.take();
+        self.finish_video_scrub(cx);
+        self.finish_video_volume_drag(cx);
+        self.video_volume_popup_bounds.set(None);
+        self.video_controls.player_hovered = false;
+        self.schedule_video_controls_hide(theater.key, cx);
+        cx.notify();
+        true
+    }
+
+    fn hover_video_scrub(
+        &mut self,
+        key: VideoKey,
+        fraction: f64,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_video_controls(key, cx);
+        if self.video_controls.scrub_hover_fraction != Some(fraction) {
+            self.video_controls.scrub_hover_fraction = Some(fraction);
+            cx.notify();
+        }
+    }
+
+    fn clear_video_scrub_hover(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        if self.video_controls.active_key == Some(key)
+            && self.video_controls.scrub_hover_fraction.take().is_some()
+        {
+            cx.notify();
+        }
     }
 
     fn begin_video_scrub(
@@ -2759,14 +2906,17 @@ impl ChattView {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let Some(fraction) = video_scrub_fraction(bounds, event.position.x, duration) else {
+        let Some(fraction) = horizontal_fraction(bounds, event.position.x, duration) else {
             return;
         };
+        self.show_video_controls(key, cx);
+        self.video_controls_hide_task.take();
         self.video_scrub = Some(VideoScrub {
             key,
             bounds,
             duration,
             last_fraction: fraction,
+            last_seek: Instant::now(),
         });
         if let Err(error) = self.videos.scrub(key, fraction, duration, SeekMode::Exact) {
             log::error!("embedded video scrub failed key={key:?} fraction={fraction}: {error:#}");
@@ -2784,17 +2934,23 @@ impl ChattView {
             self.finish_video_scrub(cx);
             return true;
         }
-        let Some(fraction) = video_scrub_fraction(scrub.bounds, event.position.x, scrub.duration)
+        let Some(fraction) = horizontal_fraction(scrub.bounds, event.position.x, scrub.duration)
         else {
             self.finish_video_scrub(cx);
             return true;
         };
         if fraction != scrub.last_fraction {
             scrub.last_fraction = fraction;
+            let dispatch_seek = scrub.should_dispatch_seek(Instant::now());
             self.video_scrub = Some(scrub);
-            if let Err(error) =
-                self.videos
-                    .scrub(scrub.key, fraction, scrub.duration, SeekMode::Keyframes)
+            self.video_controls.scrub_hover_fraction = Some(fraction);
+            if dispatch_seek
+                && let Err(error) = self.videos.scrub(
+                    scrub.key,
+                    fraction,
+                    scrub.duration,
+                    SeekMode::Keyframes,
+                )
             {
                 log::error!(
                     "embedded video drag scrub failed key={:?} fraction={fraction}: {error:#}",
@@ -2825,7 +2981,139 @@ impl ChattView {
             );
             self.status = format!("Seek failed: {error}").into();
         }
+        self.schedule_video_controls_hide(scrub.key, cx);
         cx.notify();
+    }
+
+    fn hover_video_volume(&mut self, key: VideoKey, hovered: bool, cx: &mut Context<Self>) {
+        self.show_video_controls(key, cx);
+        self.video_controls.volume_button_hovered = hovered;
+        if hovered {
+            self.video_volume_hide_task.take();
+            self.video_controls.volume_open = true;
+            self.video_controls_hide_task.take();
+        } else {
+            self.schedule_video_volume_close(key, cx);
+        }
+        cx.notify();
+    }
+
+    fn hover_video_volume_popup(&mut self, key: VideoKey, hovered: bool, cx: &mut Context<Self>) {
+        self.video_controls.volume_popup_hovered = hovered;
+        if hovered {
+            self.video_volume_hide_task.take();
+            self.video_controls.volume_open = true;
+        } else {
+            self.schedule_video_volume_close(key, cx);
+        }
+        cx.notify();
+    }
+
+    fn schedule_video_volume_close(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.video_volume_hide_task.take();
+        self.video_volume_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(160))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_volume_hide_task.take();
+                if this.video_controls.active_key == Some(key)
+                    && !this.video_controls.volume_button_hovered
+                    && !this.video_controls.volume_popup_hovered
+                    && !this.video_volume_drag.is_some_and(|drag| drag.key == key)
+                {
+                    this.video_controls.volume_open = false;
+                    this.video_volume_popup_bounds.set(None);
+                    this.schedule_video_controls_hide(key, cx);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn set_video_volume(&mut self, key: VideoKey, volume: f64, cx: &mut Context<Self>) {
+        if let Err(error) = self.videos.set_volume_for(key, volume) {
+            log::error!("embedded video volume change failed key={key:?} volume={volume}: {error:#}");
+            self.status = format!("Volume failed: {error}").into();
+        }
+        self.show_video_controls(key, cx);
+        cx.notify();
+    }
+
+    fn toggle_video_mute(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        if let Err(error) = self.videos.toggle_mute(key) {
+            log::error!("embedded video mute toggle failed key={key:?}: {error:#}");
+            self.status = format!("Volume failed: {error}").into();
+        }
+        self.show_video_controls(key, cx);
+        self.video_controls.volume_open = true;
+        cx.notify();
+    }
+
+    fn begin_video_volume_drag(
+        &mut self,
+        key: VideoKey,
+        bounds: Bounds<Pixels>,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fraction) = vertical_fraction(bounds, event.position.y) else {
+            return;
+        };
+        self.video_volume_drag = Some(VideoVolumeDrag { key, bounds });
+        self.video_controls.volume_open = true;
+        self.video_controls_hide_task.take();
+        self.set_video_volume(key, fraction * 100.0, cx);
+        cx.stop_propagation();
+    }
+
+    fn drag_video_volume(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.video_volume_drag else {
+            return false;
+        };
+        if !event.dragging() {
+            self.finish_video_volume_drag(cx);
+            return true;
+        }
+        if let Some(fraction) = vertical_fraction(drag.bounds, event.position.y) {
+            self.set_video_volume(drag.key, fraction * 100.0, cx);
+        }
+        cx.stop_propagation();
+        true
+    }
+
+    fn finish_video_volume_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.video_volume_drag.take() else {
+            return;
+        };
+        self.schedule_video_volume_close(drag.key, cx);
+        cx.notify();
+    }
+
+    fn scroll_video_volume(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) -> bool {
+        let Some(key) = self.video_controls.active_key else {
+            return false;
+        };
+        if !self.video_controls.volume_open
+            || !self
+                .video_volume_popup_bounds
+                .get()
+                .is_some_and(|bounds| bounds.contains(&event.position))
+                && !self
+                    .video_volume_button_bounds
+                    .get()
+                    .is_some_and(|bounds| bounds.contains(&event.position))
+        {
+            return false;
+        }
+        let delta = volume_scroll_delta(event.delta);
+        if delta == 0.0 {
+            return false;
+        }
+        self.adjust_video_volume(key, delta, cx);
+        self.video_controls.volume_open = true;
+        self.video_controls_hide_task.take();
+        true
     }
 
     fn adjust_video_volume(&mut self, key: VideoKey, delta: f64, cx: &mut Context<Self>) {
@@ -2833,32 +3121,36 @@ impl ChattView {
             log::error!("embedded video volume change failed key={key:?} delta={delta}: {error:#}");
             self.status = format!("Volume failed: {error}").into();
         }
+        self.show_video_controls(key, cx);
         cx.notify();
     }
 
     fn toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.videos.toggle_last_visible() {
-            log::error!("embedded video playback toggle failed: {error:#}");
-            self.status = format!("Playback failed: {error}").into();
+        let key = self
+            .theater_video
+            .as_ref()
+            .map(|theater| theater.key)
+            .or_else(|| self.videos.last_visible_key());
+        if let Some(key) = key {
+            self.play_video(key, cx);
         }
-        cx.notify();
     }
     fn seek_back(&mut self, _: &SeekBack, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, 30.0, 0.0, cx);
-        } else if let Err(error) = self.videos.seek_last_visible(-10.0) {
-            log::error!("embedded video shortcut seek failed seconds=-10: {error:#}");
-            self.status = format!("Seek failed: {error}").into();
-            cx.notify();
+        } else if let Some(theater) = self.theater_video.as_ref() {
+            self.seek_video(theater.key, -10.0, cx);
+        } else if let Some(key) = self.videos.last_visible_key() {
+            self.seek_video(key, -10.0, cx);
         }
     }
     fn seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, -30.0, 0.0, cx);
-        } else if let Err(error) = self.videos.seek_last_visible(10.0) {
-            log::error!("embedded video shortcut seek failed seconds=10: {error:#}");
-            self.status = format!("Seek failed: {error}").into();
-            cx.notify();
+        } else if let Some(theater) = self.theater_video.as_ref() {
+            self.seek_video(theater.key, 10.0, cx);
+        } else if let Some(key) = self.videos.last_visible_key() {
+            self.seek_video(key, 10.0, cx);
         }
     }
 
@@ -3242,6 +3534,9 @@ impl ChattView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.scroll_video_volume(event, cx) {
+            return true;
+        }
         let distance = -event.delta.pixel_delta(px(20.)).y;
         if distance == px(0.) {
             return false;
@@ -3343,6 +3638,45 @@ impl Render for ChattView {
         if !self.live_players.is_empty() {
             self.advance_live_video();
         }
+        if let Some(theater) = self.theater_video.clone() {
+            let player = self.render_attachment_video(
+                theater.key,
+                theater.descriptor,
+                theater.path,
+                true,
+                cx,
+            );
+            return div()
+                .id("chatt-video-theater")
+                .key_context("Chatt")
+                .on_action(cx.listener(Self::toggle_playback))
+                .on_action(cx.listener(Self::seek_back))
+                .on_action(cx.listener(Self::seek_forward))
+                .on_action(cx.listener(Self::close_preview_action))
+                .on_scroll_wheel(cx.listener(
+                    |this, event: &ScrollWheelEvent, _, cx| {
+                        if this.scroll_video_volume(event, cx) {
+                            cx.stop_propagation();
+                        }
+                    },
+                ))
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    if !this.drag_video_volume(event, cx) {
+                        this.drag_video_scrub(event, cx);
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        this.finish_video_scrub(cx);
+                        this.finish_video_volume_drag(cx);
+                    }),
+                )
+                .size_full()
+                .bg(rgb(0x08090b))
+                .text_color(rgb(0xd9dbe0))
+                .child(player);
+        }
         if let Some(stream_id) = self.fullscreen_share
             && let Some(share) = self
                 .model
@@ -3439,7 +3773,7 @@ impl Render for ChattView {
                 this.queue_uploads(paths.0.to_vec(), cx)
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if !this.drag_video_scrub(event, cx) {
+                if !this.drag_video_volume(event, cx) && !this.drag_video_scrub(event, cx) {
                     if this.preview_pane_resize.is_some() {
                         this.drag_preview_pane(event, window, cx)
                     } else if this.preview_last_mouse_position.is_some() {
@@ -3453,6 +3787,7 @@ impl Render for ChattView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                     this.finish_video_scrub(cx);
+                    this.finish_video_volume_drag(cx);
                     this.finish_live_pane_resize(cx);
                     this.finish_preview_pane_resize(cx);
                     this.finish_preview_image_pan(cx)
@@ -4023,19 +4358,6 @@ fn message_video_key(message: &timeline::Message) -> Option<VideoKey> {
         .then(|| video_key(message.room_id, message.id, &attachment.descriptor))
 }
 
-fn format_time(seconds: f64) -> String {
-    let seconds = seconds.max(0.).round() as u64;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
-}
-
-fn video_scrub_fraction(bounds: Bounds<Pixels>, pointer_x: Pixels, duration: f64) -> Option<f64> {
-    let width = bounds.size.width.as_f32();
-    if duration <= 0.0 || width <= 0.0 {
-        return None;
-    }
-    Some(((pointer_x - bounds.origin.x).as_f32() / width).clamp(0.0, 1.0) as f64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4192,11 +4514,11 @@ mod tests {
             size: gpui::size(px(400.0), px(16.0)),
         };
 
-        assert_eq!(video_scrub_fraction(bounds, px(100.0), 60.0), Some(0.0));
-        assert_eq!(video_scrub_fraction(bounds, px(300.0), 60.0), Some(0.5));
-        assert_eq!(video_scrub_fraction(bounds, px(500.0), 60.0), Some(1.0));
-        assert_eq!(video_scrub_fraction(bounds, px(20.0), 60.0), Some(0.0));
-        assert_eq!(video_scrub_fraction(bounds, px(900.0), 60.0), Some(1.0));
+        assert_eq!(horizontal_fraction(bounds, px(100.0), 60.0), Some(0.0));
+        assert_eq!(horizontal_fraction(bounds, px(300.0), 60.0), Some(0.5));
+        assert_eq!(horizontal_fraction(bounds, px(500.0), 60.0), Some(1.0));
+        assert_eq!(horizontal_fraction(bounds, px(20.0), 60.0), Some(0.0));
+        assert_eq!(horizontal_fraction(bounds, px(900.0), 60.0), Some(1.0));
     }
 
     #[test]
@@ -4210,8 +4532,8 @@ mod tests {
             size: gpui::size(px(400.0), px(16.0)),
         };
 
-        assert_eq!(video_scrub_fraction(zero_width, px(100.0), 60.0), None);
-        assert_eq!(video_scrub_fraction(valid, px(100.0), 0.0), None);
+        assert_eq!(horizontal_fraction(zero_width, px(100.0), 60.0), None);
+        assert_eq!(horizontal_fraction(valid, px(100.0), 0.0), None);
     }
 
     #[test]
