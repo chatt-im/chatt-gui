@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::OpenOptionsExt as _,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -33,6 +33,33 @@ const RENDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
 const RENDER_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const RENDER_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const INITIAL_RENDER_TRACE_LIMIT: u64 = 8;
+// The update callback coalesces notifications while one render update is
+// pending, so at most one pre-seek frame update can still reach the render
+// worker. Preserve one additional invalidation for the post-seek frame.
+const SEEK_INVALIDATION_FRAME_UPDATES: u8 = 2;
+
+#[derive(Default)]
+struct SeekFrameInvalidation {
+    remaining_frame_updates: AtomicU8,
+}
+
+impl SeekFrameInvalidation {
+    fn invalidate(&self) {
+        self.remaining_frame_updates
+            .store(SEEK_INVALIDATION_FRAME_UPDATES, Ordering::Release);
+    }
+
+    fn take_for_update(&self, updates: u64) -> bool {
+        if updates & u64::from(mpv_render_update::Frame) == 0 {
+            return false;
+        }
+        self.remaining_frame_updates
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
 
 /// The render path selected by the first attachment player. Later players can
 /// reuse this decision instead of repeating capability probing and a known-to-
@@ -367,7 +394,7 @@ impl MpvPlayer {
 
         let (error_sender, errors) = mpsc::channel();
         let playback = Arc::new(SharedPlaybackState::default());
-        let frame_invalidated = Arc::new(AtomicBool::new(false));
+        let frame_invalidated = Arc::new(SeekFrameInvalidation::default());
         let render_playback = playback.clone();
         let render_frame_invalidated = frame_invalidated.clone();
         let render_error_sender = error_sender.clone();
@@ -1209,7 +1236,7 @@ fn control_worker(
     errors: mpsc::Sender<String>,
     render_sender: mpsc::Sender<RenderMessage>,
     initial_render_size: Option<(u32, u32)>,
-    frame_invalidated: Arc<AtomicBool>,
+    frame_invalidated: Arc<SeekFrameInvalidation>,
 ) {
     log::info!("mpv control worker started");
     let mut state = PlaybackState::default();
@@ -1260,7 +1287,7 @@ fn control_worker(
                     state.position = seconds;
                     state.finished = false;
                     playback.publish(state);
-                    frame_invalidated.store(true, Ordering::Release);
+                    frame_invalidated.invalidate();
                     mpv.command("seek", &[&seconds.to_string(), mode.absolute_flag()])
                 }
                 ControlCommand::SeekPercent {
@@ -1274,7 +1301,7 @@ fn control_worker(
                     state.position = position;
                     state.finished = false;
                     playback.publish(state);
-                    frame_invalidated.store(true, Ordering::Release);
+                    frame_invalidated.invalidate();
                     mpv.command(
                         "seek",
                         &[&percent.to_string(), mode.absolute_percent_flag()],
@@ -1531,7 +1558,7 @@ fn render_worker(
     live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
     live_input_gate: Option<Arc<crate::live_stream::LiveInputGate>>,
     playback: Arc<SharedPlaybackState>,
-    frame_invalidated: Arc<AtomicBool>,
+    frame_invalidated: Arc<SeekFrameInvalidation>,
 ) {
     let backend_name = backend.name();
     log::info!("video render worker started backend={backend_name}");
@@ -1597,12 +1624,12 @@ fn render_worker(
             RenderMessage::Update => {
                 diagnostics.callbacks += 1;
                 pending.store(false, Ordering::Release);
-                if frame_invalidated.swap(false, Ordering::AcqRel) {
+                let updates = backend.context().update();
+                if frame_invalidated.take_for_update(updates) {
                     has_frame = false;
                     redraw_pending = false;
                     log::debug!("invalidated displayed video frame after seek");
                 }
-                let updates = backend.context().update();
                 if !enabled {
                     // A live stream can expose its first decoded frame before
                     // Vulkan output reconfiguration has settled. Keep that
@@ -2097,6 +2124,34 @@ mod tests {
                 false,
             ),
             RenderAction::Render
+        );
+    }
+
+    #[test]
+    fn stale_frame_update_does_not_consume_seek_invalidation() {
+        let invalidation = SeekFrameInvalidation::default();
+        let updates = u64::from(mpv_render_update::Frame);
+        let repeat = Some(info(4));
+        invalidation.invalidate();
+
+        assert!(!invalidation.take_for_update(0));
+
+        let stale_has_frame = !invalidation.take_for_update(updates);
+        assert_eq!(
+            render_action(updates, repeat, stale_has_frame),
+            RenderAction::Render,
+        );
+
+        let post_seek_has_frame = !invalidation.take_for_update(updates);
+        assert_eq!(
+            render_action(updates, repeat, post_seek_has_frame),
+            RenderAction::Render,
+        );
+
+        let settled_has_frame = !invalidation.take_for_update(updates);
+        assert_eq!(
+            render_action(updates, repeat, settled_has_frame),
+            RenderAction::Skip,
         );
     }
 
