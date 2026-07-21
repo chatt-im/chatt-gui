@@ -1,0 +1,89 @@
+mod dispatcher;
+mod accessibility;
+mod headless;
+mod keyboard;
+mod platform;
+#[cfg(feature = "system-notifications")]
+mod system_notifications;
+#[cfg(not(feature = "system-notifications"))]
+mod system_notifications {
+    use gpui::{ForegroundExecutor, SystemNotification, SystemNotificationResponse};
+
+    pub(crate) struct SystemNotificationState;
+
+    impl SystemNotificationState {
+        pub(crate) fn new() -> Self {
+            Self
+        }
+
+        pub(crate) fn show(&self, _app_name: Option<&str>, _notification: SystemNotification) {}
+
+        pub(crate) fn dismiss(&self, _tag: &str) {}
+
+        pub(crate) fn on_response(
+            &mut self,
+            _executor: &ForegroundExecutor,
+            _callback: Box<dyn FnMut(SystemNotificationResponse)>,
+        ) {
+        }
+    }
+}
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod text_system;
+#[cfg(feature = "wayland")]
+mod wayland;
+#[cfg(feature = "x11")]
+mod x11;
+
+#[cfg(all(
+    any(feature = "wayland", feature = "x11"),
+    feature = "xdg-desktop-portal"
+))]
+mod xdg_desktop_portal;
+
+pub(crate) use accessibility::*;
+pub use dispatcher::*;
+pub(crate) use headless::*;
+pub(crate) use keyboard::*;
+pub(crate) use platform::*;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) use text_system::*;
+#[cfg(feature = "wayland")]
+pub(crate) use wayland::*;
+#[cfg(feature = "x11")]
+pub(crate) use x11::*;
+
+use std::rc::Rc;
+
+/// Returns the default platform implementation for the current OS.
+pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
+    #[cfg(feature = "x11")]
+    use anyhow::Context as _;
+
+    if headless {
+        return Rc::new(LinuxPlatform {
+            inner: HeadlessClient::new(),
+        });
+    }
+
+    match gpui::guess_compositor() {
+        #[cfg(feature = "wayland")]
+        "Wayland" => Rc::new(LinuxPlatform {
+            inner: WaylandClient::new(),
+        }),
+
+        #[cfg(feature = "x11")]
+        "X11" => Rc::new(LinuxPlatform {
+            inner: X11Client::new()
+                .context("Failed to initialize X11 client.")
+                .unwrap(),
+        }),
+
+        "Headless" => Rc::new(LinuxPlatform {
+            inner: HeadlessClient::new(),
+        }),
+        _ => unreachable!(
+            r#"At least one of the "wayland" or "x11" features must be enabled on gpui_linux or gpui_platform."#
+        ),
+    }
+}
