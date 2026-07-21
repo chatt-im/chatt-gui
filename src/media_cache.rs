@@ -102,11 +102,20 @@ impl MediaCache {
             PartialEntry {
                 descriptor: descriptor.clone(),
                 file,
-                path,
+                path: path.clone(),
                 received: 0,
             },
         );
         self.partial_bytes = self.partial_bytes.saturating_add(descriptor.byte_len);
+        log::info!(
+            "attachment cache reserved bulk_transfer_id={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} bytes={} partial_path={:?}",
+            transfer_id.0,
+            descriptor.id.timestamp_ms,
+            descriptor.id.transfer_id.0,
+            descriptor.file_name,
+            descriptor.byte_len,
+            path,
+        );
         Ok(())
     }
 
@@ -142,7 +151,7 @@ impl MediaCache {
         drop(partial.file);
         let final_path = self.root.path().join(format!(
             "{}-{}.cache",
-            partial.descriptor.id.room_id.0, partial.descriptor.id.message_id.0
+            partial.descriptor.id.timestamp_ms, partial.descriptor.id.transfer_id.0
         ));
         if let Err(error) = fs::rename(&partial.path, &final_path) {
             let _ = fs::remove_file(&partial.path);
@@ -153,10 +162,19 @@ impl MediaCache {
         self.entries.insert(
             partial.descriptor.id,
             CacheEntry {
-                path: final_path,
+                path: final_path.clone(),
                 byte_len: partial.received,
                 touched: self.clock,
             },
+        );
+        log::info!(
+            "attachment cache finalized bulk_transfer_id={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} bytes={} cache_path={:?}",
+            finished.transfer_id.0,
+            partial.descriptor.id.timestamp_ms,
+            partial.descriptor.id.transfer_id.0,
+            partial.descriptor.file_name,
+            partial.received,
+            final_path,
         );
         self.evict();
         Ok(partial.descriptor)
@@ -230,16 +248,13 @@ impl MediaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use local_rpc::{
-        ids::{MessageId, RoomId},
-        model::MediaKind,
-    };
+    use local_rpc::{ids::FileTransferId, model::MediaKind};
 
-    fn descriptor(room: u32, message: u64, byte_len: u64) -> AttachmentDescriptor {
+    fn descriptor(timestamp_ms: u64, transfer: u64, byte_len: u64) -> AttachmentDescriptor {
         AttachmentDescriptor {
             id: AttachmentId {
-                room_id: RoomId(room),
-                message_id: MessageId(message),
+                timestamp_ms,
+                transfer_id: FileTransferId(transfer),
             },
             file_name: "../../escape.png".into(),
             media_kind: MediaKind::Image,
@@ -319,6 +334,46 @@ mod tests {
         assert!(path.starts_with(cache.root.path()));
         assert!(!path.to_string_lossy().contains("escape"));
         assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn same_filename_uploads_keep_independent_cached_bytes() {
+        let first = descriptor(1_000, 7, 3);
+        let second = descriptor(2_000, 8, 4);
+        assert_eq!(first.file_name, second.file_name);
+        let mut cache = MediaCache::new(1024).unwrap();
+
+        cache.reserve(BulkTransferId(1), &first).unwrap();
+        cache
+            .chunk(BulkChunk {
+                transfer_id: BulkTransferId(1),
+                bytes: b"one".to_vec(),
+            })
+            .unwrap();
+        cache
+            .finish(BulkFinished {
+                transfer_id: BulkTransferId(1),
+            })
+            .unwrap();
+
+        cache.reserve(BulkTransferId(2), &second).unwrap();
+        cache
+            .chunk(BulkChunk {
+                transfer_id: BulkTransferId(2),
+                bytes: b"two!".to_vec(),
+            })
+            .unwrap();
+        cache
+            .finish(BulkFinished {
+                transfer_id: BulkTransferId(2),
+            })
+            .unwrap();
+
+        let first_path = cache.path_for(&first).unwrap();
+        let second_path = cache.path_for(&second).unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(fs::read(first_path).unwrap(), b"one");
+        assert_eq!(fs::read(second_path).unwrap(), b"two!");
     }
 
     #[test]

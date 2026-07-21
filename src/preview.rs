@@ -276,10 +276,7 @@ pub fn clamp_panel_width(width: Pixels, body_width: Pixels) -> Pixels {
 
 #[cfg(test)]
 mod tests {
-    use local_rpc::{
-        ids::{MessageId, RoomId},
-        model::MediaKind,
-    };
+    use local_rpc::{ids::FileTransferId, model::MediaKind};
 
     use super::*;
 
@@ -287,8 +284,8 @@ mod tests {
         PreviewItem::new(
             AttachmentDescriptor {
                 id: AttachmentId {
-                    room_id: RoomId(1),
-                    message_id: MessageId(message_id),
+                    timestamp_ms: message_id,
+                    transfer_id: FileTransferId(message_id),
                 },
                 file_name: format!("image-{message_id}.png"),
                 media_kind: MediaKind::Image,

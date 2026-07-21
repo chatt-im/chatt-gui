@@ -426,8 +426,10 @@ where
         window
             .spawn(cx, async move |cx| {
                 let result = task.await;
+                let image_id = result.as_ref().ok().map(|image| image.id.0);
+                let image_size = result.as_ref().ok().map(|image| image.size(0));
                 log::info!(
-                    "image cache load finished hash={source_hash} owner={entity:?} ok={}",
+                    "image cache load finished hash={source_hash} owner={entity:?} ok={} render_image_id={image_id:?} size={image_size:?}",
                     result.is_ok(),
                 );
                 cx.on_next_frame(move |_, cx| {

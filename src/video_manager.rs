@@ -638,8 +638,8 @@ mod tests {
             room_id: RoomId(1),
             message_id,
             attachment_id: AttachmentId {
-                room_id: RoomId(1),
-                message_id: local_rpc::ids::MessageId(message_id),
+                timestamp_ms: message_id,
+                transfer_id: local_rpc::ids::FileTransferId(message_id),
             },
         }
     }

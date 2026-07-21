@@ -564,8 +564,8 @@ mod tests {
     fn key(value: u8) -> ThumbnailKey {
         ThumbnailKey {
             attachment_id: AttachmentId {
-                room_id: local_rpc::ids::RoomId(1),
-                message_id: local_rpc::ids::MessageId(value as u64),
+                timestamp_ms: value as u64,
+                transfer_id: local_rpc::ids::FileTransferId(value as u64),
             },
         }
     }
@@ -652,8 +652,8 @@ mod tests {
             cache.entries.insert(
                 ThumbnailKey {
                     attachment_id: AttachmentId {
-                        room_id: local_rpc::ids::RoomId(1),
-                        message_id: local_rpc::ids::MessageId(value as u64),
+                        timestamp_ms: value as u64,
+                        transfer_id: local_rpc::ids::FileTransferId(value as u64),
                     },
                 },
                 CacheEntry {

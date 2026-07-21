@@ -116,8 +116,8 @@ mod tests {
         Attachment {
             descriptor: AttachmentDescriptor {
                 id: local_rpc::model::AttachmentId {
-                    room_id: local_rpc::ids::RoomId(1),
-                    message_id: local_rpc::ids::MessageId(1),
+                    timestamp_ms: 1,
+                    transfer_id: local_rpc::ids::FileTransferId(1),
                 },
                 file_name: file_name.into(),
                 media_kind,

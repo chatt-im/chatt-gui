@@ -66,6 +66,7 @@ type EagerImageKey = AttachmentId;
 #[derive(Clone, Debug)]
 struct EagerImageFetch {
     key: EagerImageKey,
+    room_id: RoomId,
     descriptor: AttachmentDescriptor,
 }
 
@@ -221,9 +222,10 @@ fn clamp_live_pane_height(height: Pixels, window_height: Pixels) -> Pixels {
 }
 
 impl EagerImageFetch {
-    fn new(descriptor: AttachmentDescriptor) -> Self {
+    fn new(room_id: RoomId, descriptor: AttachmentDescriptor) -> Self {
         Self {
             key: descriptor.id,
+            room_id,
             descriptor,
         }
     }
@@ -896,7 +898,9 @@ impl ChattView {
             }
             DaemonEvent::MediaCached(descriptor) => {
                 log::info!(
-                    "attachment cached file={:?} media_kind={:?} content_type={:?} bytes={}",
+                    "attachment cached attachment_timestamp_ms={} attachment_transfer_id={} file={:?} media_kind={:?} content_type={:?} bytes={}",
+                    descriptor.id.timestamp_ms,
+                    descriptor.id.transfer_id.0,
                     descriptor.file_name,
                     descriptor.media_kind,
                     descriptor.content_type,
@@ -1941,7 +1945,7 @@ impl ChattView {
                 .into_any_element();
         }
         if attachment.is_image() {
-            let fetch = EagerImageFetch::new(descriptor.clone());
+            let fetch = EagerImageFetch::new(room_id, descriptor.clone());
             if let Some(transfer_id) = active_transfer {
                 let action = mini_button(("cancel-image-read", transfer_id.0 as usize), "Cancel")
                     .on_click(
@@ -2273,11 +2277,15 @@ impl ChattView {
             .messages
             .iter()
             .rev()
-            .filter_map(|message| message.attachment.as_ref())
-            .filter(|attachment| attachment.is_image())
-            .map(|attachment| attachment.descriptor.clone())
+            .filter_map(|message| {
+                message
+                    .attachment
+                    .as_ref()
+                    .filter(|attachment| attachment.is_image())
+                    .map(|attachment| (message.room_id, attachment.descriptor.clone()))
+            })
             .collect::<Vec<_>>();
-        for descriptor in descriptors {
+        for (room_id, descriptor) in descriptors {
             let cached_or_active = {
                 let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
                 cache.path_for(&descriptor).is_some()
@@ -2285,7 +2293,7 @@ impl ChattView {
             };
             if !cached_or_active {
                 self.eager_image_fetches
-                    .enqueue(EagerImageFetch::new(descriptor));
+                    .enqueue(EagerImageFetch::new(room_id, descriptor));
             }
         }
         self.schedule_eager_image_fetches(window, cx);
@@ -2330,11 +2338,7 @@ impl ChattView {
             let Some(fetch) = self.eager_image_fetches.pop_front() else {
                 break;
             };
-            match self.begin_attachment_read(
-                fetch.descriptor.id.room_id,
-                fetch.descriptor.clone(),
-                cx,
-            ) {
+            match self.begin_attachment_read(fetch.room_id, fetch.descriptor.clone(), cx) {
                 Ok(Some(transfer_id)) => {
                     self.eager_image_fetches.started(transfer_id, fetch);
                 }
@@ -2355,8 +2359,10 @@ impl ChattView {
             return;
         };
         log::info!(
-            "attachment fetch requested room={} file={:?} media_kind={:?} content_type={:?} bytes={}",
+            "attachment fetch requested room={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} media_kind={:?} content_type={:?} bytes={}",
             room_id.0,
+            descriptor.id.timestamp_ms,
+            descriptor.id.transfer_id.0,
             descriptor.file_name,
             descriptor.media_kind,
             descriptor.content_type,
@@ -2418,9 +2424,12 @@ impl ChattView {
             return Err(error);
         } else {
             log::info!(
-                "attachment request queued request_id={} transfer_id={} file={:?} bytes={}",
+                "attachment request queued request_id={} bulk_transfer_id={} room={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} bytes={}",
                 request_id.0,
                 transfer_id.0,
+                room_id.0,
+                descriptor.id.timestamp_ms,
+                descriptor.id.transfer_id.0,
                 descriptor.file_name,
                 descriptor.byte_len,
             );
@@ -2451,10 +2460,16 @@ impl ChattView {
             let selected = key == active_key;
             let select_key = key;
             let close_key = key;
-            let select_id: SharedString =
-                format!("preview-tab-select-{}-{}", key.room_id.0, key.message_id.0).into();
-            let close_id: SharedString =
-                format!("preview-tab-close-{}-{}", key.room_id.0, key.message_id.0).into();
+            let select_id: SharedString = format!(
+                "preview-tab-select-{}-{}",
+                key.timestamp_ms, key.transfer_id.0
+            )
+            .into();
+            let close_id: SharedString = format!(
+                "preview-tab-close-{}-{}",
+                key.timestamp_ms, key.transfer_id.0
+            )
+            .into();
             tabs = tabs.child(
                 div()
                     .h_full()
@@ -4027,18 +4042,21 @@ mod tests {
     use local_rpc::model::MediaKind;
 
     fn image_fetch(room_id: RoomId, marker: u8) -> EagerImageFetch {
-        EagerImageFetch::new(AttachmentDescriptor {
-            id: AttachmentId {
-                room_id,
-                message_id: local_rpc::ids::MessageId(marker as u64),
+        EagerImageFetch::new(
+            room_id,
+            AttachmentDescriptor {
+                id: AttachmentId {
+                    timestamp_ms: marker as u64,
+                    transfer_id: local_rpc::ids::FileTransferId(marker as u64),
+                },
+                file_name: format!("image-{marker}.png"),
+                media_kind: MediaKind::Image,
+                content_type: "image/png".into(),
+                byte_len: 10,
+                width: Some(400),
+                height: Some(300),
             },
-            file_name: format!("image-{marker}.png"),
-            media_kind: MediaKind::Image,
-            content_type: "image/png".into(),
-            byte_len: 10,
-            width: Some(400),
-            height: Some(300),
-        })
+        )
     }
 
     #[test]

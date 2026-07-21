@@ -39,7 +39,9 @@ impl Asset for TimelineImageLoader {
             };
 
             log::info!(
-                "timeline image decode finished path={path:?} size={:?}",
+                "timeline image decode finished path={path:?} source_bytes={} render_image_id={} size={:?}",
+                bytes.len(),
+                image.id.0,
                 image.size(0),
             );
             Ok(image)
@@ -61,10 +63,18 @@ impl Asset for PreviewImageLoader {
                 return Err(anyhow!("preview images must be local files").into());
             };
             let bytes = fs::read(path.as_ref())?;
-            if image::guess_format(&bytes).is_ok() {
-                return Ok(render_image_from_dynamic(image::load_from_memory(&bytes)?));
-            }
-            Ok(svg_renderer.render_single_frame(&bytes, 1.0)?)
+            let image = if image::guess_format(&bytes).is_ok() {
+                render_image_from_dynamic(image::load_from_memory(&bytes)?)
+            } else {
+                svg_renderer.render_single_frame(&bytes, 1.0)?
+            };
+            log::info!(
+                "preview image decode finished path={path:?} source_bytes={} render_image_id={} size={:?}",
+                bytes.len(),
+                image.id.0,
+                image.size(0),
+            );
+            Ok(image)
         }
     }
 }
