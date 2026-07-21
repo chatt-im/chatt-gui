@@ -10,10 +10,8 @@ const IBM_PLEX_SANS_SEMIBOLD: &[u8] =
     include_bytes!("../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
 const IBM_PLEX_SANS_SEMIBOLD_ITALIC: &[u8] =
     include_bytes!("../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
-const LILEX_REGULAR: &[u8] =
-    include_bytes!("../vendor/zed/assets/fonts/lilex/Lilex-Regular.ttf");
-const LILEX_ITALIC: &[u8] =
-    include_bytes!("../vendor/zed/assets/fonts/lilex/Lilex-Italic.ttf");
+const LILEX_REGULAR: &[u8] = include_bytes!("../vendor/zed/assets/fonts/lilex/Lilex-Regular.ttf");
+const LILEX_ITALIC: &[u8] = include_bytes!("../vendor/zed/assets/fonts/lilex/Lilex-Italic.ttf");
 const LILEX_BOLD: &[u8] = include_bytes!("../vendor/zed/assets/fonts/lilex/Lilex-Bold.ttf");
 const LILEX_BOLD_ITALIC: &[u8] =
     include_bytes!("../vendor/zed/assets/fonts/lilex/Lilex-BoldItalic.ttf");

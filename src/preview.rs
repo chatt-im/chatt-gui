@@ -187,11 +187,7 @@ impl ImageViewState {
     }
 
     pub fn zoom_from_center(&mut self, delta: f32, viewport: Bounds<Pixels>) {
-        self.zoom_at(
-            self.scale(viewport) + delta,
-            viewport,
-            viewport.center(),
-        );
+        self.zoom_at(self.scale(viewport) + delta, viewport, viewport.center());
     }
 
     pub fn zoom_by_factor(
@@ -230,19 +226,18 @@ impl ImageViewState {
 
     fn pan_limits(&self, viewport: Bounds<Pixels>, scale: f32) -> Point<Pixels> {
         point(
-            px(((self.natural_size.0 as f32 * scale - viewport.size.width.as_f32()) / 2.0)
-                .max(0.0)),
-            px(((self.natural_size.1 as f32 * scale - viewport.size.height.as_f32()) / 2.0)
-                .max(0.0)),
+            px(
+                ((self.natural_size.0 as f32 * scale - viewport.size.width.as_f32()) / 2.0)
+                    .max(0.0),
+            ),
+            px(
+                ((self.natural_size.1 as f32 * scale - viewport.size.height.as_f32()) / 2.0)
+                    .max(0.0),
+            ),
         )
     }
 
-    fn clamp_pan(
-        &self,
-        pan: Point<Pixels>,
-        viewport: Bounds<Pixels>,
-        scale: f32,
-    ) -> Point<Pixels> {
+    fn clamp_pan(&self, pan: Point<Pixels>, viewport: Bounds<Pixels>, scale: f32) -> Point<Pixels> {
         let limits = self.pan_limits(viewport, scale);
         point(
             pan.x.clamp(-limits.x, limits.x),
@@ -250,12 +245,7 @@ impl ImageViewState {
         )
     }
 
-    fn zoom_at(
-        &mut self,
-        target_scale: f32,
-        viewport: Bounds<Pixels>,
-        focal_point: Point<Pixels>,
-    ) {
+    fn zoom_at(&mut self, target_scale: f32, viewport: Bounds<Pixels>, focal_point: Point<Pixels>) {
         let old_scale = self.scale(viewport);
         if !target_scale.is_finite() || old_scale <= 0.0 {
             return;
@@ -363,7 +353,10 @@ mod tests {
         );
 
         view.fit(view_bounds);
-        assert_eq!(view.geometry(view_bounds).bounds.origin, point(px(0.0), px(18.75)));
+        assert_eq!(
+            view.geometry(view_bounds).bounds.origin,
+            point(px(0.0), px(18.75))
+        );
     }
 
     #[test]

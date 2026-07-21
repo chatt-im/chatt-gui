@@ -32,11 +32,7 @@ impl Asset for TimelineImageLoader {
             let bytes = fs::read(path.as_ref())?;
             let image = if image::guess_format(&bytes).is_ok() {
                 let image = image::load_from_memory(&bytes)?;
-                thumbnail_from_image(
-                    image,
-                    MAX_THUMBNAIL_WIDTH,
-                    MAX_THUMBNAIL_HEIGHT,
-                )
+                thumbnail_from_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)
             } else {
                 let image = svg_renderer.render_single_frame(&bytes, 1.0)?;
                 downsample_render_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)?

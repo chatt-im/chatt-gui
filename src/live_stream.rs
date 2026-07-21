@@ -220,7 +220,8 @@ impl LiveRecordingWriter {
     fn create(path: &Path, share: &LiveShare) -> Result<Self> {
         let file = OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(path)
             .with_context(|| format!("create live video recording at {}", path.display()))?;
         let mut output = BufWriter::new(file);
@@ -260,6 +261,10 @@ impl LiveRecordingWriter {
         self.output.write_all(&received_ns.to_le_bytes())?;
         self.output.write_all(header)?;
         self.output.write_all(payload)?;
+        // Recording is an opt-in diagnostic path, and reproductions are often
+        // terminated immediately after a visual failure. Persist each complete
+        // frame so Ctrl-C cannot leave the decisive tail buffered in memory.
+        self.output.flush()?;
         self.frames += 1;
         self.bytes += (header.len() + payload.len()) as u64;
         Ok(())
@@ -1195,7 +1200,7 @@ fn read_recording_bytes(input: &mut impl Read) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libmpv2::events::Event;
+    use libmpv2::{events::Event, render::SoftwareRenderTarget};
     use local_rpc::ids::{RoomId, StreamId};
     use std::{
         io::Write,
@@ -1265,7 +1270,13 @@ mod tests {
         let path = std::env::var_os("CHATT_LIVE_REPLAY")
             .map(PathBuf::from)
             .expect("set CHATT_LIVE_REPLAY to a live RPC recording");
-        let recording = read_live_recording(&path).unwrap();
+        let mut recording = read_live_recording(&path).unwrap();
+        if let Some(limit) = std::env::var("CHATT_LIVE_REPLAY_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            recording.frames.truncate(limit);
+        }
         assert!(
             !recording.frames.is_empty(),
             "recording has no video frames"
@@ -1304,6 +1315,9 @@ mod tests {
                 initializer.set_option("vd-lavc-threads", "1")?;
                 initializer.set_option("vd-lavc-low-latency", "yes")?;
                 initializer.set_option("stream-buffer-size", "4k")?;
+                if let Ok(hwdec) = std::env::var("CHATT_LIVE_REPLAY_HWDEC") {
+                    initializer.set_option("hwdec", hwdec.as_str())?;
+                }
                 Ok(())
             })
             .unwrap(),
@@ -1359,6 +1373,41 @@ mod tests {
             reached_final_frame,
             "libmpv did not retain the recording's final frame at {expected_position:.3}s"
         );
+        let width = recording.coded_width as usize;
+        let height = recording.coded_height as usize;
+        let stride = width * 4;
+        let mut pixels = vec![0; stride * height];
+        render
+            .render_software(SoftwareRenderTarget {
+                width: recording.coded_width,
+                height: recording.coded_height,
+                format: c"rgba",
+                stride,
+                pixels: &mut pixels,
+            })
+            .unwrap();
+        render.report_swap();
+        let rgb_sum = pixels
+            .chunks_exact(4)
+            .map(|pixel| u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]))
+            .sum::<u64>();
+        let non_black_pixels = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] != [0, 0, 0])
+            .count();
+        eprintln!(
+            "final software frame rgb_sum={rgb_sum} non_black_pixels={non_black_pixels}/{}",
+            width * height,
+        );
+        if let Some(path) = std::env::var_os("CHATT_LIVE_REPLAY_FRAME") {
+            let mut ppm = Vec::with_capacity(width * height * 3 + 64);
+            write!(&mut ppm, "P6\n{} {}\n255\n", width, height).unwrap();
+            for pixel in pixels.chunks_exact(4) {
+                ppm.extend_from_slice(&pixel[..3]);
+            }
+            std::fs::write(&path, ppm).unwrap();
+            eprintln!("wrote final software frame to {:?}", path);
+        }
         eprintln!(
             "replayed {frame_count} frames spanning {expected_position:.3}s in {:.3}s",
             replay_started.elapsed().as_secs_f64()

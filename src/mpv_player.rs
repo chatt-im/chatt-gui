@@ -1531,14 +1531,20 @@ fn relay_mpv_log(level: libmpv2::LogLevel, prefix: &str, text: &str) {
     let text = text.trim_end_matches(['\r', '\n']);
     match level {
         libmpv2::mpv_log_level::Fatal | libmpv2::mpv_log_level::Error => {
-            log::error!("mpv[{prefix}] {text}")
+            log::error!(target: "chatt_mpv", "mpv[{prefix}] {text}")
         }
-        libmpv2::mpv_log_level::Warn => log::warn!("mpv[{prefix}] {text}"),
-        libmpv2::mpv_log_level::Info => log::info!("mpv[{prefix}] {text}"),
+        libmpv2::mpv_log_level::Warn => {
+            log::warn!(target: "chatt_mpv", "mpv[{prefix}] {text}")
+        }
+        libmpv2::mpv_log_level::Info => {
+            log::info!(target: "chatt_mpv", "mpv[{prefix}] {text}")
+        }
         libmpv2::mpv_log_level::V | libmpv2::mpv_log_level::Debug => {
-            log::debug!("mpv[{prefix}] {text}")
+            log::debug!(target: "chatt_mpv", "mpv[{prefix}] {text}")
         }
-        libmpv2::mpv_log_level::Trace => log::trace!("mpv[{prefix}] {text}"),
+        libmpv2::mpv_log_level::Trace => {
+            log::trace!(target: "chatt_mpv", "mpv[{prefix}] {text}")
+        }
         _ => {}
     }
 }

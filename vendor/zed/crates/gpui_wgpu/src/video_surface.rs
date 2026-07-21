@@ -352,6 +352,27 @@ impl WgpuVideoSurface {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("initialize_mpv_video_textures"),
             });
+        for texture in &textures {
+            // Raw Vulkan writes performed by libmpv are invisible to wgpu's
+            // lazy memory-initialization tracker. Explicitly initialize every
+            // image through wgpu before exporting it; otherwise the first
+            // sampled binding can inject a zero-clear after libmpv has rendered
+            // the decoded frame.
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("initialize_mpv_video_texture"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
         encoder.transition_resources(
             std::iter::empty(),
             textures.iter().map(|texture| wgpu::TextureTransition {
