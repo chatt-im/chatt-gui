@@ -37,12 +37,8 @@ ignored = ["cfg_aliases"]
 default = [
     "std",
     "parking_lot",
-    "dx12",
-    "metal",
-    "gles",
     "vulkan",
     "wgsl",
-    "webgpu",
 ]
 
 #! ### Backends
