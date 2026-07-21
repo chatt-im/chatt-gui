@@ -29,7 +29,6 @@ const MAX_RETRY_SHIFT: u32 = 6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ThumbnailKey {
     pub attachment_id: AttachmentId,
-    pub digest: [u8; 32],
 }
 
 #[derive(Clone, Default)]
@@ -61,10 +60,12 @@ struct CacheEntry {
 struct ThumbnailJob {
     key: ThumbnailKey,
     path: PathBuf,
+    generation: u64,
 }
 
 struct ThumbnailResult {
     key: ThumbnailKey,
+    generation: u64,
     result: Result<ExtractedThumbnail, String>,
 }
 
@@ -90,6 +91,7 @@ pub(crate) struct VideoThumbnailCache {
     total_bytes: usize,
     budget_bytes: usize,
     clock: u64,
+    generation: u64,
     jobs: SharedWorkQueue,
     worker_started: bool,
     results: mpsc::Receiver<ThumbnailResult>,
@@ -105,12 +107,21 @@ impl VideoThumbnailCache {
             total_bytes: 0,
             budget_bytes,
             clock: 0,
+            generation: 0,
             jobs: Arc::new((Mutex::new(ThumbnailWorkQueue::default()), Condvar::new())),
             worker_started: false,
             results,
             worker_results,
             wakeup,
         }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.jobs.0.lock().unwrap().jobs.clear();
+        while self.results.try_recv().is_ok() {}
     }
 
     pub(crate) fn request(&mut self, key: ThumbnailKey, path: PathBuf) -> ThumbnailView {
@@ -140,7 +151,11 @@ impl VideoThumbnailCache {
             self.record_failure(key, error);
             return self.entries.get(&key).map(view_for_entry).unwrap_or_default();
         }
-        match self.enqueue(ThumbnailJob { key, path }) {
+        match self.enqueue(ThumbnailJob {
+            key,
+            path,
+            generation: self.generation,
+        }) {
             Ok(dropped) => {
                 if let Some(dropped) = dropped {
                     self.entries.remove(&dropped);
@@ -155,6 +170,9 @@ impl VideoThumbnailCache {
     pub(crate) fn drain_results(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.results.try_recv() {
+            if result.generation != self.generation {
+                continue;
+            }
             let Some(entry) = self.entries.get_mut(&result.key) else {
                 continue;
             };
@@ -339,6 +357,7 @@ fn thumbnail_worker(
         if results
             .send(ThumbnailResult {
                 key: job.key,
+                generation: job.generation,
                 result,
             })
             .is_err()
@@ -533,8 +552,10 @@ mod tests {
 
     fn key(value: u8) -> ThumbnailKey {
         ThumbnailKey {
-            attachment_id: AttachmentId([value; 16]),
-            digest: [value; 32],
+            attachment_id: AttachmentId {
+                room_id: rpc::ids::RoomId(1),
+                message_id: rpc::ids::MessageId(value as u64),
+            },
         }
     }
 
@@ -592,6 +613,7 @@ mod tests {
                     .enqueue(ThumbnailJob {
                         key: key(value),
                         path: PathBuf::from("video.mp4"),
+                        generation: 0,
                     })
                     .unwrap()
                     .is_none()
@@ -601,6 +623,7 @@ mod tests {
             .enqueue(ThumbnailJob {
                 key: key(255),
                 path: PathBuf::from("latest.mp4"),
+                generation: 0,
             })
             .unwrap();
 
@@ -617,8 +640,10 @@ mod tests {
         for value in 0..(MAX_CACHE_ENTRIES + 20) {
             cache.entries.insert(
                 ThumbnailKey {
-                    attachment_id: AttachmentId([(value & 0xff) as u8; 16]),
-                    digest: [(value >> 8) as u8; 32],
+                    attachment_id: AttachmentId {
+                        room_id: rpc::ids::RoomId(1),
+                        message_id: rpc::ids::MessageId(value as u64),
+                    },
                 },
                 CacheEntry {
                     state: CacheState::Failed {

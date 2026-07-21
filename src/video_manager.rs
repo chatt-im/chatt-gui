@@ -24,7 +24,6 @@ pub(crate) struct VideoKey {
     pub room_id: RoomId,
     pub message_id: u64,
     pub attachment_id: AttachmentId,
-    pub digest: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -635,8 +634,10 @@ mod tests {
         VideoKey {
             room_id: RoomId(1),
             message_id,
-            attachment_id: AttachmentId([message_id as u8; 16]),
-            digest: [message_id as u8; 32],
+            attachment_id: AttachmentId {
+                room_id: RoomId(1),
+                message_id: rpc::ids::MessageId(message_id),
+            },
         }
     }
 

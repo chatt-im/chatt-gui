@@ -115,12 +115,14 @@ mod tests {
     fn attachment(file_name: &str, media_kind: MediaKind, content_type: &str) -> Attachment {
         Attachment {
             descriptor: AttachmentDescriptor {
-                id: rpc::daemon::model::AttachmentId([1; 16]),
+                id: rpc::daemon::model::AttachmentId {
+                    room_id: rpc::ids::RoomId(1),
+                    message_id: rpc::ids::MessageId(1),
+                },
                 file_name: file_name.into(),
                 media_kind,
                 content_type: content_type.into(),
                 byte_len: 1,
-                digest: [2; 32],
                 width: None,
                 height: None,
             },

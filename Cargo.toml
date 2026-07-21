@@ -19,7 +19,6 @@ naga = { path = "vendor/wgpu/naga", features = ["glsl-in", "spv-out"] }
 rpc = { package = "chatt-rpc", path = "crates/chatt_rpc" }
 theme = { path = "/code/ref/zed/crates/theme" }
 unicode-segmentation = "1"
-aws-lc-rs = { version = "1.17", default-features = false, features = ["alloc", "non-fips"] }
 tempfile = "3"
 
 [profile.dist]

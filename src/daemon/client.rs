@@ -34,7 +34,6 @@ pub enum DaemonEvent {
         finish_request: RequestId,
         reason: String,
     },
-    MediaTransferStarted,
     MediaCached(AttachmentDescriptor),
     MediaTransferFailed {
         transfer_id: BulkTransferId,
@@ -62,15 +61,13 @@ struct PreparedUpload {
     begin_request: RequestId,
     finish_request: RequestId,
     upload: BeginUpload,
-    path: PathBuf,
+    file: File,
 }
 
 struct ActiveUpload {
     prepared: PreparedUpload,
-    file: File,
     buffer: Vec<u8>,
-    offset: u64,
-    digest: aws_lc_rs::digest::Context,
+    sent: u64,
 }
 
 impl DaemonClient {
@@ -181,7 +178,7 @@ impl DaemonClient {
                         begin_request,
                         finish_request,
                         upload,
-                        path,
+                        file,
                     }))
                     .is_err()
                 {
@@ -394,34 +391,6 @@ fn handle_bulk_frame(
     events: &EventSender<DaemonEvent>,
 ) -> Option<DaemonFrame> {
     match frame {
-        DaemonFrame::BulkStarted(started) => {
-            let transfer_id = started.transfer_id;
-            log::info!(
-                "attachment transfer started transfer_id={} file={:?} bytes={}",
-                transfer_id.0,
-                started.attachment.file_name,
-                started.attachment.byte_len,
-            );
-            match media_cache
-                .lock()
-                .expect("media cache lock poisoned")
-                .begin(started)
-            {
-                Ok(()) => {
-                    if events
-                        .send_blocking(DaemonEvent::MediaTransferStarted)
-                        .is_err()
-                    {
-                        log::error!(
-                            "could not deliver attachment-start event transfer_id={}",
-                            transfer_id.0,
-                        );
-                    }
-                }
-                Err(reason) => cancel_failed_download(transfer_id, reason, commands, events),
-            }
-            None
-        }
         DaemonFrame::BulkChunk(chunk) => {
             let transfer_id = chunk.transfer_id;
             if let Err(reason) = media_cache
@@ -435,11 +404,7 @@ fn handle_bulk_frame(
         }
         DaemonFrame::BulkFinished(finished) => {
             let transfer_id = finished.transfer_id;
-            log::info!(
-                "attachment transfer finished transfer_id={} bytes={}",
-                transfer_id.0,
-                finished.byte_len,
-            );
+            log::info!("attachment transfer finished transfer_id={}", transfer_id.0);
             match media_cache
                 .lock()
                 .expect("media cache lock poisoned")
@@ -587,36 +552,11 @@ fn writer_loop(
                         );
                         continue;
                     }
-                    match File::open(&upload.path) {
-                        Ok(file) => active.push_back(ActiveUpload {
-                            prepared: upload,
-                            file,
-                            buffer: Vec::with_capacity(chunk_bytes),
-                            offset: 0,
-                            digest: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
-                        }),
-                        Err(error) => {
-                            report_upload_error(
-                                &events,
-                                upload.begin_request,
-                                upload.finish_request,
-                                error.to_string(),
-                            );
-                            let cancel = ClientFrame::CancelUpload {
-                                request_id: upload.finish_request,
-                                transfer_id: upload.upload.transfer_id,
-                            };
-                            if let Err(error) = writer.send_client(&cancel) {
-                                log::error!(
-                                    "could not write upload cancellation request_id={} transfer_id={}: {error}",
-                                    upload.finish_request.0,
-                                    upload.upload.transfer_id.0,
-                                );
-                                let _ = writer.shutdown();
-                                break;
-                            }
-                        }
-                    }
+                    active.push_back(ActiveUpload {
+                        prepared: upload,
+                        buffer: Vec::with_capacity(chunk_bytes),
+                        sent: 0,
+                    });
                 }
                 ConnectorCommand::ChunkBytes(bytes) => chunk_bytes = bytes,
                 ConnectorCommand::CancelBulk(transfer_id) => {
@@ -687,15 +627,14 @@ fn stream_upload_chunk(
 ) -> Result<bool, String> {
     upload.buffer.resize(chunk_bytes, 0);
     let read = upload
+        .prepared
         .file
         .read(&mut upload.buffer)
         .map_err(|error| error.to_string())?;
     if read != 0 {
         upload.buffer.truncate(read);
-        upload.digest.update(&upload.buffer);
         let chunk = BulkChunk {
             transfer_id: upload.prepared.upload.transfer_id,
-            offset: upload.offset,
             bytes: std::mem::take(&mut upload.buffer),
         };
         let frame = ClientFrame::UploadChunk(chunk);
@@ -706,26 +645,17 @@ fn stream_upload_chunk(
             unreachable!("constructed upload chunk frame")
         };
         upload.buffer = std::mem::take(&mut chunk.bytes);
-        upload.offset += read as u64;
+        upload.sent += read as u64;
         return Ok(true);
     }
 
-    if upload.offset != upload.prepared.upload.byte_len {
+    if upload.sent != upload.prepared.upload.byte_len {
         return Err("upload changed length while it was being read".into());
     }
-    let digest = std::mem::replace(
-        &mut upload.digest,
-        aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
-    )
-    .finish();
-    let mut digest_bytes = [0; 32];
-    digest_bytes.copy_from_slice(digest.as_ref());
     let frame = ClientFrame::FinishUpload {
         request_id: upload.prepared.finish_request,
         finished: BulkFinished {
             transfer_id: upload.prepared.upload.transfer_id,
-            byte_len: upload.offset,
-            digest: digest_bytes,
         },
     };
     writer

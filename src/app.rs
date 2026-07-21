@@ -12,7 +12,7 @@ use gpui::{
     KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
-    list, point, prelude::*, px, relative, rgb, rgba, surface,
+    list, point, prelude::*, px, relative, rgb, rgba, surface, Resource,
 };
 use markdown::{
     Markdown, MarkdownElement, MarkdownSelectionArea, MarkdownSelectionGroup, MarkdownSelectionKey,
@@ -59,12 +59,7 @@ const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct EagerImageKey {
-    room_id: RoomId,
-    attachment_id: AttachmentId,
-    digest: [u8; 32],
-}
+type EagerImageKey = AttachmentId;
 
 #[derive(Clone, Debug)]
 struct EagerImageFetch {
@@ -229,13 +224,9 @@ fn clamp_live_pane_height(height: Pixels, window_height: Pixels) -> Pixels {
 }
 
 impl EagerImageFetch {
-    fn new(room_id: RoomId, descriptor: AttachmentDescriptor) -> Self {
+    fn new(descriptor: AttachmentDescriptor) -> Self {
         Self {
-            key: EagerImageKey {
-                room_id,
-                attachment_id: descriptor.id,
-                digest: descriptor.digest,
-            },
+            key: descriptor.id,
             descriptor,
         }
     }
@@ -284,12 +275,9 @@ impl EagerImageFetches {
     }
 
     fn cached(&mut self, descriptor: &AttachmentDescriptor) {
-        self.active.retain(|_, fetch| {
-            fetch.descriptor.id != descriptor.id || fetch.descriptor.digest != descriptor.digest
-        });
-        self.failures.retain(|key, _| {
-            key.attachment_id != descriptor.id || key.digest != descriptor.digest
-        });
+        self.active
+            .retain(|_, fetch| fetch.descriptor.id != descriptor.id);
+        self.failures.retain(|key, _| *key != descriptor.id);
     }
 
     fn failure(&self, key: EagerImageKey) -> Option<&str> {
@@ -306,6 +294,11 @@ impl EagerImageFetches {
         self.queued_keys.clear();
         self.active.clear();
         self.pump_scheduled = false;
+    }
+
+    fn clear(&mut self) {
+        self.reset_transient();
+        self.failures.clear();
     }
 }
 
@@ -929,10 +922,6 @@ impl ChattView {
                 self.model.pending.remove(&finish_request);
                 self.status = format!("Could not prepare upload · {reason}").into();
             }
-            DaemonEvent::MediaTransferStarted => {
-                log::info!("receiving attachment bytes from daemon");
-                self.status = "Receiving attachment…".into();
-            }
             DaemonEvent::MediaCached(descriptor) => {
                 log::info!(
                     "attachment cached file={:?} media_kind={:?} content_type={:?} bytes={}",
@@ -942,6 +931,18 @@ impl ChattView {
                     descriptor.byte_len,
                 );
                 self.status = format!("Cached {}", descriptor.file_name).into();
+                if descriptor.media_kind == rpc::daemon::model::MediaKind::Image
+                    && let Some(path) = self
+                        .media_cache
+                        .lock()
+                        .expect("media cache lock poisoned")
+                        .path_for(&descriptor)
+                {
+                    let resource = Resource::Path(path.into());
+                    self.image_cache.update(cx, |cache, cx| {
+                        let _ = cache.load(&resource, window, cx);
+                    });
+                }
                 self.eager_image_fetches.cached(&descriptor);
                 self.pump_eager_image_fetches(cx);
             }
@@ -1020,7 +1021,22 @@ impl ChattView {
         };
         let old_len = self.model.messages.len();
         let old_selected_room = self.model.selected_room;
+        let old_daemon_instance = self.model.daemon_instance;
+        let old_active_server = self.model.active_server.clone();
         let effect = reducer::apply(&mut self.model, frame);
+        let media_namespace_changed = self.model.daemon_instance != old_daemon_instance
+            || self.model.active_server != old_active_server;
+        if media_namespace_changed {
+            self.media_cache
+                .lock()
+                .expect("media cache lock poisoned")
+                .clear();
+            self.image_cache
+                .update(cx, |cache, cx| cache.clear(window, cx));
+            self.eager_image_fetches.clear();
+            self.videos.clear_sessions();
+            self.video_thumbnails.clear();
+        }
         let available = self
             .model
             .live_shares
@@ -1051,8 +1067,7 @@ impl ChattView {
         if self.model.selected_room != old_selected_room {
             self.videos.clear_sessions();
             self.message_markdown.clear();
-            self.image_cache
-                .update(cx, |cache, cx| cache.clear(window, cx));
+            self.eager_image_fetches.reset_transient();
         } else if effect.messages_changed {
             let retained = self
                 .model
@@ -1069,6 +1084,9 @@ impl ChattView {
         }
         for (start, end, count) in effect.splices {
             self.list_state.splice(start..end, count);
+        }
+        if effect.messages_changed {
+            self.enqueue_new_image_fetches(window, cx);
         }
         if effect.request_resync {
             let request_id = self.request_id();
@@ -1722,7 +1740,7 @@ impl ChattView {
                 .into_any_element();
         }
         if attachment.is_image() {
-            let fetch = EagerImageFetch::new(room_id, descriptor.clone());
+            let fetch = EagerImageFetch::new(descriptor.clone());
             if let Some(transfer_id) = active_transfer {
                 let action = mini_button(
                     ("cancel-image-read", transfer_id.0 as usize),
@@ -1796,7 +1814,6 @@ impl ChattView {
             let thumbnail = self.video_thumbnails.request(
                 ThumbnailKey {
                     attachment_id: descriptor.id,
-                    digest: descriptor.digest,
                 },
                 path,
             );
@@ -2084,6 +2101,30 @@ impl ChattView {
         self.schedule_eager_image_fetches(window, cx);
     }
 
+    fn enqueue_new_image_fetches(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let descriptors = self
+            .model
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|message| message.attachment.as_ref())
+            .filter(|attachment| attachment.is_image())
+            .map(|attachment| attachment.descriptor.clone())
+            .collect::<Vec<_>>();
+        for descriptor in descriptors {
+            let cached_or_active = {
+                let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
+                cache.path_for(&descriptor).is_some()
+                    || cache.active_transfer(&descriptor).is_some()
+            };
+            if !cached_or_active {
+                self.eager_image_fetches
+                    .enqueue(EagerImageFetch::new(descriptor));
+            }
+        }
+        self.schedule_eager_image_fetches(window, cx);
+    }
+
     fn retry_eager_image(
         &mut self,
         fetch: EagerImageFetch,
@@ -2123,7 +2164,11 @@ impl ChattView {
             let Some(fetch) = self.eager_image_fetches.pop_front() else {
                 break;
             };
-            match self.begin_attachment_read(fetch.key.room_id, fetch.descriptor.clone(), cx) {
+            match self.begin_attachment_read(
+                fetch.descriptor.id.room_id,
+                fetch.descriptor.clone(),
+                cx,
+            ) {
                 Ok(Some(transfer_id)) => {
                     self.eager_image_fetches.started(transfer_id, fetch);
                 }
@@ -3328,7 +3373,6 @@ fn video_key(
         room_id,
         message_id,
         attachment_id: descriptor.id,
-        digest: descriptor.digest,
     }
 }
 
@@ -3365,14 +3409,15 @@ mod tests {
 
     fn image_fetch(room_id: RoomId, marker: u8) -> EagerImageFetch {
         EagerImageFetch::new(
-            room_id,
             AttachmentDescriptor {
-                id: AttachmentId([marker; 16]),
+                id: AttachmentId {
+                    room_id,
+                    message_id: rpc::ids::MessageId(marker as u64),
+                },
                 file_name: format!("image-{marker}.png"),
                 media_kind: MediaKind::Image,
                 content_type: "image/png".into(),
                 byte_len: 10,
-                digest: [marker; 32],
                 width: Some(400),
                 height: Some(300),
             },
