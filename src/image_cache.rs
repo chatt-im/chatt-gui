@@ -28,18 +28,25 @@ impl Asset for TimelineImageLoader {
             let Resource::Path(path) = source else {
                 return Err(anyhow!("timeline images must be local files").into());
             };
+            log::info!("timeline image decode started path={path:?}");
             let bytes = fs::read(path.as_ref())?;
-            if image::guess_format(&bytes).is_ok() {
+            let image = if image::guess_format(&bytes).is_ok() {
                 let image = image::load_from_memory(&bytes)?;
-                return Ok(thumbnail_from_image(
+                thumbnail_from_image(
                     image,
                     MAX_THUMBNAIL_WIDTH,
                     MAX_THUMBNAIL_HEIGHT,
-                ));
-            }
+                )
+            } else {
+                let image = svg_renderer.render_single_frame(&bytes, 1.0)?;
+                downsample_render_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)?
+            };
 
-            let image = svg_renderer.render_single_frame(&bytes, 1.0)?;
-            downsample_render_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)
+            log::info!(
+                "timeline image decode finished path={path:?} size={:?}",
+                image.size(0),
+            );
+            Ok(image)
         }
     }
 }

@@ -420,10 +420,20 @@ where
         );
 
         let entity = window.current_view();
+        log::info!(
+            "image cache load started source={source:?} hash={source_hash} owner={entity:?}"
+        );
         window
             .spawn(cx, async move |cx| {
-                _ = task.await;
+                let result = task.await;
+                log::info!(
+                    "image cache load finished hash={source_hash} owner={entity:?} ok={}",
+                    result.is_ok(),
+                );
                 cx.on_next_frame(move |_, cx| {
+                    log::info!(
+                        "image cache owner notified hash={source_hash} owner={entity:?}"
+                    );
                     cx.notify(entity);
                 });
             })

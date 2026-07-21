@@ -1527,6 +1527,11 @@ impl Window {
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    log::debug!(
+                        "platform frame drawing dirty window window={:?} force_render={}",
+                        handle.window_id(),
+                        request_frame_options.force_render,
+                    );
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {

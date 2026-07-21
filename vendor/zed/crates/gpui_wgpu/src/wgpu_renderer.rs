@@ -1128,6 +1128,7 @@ impl WgpuRenderer {
                 resources
                     .surface
                     .configure(&resources.device, &surface_config);
+                self.needs_redraw = true;
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -1136,6 +1137,7 @@ impl WgpuRenderer {
                 resources
                     .surface
                     .configure(&resources.device, &surface_config);
+                self.needs_redraw = true;
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {

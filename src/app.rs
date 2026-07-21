@@ -12,8 +12,8 @@ use gpui::{
     AnyElement, App, Bounds, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight,
     KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
-    Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas,
-    div, img, list, point, prelude::*, px, relative, rgb, rgba, surface,
+    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
+    list, point, prelude::*, px, relative, rgb, rgba, surface,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
@@ -401,6 +401,7 @@ impl ChattView {
                             this.apply_daemon_event(event, window, cx);
                         }
                         cx.notify();
+                        log::debug!("daemon event batch notified ChattView");
                     })
                     .is_err()
                 {
@@ -902,18 +903,6 @@ impl ChattView {
                     descriptor.byte_len,
                 );
                 self.status = format!("Cached {}", descriptor.file_name).into();
-                if descriptor.media_kind == local_rpc::model::MediaKind::Image
-                    && let Some(path) = self
-                        .media_cache
-                        .lock()
-                        .expect("media cache lock poisoned")
-                        .path_for(&descriptor)
-                {
-                    let resource = Resource::Path(path.into());
-                    self.image_cache.update(cx, |cache, cx| {
-                        let _ = cache.load(&resource, window, cx);
-                    });
-                }
                 self.eager_image_fetches.cached(&descriptor);
                 self.pump_eager_image_fetches(cx);
             }
