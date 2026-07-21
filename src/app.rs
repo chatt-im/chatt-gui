@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
+    fs,
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
@@ -30,10 +31,14 @@ use crate::{
         client::{DaemonClient, DaemonEvent},
         reducer,
     },
-    image_cache::TimelineImageLoader,
+    image_cache::{PreviewImageLoader, TimelineImageLoader},
     media_cache::MediaCache,
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode},
+    preview::{
+        DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, DEFAULT_PANEL_WIDTH, ImageViewState,
+        PreviewHistory, PreviewItem, clamp_panel_width,
+    },
     scroll_capture::capture_scroll,
     timeline::{self, Attachment},
     video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
@@ -45,6 +50,7 @@ const TOP_BAR_HEIGHT: f32 = 52.0;
 const MIN_COMPOSER_HEIGHT: f32 = 82.0;
 const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const PREVIEW_IMAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const VIDEO_THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SCROLL_RESPONSE_SECONDS: f32 = 0.006;
 const SCROLL_SETTLE_THRESHOLD: f32 = 0.50;
@@ -90,6 +96,12 @@ impl VideoScrub {
 struct LivePaneResize {
     start_y: Pixels,
     start_height: Pixels,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreviewPaneResize {
+    start_x: Pixels,
+    start_width: Pixels,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -302,7 +314,8 @@ actions!(
         LivePanDown,
         ToggleMute,
         ToggleDeafen,
-        ToggleVoice
+        ToggleVoice,
+        ClosePreview
     ]
 );
 
@@ -311,6 +324,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-c", markdown::Copy, Some("Markdown")),
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
+        KeyBinding::new("escape", ClosePreview, Some("Chatt && !ChattComposer")),
         KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
         KeyBinding::new("space", TogglePlayback, Some("Chatt && !ChattComposer")),
         KeyBinding::new("left", SeekBack, Some("Chatt")),
@@ -332,7 +346,14 @@ pub struct ChattView {
     composer: gpui::Entity<Composer>,
     media_cache: Arc<Mutex<MediaCache>>,
     image_cache: gpui::Entity<LruImageCache<TimelineImageLoader>>,
+    preview_image_cache: gpui::Entity<LruImageCache<PreviewImageLoader>>,
     eager_image_fetches: EagerImageFetches,
+    preview_history: PreviewHistory,
+    preview_image: ImageViewState,
+    preview_image_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
+    preview_last_mouse_position: Option<Point<Pixels>>,
+    preview_panel_width: Pixels,
+    preview_pane_resize: Option<PreviewPaneResize>,
     list_state: ListState,
     pending_scroll: gpui::Pixels,
     scroll_animation_active: bool,
@@ -365,6 +386,8 @@ impl ChattView {
         let composer = cx.new(Composer::new);
         let timeline_selection = MarkdownSelectionGroup::new(cx.focus_handle());
         let image_cache = LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
+        let preview_image_cache =
+            LruImageCache::<PreviewImageLoader>::new(PREVIEW_IMAGE_CACHE_BYTES, cx);
         window.focus(&composer.focus_handle(cx), cx);
         let daemon_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(first_event) = daemon_events.recv().await {
@@ -416,7 +439,14 @@ impl ChattView {
             composer,
             media_cache,
             image_cache,
+            preview_image_cache,
             eager_image_fetches: EagerImageFetches::default(),
+            preview_history: PreviewHistory::default(),
+            preview_image: ImageViewState::default(),
+            preview_image_viewport: Rc::new(Cell::new(None)),
+            preview_last_mouse_position: None,
+            preview_panel_width: px(DEFAULT_PANEL_WIDTH),
+            preview_pane_resize: None,
             list_state,
             pending_scroll: px(0.),
             scroll_animation_active: false,
@@ -973,7 +1003,13 @@ impl ChattView {
                 .clear();
             self.image_cache
                 .update(cx, |cache, cx| cache.clear(window, cx));
+            self.preview_image_cache
+                .update(cx, |cache, cx| cache.clear(window, cx));
             self.eager_image_fetches.clear();
+            self.preview_history.clear();
+            self.preview_image_viewport.set(None);
+            self.preview_last_mouse_position = None;
+            self.preview_pane_resize = None;
             self.videos.clear_sessions();
             self.video_thumbnails.clear();
         }
@@ -1487,6 +1523,241 @@ impl ChattView {
         cx.notify();
     }
 
+    fn open_image_preview(
+        &mut self,
+        descriptor: AttachmentDescriptor,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self
+            .media_cache
+            .lock()
+            .expect("media cache lock poisoned")
+            .path_for(&descriptor)
+        else {
+            self.status = format!("{} is not cached yet", descriptor.file_name).into();
+            cx.notify();
+            return;
+        };
+        let natural_size = match (descriptor.width, descriptor.height) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
+            _ => image::image_dimensions(&path).unwrap_or((640, 480)),
+        };
+        let item = PreviewItem::new(descriptor, natural_size);
+        if self.preview_history.open(item.clone()) {
+            self.preview_image.reset(item.natural_size);
+            self.preview_image_viewport.set(None);
+            self.preview_last_mouse_position = None;
+        }
+        cx.notify();
+    }
+
+    fn select_preview(&mut self, key: AttachmentId, cx: &mut Context<Self>) {
+        if self.preview_history.select(key) {
+            if let Some(item) = self.preview_history.active() {
+                self.preview_image.reset(item.natural_size);
+            }
+            self.preview_image_viewport.set(None);
+            self.preview_last_mouse_position = None;
+            cx.notify();
+        }
+    }
+
+    fn close_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview_history.active().is_none() {
+            return;
+        }
+        self.preview_history.close_panel();
+        self.preview_image_viewport.set(None);
+        self.preview_last_mouse_position = None;
+        self.preview_pane_resize = None;
+        cx.notify();
+    }
+
+    fn close_preview_action(
+        &mut self,
+        _: &ClosePreview,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_preview(cx);
+    }
+
+    fn close_preview_tab(&mut self, key: AttachmentId, cx: &mut Context<Self>) {
+        if self.preview_history.close_tab(key) {
+            if let Some(item) = self.preview_history.active() {
+                self.preview_image.reset(item.natural_size);
+            }
+            self.preview_image_viewport.set(None);
+            self.preview_last_mouse_position = None;
+        }
+        cx.notify();
+    }
+
+    fn save_preview_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.preview_history.active().cloned() else {
+            return;
+        };
+        let Some(source) = self
+            .media_cache
+            .lock()
+            .expect("media cache lock poisoned")
+            .path_for(&item.descriptor)
+        else {
+            self.status = format!("{} is no longer cached", item.descriptor.file_name).into();
+            cx.notify();
+            return;
+        };
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some(&item.descriptor.file_name));
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(destination))) = receiver.await else {
+                return;
+            };
+            let result = executor
+                .spawn(async move { fs::copy(source, &destination).map(|_| destination) })
+                .await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                match result {
+                    Ok(destination) => {
+                        this.status = format!("Saved image to {}", destination.display()).into()
+                    }
+                    Err(error) => this.status = format!("Could not save image · {error}").into(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn preview_viewport(&self) -> Option<Bounds<Pixels>> {
+        self.preview_image_viewport.get()
+    }
+
+    fn fit_preview_image(&mut self, cx: &mut Context<Self>) {
+        if let Some(viewport) = self.preview_viewport() {
+            self.preview_image.fit(viewport);
+            cx.notify();
+        }
+    }
+
+    fn actual_size_preview_image(&mut self, cx: &mut Context<Self>) {
+        self.preview_image.actual_size();
+        cx.notify();
+    }
+
+    fn zoom_preview_image(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if let Some(viewport) = self.preview_viewport() {
+            self.preview_image.zoom_from_center(delta, viewport);
+            cx.notify();
+        }
+    }
+
+    fn scroll_preview_image(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let Some(viewport) = self.preview_viewport() else {
+            return;
+        };
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+            ScrollDelta::Lines(delta) => delta.y * 16.0,
+        };
+        if delta == 0.0 {
+            return;
+        }
+        self.preview_image
+            .zoom_by_factor((delta * 0.002).exp(), viewport, event.position);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn pinch_preview_image(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
+        let Some(viewport) = self.preview_viewport() else {
+            return;
+        };
+        self.preview_image.zoom_by_factor(
+            (1.0 + event.delta).max(0.01),
+            viewport,
+            event.position,
+        );
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn preview_image_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        self.preview_last_mouse_position = Some(event.position);
+        cx.stop_propagation();
+    }
+
+    fn preview_image_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(previous) = self.preview_last_mouse_position else {
+            return;
+        };
+        if !event.dragging() {
+            self.finish_preview_image_pan(cx);
+            return;
+        }
+        if let Some(viewport) = self.preview_viewport() {
+            self.preview_image
+                .pan_by(event.position - previous, viewport);
+            self.preview_last_mouse_position = Some(event.position);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn finish_preview_image_pan(&mut self, cx: &mut Context<Self>) {
+        if self.preview_last_mouse_position.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn begin_preview_pane_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
+        self.preview_panel_width = clamp_panel_width(self.preview_panel_width, body_width);
+        self.preview_pane_resize = Some(PreviewPaneResize {
+            start_x: event.position.x,
+            start_width: self.preview_panel_width,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn drag_preview_pane(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.preview_pane_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.finish_preview_pane_resize(cx);
+            return;
+        }
+        let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
+        self.preview_panel_width = clamp_panel_width(
+            resize.start_width + resize.start_x - event.position.x,
+            body_width,
+        );
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn finish_preview_pane_resize(&mut self, cx: &mut Context<Self>) {
+        if self.preview_pane_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn render_message(
         &mut self,
         index: usize,
@@ -1659,6 +1930,7 @@ impl ChattView {
         if attachment.is_image()
             && let Some(path) = cache_path.clone()
         {
+            let preview = descriptor.clone();
             let (width, height) = timeline::media_box_size(
                 descriptor.width.unwrap_or(4),
                 descriptor.height.unwrap_or(3),
@@ -1671,6 +1943,11 @@ impl ChattView {
                 .h(px(height))
                 .max_w_full()
                 .object_fit(ObjectFit::Contain)
+                .cursor_pointer()
+                .hover(|image| image.opacity(0.88))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_image_preview(preview.clone(), cx)
+                }))
                 .into_any_element();
         }
         if attachment.is_image() {
@@ -2178,6 +2455,305 @@ impl ChattView {
         }
         cx.notify();
         Ok(Some(transfer_id))
+    }
+
+    fn render_preview_panel(
+        &mut self,
+        active: PreviewItem,
+        width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let active_key = active.key();
+        let history = self.preview_history.items().to_vec();
+        let mut tabs = div()
+            .id("preview-tabs")
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .overflow_x_scroll();
+        for item in history {
+            let key = item.key();
+            let selected = key == active_key;
+            let select_key = key;
+            let close_key = key;
+            let select_id: SharedString = format!(
+                "preview-tab-select-{}-{}",
+                key.room_id.0, key.message_id.0
+            )
+            .into();
+            let close_id: SharedString = format!(
+                "preview-tab-close-{}-{}",
+                key.room_id.0, key.message_id.0
+            )
+            .into();
+            tabs = tabs.child(
+                div()
+                    .h_full()
+                    .max_w(px(210.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(rgb(0x272a30))
+                    .bg(rgb(if selected { 0x111317 } else { 0x191c21 }))
+                    .text_color(rgb(if selected { 0xaebce0 } else { 0x8b929d }))
+                    .hover(|tab| tab.bg(rgb(0x15181c)).text_color(rgb(0xd9dbe0)))
+                    .child(
+                        div()
+                            .id(select_id)
+                            .h_full()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .pl_3()
+                            .pr_1()
+                            .cursor_pointer()
+                            .child(div().flex_none().text_xs().child("▧"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .child(item.descriptor.file_name),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_preview(select_key, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(close_id)
+                            .w(px(28.0))
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_sm()
+                            .hover(|button| button.bg(rgb(0x20242a)).text_color(rgb(0xe4e6ea)))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_preview_tab(close_key, cx)
+                            })),
+                    ),
+            );
+        }
+
+        let cache_path = self
+            .media_cache
+            .lock()
+            .expect("media cache lock poisoned")
+            .path_for(&active.descriptor);
+        let cache_missing = cache_path.is_none();
+        let viewport = self.preview_image_viewport.get().unwrap_or(Bounds {
+            origin: point(
+                window.viewport_size().width - width,
+                px(TOP_BAR_HEIGHT + 80.0),
+            ),
+            size: gpui::size(
+                width,
+                (window.viewport_size().height - px(TOP_BAR_HEIGHT + 80.0)).max(px(1.0)),
+            ),
+        });
+        let geometry = self.preview_image.geometry(viewport);
+        let zoom_percent = self.preview_image.zoom_percent(viewport);
+        let can_pan = self.preview_image.can_pan(viewport);
+        let panning = self.preview_last_mouse_position.is_some() && can_pan;
+        let measured_viewport = self.preview_image_viewport.clone();
+
+        let viewport_element = div()
+            .id("preview-image-viewport")
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rgb(0x08090b))
+            .cursor(if panning {
+                gpui::CursorStyle::ClosedHand
+            } else if can_pan {
+                gpui::CursorStyle::OpenHand
+            } else {
+                gpui::CursorStyle::Arrow
+            })
+            .on_scroll_wheel(cx.listener(
+                |this, event: &ScrollWheelEvent, _, cx| this.scroll_preview_image(event, cx),
+            ))
+            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                this.pinch_preview_image(event, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.preview_image_mouse_down(event, cx)
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.preview_image_mouse_move(event, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_preview_image_pan(cx)
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_preview_image_pan(cx)
+                }),
+            )
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        if measured_viewport.get() != Some(bounds) {
+                            measured_viewport.set(Some(bounds));
+                            window.request_animation_frame();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(cache_path, |viewport_element, path| {
+                viewport_element.child(
+                    img(path)
+                        .image_cache(&self.preview_image_cache)
+                        .absolute()
+                        .left(geometry.bounds.origin.x - viewport.origin.x)
+                        .top(geometry.bounds.origin.y - viewport.origin.y)
+                        .w(geometry.bounds.size.width)
+                        .h(geometry.bounds.size.height)
+                        .object_fit(ObjectFit::Contain)
+                        .with_loading(|| {
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(rgb(0x8b929d))
+                                .child("loading…")
+                                .into_any_element()
+                        })
+                        .with_fallback(|| {
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(rgb(0x8b929d))
+                                .child("failed to load image")
+                                .into_any_element()
+                        }),
+                )
+            })
+            .when(cache_missing, |viewport_element| {
+                viewport_element.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(rgb(0x8b929d))
+                        .child("image is no longer cached"),
+                )
+            });
+
+        div()
+            .id("preview-panel")
+            .w(width)
+            .h_full()
+            .min_w_0()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(0x111317))
+            .child(
+                div()
+                    .h(px(39.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .border_b_1()
+                    .border_color(rgb(0x272a30))
+                    .bg(rgb(0x191c21))
+                    .child(tabs)
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .bg(rgb(0x191c21))
+                            .child(
+                                preview_action_button("preview-save", "↓")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_preview_image(window, cx)
+                                    })),
+                            )
+                            .child(
+                                preview_action_button("preview-close", "×")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_preview(cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(41.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(rgb(0x272a30))
+                    .bg(rgb(0x111317))
+                    .child(
+                        preview_control_button("preview-fit", "Fit").on_click(cx.listener(
+                            |this, _, _, cx| this.fit_preview_image(cx),
+                        )),
+                    )
+                    .child(
+                        preview_control_button("preview-actual", "100%").on_click(cx.listener(
+                            |this, _, _, cx| this.actual_size_preview_image(cx),
+                        )),
+                    )
+                    .child(
+                        preview_control_button("preview-zoom-out", "−").on_click(cx.listener(
+                            |this, _, _, cx| this.zoom_preview_image(-0.25, cx),
+                        )),
+                    )
+                    .child(
+                        div()
+                            .w(px(56.0))
+                            .text_center()
+                            .text_xs()
+                            .text_color(rgb(0x8b929d))
+                            .child(format!("{zoom_percent}%")),
+                    )
+                    .child(
+                        preview_control_button("preview-zoom-in", "+").on_click(cx.listener(
+                            |this, _, _, cx| this.zoom_preview_image(0.25, cx),
+                        )),
+                    ),
+            )
+            .child(viewport_element)
     }
 
     fn play_video(&mut self, key: VideoKey, cx: &mut Context<Self>) {
@@ -2871,6 +3447,13 @@ impl Render for ChattView {
         let live_panel =
             (!self.model.live_shares.is_empty()).then(|| self.render_live_shares(window, cx));
         let resizing_live_pane = self.live_pane_resize.is_some();
+        let active_preview = self.preview_history.active().cloned();
+        let preview_panel = active_preview.map(|active| {
+            let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
+            self.preview_panel_width = clamp_panel_width(self.preview_panel_width, body_width);
+            self.render_preview_panel(active, self.preview_panel_width, window, cx)
+        });
+        let resizing_preview_pane = self.preview_pane_resize.is_some();
         div()
             .id("chatt")
             .key_context("Chatt")
@@ -2887,19 +3470,28 @@ impl Render for ChattView {
             .on_action(cx.listener(Self::toggle_mute))
             .on_action(cx.listener(Self::toggle_deafen))
             .on_action(cx.listener(Self::toggle_voice))
+            .on_action(cx.listener(Self::close_preview_action))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.queue_uploads(paths.0.to_vec(), cx)
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if !this.drag_video_scrub(event, cx) {
-                    this.drag_live_pane(event, window, cx)
+                    if this.preview_pane_resize.is_some() {
+                        this.drag_preview_pane(event, window, cx)
+                    } else if this.preview_last_mouse_position.is_some() {
+                        this.preview_image_mouse_move(event, cx)
+                    } else {
+                        this.drag_live_pane(event, window, cx)
+                    }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                     this.finish_video_scrub(cx);
-                    this.finish_live_pane_resize(cx)
+                    this.finish_live_pane_resize(cx);
+                    this.finish_preview_pane_resize(cx);
+                    this.finish_preview_image_pan(cx)
                 }),
             )
             .size_full()
@@ -2912,6 +3504,18 @@ impl Render for ChattView {
                         |_, _, _| {},
                         |_, _, window, _| {
                             window.set_window_cursor_style(gpui::CursorStyle::ResizeRow)
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
+            .when(resizing_preview_pane, |root| {
+                root.child(
+                    canvas(
+                        |_, _, _| {},
+                        |_, _, window, _| {
+                            window.set_window_cursor_style(gpui::CursorStyle::ResizeColumn)
                         },
                     )
                     .absolute()
@@ -3108,6 +3712,48 @@ impl Render for ChattView {
                             ),
                     ),
             )
+            .when_some(preview_panel, |root, preview_panel| {
+                root.child(
+                    div()
+                        .id("preview-pane-resize")
+                        .w(px(PREVIEW_DIVIDER_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .cursor_col_resize()
+                        .hover(|divider| divider.bg(rgba(0x53698733)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                this.begin_preview_pane_resize(event, window, cx)
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                this.finish_preview_pane_resize(cx)
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                this.finish_preview_pane_resize(cx)
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(3.0))
+                                .h_full()
+                                .bg(rgb(if resizing_preview_pane {
+                                    0x536987
+                                } else {
+                                    0x272a30
+                                })),
+                        ),
+                )
+                .child(preview_panel)
+            })
     }
 }
 
@@ -3256,6 +3902,36 @@ fn mini_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<
         .border_1()
         .border_color(rgb(0x353a43))
         .bg(rgb(0x22262c))
+        .text_xs()
+        .child(label)
+}
+
+fn preview_action_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(28.0))
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_color(rgb(0x8b929d))
+        .hover(|button| button.bg(rgb(0x111317)).text_color(rgb(0xd9dbe0)))
+        .child(label)
+}
+
+fn preview_control_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .min_w(px(32.0))
+        .h(px(28.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .bg(rgb(0x202329))
+        .hover(|button| button.bg(rgb(0x536987)))
         .text_xs()
         .child(label)
 }

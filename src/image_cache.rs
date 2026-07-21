@@ -12,6 +12,9 @@ const MAX_THUMBNAIL_HEIGHT: u32 = 840;
 #[derive(Clone)]
 pub enum TimelineImageLoader {}
 
+#[derive(Clone)]
+pub enum PreviewImageLoader {}
+
 impl Asset for TimelineImageLoader {
     type Source = Resource;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
@@ -41,8 +44,36 @@ impl Asset for TimelineImageLoader {
     }
 }
 
+impl Asset for PreviewImageLoader {
+    type Source = Resource;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let svg_renderer = cx.svg_renderer();
+        async move {
+            let Resource::Path(path) = source else {
+                return Err(anyhow!("preview images must be local files").into());
+            };
+            let bytes = fs::read(path.as_ref())?;
+            if image::guess_format(&bytes).is_ok() {
+                return Ok(render_image_from_dynamic(image::load_from_memory(&bytes)?));
+            }
+            Ok(svg_renderer.render_single_frame(&bytes, 1.0)?)
+        }
+    }
+}
+
 fn thumbnail_from_image(image: DynamicImage, max_width: u32, max_height: u32) -> Arc<RenderImage> {
     let mut buffer = image.thumbnail(max_width, max_height).into_rgba8();
+    rgba_to_bgra(&mut buffer);
+    Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
+}
+
+fn render_image_from_dynamic(image: DynamicImage) -> Arc<RenderImage> {
+    let mut buffer = image.into_rgba8();
     rgba_to_bgra(&mut buffer);
     Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
 }

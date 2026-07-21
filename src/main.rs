@@ -10,6 +10,7 @@ mod media_cache;
 mod model;
 mod mpv_player;
 mod naga_bridge;
+mod preview;
 mod scroll_capture;
 mod timeline;
 mod video_manager;
