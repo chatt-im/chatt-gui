@@ -3,6 +3,7 @@ mod composer;
 mod daemon;
 mod fonts;
 mod frame_stats;
+mod icons;
 mod image_cache;
 mod live_stream;
 mod logger;
@@ -26,25 +27,27 @@ fn main() {
     log::info!(
         "logging initialized (set RUST_LOG for Rust diagnostics and CHATT_MPV_LOG for native mpv diagnostics)"
     );
-    application().run(move |cx: &mut App| {
-        fonts::load(cx);
-        theme::init(theme::LoadThemes::JustBase, cx);
-        app::bind_keys(cx);
-        frame_stats::start(cx);
+    application()
+        .with_assets(icons::IconAssets)
+        .run(move |cx: &mut App| {
+            fonts::load(cx);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            app::bind_keys(cx);
+            frame_stats::start(cx);
 
-        let bounds = Bounds::centered(None, size(px(1240.0), px(820.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                frame_stats::start_window(window);
-                cx.new(|cx| ChattView::new(window, cx))
-            },
-        )
-        .expect("failed to open Chatt window");
+            let bounds = Bounds::centered(None, size(px(1240.0), px(820.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    frame_stats::start_window(window);
+                    cx.new(|cx| ChattView::new(window, cx))
+                },
+            )
+            .expect("failed to open Chatt window");
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }

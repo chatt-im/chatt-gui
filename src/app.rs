@@ -31,6 +31,7 @@ use crate::{
         client::{DaemonClient, DaemonEvent},
         reducer,
     },
+    icons::{IconName, icon},
     image_cache::{PreviewImageLoader, TimelineImageLoader},
     media_cache::MediaCache,
     model::{ChatModel, ConnectionPhase, PendingRequest},
@@ -47,8 +48,7 @@ use crate::{
 
 const SIDEBAR_WIDTH: f32 = 232.0;
 const TOP_BAR_HEIGHT: f32 = 52.0;
-const MIN_COMPOSER_HEIGHT: f32 = 82.0;
-const MIN_COMPOSER_FRAME_HEIGHT: f32 = 54.0;
+const MIN_COMPOSER_HEIGHT: f32 = 64.0;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PREVIEW_IMAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const VIDEO_THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -1773,6 +1773,7 @@ impl ChattView {
         let edited = message.edited;
         let unverified = message.unverified;
         let timestamp_ms = message.timestamp_ms;
+        let hover_group: SharedString = format!("message-actions-{message_id}").into();
         let edit = (message.local && !message.notice).then(|| {
             (
                 message.room_id,
@@ -1783,6 +1784,8 @@ impl ChattView {
         let attachment = message.attachment.clone();
         div()
             .id(("message", message_id as usize))
+            .group(hover_group.clone())
+            .relative()
             .w_full()
             .pl(px(64.))
             .pr(px(28.))
@@ -1815,6 +1818,7 @@ impl ChattView {
                                         .flex()
                                         .items_center()
                                         .gap_2()
+                                        .pr(px(66.))
                                         .child(
                                             div()
                                                 .font_weight(FontWeight::SEMIBOLD)
@@ -1838,32 +1842,6 @@ impl ChattView {
                                             )
                                         })
                                         .child(div().flex_1())
-                                        .when_some(edit, |header, (room_id, edit_id, edit_body)| {
-                                            header
-                                                .child(
-                                                    mini_button(
-                                                        ("edit", message_id as usize),
-                                                        "Edit",
-                                                    )
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.begin_edit(
-                                                            room_id,
-                                                            edit_id,
-                                                            edit_body.clone(),
-                                                            cx,
-                                                        )
-                                                    })),
-                                                )
-                                                .child(
-                                                    mini_button(
-                                                        ("delete", message_id as usize),
-                                                        "Delete",
-                                                    )
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.delete_message(room_id, edit_id, cx)
-                                                    })),
-                                                )
-                                        })
                                         .child(div().text_xs().text_color(rgb(0x777d87)).child(
                                             timeline::format_age(timestamp_ms, timeline::now_ms()),
                                         )),
@@ -1885,6 +1863,40 @@ impl ChattView {
                             }),
                     ),
             )
+            .when_some(edit, |row, (room_id, edit_id, edit_body)| {
+                row.child(
+                    div()
+                        .absolute()
+                        .top(px(if continuation { 1. } else { 7. }))
+                        .right(px(28.))
+                        .flex()
+                        .gap_1()
+                        .invisible()
+                        .group_hover(hover_group, |actions| actions.visible())
+                        .child(
+                            message_action_button(
+                                ("edit", message_id as usize),
+                                IconName::Pencil,
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.begin_edit(room_id, edit_id, edit_body.clone(), cx)
+                                },
+                            )),
+                        )
+                        .child(
+                            message_action_button(
+                                ("delete", message_id as usize),
+                                IconName::Trash,
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.delete_message(room_id, edit_id, cx),
+                            )),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -1974,8 +1986,6 @@ impl ChattView {
                 .flex()
                 .items_center()
                 .gap_3()
-                .border_1()
-                .border_color(rgb(0x596a90))
                 .bg(rgb(0x171a20))
                 .child(
                     div()
@@ -2017,11 +2027,6 @@ impl ChattView {
             } else {
                 0.0
             };
-            let engaged = video.surface.is_some()
-                || video.loading
-                || !video.paused
-                || video.position > 0.0
-                || video.finished;
             let aspect_ratio = match (descriptor.width, descriptor.height) {
                 (Some(width), Some(height)) if width > 0 && height > 0 => {
                     width as f32 / height as f32
@@ -2043,8 +2048,6 @@ impl ChattView {
                 .id(("video", message_id as usize))
                 .mt_2()
                 .w_full()
-                .border_1()
-                .border_color(rgb(if engaged { 0x596a90 } else { 0x292d34 }))
                 .bg(rgb(0x08090b))
                 .child(
                     div()
@@ -2214,8 +2217,6 @@ impl ChattView {
             .mt_2()
             .px_3()
             .py_2()
-            .border_1()
-            .border_color(rgb(0x30343b))
             .bg(rgb(0x171a20))
             .cursor_pointer()
             .hover(|item| item.bg(rgb(0x20242a)))
@@ -2244,8 +2245,6 @@ impl ChattView {
             .items_center()
             .justify_center()
             .gap_3()
-            .border_1()
-            .border_color(rgb(0x596a90))
             .bg(rgb(0x171a20))
             .child(
                 div()
@@ -2663,13 +2662,15 @@ impl ChattView {
                             .gap_1()
                             .px_2()
                             .bg(rgb(0x191c21))
-                            .child(preview_action_button("preview-save", "↓").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.save_preview_image(window, cx)
-                                }),
-                            ))
                             .child(
-                                preview_action_button("preview-close", "×")
+                                preview_action_button("preview-save", IconName::Download).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.save_preview_image(window, cx)
+                                    }),
+                                ),
+                            )
+                            .child(
+                                preview_action_button("preview-close", IconName::Close)
                                     .on_click(cx.listener(|this, _, _, cx| this.close_preview(cx))),
                             ),
                     ),
@@ -2865,8 +2866,7 @@ impl ChattView {
             .flex_col()
             .min_h_0()
             .overflow_hidden()
-            .gap_2()
-            .p_3()
+            .gap_0()
             .border_b_1()
             .border_color(rgb(0x272a30))
             .bg(rgb(0x14161a))
@@ -2940,31 +2940,10 @@ impl ChattView {
             .id(("live-share", stream_id.0 as usize))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_2()
-            .border_1()
-            .border_color(rgb(0x30343b))
-            .bg(rgb(0x111317))
+            .bg(rgb(0x08090b))
             .when(fullscreen, |card| card.size_full())
             .when(constrained && active_share, |card| card.flex_1().min_h_0())
-            .when(constrained && !active_share, |card| card.flex_none())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("{} is sharing", share.sender_name)),
-                    )
-                    .child(div().text_xs().text_color(rgb(0x747a84)).child(format!(
-                        "{}×{} · {}",
-                        share.coded_width, share.coded_height, share.codec
-                    )))
-                    .child(div().flex_1()),
-            );
+            .when(constrained && !active_share, |card| card.flex_none());
         if let Some((video_surface, zoom, pan, dragging, viewport_bounds, coded_size)) = active {
             let stop_id = stream_id;
             let reset_id = stream_id;
@@ -2976,32 +2955,33 @@ impl ChattView {
                     div()
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
+                        .px_3()
+                        .py_2()
+                        .bg(rgb(0x111317))
+                        .child(live_share_title(&share))
                         .child(
-                            mini_button(("live-stop", stream_id.0 as usize), "Stop").on_click(
-                                cx.listener(move |this, _, window, cx| {
+                            icon_button(("live-stop", stream_id.0 as usize), IconName::Stop)
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     if this.fullscreen_share == Some(stop_id)
                                         && window.is_fullscreen()
                                     {
                                         window.toggle_fullscreen();
                                     }
                                     this.stop_live_share(stop_id, cx)
-                                }),
-                            ),
+                                })),
                         )
                         .child(
-                            mini_button(("live-reset", stream_id.0 as usize), "Reset").on_click(
-                                cx.listener(move |this, _, _, cx| {
+                            icon_button(("live-reset", stream_id.0 as usize), IconName::RotateCcw)
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.reset_live_view(reset_id, cx)
-                                }),
-                            ),
+                                })),
                         )
                         .child(
-                            mini_button(("live-zoom-out", stream_id.0 as usize), "−").on_click(
-                                cx.listener(move |this, _, _, cx| {
+                            icon_button(("live-zoom-out", stream_id.0 as usize), IconName::ZoomOut)
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.zoom_live_view(zoom_out_id, 1.0 / 1.25, cx)
-                                }),
-                            ),
+                                })),
                         )
                         .child(
                             div()
@@ -3010,19 +2990,18 @@ impl ChattView {
                                 .child(format!("{:.0}%", zoom * 100.0)),
                         )
                         .child(
-                            mini_button(("live-zoom-in", stream_id.0 as usize), "+").on_click(
-                                cx.listener(move |this, _, _, cx| {
+                            icon_button(("live-zoom-in", stream_id.0 as usize), IconName::ZoomIn)
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.zoom_live_view(zoom_in_id, 1.25, cx)
-                                }),
-                            ),
+                                })),
                         )
                         .child(
-                            mini_button(
+                            icon_button(
                                 ("live-fullscreen", stream_id.0 as usize),
                                 if fullscreen {
-                                    "Exit fullscreen"
+                                    IconName::Minimize
                                 } else {
-                                    "Fullscreen"
+                                    IconName::Maximize
                                 },
                             )
                             .on_click(cx.listener(
@@ -3095,9 +3074,19 @@ impl ChattView {
                 });
         } else {
             card = card.child(
-                mini_button(("live-play", stream_id.0 as usize), "Play").on_click(
-                    cx.listener(move |this, _, _, cx| this.start_live_share(stream_id, cx)),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(0x111317))
+                    .child(live_share_title(&share))
+                    .child(
+                        icon_button(("live-play", stream_id.0 as usize), IconName::Play).on_click(
+                            cx.listener(move |this, _, _, cx| this.start_live_share(stream_id, cx)),
+                        ),
+                    ),
             );
         }
         card
@@ -3531,13 +3520,18 @@ impl Render for ChattView {
                             )
                             .when(!ready, |bar| {
                                 bar.child(
-                                    toolbar_button("retry", "Retry")
+                                    toolbar_button("retry", Some(IconName::RotateCcw), "Retry")
                                         .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                                 )
                             })
                             .child(
                                 toolbar_button(
                                     "mute",
+                                    Some(if self.model.voice.muted {
+                                        IconName::MicOff
+                                    } else {
+                                        IconName::Mic
+                                    }),
                                     if self.model.voice.muted {
                                         "Unmute"
                                     } else {
@@ -3551,6 +3545,11 @@ impl Render for ChattView {
                             .child(
                                 toolbar_button(
                                     "deafen",
+                                    Some(if self.model.voice.deafened {
+                                        IconName::AudioOff
+                                    } else {
+                                        IconName::AudioOn
+                                    }),
                                     if self.model.voice.deafened {
                                         "Undeafen"
                                     } else {
@@ -3563,7 +3562,7 @@ impl Render for ChattView {
                                     },
                                 )),
                             )
-                            .child(toolbar_button("output-down", "Vol −").on_click(
+                            .child(toolbar_button("output-down", None, "Vol −").on_click(
                                 cx.listener(|this, _, _, cx| this.adjust_output_volume(-5., cx)),
                             ))
                             .child(
@@ -3572,12 +3571,21 @@ impl Render for ChattView {
                                     .text_color(rgb(0x8b929d))
                                     .child(format!("{}", self.model.voice.output_volume.round())),
                             )
-                            .child(toolbar_button("output-up", "Vol +").on_click(
+                            .child(toolbar_button("output-up", None, "Vol +").on_click(
                                 cx.listener(|this, _, _, cx| this.adjust_output_volume(5., cx)),
                             ))
                             .child(
                                 toolbar_button(
                                     "voice",
+                                    Some(
+                                        if self.model.voice.joined_room == self.model.selected_room
+                                            && self.model.selected_room.is_some()
+                                        {
+                                            IconName::Stop
+                                        } else {
+                                            IconName::Play
+                                        },
+                                    ),
                                     if self.model.voice.joined_room == self.model.selected_room
                                         && self.model.selected_room.is_some()
                                     {
@@ -3590,11 +3598,6 @@ impl Render for ChattView {
                                     |this, _, window, cx| {
                                         this.toggle_voice(&ToggleVoice, window, cx)
                                     },
-                                )),
-                            )
-                            .child(
-                                toolbar_button("add-media", "+ Upload").on_click(cx.listener(
-                                    |this, _, window, cx| this.open_media(&OpenMedia, window, cx),
                                 )),
                             ),
                     )
@@ -3612,10 +3615,14 @@ impl Render for ChattView {
                                     .border_b_1()
                                     .border_color(rgb(0x272a30))
                                     .child(
-                                        toolbar_button("load-older", "Load older messages")
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.load_older(cx)),
-                                            ),
+                                        toolbar_button(
+                                            "load-older",
+                                            Some(IconName::Download),
+                                            "Load older messages",
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.load_older(cx)),
+                                        ),
                                     ),
                             )
                         },
@@ -3635,40 +3642,37 @@ impl Render for ChattView {
                         div()
                             .min_h(px(MIN_COMPOSER_HEIGHT))
                             .flex_none()
-                            .px_4()
-                            .pt_3()
-                            .pb_4()
+                            .flex()
+                            .items_center()
+                            .pl(px(28.))
+                            .pr(px(28.))
+                            .py_2()
                             .border_t_1()
                             .border_color(rgb(0x272a30))
-                            .bg(rgb(0x111317))
+                            .bg(rgb(0x14161a))
                             .child(
                                 div()
-                                    .min_h(px(MIN_COMPOSER_FRAME_HEIGHT))
+                                    .w(px(36.))
+                                    .h(px(40.))
+                                    .flex_none()
                                     .flex()
                                     .items_center()
-                                    .gap_3()
-                                    .px_3()
-                                    .border_1()
-                                    .border_color(rgb(if ready { 0x333740 } else { 0x292c32 }))
-                                    .bg(rgb(0x191c21))
-                                    .child(self.composer.clone())
-                                    .child(
-                                        toolbar_button(
-                                            "send",
-                                            if !ready {
-                                                "Offline"
-                                            } else if self.editing.is_some() {
-                                                "Save edit"
-                                            } else {
-                                                "Send"
-                                            },
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.send_message(&SendMessage, window, cx)
-                                            }),
-                                        ),
-                                    ),
+                                    .justify_center()
+                                    .mr(px(15.))
+                                    .child(composer_add_button(ready).on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.open_media(&OpenMedia, window, cx)
+                                        },
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .min_h(px(40.))
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .child(self.composer.clone()),
                             ),
                     ),
             )
@@ -3710,6 +3714,33 @@ impl Render for ChattView {
                 .child(preview_panel)
             })
     }
+}
+
+fn live_share_title(share: &local_rpc::model::LiveShare) -> Div {
+    div()
+        .min_w_0()
+        .flex_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_sm()
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("{} is sharing", share.sender_name)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(0x747a84))
+                .child(format!(
+                    "{}×{} · {}",
+                    share.coded_width, share.coded_height, share.codec
+                )),
+        )
 }
 
 fn image_box_size(descriptor: &AttachmentDescriptor) -> (f32, f32) {
@@ -3838,20 +3869,26 @@ fn room_button(
         })
 }
 
-fn toolbar_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn toolbar_button(
+    id: &'static str,
+    icon_name: Option<IconName>,
+    label: &'static str,
+) -> Stateful<Div> {
     div()
         .id(id)
         .h(px(30.))
-        .px_3()
+        .px_2()
         .flex()
         .items_center()
         .justify_center()
+        .gap_1()
         .cursor_pointer()
-        .border_1()
-        .border_color(rgb(0x363b44))
-        .bg(rgb(0x202329))
+        .bg(rgb(0x1b1e23))
         .hover(|button| button.bg(rgb(0x292d34)))
         .text_xs()
+        .when_some(icon_name, |button, icon_name| {
+            button.child(icon(icon_name, 15.0, 0xaeb4bf))
+        })
         .child(label)
 }
 fn mini_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<Div> {
@@ -3863,14 +3900,70 @@ fn mini_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .border_1()
-        .border_color(rgb(0x353a43))
         .bg(rgb(0x22262c))
+        .hover(|button| button.bg(rgb(0x30353d)))
         .text_xs()
         .child(label)
 }
 
-fn preview_action_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn icon_button(id: impl Into<gpui::ElementId>, icon_name: IconName) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .bg(rgb(0x202329))
+        .text_color(rgb(0xb4b9c2))
+        .hover(|button| button.bg(rgb(0x536987)).text_color(rgb(0xf0f2f5)))
+        .child(icon(icon_name, 17.0, 0xd0d4dc))
+}
+
+fn message_action_button(
+    id: impl Into<gpui::ElementId>,
+    icon_name: IconName,
+    destructive: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .bg(rgb(0x202329))
+        .text_color(rgb(0x8b929d))
+        .hover(move |button| {
+            button
+                .bg(rgb(0x30353d))
+                .text_color(rgb(if destructive { 0xd99a93 } else { 0xe4e6ea }))
+        })
+        .child(icon(
+            icon_name,
+            16.0,
+            if destructive { 0xb9827d } else { 0xadb3bd },
+        ))
+}
+
+fn composer_add_button(ready: bool) -> Stateful<Div> {
+    div()
+        .id("add-media")
+        .size(px(36.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_color(rgb(if ready { 0x8b929d } else { 0x555a63 }))
+        .hover(|button| button.text_color(rgb(0xd9dbe0)))
+        .child(icon(
+            IconName::Plus,
+            24.0,
+            if ready { 0x8b929d } else { 0x555a63 },
+        ))
+}
+
+fn preview_action_button(id: &'static str, icon_name: IconName) -> Stateful<Div> {
     div()
         .id(id)
         .w(px(28.0))
@@ -3881,7 +3974,7 @@ fn preview_action_button(id: &'static str, label: &'static str) -> Stateful<Div>
         .cursor_pointer()
         .text_color(rgb(0x8b929d))
         .hover(|button| button.bg(rgb(0x111317)).text_color(rgb(0xd9dbe0)))
-        .child(label)
+        .child(icon(icon_name, 17.0, 0x9ba1ab))
 }
 
 fn preview_control_button(id: &'static str, label: &'static str) -> Stateful<Div> {
