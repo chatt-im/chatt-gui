@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rpc::daemon::model::{AttachmentDescriptor, MediaKind};
 
@@ -29,6 +32,16 @@ impl Attachment {
     }
     pub fn is_video(&self) -> bool {
         self.descriptor.media_kind == MediaKind::Video
+            || self.descriptor.content_type.starts_with("video/")
+            || Path::new(&self.descriptor.file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "ogv" | "webm"
+                    )
+                })
     }
 }
 
@@ -99,6 +112,21 @@ pub fn format_age(timestamp_ms: u64, current_ms: u64) -> String {
 mod tests {
     use super::*;
 
+    fn attachment(file_name: &str, media_kind: MediaKind, content_type: &str) -> Attachment {
+        Attachment {
+            descriptor: AttachmentDescriptor {
+                id: rpc::daemon::model::AttachmentId([1; 16]),
+                file_name: file_name.into(),
+                media_kind,
+                content_type: content_type.into(),
+                byte_len: 1,
+                digest: [2; 32],
+                width: None,
+                height: None,
+            },
+        }
+    }
+
     fn message(sender: &str, timestamp_ms: u64) -> Message {
         Message {
             room_id: rpc::ids::RoomId(1),
@@ -119,6 +147,13 @@ mod tests {
         let messages = vec![message("Mara", 1_000), message("Mara", 60_000)];
         assert!(!is_continuation(&messages, 0));
         assert!(is_continuation(&messages, 1));
+    }
+
+    #[test]
+    fn recognizes_playable_video_when_protocol_metadata_is_generic() {
+        assert!(attachment("clip.MKV", MediaKind::File, "application/octet-stream").is_video());
+        assert!(attachment("clip.bin", MediaKind::File, "video/mp4").is_video());
+        assert!(!attachment("notes.txt", MediaKind::File, "text/plain").is_video());
     }
 
     #[test]

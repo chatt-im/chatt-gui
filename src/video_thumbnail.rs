@@ -321,7 +321,13 @@ fn thumbnail_worker(
             jobs.jobs.pop_back().expect("non-empty thumbnail queue")
         };
         if extractor.is_none() {
-            extractor = ThumbnailExtractor::new().ok();
+            extractor = match ThumbnailExtractor::new() {
+                Ok(created) => Some(created),
+                Err(error) => {
+                    log::error!("video thumbnail decoder initialization failed: {error:#}");
+                    None
+                }
+            };
         }
         let result = match extractor.as_mut() {
             Some(extractor) => extractor.extract(&job.path).map_err(|error| format!("{error:#}")),

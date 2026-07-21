@@ -102,11 +102,19 @@ impl DaemonClient {
     }
 
     pub fn send(&self, frame: ClientFrame) -> Result<(), String> {
+        let request_id = frame.request_id();
         self.commands
             .try_send(ConnectorCommand::Frame(frame))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => "daemon command queue is full".into(),
-                TrySendError::Disconnected(_) => "daemon connector stopped".into(),
+            .map_err(|error| {
+                let reason: String = match error {
+                    TrySendError::Full(_) => "daemon command queue is full".into(),
+                    TrySendError::Disconnected(_) => "daemon connector stopped".into(),
+                };
+                log::error!(
+                    "could not enqueue daemon request request_id={:?}: {reason}",
+                    request_id.map(|id| id.0),
+                );
+                reason
             })
     }
 
@@ -217,6 +225,7 @@ fn connection_loop(
                 let reader_stream = match stream.try_clone() {
                     Ok(stream) => stream,
                     Err(error) => {
+                        log::error!("could not clone daemon RPC stream: {error}");
                         if events
                             .send_blocking(DaemonEvent::Disconnected(error.to_string()))
                             .is_err()
@@ -234,6 +243,7 @@ fn connection_loop(
                 {
                     Ok(thread) => thread,
                     Err(error) => {
+                        log::error!("could not start daemon RPC writer: {error}");
                         let _ = events.send_blocking(DaemonEvent::Disconnected(error.to_string()));
                         return;
                     }
@@ -301,6 +311,20 @@ fn connection_loop(
                             {
                                 break 'connected "daemon writer stopped".into();
                             }
+                            if let DaemonFrame::RequestResult(result) = &frame {
+                                match &result.outcome {
+                                    RequestOutcome::Accepted => log::info!(
+                                        "daemon request accepted request_id={} operation={:?}",
+                                        result.request_id.0,
+                                        result.operation,
+                                    ),
+                                    RequestOutcome::Rejected { code, message } => log::error!(
+                                        "daemon request rejected request_id={} operation={:?} code={code}: {message}",
+                                        result.request_id.0,
+                                        result.operation,
+                                    ),
+                                }
+                            }
                             if matches!(
                                 &frame,
                                 DaemonFrame::RequestResult(result)
@@ -326,6 +350,7 @@ fn connection_loop(
                     .lock()
                     .expect("media cache lock poisoned")
                     .cancel_all();
+                log::error!("daemon RPC connection ended: {reason}");
                 if events
                     .send_blocking(DaemonEvent::Disconnected(reason))
                     .is_err()
@@ -338,6 +363,7 @@ fn connection_loop(
                 | ConnectError::Permission(details)
                 | ConnectError::Rejected(details),
             ) => {
+                log::error!("daemon RPC connection rejected: {details}");
                 if events
                     .send_blocking(DaemonEvent::Incompatible(details))
                     .is_err()
@@ -347,6 +373,7 @@ fn connection_loop(
                 wait_for_retry(&commands, Duration::from_secs(5));
             }
             Err(error) => {
+                log::error!("daemon RPC connection failed: {error}");
                 if events
                     .send_blocking(DaemonEvent::Disconnected(error.to_string()))
                     .is_err()
@@ -369,13 +396,27 @@ fn handle_bulk_frame(
     match frame {
         DaemonFrame::BulkStarted(started) => {
             let transfer_id = started.transfer_id;
+            log::info!(
+                "attachment transfer started transfer_id={} file={:?} bytes={}",
+                transfer_id.0,
+                started.attachment.file_name,
+                started.attachment.byte_len,
+            );
             match media_cache
                 .lock()
                 .expect("media cache lock poisoned")
                 .begin(started)
             {
                 Ok(()) => {
-                    let _ = events.send_blocking(DaemonEvent::MediaTransferStarted);
+                    if events
+                        .send_blocking(DaemonEvent::MediaTransferStarted)
+                        .is_err()
+                    {
+                        log::error!(
+                            "could not deliver attachment-start event transfer_id={}",
+                            transfer_id.0,
+                        );
+                    }
                 }
                 Err(reason) => cancel_failed_download(transfer_id, reason, commands, events),
             }
@@ -394,13 +435,26 @@ fn handle_bulk_frame(
         }
         DaemonFrame::BulkFinished(finished) => {
             let transfer_id = finished.transfer_id;
+            log::info!(
+                "attachment transfer finished transfer_id={} bytes={}",
+                transfer_id.0,
+                finished.byte_len,
+            );
             match media_cache
                 .lock()
                 .expect("media cache lock poisoned")
                 .finish(finished)
             {
                 Ok(descriptor) => {
-                    let _ = events.send_blocking(DaemonEvent::MediaCached(descriptor));
+                    if events
+                        .send_blocking(DaemonEvent::MediaCached(descriptor))
+                        .is_err()
+                    {
+                        log::error!(
+                            "could not deliver attachment-cached event transfer_id={}",
+                            transfer_id.0,
+                        );
+                    }
                 }
                 Err(reason) => cancel_failed_download(transfer_id, reason, commands, events),
             }
@@ -410,6 +464,10 @@ fn handle_bulk_frame(
             transfer_id,
             reason,
         } => {
+            log::error!(
+                "attachment transfer canceled transfer_id={}: {reason}",
+                transfer_id.0,
+            );
             media_cache
                 .lock()
                 .expect("media cache lock poisoned")
@@ -430,11 +488,25 @@ fn cancel_failed_download(
     commands: &SyncSender<ConnectorCommand>,
     events: &EventSender<DaemonEvent>,
 ) {
-    let _ = commands.send(ConnectorCommand::CancelBulk(transfer_id));
-    let _ = events.send_blocking(DaemonEvent::MediaTransferFailed {
+    log::error!(
+        "attachment transfer failed transfer_id={}: {reason}",
+        transfer_id.0,
+    );
+    if commands.send(ConnectorCommand::CancelBulk(transfer_id)).is_err() {
+        log::error!(
+            "could not enqueue attachment cancellation transfer_id={}",
+            transfer_id.0,
+        );
+    }
+    if events.send_blocking(DaemonEvent::MediaTransferFailed {
         transfer_id,
         reason,
-    });
+    }).is_err() {
+        log::error!(
+            "could not deliver attachment-failure event transfer_id={}",
+            transfer_id.0,
+        );
+    }
 }
 
 fn writer_loop(
@@ -464,9 +536,26 @@ fn writer_loop(
                         prepared.retain(|_, upload| upload.upload.transfer_id != *transfer_id);
                         active.retain(|upload| upload.prepared.upload.transfer_id != *transfer_id);
                     }
-                    if writer.send_client(&frame).is_err() {
+                    let attachment_request = match &frame {
+                        ClientFrame::BeginAttachmentRead { request_id, read } => Some((
+                            request_id.0,
+                            read.transfer_id.0,
+                            read.room_id.0,
+                        )),
+                        _ => None,
+                    };
+                    if let Err(error) = writer.send_client(&frame) {
+                        log::error!(
+                            "could not write daemon request request_id={:?}: {error}",
+                            frame.request_id().map(|id| id.0),
+                        );
                         let _ = writer.shutdown();
                         break;
+                    }
+                    if let Some((request_id, transfer_id, room_id)) = attachment_request {
+                        log::info!(
+                            "attachment request sent request_id={request_id} transfer_id={transfer_id} room={room_id}"
+                        );
                     }
                 }
                 ConnectorCommand::PreparedUpload(upload) => {
@@ -474,7 +563,12 @@ fn writer_loop(
                         request_id: upload.begin_request,
                         upload: upload.upload.clone(),
                     };
-                    if writer.send_client(&frame).is_err() {
+                    if let Err(error) = writer.send_client(&frame) {
+                        log::error!(
+                            "could not write begin-upload request request_id={} transfer_id={}: {error}",
+                            upload.begin_request.0,
+                            upload.upload.transfer_id.0,
+                        );
                         let _ = writer.shutdown();
                         break;
                     }
@@ -508,13 +602,16 @@ fn writer_loop(
                                 upload.finish_request,
                                 error.to_string(),
                             );
-                            if writer
-                                .send_client(&ClientFrame::CancelUpload {
-                                    request_id: upload.finish_request,
-                                    transfer_id: upload.upload.transfer_id,
-                                })
-                                .is_err()
-                            {
+                            let cancel = ClientFrame::CancelUpload {
+                                request_id: upload.finish_request,
+                                transfer_id: upload.upload.transfer_id,
+                            };
+                            if let Err(error) = writer.send_client(&cancel) {
+                                log::error!(
+                                    "could not write upload cancellation request_id={} transfer_id={}: {error}",
+                                    upload.finish_request.0,
+                                    upload.upload.transfer_id.0,
+                                );
                                 let _ = writer.shutdown();
                                 break;
                             }
@@ -528,7 +625,11 @@ fn writer_loop(
                         transfer_id,
                     };
                     internal_request_id = internal_request_id.wrapping_add(1).max(1 << 63);
-                    if writer.send_client(&frame).is_err() {
+                    if let Err(error) = writer.send_client(&frame) {
+                        log::error!(
+                            "could not write attachment cancellation transfer_id={}: {error}",
+                            transfer_id.0,
+                        );
                         let _ = writer.shutdown();
                         break;
                     }
@@ -552,13 +653,16 @@ fn writer_loop(
                     upload.prepared.finish_request,
                     error,
                 );
-                if writer
-                    .send_client(&ClientFrame::CancelUpload {
-                        request_id: upload.prepared.finish_request,
-                        transfer_id: upload.prepared.upload.transfer_id,
-                    })
-                    .is_err()
-                {
+                let cancel = ClientFrame::CancelUpload {
+                    request_id: upload.prepared.finish_request,
+                    transfer_id: upload.prepared.upload.transfer_id,
+                };
+                if let Err(error) = writer.send_client(&cancel) {
+                    log::error!(
+                        "could not write failed-upload cancellation request_id={} transfer_id={}: {error}",
+                        upload.prepared.finish_request.0,
+                        upload.prepared.upload.transfer_id.0,
+                    );
                     let _ = writer.shutdown();
                     break;
                 }
@@ -636,11 +740,22 @@ fn report_upload_error(
     finish_request: RequestId,
     reason: String,
 ) {
-    let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
+    log::error!(
+        "upload failed begin_request={} finish_request={}: {reason}",
+        begin_request.0,
+        finish_request.0,
+    );
+    if events.send_blocking(DaemonEvent::UploadPreparationFailed {
         begin_request,
         finish_request,
         reason,
-    });
+    }).is_err() {
+        log::error!(
+            "could not deliver upload-failure event begin_request={} finish_request={}",
+            begin_request.0,
+            finish_request.0,
+        );
+    }
 }
 
 fn drain_stale_commands(commands: &Receiver<ConnectorCommand>) {

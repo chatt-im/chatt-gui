@@ -367,7 +367,9 @@ impl MpvPlayer {
 
         let (error_sender, errors) = mpsc::channel();
         let playback = Arc::new(SharedPlaybackState::default());
+        let frame_invalidated = Arc::new(AtomicBool::new(false));
         let render_playback = playback.clone();
+        let render_frame_invalidated = frame_invalidated.clone();
         let render_error_sender = error_sender.clone();
         let render_gpui_wakeup = gpui_wakeup.clone();
         let render_live_diagnostics = live_diagnostics.clone();
@@ -385,6 +387,7 @@ impl MpvPlayer {
                     render_live_diagnostics,
                     render_live_input_gate,
                     render_playback,
+                    render_frame_invalidated,
                 );
             })
             .context("spawn mpv render thread")?;
@@ -403,6 +406,7 @@ impl MpvPlayer {
 
         let (control_sender, control_commands) = mpsc::channel();
         let control_playback = playback.clone();
+        let control_frame_invalidated = frame_invalidated.clone();
         let control_mpv = mpv.clone();
         let control_error_sender = error_sender.clone();
         let control_render_sender = render_sender.clone();
@@ -417,6 +421,7 @@ impl MpvPlayer {
                     control_error_sender,
                     control_render_sender,
                     fixed_render_size,
+                    control_frame_invalidated,
                 );
             })
         {
@@ -857,6 +862,13 @@ impl RenderBackend {
         }
     }
 
+    fn skip_rendering(&self) -> Result<()> {
+        let context = self.context();
+        context.skip_rendering()?;
+        context.report_swap();
+        Ok(())
+    }
+
     fn resize(&mut self, surface: &WgpuVideoSurface, width: u32, height: u32) -> Result<bool> {
         match self {
             Self::Vulkan {
@@ -878,8 +890,11 @@ impl RenderBackend {
                         old.textures.len(),
                     );
                     for texture in &old.textures {
+                        let image = texture
+                            .image()
+                            .context("get Vulkan video image during resize")?;
                         context
-                            .remove_vulkan_target(texture.image())
+                            .remove_vulkan_target(image)
                             .context("remove Vulkan render target from libmpv")?;
                     }
                     surface
@@ -914,7 +929,7 @@ impl RenderBackend {
                         .wait_idle()
                         .context("wait before retiring software-upload video textures")?;
                 }
-                let new_generation = surface.allocate_generation(width, height)?;
+                let new_generation = surface.allocate_software_generation(width, height)?;
                 log::info!(
                     "video texture generation ready backend=software generation={} size={}x{} textures={}",
                     new_generation.id,
@@ -938,8 +953,11 @@ impl RenderBackend {
             } => {
                 if let Some(old) = generation.take() {
                     for texture in &old.textures {
+                        let image = texture
+                            .image()
+                            .context("get Vulkan video image during release")?;
                         context
-                            .remove_vulkan_target(texture.image())
+                            .remove_vulkan_target(image)
                             .context("remove recycled Vulkan render target from libmpv")?;
                     }
                     surface
@@ -982,20 +1000,25 @@ impl RenderBackend {
             } => {
                 let Some(generation) = generation else {
                     diagnostics.note_unconfigured();
-                    if acknowledge_if_busy {
-                        context.skip_rendering()?;
-                    }
+                    // Keep mpv's pending frame intact until Resize installs the
+                    // first texture generation. Consuming it here skips the
+                    // beginning of a file when dimensions arrive after load.
                     return Ok(false);
                 };
                 let Some((texture, sync)) = next_ring_texture(generation, next_texture) else {
                     diagnostics.note_ring_busy("vulkan", generation.id);
                     if acknowledge_if_busy {
                         context.skip_rendering()?;
+                        context.report_swap();
                     }
                     return Ok(false);
                 };
+                let image = texture.image().context("get Vulkan video render image")?;
+                let semaphore = texture
+                    .semaphore()
+                    .context("get Vulkan video render semaphore")?;
                 let render = context.render_vulkan(VulkanRenderTarget {
-                    image: texture.image(),
+                    image,
                     format: vk::Format::R8G8B8A8_UNORM,
                     usage: vk::ImageUsageFlags::SAMPLED
                         | vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -1005,9 +1028,9 @@ impl RenderBackend {
                     height: texture.height(),
                     input_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     output_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    wait_semaphore: texture.semaphore(),
+                    wait_semaphore: semaphore,
                     wait_value: sync.wait_value,
-                    signal_semaphore: texture.semaphore(),
+                    signal_semaphore: semaphore,
                     signal_value: sync.ready_value,
                 });
                 if let Err(error) = render {
@@ -1015,6 +1038,7 @@ impl RenderBackend {
                     return Err(error).context("render libmpv frame into Vulkan texture");
                 }
                 surface.publish(texture, sync);
+                context.report_swap();
                 Ok(true)
             }
             Self::Software {
@@ -1026,15 +1050,15 @@ impl RenderBackend {
             } => {
                 let Some(generation) = generation else {
                     diagnostics.note_unconfigured();
-                    if acknowledge_if_busy {
-                        context.skip_rendering()?;
-                    }
+                    // The decoded frame remains pending and is rendered by the
+                    // Resize message once a backend-neutral texture exists.
                     return Ok(false);
                 };
                 let Some((texture, _sync)) = next_ring_texture(generation, next_texture) else {
                     diagnostics.note_ring_busy("software", generation.id);
                     if acknowledge_if_busy {
                         context.skip_rendering()?;
+                        context.report_swap();
                     }
                     return Ok(false);
                 };
@@ -1069,6 +1093,7 @@ impl RenderBackend {
                     texture.cancel_render();
                     return Err(error);
                 }
+                context.report_swap();
                 Ok(true)
             }
         }
@@ -1184,6 +1209,7 @@ fn control_worker(
     errors: mpsc::Sender<String>,
     render_sender: mpsc::Sender<RenderMessage>,
     initial_render_size: Option<(u32, u32)>,
+    frame_invalidated: Arc<AtomicBool>,
 ) {
     log::info!("mpv control worker started");
     let mut state = PlaybackState::default();
@@ -1234,6 +1260,7 @@ fn control_worker(
                     state.position = seconds;
                     state.finished = false;
                     playback.publish(state);
+                    frame_invalidated.store(true, Ordering::Release);
                     mpv.command("seek", &[&seconds.to_string(), mode.absolute_flag()])
                 }
                 ControlCommand::SeekPercent {
@@ -1247,6 +1274,7 @@ fn control_worker(
                     state.position = position;
                     state.finished = false;
                     playback.publish(state);
+                    frame_invalidated.store(true, Ordering::Release);
                     mpv.command(
                         "seek",
                         &[&percent.to_string(), mode.absolute_percent_flag()],
@@ -1503,6 +1531,7 @@ fn render_worker(
     live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
     live_input_gate: Option<Arc<crate::live_stream::LiveInputGate>>,
     playback: Arc<SharedPlaybackState>,
+    frame_invalidated: Arc<AtomicBool>,
 ) {
     let backend_name = backend.name();
     log::info!("video render worker started backend={backend_name}");
@@ -1568,6 +1597,11 @@ fn render_worker(
             RenderMessage::Update => {
                 diagnostics.callbacks += 1;
                 pending.store(false, Ordering::Release);
+                if frame_invalidated.swap(false, Ordering::AcqRel) {
+                    has_frame = false;
+                    redraw_pending = false;
+                    log::debug!("invalidated displayed video frame after seek");
+                }
                 let updates = backend.context().update();
                 if !enabled {
                     // A live stream can expose its first decoded frame before
@@ -1603,7 +1637,6 @@ fn render_worker(
                         RenderAction::Skip => {
                             diagnostics.repeats += 1;
                             backend
-                                .context()
                                 .skip_rendering()
                                 .map(|()| false)
                                 .map_err(Into::into)
@@ -1635,7 +1668,7 @@ fn render_worker(
             } => {
                 diagnostics.resizes += 1;
                 let result = backend.resize(&surface, width, height).and_then(|resized| {
-                    if enabled && ((resized && has_frame) || redraw) {
+                    if should_render_after_resize(enabled, resized, redraw) {
                         backend.render(&surface, false, &mut diagnostics)
                     } else {
                         Ok(false)
@@ -1728,6 +1761,10 @@ fn render_action(
     } else {
         RenderAction::Render
     }
+}
+
+fn should_render_after_resize(enabled: bool, resized: bool, redraw: bool) -> bool {
+    enabled && (resized || redraw)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2061,6 +2098,12 @@ mod tests {
             ),
             RenderAction::Render
         );
+    }
+
+    #[test]
+    fn first_texture_generation_renders_the_pending_initial_frame() {
+        assert!(should_render_after_resize(true, true, false));
+        assert!(!should_render_after_resize(false, true, false));
     }
 
     #[test]

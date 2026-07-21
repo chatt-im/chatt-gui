@@ -490,6 +490,9 @@ impl ChattView {
     }
 
     fn apply_video_drain(&mut self, drain: VideoDrain) {
+        for error in &drain.errors {
+            log::error!("embedded video failed: {error}");
+        }
         if let Some(error) = drain.errors.last() {
             self.status = error.clone().into();
         }
@@ -525,6 +528,7 @@ impl ChattView {
                 }
                 Ok(_) => {}
                 Err(error) => {
+                    log::error!("screen-share playback failed stream_id={}: {error:#}", stream_id.0);
                     ended.push((*stream_id, format!("Screen share failed · {error:#}")));
                 }
             }
@@ -886,6 +890,7 @@ impl ChattView {
             DaemonEvent::Connecting => self.model.phase = ConnectionPhase::Connecting,
             DaemonEvent::TransportConnected => self.model.phase = ConnectionPhase::Syncing,
             DaemonEvent::Disconnected(reason) => {
+                log::error!("daemon disconnected: {reason}");
                 self.media_cache
                     .lock()
                     .expect("media cache lock poisoned")
@@ -904,6 +909,7 @@ impl ChattView {
                 self.release_live_players(window);
             }
             DaemonEvent::Incompatible(details) => {
+                log::error!("daemon connection is incompatible: {details}");
                 self.model.phase = ConnectionPhase::Incompatible {
                     details: details.clone(),
                 };
@@ -914,14 +920,27 @@ impl ChattView {
                 finish_request,
                 reason,
             } => {
+                log::error!(
+                    "upload preparation failed begin_request={} finish_request={}: {reason}",
+                    begin_request.0,
+                    finish_request.0,
+                );
                 self.model.pending.remove(&begin_request);
                 self.model.pending.remove(&finish_request);
                 self.status = format!("Could not prepare upload · {reason}").into();
             }
             DaemonEvent::MediaTransferStarted => {
+                log::info!("receiving attachment bytes from daemon");
                 self.status = "Receiving attachment…".into();
             }
             DaemonEvent::MediaCached(descriptor) => {
+                log::info!(
+                    "attachment cached file={:?} media_kind={:?} content_type={:?} bytes={}",
+                    descriptor.file_name,
+                    descriptor.media_kind,
+                    descriptor.content_type,
+                    descriptor.byte_len,
+                );
                 self.status = format!("Cached {}", descriptor.file_name).into();
                 self.eager_image_fetches.cached(&descriptor);
                 self.pump_eager_image_fetches(cx);
@@ -930,6 +949,10 @@ impl ChattView {
                 transfer_id,
                 reason,
             } => {
+                log::error!(
+                    "attachment transfer failed transfer_id={}: {reason}",
+                    transfer_id.0,
+                );
                 self.media_cache
                     .lock()
                     .expect("media cache lock poisoned")
@@ -1060,6 +1083,11 @@ impl ChattView {
         if let Some(result) = effect.request_result {
             match result.outcome {
                 RequestOutcome::Accepted => {
+                    log::info!(
+                        "daemon result applied request_id={} operation={:?} outcome=accepted",
+                        result.request_id.0,
+                        result.operation,
+                    );
                     self.status = format!("{} accepted", operation_label(&result.operation)).into();
                     if let Some(pending) = pending.as_ref()
                         && pending.operation == Operation::EditMessage
@@ -1069,7 +1097,12 @@ impl ChattView {
                         self.editing = None;
                     }
                 }
-                RequestOutcome::Rejected { message, .. } => {
+                RequestOutcome::Rejected { code, message } => {
+                    log::error!(
+                        "daemon result applied request_id={} operation={:?} outcome=rejected code={code}: {message}",
+                        result.request_id.0,
+                        result.operation,
+                    );
                     if let Some(transfer_id) = pending.as_ref().and_then(|pending| {
                         (pending.operation == Operation::BeginAttachmentRead)
                             .then_some(pending.transfer_id)
@@ -2114,6 +2147,14 @@ impl ChattView {
         let Some(room_id) = self.model.selected_room else {
             return;
         };
+        log::info!(
+            "attachment fetch requested room={} file={:?} media_kind={:?} content_type={:?} bytes={}",
+            room_id.0,
+            descriptor.file_name,
+            descriptor.media_kind,
+            descriptor.content_type,
+            descriptor.byte_len,
+        );
         if let Err(error) = self.begin_attachment_read(room_id, descriptor, cx) {
             self.status = error.into();
             self.pump_eager_image_fetches(cx);
@@ -2158,6 +2199,11 @@ impl ChattView {
             .daemon
             .send(ClientFrame::BeginAttachmentRead { request_id, read })
         {
+            log::error!(
+                "attachment request enqueue failed request_id={} transfer_id={}: {error}",
+                request_id.0,
+                transfer_id.0,
+            );
             self.model.pending.remove(&request_id);
             self.media_cache
                 .lock()
@@ -2165,6 +2211,13 @@ impl ChattView {
                 .cancel(transfer_id);
             return Err(error);
         } else {
+            log::info!(
+                "attachment request queued request_id={} transfer_id={} file={:?} bytes={}",
+                request_id.0,
+                transfer_id.0,
+                descriptor.file_name,
+                descriptor.byte_len,
+            );
             self.status = format!("Fetching {}…", descriptor.file_name).into();
         }
         cx.notify();
@@ -2174,13 +2227,17 @@ impl ChattView {
     fn play_video(&mut self, key: VideoKey, cx: &mut Context<Self>) {
         match self.videos.play(key) {
             Ok(()) => self.status = "Starting cached attachment…".into(),
-            Err(error) => self.status = format!("Playback failed: {error}").into(),
+            Err(error) => {
+                log::error!("embedded video play failed key={key:?}: {error:#}");
+                self.status = format!("Playback failed: {error}").into();
+            }
         }
         cx.notify();
     }
 
     fn seek_video(&mut self, key: VideoKey, seconds: f64, cx: &mut Context<Self>) {
         if let Err(error) = self.videos.seek(key, seconds) {
+            log::error!("embedded video seek failed key={key:?} seconds={seconds}: {error:#}");
             self.status = format!("Seek failed: {error}").into();
         }
         cx.notify();
@@ -2204,6 +2261,7 @@ impl ChattView {
             last_fraction: fraction,
         });
         if let Err(error) = self.videos.scrub(key, fraction, duration, SeekMode::Exact) {
+            log::error!("embedded video scrub failed key={key:?} fraction={fraction}: {error:#}");
             self.status = format!("Seek failed: {error}").into();
         }
         cx.stop_propagation();
@@ -2234,6 +2292,10 @@ impl ChattView {
                 self.videos
                     .scrub(scrub.key, fraction, scrub.duration, SeekMode::Keyframes)
             {
+                log::error!(
+                    "embedded video drag scrub failed key={:?} fraction={fraction}: {error:#}",
+                    scrub.key,
+                );
                 self.status = format!("Seek failed: {error}").into();
             }
             cx.notify();
@@ -2252,6 +2314,11 @@ impl ChattView {
             scrub.duration,
             SeekMode::Exact,
         ) {
+            log::error!(
+                "embedded video final scrub failed key={:?} fraction={}: {error:#}",
+                scrub.key,
+                scrub.last_fraction,
+            );
             self.status = format!("Seek failed: {error}").into();
         }
         cx.notify();
@@ -2259,6 +2326,7 @@ impl ChattView {
 
     fn adjust_video_volume(&mut self, key: VideoKey, delta: f64, cx: &mut Context<Self>) {
         if let Err(error) = self.videos.adjust_volume(key, delta) {
+            log::error!("embedded video volume change failed key={key:?} delta={delta}: {error:#}");
             self.status = format!("Volume failed: {error}").into();
         }
         cx.notify();
@@ -2266,6 +2334,7 @@ impl ChattView {
 
     fn toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.videos.toggle_last_visible() {
+            log::error!("embedded video playback toggle failed: {error:#}");
             self.status = format!("Playback failed: {error}").into();
         }
         cx.notify();
@@ -2274,6 +2343,7 @@ impl ChattView {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, 30.0, 0.0, cx);
         } else if let Err(error) = self.videos.seek_last_visible(-10.0) {
+            log::error!("embedded video shortcut seek failed seconds=-10: {error:#}");
             self.status = format!("Seek failed: {error}").into();
             cx.notify();
         }
@@ -2282,6 +2352,7 @@ impl ChattView {
         if let Some(stream_id) = self.fullscreen_share {
             self.pan_live_view(stream_id, -30.0, 0.0, cx);
         } else if let Err(error) = self.videos.seek_last_visible(10.0) {
+            log::error!("embedded video shortcut seek failed seconds=10: {error:#}");
             self.status = format!("Seek failed: {error}").into();
             cx.notify();
         }

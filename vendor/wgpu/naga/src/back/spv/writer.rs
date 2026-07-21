@@ -3997,12 +3997,17 @@ impl Writer {
         debug_assert!(self.constant_ids.iter().all(|&id| id != 0));
 
         // GLSL specialization constants carry explicit numeric IDs and can be
-        // represented directly in SPIR-V. Other frontends continue resolving
-        // overrides before invoking this backend.
-        for (handle, _) in ir_module.overrides.iter() {
-            self.write_override(handle, ir_module)?;
+        // represented directly in SPIR-V. Pipeline-constant processing leaves
+        // resolved WGSL override records in the arena, so do not emit records
+        // without a SPIR-V specialization ID merely because they remain here.
+        for (handle, r#override) in ir_module.overrides.iter() {
+            if r#override.id.is_some() {
+                self.write_override(handle, ir_module)?;
+            }
         }
-        debug_assert!(self.override_ids.iter().all(|&id| id != 0));
+        debug_assert!(ir_module.overrides.iter().all(|(handle, r#override)| {
+            r#override.id.is_none() || self.override_ids[handle] != 0
+        }));
 
         // write the name of constants on their respective const-expression initializer
         if self.flags.contains(WriterFlags::DEBUG) {
