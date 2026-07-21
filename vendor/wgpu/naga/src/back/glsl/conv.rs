@@ -210,6 +210,11 @@ pub(in crate::back::glsl) fn glsl_storage_format(
     use crate::StorageFormat as Sf;
 
     Ok(match format {
+        Sf::UnknownFloat | Sf::UnknownSint | Sf::UnknownUint => {
+            return Err(Error::Custom(
+                "Formatless storage images cannot be emitted as portable GLSL".into(),
+            ))
+        }
         Sf::R8Unorm => "r8",
         Sf::R8Snorm => "r8_snorm",
         Sf::R8Uint => "r8ui",

@@ -1003,7 +1003,9 @@ impl super::Validator {
                         ));
                     }
                 }
-                if access == crate::StorageAccess::STORE {
+                if access == crate::StorageAccess::STORE
+                    && !self.allow_glsl_write_only_storage_buffers
+                {
                     return Err(GlobalVariableError::StorageAddressSpaceWriteOnlyNotSupported);
                 }
                 (
@@ -1130,9 +1132,15 @@ impl super::Validator {
             }
         }
 
-        if !var.memory_decorations.is_empty()
-            && !matches!(var.space, crate::AddressSpace::Storage { .. })
-        {
+        let storage_memory = matches!(var.space, crate::AddressSpace::Storage { .. })
+            || matches!(
+                gctx.types[var.ty].inner,
+                crate::TypeInner::Image {
+                    class: crate::ImageClass::Storage { .. },
+                    ..
+                }
+            );
+        if !var.memory_decorations.is_empty() && !storage_memory {
             return Err(GlobalVariableError::InvalidMemoryDecorationsAddressSpace);
         }
         if var

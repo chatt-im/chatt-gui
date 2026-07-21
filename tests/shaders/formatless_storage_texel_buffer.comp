@@ -1,0 +1,22 @@
+#version 450
+#extension GL_ARB_compute_shader : enable
+#extension GL_ARB_shader_image_load_store : enable
+#extension GL_ARB_texture_buffer_object : enable
+#extension GL_EXT_shader_image_load_formatted : enable
+
+layout(std430, push_constant) uniform PushC {
+    layout(offset=0) int base_offset;
+};
+layout(constant_id=0) const int pixel_stride = 1;
+layout(binding=0) restrict uniform imageBuffer src;
+layout(binding=1, rgba16) writeonly restrict uniform image1D dst;
+layout(local_size_x=16, local_size_y=1) in;
+
+void main() {
+    int base = base_offset + int(gl_GlobalInvocationID.x) * pixel_stride;
+    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
+    color[0] = imageLoad(src, base + 0).r;
+    color[1] = imageLoad(src, base + 1).r;
+    color[2] = imageLoad(src, base + 2).r;
+    imageStore(dst, int(gl_GlobalInvocationID.x), color);
+}

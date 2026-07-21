@@ -252,6 +252,9 @@ pub fn map_storage_format_from_naga(format: naga::StorageFormat) -> wgt::Texture
     use wgt::TextureFormat as Tf;
 
     match format {
+        Sf::UnknownFloat | Sf::UnknownSint | Sf::UnknownUint => {
+            panic!("formatless storage images have no WebGPU texture format")
+        }
         Sf::R8Unorm => Tf::R8Unorm,
         Sf::R8Snorm => Tf::R8Snorm,
         Sf::R8Uint => Tf::R8Uint,

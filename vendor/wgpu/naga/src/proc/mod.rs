@@ -35,6 +35,9 @@ impl From<super::StorageFormat> for super::Scalar {
     fn from(format: super::StorageFormat) -> Self {
         use super::{ScalarKind as Sk, StorageFormat as Sf};
         let kind = match format {
+            Sf::UnknownFloat => Sk::Float,
+            Sf::UnknownSint => Sk::Sint,
+            Sf::UnknownUint => Sk::Uint,
             Sf::R8Unorm => Sk::Float,
             Sf::R8Snorm => Sk::Float,
             Sf::R8Uint => Sk::Uint,

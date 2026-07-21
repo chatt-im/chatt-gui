@@ -114,7 +114,21 @@ impl Load {
         result_type_id: Word,
     ) -> Result<Load, Error> {
         let opcode = match image_class {
-            crate::ImageClass::Storage { .. } => spirv::Op::ImageRead,
+            crate::ImageClass::Storage { format, .. } => {
+                if matches!(
+                    format,
+                    crate::StorageFormat::UnknownFloat
+                        | crate::StorageFormat::UnknownSint
+                        | crate::StorageFormat::UnknownUint
+                        | crate::StorageFormat::Bgra8Unorm
+                ) {
+                    ctx.writer.require_any(
+                        "formatless storage image read",
+                        &[spirv::Capability::StorageImageReadWithoutFormat],
+                    )?;
+                }
+                spirv::Op::ImageRead
+            }
             crate::ImageClass::Depth { .. } | crate::ImageClass::Sampled { .. } => {
                 spirv::Op::ImageFetch
             }
@@ -1302,12 +1316,16 @@ impl BlockContext<'_> {
             crate::TypeInner::Image {
                 class:
                     crate::ImageClass::Storage {
-                        format: crate::StorageFormat::Bgra8Unorm,
+                        format:
+                            crate::StorageFormat::UnknownFloat
+                            | crate::StorageFormat::UnknownSint
+                            | crate::StorageFormat::UnknownUint
+                            | crate::StorageFormat::Bgra8Unorm,
                         ..
                     },
                 ..
             } => self.writer.require_any(
-                "Bgra8Unorm storage write",
+                "formatless storage image write",
                 &[spirv::Capability::StorageImageWriteWithoutFormat],
             )?,
             _ => {}

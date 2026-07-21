@@ -752,6 +752,13 @@ bitflags::bitflags! {
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub enum StorageFormat {
+    /// Formatless floating-point storage image for direct SPIR-V emission.
+    UnknownFloat,
+    /// Formatless signed-integer storage image for direct SPIR-V emission.
+    UnknownSint,
+    /// Formatless unsigned-integer storage image for direct SPIR-V emission.
+    UnknownUint,
+
     // 8-bit formats
     R8Unorm,
     R8Snorm,

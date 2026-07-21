@@ -954,6 +954,8 @@ pub struct Writer {
     wrapped_functions: crate::FastHashMap<WrappedFunction, Word>,
     /// Indexed by const-expression handle indexes
     constant_ids: HandleVec<crate::Expression, Word>,
+    /// Indexed by pipeline-overridable constant handle indexes.
+    override_ids: HandleVec<crate::Override, Word>,
     cached_constants: crate::FastHashMap<CachedConstant, Word>,
     global_variables: HandleVec<crate::GlobalVariable, GlobalVariable>,
     std140_compat_uniform_types: crate::FastHashMap<Handle<crate::Type>, Std140CompatTypeInfo>,

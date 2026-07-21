@@ -1,4 +1,4 @@
-use alloc::{string::String, vec};
+use alloc::{format, string::String, vec};
 use core::iter::Peekable;
 
 use pp_rs::token::{PreprocessorError, Token as PPToken, TokenValue as PPTokenValue};
@@ -14,7 +14,7 @@ use super::{
     variables::{GlobalOrConstant, VarDeclaration},
     Frontend, Result,
 };
-use crate::{arena::Handle, proc::ConstValueError, Expression, Module, Span, Type};
+use crate::{ArraySize, arena::Handle, proc::ConstValueError, Expression, Module, Span, Type};
 
 mod declarations;
 mod expressions;
@@ -226,6 +226,79 @@ impl<'source> ParsingContext<'source> {
         }?;
 
         Ok((int, meta))
+    }
+
+    fn parse_array_size(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+    ) -> Result<(ArraySize, Span)> {
+        let (const_expr, meta) = self.parse_constant_expression(
+            frontend,
+            ctx.module,
+            ctx.global_expression_kind_tracker,
+        )?;
+
+        if let Expression::Override(handle) = ctx.module.global_expressions[const_expr] {
+            return Ok((ArraySize::Pending(handle), meta));
+        }
+
+        let value = match ctx.module.to_ctx().get_const_val(const_expr) {
+            Ok(value) => value,
+            Err(ConstValueError::NonConst)
+                if ctx
+                    .global_expression_kind_tracker
+                    .is_const_or_override(const_expr) =>
+            {
+                let mut typifier = crate::front::Typifier::new();
+                let local_variables = crate::Arena::new();
+                let resolve_context = crate::proc::ResolveContext::with_locals(
+                    ctx.module,
+                    &local_variables,
+                    &[],
+                );
+                typifier
+                    .grow(
+                        const_expr,
+                        &ctx.module.global_expressions,
+                        &resolve_context,
+                    )
+                    .map_err(|error| Error {
+                        kind: ErrorKind::SemanticError(
+                            format!("Unable to resolve array size type: {error}").into(),
+                        ),
+                        meta,
+                    })?;
+                let ty = typifier.register_type(const_expr, &mut ctx.module.types);
+                let handle = ctx.module.overrides.append(
+                    crate::Override {
+                        name: None,
+                        id: None,
+                        ty,
+                        init: Some(const_expr),
+                    },
+                    meta,
+                );
+                return Ok((ArraySize::Pending(handle), meta));
+            }
+            Err(ConstValueError::Negative) => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError("int constant overflows".into()),
+                    meta,
+                });
+            }
+            Err(ConstValueError::NonConst | ConstValueError::InvalidType) => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError("Expected a uint constant".into()),
+                    meta,
+                });
+            }
+        };
+        let value = core::num::NonZeroU32::new(value).ok_or(Error {
+            kind: ErrorKind::SemanticError("Array size must be greater than zero".into()),
+            meta,
+        })?;
+        Ok((ArraySize::Constant(value), meta))
     }
 
     fn parse_constant_expression(

@@ -138,6 +138,7 @@ impl Writer {
             lookup_function_type: crate::FastHashMap::default(),
             wrapped_functions: crate::FastHashMap::default(),
             constant_ids: HandleVec::new(),
+            override_ids: HandleVec::new(),
             cached_constants: crate::FastHashMap::default(),
             global_variables: HandleVec::new(),
             std140_compat_uniform_types: crate::FastHashMap::default(),
@@ -233,6 +234,7 @@ impl Writer {
             lookup_function_type: take(&mut self.lookup_function_type).reclaim(),
             wrapped_functions: take(&mut self.wrapped_functions).reclaim(),
             constant_ids: take(&mut self.constant_ids).reclaim(),
+            override_ids: take(&mut self.override_ids).reclaim(),
             cached_constants: take(&mut self.cached_constants).reclaim(),
             global_variables: take(&mut self.global_variables).reclaim(),
             std140_compat_uniform_types: take(&mut self.std140_compat_uniform_types).reclaim(),
@@ -2257,6 +2259,10 @@ impl Writer {
                     }
 
                     let type_id = self.get_handle_type_id(base);
+                    if let crate::ArraySize::Pending(handle) = size {
+                        let length_id = self.write_override(handle, module)?;
+                        Instruction::type_array(id, type_id, length_id)
+                    } else {
                     match size.resolve(module.to_ctx())? {
                         crate::proc::IndexableLength::Known(length) => {
                             let length_id = self.get_index_constant(length);
@@ -2265,6 +2271,7 @@ impl Writer {
                         crate::proc::IndexableLength::Dynamic => {
                             Instruction::type_runtime_array(id, type_id)
                         }
+                    }
                     }
                 }
                 crate::TypeInner::BindingArray { base, size } => {
@@ -2769,17 +2776,163 @@ impl Writer {
         null_id
     }
 
+    fn write_override(
+        &mut self,
+        handle: Handle<crate::Override>,
+        ir_module: &crate::Module,
+    ) -> Result<Word, Error> {
+        let cached = self.override_ids[handle];
+        if cached != 0 {
+            return Ok(cached);
+        }
+
+        let r#override = &ir_module.overrides[handle];
+        let init = r#override.init.ok_or(Error::Override)?;
+        if r#override.id.is_none() && r#override.name.is_none() {
+            let id = self.write_derived_override(init, r#override.ty, ir_module)?;
+            self.override_ids[handle] = id;
+            return Ok(id);
+        }
+
+        let spec_id = r#override.id.ok_or(Error::Override)?;
+        let literal = match ir_module.global_expressions[init] {
+            crate::Expression::Literal(literal) => literal,
+            _ => return Err(Error::Override),
+        };
+
+        let id = self.id_gen.next();
+        if self.flags.contains(WriterFlags::DEBUG) {
+            if let Some(ref name) = r#override.name {
+                self.debugs.push(Instruction::name(id, name));
+            }
+        }
+        self.decorate(id, spirv::Decoration::SpecId, &[Word::from(spec_id)]);
+
+        let type_id = self.get_handle_type_id(r#override.ty);
+        let instruction = match literal {
+            crate::Literal::F64(value) => {
+                let bits = value.to_bits();
+                Instruction::spec_constant(type_id, id, &[bits as u32, (bits >> 32) as u32])
+            }
+            crate::Literal::F32(value) => {
+                Instruction::spec_constant(type_id, id, &[value.to_bits()])
+            }
+            crate::Literal::F16(value) => {
+                Instruction::spec_constant(type_id, id, &[u32::from(value.to_bits())])
+            }
+            crate::Literal::U32(value) => Instruction::spec_constant(type_id, id, &[value]),
+            crate::Literal::I32(value) => {
+                Instruction::spec_constant(type_id, id, &[value as u32])
+            }
+            crate::Literal::U64(value) => {
+                Instruction::spec_constant(type_id, id, &[value as u32, (value >> 32) as u32])
+            }
+            crate::Literal::I64(value) => {
+                Instruction::spec_constant(type_id, id, &[value as u32, (value >> 32) as u32])
+            }
+            crate::Literal::Bool(true) => Instruction::spec_constant_true(type_id, id),
+            crate::Literal::Bool(false) => Instruction::spec_constant_false(type_id, id),
+            crate::Literal::AbstractInt(_) | crate::Literal::AbstractFloat(_) => {
+                unreachable!("Abstract types should not appear in IR presented to backends");
+            }
+        };
+        instruction.to_words(&mut self.logical_layout.declarations);
+        self.override_ids[handle] = id;
+        Ok(id)
+    }
+
+    fn write_derived_override(
+        &mut self,
+        handle: Handle<crate::Expression>,
+        ty: Handle<crate::Type>,
+        ir_module: &crate::Module,
+    ) -> Result<Word, Error> {
+        let cached = self.constant_ids[handle];
+        if cached != 0 {
+            return Ok(cached);
+        }
+
+        let id = match ir_module.global_expressions[handle] {
+            crate::Expression::Literal(literal) => self.get_constant_scalar(literal),
+            crate::Expression::Constant(constant) => {
+                self.write_derived_override(ir_module.constants[constant].init, ty, ir_module)?
+            }
+            crate::Expression::Override(r#override) => {
+                self.write_override(r#override, ir_module)?
+            }
+            crate::Expression::Binary { op, left, right } => {
+                use crate::BinaryOperator as Bo;
+                let scalar_kind = match ir_module.types[ty].inner {
+                    crate::TypeInner::Scalar(scalar) => scalar.kind,
+                    _ => return Err(Error::Override),
+                };
+                let op = match op {
+                    Bo::Add => match scalar_kind {
+                        crate::ScalarKind::Float => spirv::Op::FAdd,
+                        _ => spirv::Op::IAdd,
+                    },
+                    Bo::Subtract => match scalar_kind {
+                        crate::ScalarKind::Float => spirv::Op::FSub,
+                        _ => spirv::Op::ISub,
+                    },
+                    Bo::Multiply => match scalar_kind {
+                        crate::ScalarKind::Float => spirv::Op::FMul,
+                        _ => spirv::Op::IMul,
+                    },
+                    Bo::Divide => match scalar_kind {
+                        crate::ScalarKind::Sint => spirv::Op::SDiv,
+                        crate::ScalarKind::Uint => spirv::Op::UDiv,
+                        crate::ScalarKind::Float => spirv::Op::FDiv,
+                        _ => return Err(Error::Override),
+                    },
+                    Bo::Modulo => match scalar_kind {
+                        crate::ScalarKind::Sint => spirv::Op::SRem,
+                        crate::ScalarKind::Uint => spirv::Op::UMod,
+                        crate::ScalarKind::Float => spirv::Op::FRem,
+                        _ => return Err(Error::Override),
+                    },
+                    Bo::And => spirv::Op::BitwiseAnd,
+                    Bo::InclusiveOr => spirv::Op::BitwiseOr,
+                    Bo::ExclusiveOr => spirv::Op::BitwiseXor,
+                    Bo::ShiftLeft => spirv::Op::ShiftLeftLogical,
+                    Bo::ShiftRight => match scalar_kind {
+                        crate::ScalarKind::Sint => spirv::Op::ShiftRightArithmetic,
+                        _ => spirv::Op::ShiftRightLogical,
+                    },
+                    _ => return Err(Error::Override),
+                };
+                let left = self.write_derived_override(left, ty, ir_module)?;
+                let right = self.write_derived_override(right, ty, ir_module)?;
+                let id = self.id_gen.next();
+                let type_id = self.get_handle_type_id(ty);
+                Instruction::spec_constant_op(type_id, id, op, &[left, right])
+                    .to_words(&mut self.logical_layout.declarations);
+                id
+            }
+            _ => return Err(Error::Override),
+        };
+        self.constant_ids[handle] = id;
+        Ok(id)
+    }
+
     fn write_constant_expr(
         &mut self,
         handle: Handle<crate::Expression>,
         ir_module: &crate::Module,
         mod_info: &ModuleInfo,
     ) -> Result<Word, Error> {
+        let cached = self.constant_ids[handle];
+        if cached != 0 {
+            return Ok(cached);
+        }
         let id = match ir_module.global_expressions[handle] {
             crate::Expression::Literal(literal) => self.get_constant_scalar(literal),
             crate::Expression::Constant(constant) => {
                 let constant = &ir_module.constants[constant];
                 self.constant_ids[constant.init]
+            }
+            crate::Expression::Override(r#override) => {
+                self.write_override(r#override, ir_module)?
             }
             crate::Expression::ZeroValue(ty) => {
                 let type_id = self.get_handle_type_id(ty);
@@ -3821,6 +3974,10 @@ impl Writer {
             }
         }
 
+        self.constant_ids
+            .resize(ir_module.global_expressions.len(), 0);
+        self.override_ids.resize(ir_module.overrides.len(), 0);
+
         // write all types
         for (handle, _) in ir_module.types.iter() {
             self.write_type_declaration_arena(ir_module, handle)?;
@@ -3834,12 +3991,18 @@ impl Writer {
         }
 
         // write all const-expressions as constants
-        self.constant_ids
-            .resize(ir_module.global_expressions.len(), 0);
         for (handle, _) in ir_module.global_expressions.iter() {
             self.write_constant_expr(handle, ir_module, mod_info)?;
         }
         debug_assert!(self.constant_ids.iter().all(|&id| id != 0));
+
+        // GLSL specialization constants carry explicit numeric IDs and can be
+        // represented directly in SPIR-V. Other frontends continue resolving
+        // overrides before invoking this backend.
+        for (handle, _) in ir_module.overrides.iter() {
+            self.write_override(handle, ir_module)?;
+        }
+        debug_assert!(self.override_ids.iter().all(|&id| id != 0));
 
         // write the name of constants on their respective const-expression initializer
         if self.flags.contains(WriterFlags::DEBUG) {

@@ -45,6 +45,8 @@ pub enum TokenValue {
     /// The associated [`crate::StorageAccess`] is the access being allowed
     /// (for example `writeonly` has an associated value of [`crate::StorageAccess::STORE`])
     MemoryQualifier(crate::StorageAccess),
+    /// A GLSL memory visibility qualifier such as `coherent` or `volatile`.
+    MemoryDecoration(crate::MemoryDecorations),
 
     Invariant,
     Interpolation(Interpolation),

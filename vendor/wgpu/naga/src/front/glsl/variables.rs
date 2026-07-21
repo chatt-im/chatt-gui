@@ -599,14 +599,12 @@ impl Frontend {
 
                                 match qualifiers.layout_qualifiers.remove(&QualifierKey::Format) {
                                     Some((QualifierValue::Format(f), _)) => format = f,
-                                    // TODO: glsl supports images without format qualifier
-                                    // if they are `writeonly`
-                                    None => self.errors.push(Error {
-                                        kind: ErrorKind::SemanticError(
-                                            "image types require a format layout qualifier".into(),
-                                        ),
-                                        meta,
-                                    }),
+                                    // GLSL permits formatless storage images when
+                                    // the corresponding load/store extension is
+                                    // enabled. The type parser's formatless marker
+                                    // preserves the scalar kind for direct SPIR-V
+                                    // emission.
+                                    None => {}
                                     _ => unreachable!(),
                                 }
 
@@ -661,6 +659,25 @@ impl Frontend {
                     ty = mark_workgroup_arrays(&mut ctx.module.types, ty, meta);
                 }
 
+                let accepts_memory_decorations = matches!(space, AddressSpace::Storage { .. })
+                    || matches!(
+                        ctx.module.types[ty].inner,
+                        TypeInner::Image {
+                            class: crate::ImageClass::Storage { .. },
+                            ..
+                        }
+                    );
+                let memory_decorations = if accepts_memory_decorations {
+                    qualifiers
+                        .memory_decorations
+                        .take()
+                        .map_or(crate::MemoryDecorations::empty(), |(decorations, _)| {
+                            decorations
+                        })
+                } else {
+                    crate::MemoryDecorations::empty()
+                };
+
                 let handle = ctx.module.global_variables.append(
                     GlobalVariable {
                         name: name.clone(),
@@ -668,7 +685,7 @@ impl Frontend {
                         binding,
                         ty,
                         init,
-                        memory_decorations: crate::MemoryDecorations::empty(),
+                        memory_decorations,
                     },
                     meta,
                 );

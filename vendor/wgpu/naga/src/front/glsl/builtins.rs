@@ -1807,7 +1807,13 @@ impl MacroCall {
 
                 // Parse out explicit texture level.
                 let mut level = match level_type {
-                    TextureLevelType::None => SampleLevel::Auto,
+                    // GLSL only uses implicit derivatives for texture() in a
+                    // fragment shader. In every other stage, texture() samples
+                    // the base mip level (plus an optional bias).
+                    TextureLevelType::None => match frontend.meta.stage {
+                        crate::ShaderStage::Fragment => SampleLevel::Auto,
+                        _ => SampleLevel::Zero,
+                    },
 
                     TextureLevelType::Lod => {
                         num_args += 1;
@@ -1851,10 +1857,12 @@ impl MacroCall {
 
                 // Now go back and look for optional bias arg (if available)
                 if let TextureLevelType::None = level_type {
-                    level = args
-                        .get(num_args)
-                        .copied()
-                        .map_or(SampleLevel::Auto, SampleLevel::Bias);
+                    if let Some(bias) = args.get(num_args).copied() {
+                        level = match frontend.meta.stage {
+                            crate::ShaderStage::Fragment => SampleLevel::Bias(bias),
+                            _ => SampleLevel::Exact(bias),
+                        };
+                    }
                 }
 
                 texture_call(ctx, args[0], None, level, comps, texture_offset, meta)?

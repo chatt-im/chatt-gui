@@ -1,0 +1,18 @@
+#version 450
+#extension GL_ARB_compute_shader : enable
+#extension GL_ARB_shader_image_load_store : enable
+
+layout(constant_id=0) const int ring_size = 1;
+layout(constant_id=1) const int rows = 1;
+layout(binding=0, rgba32f) writeonly restrict uniform image2D output_image;
+layout(local_size_x=16, local_size_y=1) in;
+
+shared uint error_ring[ring_size * rows];
+
+void main() {
+    uint index = gl_LocalInvocationIndex % uint(ring_size);
+    error_ring[index] = 0u;
+    barrier();
+    atomicAdd(error_ring[(index + 1u) % uint(ring_size)], 1u);
+    imageStore(output_image, ivec2(gl_GlobalInvocationID.xy), vec4(error_ring[index]));
+}

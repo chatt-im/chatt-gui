@@ -211,6 +211,8 @@ pub struct TypeQualifiers<'a> {
     /// Memory qualifiers used in the declaration to set the storage access to be used
     /// in declarations that support it (storage images and buffers)
     pub storage_access: Option<(StorageAccess, Span)>,
+    /// Memory visibility decorations used by storage images and buffers.
+    pub memory_decorations: Option<(crate::MemoryDecorations, Span)>,
     pub layout_qualifiers: crate::FastHashMap<QualifierKey<'a>, (QualifierValue, Span)>,
 }
 
@@ -248,6 +250,15 @@ impl<'a> TypeQualifiers<'a> {
             errors.push(super::Error {
                 kind: super::ErrorKind::SemanticError(
                     "Memory qualifiers can only be used in storage variables".into(),
+                ),
+                meta,
+            });
+        }
+
+        if let Some((_, meta)) = self.memory_decorations {
+            errors.push(super::Error {
+                kind: super::ErrorKind::SemanticError(
+                    "Memory decorations can only be used in storage variables".into(),
                 ),
                 meta,
             });

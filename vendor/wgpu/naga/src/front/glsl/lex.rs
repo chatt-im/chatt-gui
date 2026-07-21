@@ -10,7 +10,7 @@ use super::{
     token::{Directive, DirectiveKind, Token, TokenValue},
     types::parse_type,
 };
-use crate::{FastHashMap, Span, StorageAccess};
+use crate::{FastHashMap, MemoryDecorations, Span, StorageAccess};
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -90,6 +90,12 @@ impl Iterator for Lexer<'_> {
                     "restrict" => TokenValue::Restrict,
                     "readonly" => TokenValue::MemoryQualifier(StorageAccess::LOAD),
                     "writeonly" => TokenValue::MemoryQualifier(StorageAccess::STORE),
+                    "coherent" => {
+                        TokenValue::MemoryDecoration(MemoryDecorations::COHERENT)
+                    }
+                    "volatile" => {
+                        TokenValue::MemoryDecoration(MemoryDecorations::VOLATILE)
+                    }
                     // values
                     "true" => TokenValue::BoolConstant(true),
                     "false" => TokenValue::BoolConstant(false),

@@ -1,6 +1,4 @@
 use alloc::{vec, vec::Vec};
-use core::num::NonZeroU32;
-
 use crate::{
     front::glsl::{
         ast::{QualifierKey, QualifierValue, StorageQualifier, StructLayout, TypeQualifiers},
@@ -42,14 +40,10 @@ impl ParsingContext<'_> {
                 span.subsume(meta);
                 ArraySize::Dynamic
             } else {
-                let (value, constant_span) = self.parse_uint_constant(frontend, ctx)?;
-                let size = NonZeroU32::new(value).ok_or(Error {
-                    kind: ErrorKind::SemanticError("Array size must be greater than zero".into()),
-                    meta: constant_span,
-                })?;
+                let (size, _) = self.parse_array_size(frontend, ctx)?;
                 let end_span = self.expect(frontend, TokenValue::RightBracket)?.meta;
                 span.subsume(end_span);
-                ArraySize::Constant(size)
+                size
             };
 
             frontend.layouter.update(ctx.module.to_ctx()).unwrap();
@@ -161,6 +155,7 @@ impl ParsingContext<'_> {
             | TokenValue::Buffer
             | TokenValue::Restrict
             | TokenValue::MemoryQualifier(_)
+            | TokenValue::MemoryDecoration(_)
             | TokenValue::Layout => true,
             _ => false,
         })
@@ -291,6 +286,21 @@ impl ParsingContext<'_> {
 
                     storage_access.0 &= access;
                     storage_access.1.subsume(token.meta);
+                }
+                TokenValue::MemoryDecoration(decoration) => {
+                    let memory_decorations = qualifiers
+                        .memory_decorations
+                        .get_or_insert((crate::MemoryDecorations::empty(), Span::default()));
+                    if memory_decorations.0.intersects(decoration) {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "The same memory qualifier can only be used once".into(),
+                            ),
+                            meta: token.meta,
+                        });
+                    }
+                    memory_decorations.0.insert(decoration);
+                    memory_decorations.1.subsume(token.meta);
                 }
                 TokenValue::Restrict => continue,
                 _ => unreachable!(),

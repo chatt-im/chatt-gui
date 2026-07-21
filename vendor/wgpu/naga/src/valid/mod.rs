@@ -210,9 +210,9 @@ bitflags::bitflags! {
         const DRAW_INDEX = 1 << 39;
         /// Support for binding arrays of acceleration structures.
         const ACCELERATION_STRUCTURE_BINDING_ARRAY = 1 << 40;
-        /// Support for the `@coherent` memory decoration on storage buffers.
+        /// Support for the `@coherent` memory decoration on storage resources.
         const MEMORY_DECORATION_COHERENT = 1 << 41;
-        /// Support for the `@volatile` memory decoration on storage buffers.
+        /// Support for the `@volatile` memory decoration on storage resources.
         const MEMORY_DECORATION_VOLATILE = 1 << 42;
     }
 }
@@ -374,6 +374,11 @@ pub struct Validator {
     /// Accept GLSL's representation of 32-bit integer atomics, where the
     /// pointee remains an ordinary scalar instead of `TypeInner::Atomic`.
     allow_glsl_scalar_atomics: bool,
+
+    /// Accept GLSL `writeonly` storage buffers. SPIR-V can represent these
+    /// directly with the `NonReadable` decoration, while Naga's portable IR
+    /// normally requires storage buffers to remain readable.
+    allow_glsl_write_only_storage_buffers: bool,
 
     /// A checklist of expressions that must be visited by a specific kind of
     /// statement.
@@ -618,6 +623,7 @@ impl Validator {
             override_ids: FastHashSet::default(),
             overrides_resolved: false,
             allow_glsl_scalar_atomics: false,
+            allow_glsl_write_only_storage_buffers: false,
             needs_visit: HandleSet::new(),
             trace_rays_vertex_return: TraceRayVertexReturnState::NoTraceRays,
             trace_rays_payload_type: None,
@@ -632,6 +638,20 @@ impl Validator {
     /// backends rely on the normal atomic pointee invariant.
     pub const fn allow_glsl_scalar_atomics(&mut self, allow: bool) -> &mut Self {
         self.allow_glsl_scalar_atomics = allow;
+        self
+    }
+
+    /// Permit GLSL `writeonly` storage buffers.
+    ///
+    /// Enable this only for a GLSL module that will be emitted directly as
+    /// SPIR-V. The SPIR-V backend preserves the access restriction with a
+    /// `NonReadable` decoration, but other backends rely on Naga's portable
+    /// storage-buffer access invariant.
+    pub const fn allow_glsl_write_only_storage_buffers(
+        &mut self,
+        allow: bool,
+    ) -> &mut Self {
+        self.allow_glsl_write_only_storage_buffers = allow;
         self
     }
 

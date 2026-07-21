@@ -432,6 +432,20 @@ impl super::Instruction {
         instruction
     }
 
+    pub(super) fn spec_constant_true(result_type_id: Word, id: Word) -> Self {
+        let mut instruction = Self::new(Op::SpecConstantTrue);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+        instruction
+    }
+
+    pub(super) fn spec_constant_false(result_type_id: Word, id: Word) -> Self {
+        let mut instruction = Self::new(Op::SpecConstantFalse);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+        instruction
+    }
+
     pub(super) fn constant_16bit(result_type_id: Word, id: Word, low: Word) -> Self {
         Self::constant(result_type_id, id, &[low])
     }
@@ -451,6 +465,36 @@ impl super::Instruction {
 
         for value in values {
             instruction.add_operand(*value);
+        }
+
+        instruction
+    }
+
+    pub(super) fn spec_constant(result_type_id: Word, id: Word, values: &[Word]) -> Self {
+        let mut instruction = Self::new(Op::SpecConstant);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+
+        for value in values {
+            instruction.add_operand(*value);
+        }
+
+        instruction
+    }
+
+    pub(super) fn spec_constant_op(
+        result_type_id: Word,
+        id: Word,
+        op: Op,
+        operands: &[Word],
+    ) -> Self {
+        let mut instruction = Self::new(Op::SpecConstantOp);
+        instruction.set_type(result_type_id);
+        instruction.set_result(id);
+        instruction.add_operand(op as Word);
+
+        for operand in operands {
+            instruction.add_operand(*operand);
         }
 
         instruction
@@ -1338,6 +1382,7 @@ impl From<crate::StorageFormat> for spirv::ImageFormat {
     fn from(format: crate::StorageFormat) -> Self {
         use crate::StorageFormat as Sf;
         match format {
+            Sf::UnknownFloat | Sf::UnknownSint | Sf::UnknownUint => Self::Unknown,
             Sf::R8Unorm => Self::R8,
             Sf::R8Snorm => Self::R8Snorm,
             Sf::R8Uint => Self::R8ui,

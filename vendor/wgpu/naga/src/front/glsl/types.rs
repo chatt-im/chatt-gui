@@ -207,10 +207,15 @@ pub fn parse_type(type_name: &str) -> Option<Type> {
                 let kind = iter.next()?;
                 let size = iter.next()?;
                 // TODO: Check that the texture format and the kind match
-                let _ = texture_kind(kind)?;
+                let kind = texture_kind(kind)?;
 
                 let class = ImageClass::Storage {
-                    format: crate::StorageFormat::R8Uint,
+                    format: match kind {
+                        ScalarKind::Float => crate::StorageFormat::UnknownFloat,
+                        ScalarKind::Sint => crate::StorageFormat::UnknownSint,
+                        ScalarKind::Uint => crate::StorageFormat::UnknownUint,
+                        _ => unreachable!(),
+                    },
                     access: crate::StorageAccess::LOAD | crate::StorageAccess::STORE,
                 };
 

@@ -6,6 +6,7 @@
 
 use std::{
     any::Any,
+    borrow::Cow,
     ffi::OsString,
     mem,
     panic::{self, AssertUnwindSafe},
@@ -320,9 +321,10 @@ fn validate_target_versions(
 fn compile_glsl(request: CompileRequest<'_>) -> Result<Vec<u32>, String> {
     dump_shader_if_requested(&request);
 
+    let parse_source = promote_vulkan_glsl_version(request.source);
     let mut frontend = glsl::Frontend::default();
     let options = glsl::Options::from(request.stage);
-    let module = frontend.parse(&options, request.source).map_err(|error| {
+    let module = frontend.parse(&options, &parse_source).map_err(|error| {
         format!(
             "{} shader: Naga parse failed:\n{}",
             request.stage_name,
@@ -345,6 +347,7 @@ fn compile_glsl(request: CompileRequest<'_>) -> Result<Vec<u32>, String> {
         spv::supported_capabilities(),
     );
     validator.allow_glsl_scalar_atomics(true);
+    validator.allow_glsl_write_only_storage_buffers(true);
     let info = validator.validate(&module).map_err(|error| {
         format!(
             "{} shader: Naga validation failed:\n{}",
@@ -402,6 +405,49 @@ fn compile_glsl(request: CompileRequest<'_>) -> Result<Vec<u32>, String> {
             (request.spirv_version >> 8) & 0xff,
         )
     })
+}
+
+fn promote_vulkan_glsl_version(source: &str) -> Cow<'_, str> {
+    let first_line_end = source.find('\n').unwrap_or(source.len());
+    let first_line = &source[..first_line_end];
+    let Some(hash) = first_line.find('#') else {
+        return Cow::Borrowed(source);
+    };
+    if !first_line[..hash].chars().all(char::is_whitespace) {
+        return Cow::Borrowed(source);
+    }
+
+    let after_hash = &first_line[hash + 1..];
+    let directive_start = after_hash.len() - after_hash.trim_start().len();
+    let directive = &after_hash[directive_start..];
+    let Some(after_version) = directive.strip_prefix("version") else {
+        return Cow::Borrowed(source);
+    };
+    if after_version
+        .chars()
+        .next()
+        .is_some_and(|ch| !ch.is_whitespace())
+    {
+        return Cow::Borrowed(source);
+    }
+
+    let digits_ws = after_version.len() - after_version.trim_start().len();
+    let digits = after_version[digits_ws..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count();
+    if digits != 3 {
+        return Cow::Borrowed(source);
+    }
+    let digits_start = hash + 1 + directive_start + "version".len() + digits_ws;
+    let version = &source[digits_start..digits_start + digits];
+    if !matches!(version, "410" | "420" | "430" | "440") {
+        return Cow::Borrowed(source);
+    }
+
+    let mut promoted = source.to_owned();
+    promoted.replace_range(digits_start..digits_start + digits, "450");
+    Cow::Owned(promoted)
 }
 
 fn enforce_compute_limits(
@@ -583,6 +629,16 @@ mod tests {
     }
 
     #[test]
+    fn promotes_older_libplacebo_raster_shaders_for_vulkan() {
+        let vertex = "#version 410\nlayout(location=0) in vec2 vertex_pos;\nlayout(location=1) in vec3 vertex_color;\nlayout(location=0) out vec3 frag_color;\nvoid main() { gl_Position = vec4(vertex_pos, 0, 1); frag_color = vertex_color; }\n";
+        let fragment = "#version 410\nlayout(location=0) in vec3 frag_color;\nlayout(location=0) out vec4 out_color;\nvoid main() { out_color = vec4(frag_color, 1.0); }\n";
+
+        assert!(compile(&request(STAGE_VERTEX, vertex, SPIRV_1_5)).is_ok());
+        assert!(compile(&request(STAGE_FRAGMENT, fragment, SPIRV_1_5)).is_ok());
+        assert!(matches!(promote_vulkan_glsl_version(VERTEX), Cow::Borrowed(_)));
+    }
+
+    #[test]
     fn emits_requested_spirv_target_versions() {
         for version in [SPIRV_1_5, SPIRV_1_6] {
             let words = compile(&request(STAGE_VERTEX, VERTEX, version)).unwrap();
@@ -643,6 +699,36 @@ mod tests {
                 "storage-texel-buffer",
                 STAGE_COMPUTE,
                 include_str!("../tests/shaders/storage_texel_buffer.comp"),
+            ),
+            (
+                "write-only-storage-buffer",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/storage_buffer_writeonly.comp"),
+            ),
+            (
+                "formatless-storage-texel-buffer",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/formatless_storage_texel_buffer.comp"),
+            ),
+            (
+                "h274-vector-modulo",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/h274_vector_modulo.comp"),
+            ),
+            (
+                "error-diffusion-specialized-shared",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/error_diffusion_specialized_shared.comp"),
+            ),
+            (
+                "compute-implicit-texture",
+                STAGE_COMPUTE,
+                include_str!("../tests/shaders/compute_implicit_texture.comp"),
+            ),
+            (
+                "coherent-storage",
+                STAGE_FRAGMENT,
+                include_str!("../tests/shaders/coherent_storage.frag"),
             ),
         ] {
             let words = compile(&request(stage, source, SPIRV_1_5)).unwrap();
@@ -780,10 +866,84 @@ mod tests {
         assert!(instructions(&storage_texel_buffer).any(|(opcode, operands)| {
             opcode == 17 && operands.first() == Some(&47)
         }), "missing ImageBuffer capability");
+
+        let write_only_storage = compile(&request(
+            STAGE_COMPUTE,
+            include_str!("../tests/shaders/storage_buffer_writeonly.comp"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&write_only_storage, 50), "missing OpSpecConstant");
+        assert!(instructions(&write_only_storage).any(|(opcode, operands)| {
+            opcode == 71 && operands.get(1) == Some(&1) && operands.get(2) == Some(&0)
+        }), "missing SpecId 0 decoration");
+        assert!(instructions(&write_only_storage).any(|(opcode, operands)| {
+            opcode == 71 && operands.get(1) == Some(&1) && operands.get(2) == Some(&1)
+        }), "missing SpecId 1 decoration");
+        assert!(instructions(&write_only_storage).any(|(opcode, operands)| {
+            opcode == 71 && operands.get(1) == Some(&25)
+        }), "missing NonReadable decoration for write-only storage buffer");
+
+        let formatless_storage = compile(&request(
+            STAGE_COMPUTE,
+            include_str!("../tests/shaders/formatless_storage_texel_buffer.comp"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&formatless_storage, 98), "missing OpImageRead");
+        assert!(contains_opcode(&formatless_storage, 99), "missing OpImageWrite");
+        assert!(instructions(&formatless_storage).any(|(opcode, operands)| {
+            opcode == 25
+                && operands.len() >= 8
+                && operands[2] == 5
+                && operands[6] == 2
+                && operands[7] == 0
+        }), "missing unknown-format storage Buffer OpTypeImage");
+        assert!(instructions(&formatless_storage).any(|(opcode, operands)| {
+            opcode == 17 && operands.first() == Some(&55)
+        }), "missing StorageImageReadWithoutFormat capability");
+
+        let specialized_shared = compile(&request(
+            STAGE_COMPUTE,
+            include_str!("../tests/shaders/error_diffusion_specialized_shared.comp"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        let spec_constant = instructions(&specialized_shared)
+            .find_map(|(opcode, operands)| (opcode == 52).then(|| operands[1]))
+            .expect("missing derived specialized shared-array length");
+        assert!(instructions(&specialized_shared).any(|(opcode, operands)| {
+            opcode == 28 && operands.get(2) == Some(&spec_constant)
+        }), "OpTypeArray does not use the specialization constant length");
+
+        let compute_texture = compile(&request(
+            STAGE_COMPUTE,
+            include_str!("../tests/shaders/compute_implicit_texture.comp"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert!(contains_opcode(&compute_texture, 88), "missing explicit-LOD sample");
+        assert!(!contains_opcode(&compute_texture, 87), "compute texture() used implicit LOD");
+
+        let coherent_storage = compile(&request(
+            STAGE_FRAGMENT,
+            include_str!("../tests/shaders/coherent_storage.frag"),
+            SPIRV_1_5,
+        ))
+        .unwrap();
+        assert_eq!(
+            instructions(&coherent_storage)
+                .filter(|(opcode, operands)| {
+                    *opcode == 71 && operands.get(1) == Some(&23)
+                })
+                .count(),
+            2,
+            "missing Coherent decorations for storage image and buffer"
+        );
     }
 
     #[test]
-    fn scalar_atomics_are_enabled_only_for_the_glsl_spirv_bridge() {
+    fn glsl_spirv_validation_relaxations_are_bridge_scoped() {
         let source = "#version 450\nlayout(local_size_x=1) in;\nshared uint value;\nvoid main() { atomicAdd(value, 1u); }\n";
         let mut frontend = glsl::Frontend::default();
         let module = frontend
@@ -801,6 +961,25 @@ mod tests {
             spv::supported_capabilities(),
         );
         glsl_spirv.allow_glsl_scalar_atomics(true);
+        assert!(glsl_spirv.validate(&module).is_ok());
+
+        let source = include_str!("../tests/shaders/storage_buffer_writeonly.comp");
+        let mut frontend = glsl::Frontend::default();
+        let module = frontend
+            .parse(&glsl::Options::from(ShaderStage::Compute), source)
+            .unwrap();
+
+        let mut portable = Validator::new(
+            ValidationFlags::all(),
+            spv::supported_capabilities(),
+        );
+        assert!(portable.validate(&module).is_err());
+
+        let mut glsl_spirv = Validator::new(
+            ValidationFlags::all(),
+            spv::supported_capabilities(),
+        );
+        glsl_spirv.allow_glsl_write_only_storage_buffers(true);
         assert!(glsl_spirv.validate(&module).is_ok());
     }
 

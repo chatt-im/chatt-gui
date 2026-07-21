@@ -1154,7 +1154,7 @@ impl<'a> ConstantEvaluator<'a> {
                     Ok(self.append_expr(expr, span, ExpressionKind::Override))
                 }
                 Behavior::Glsl(GlslRestrictions::Const) => {
-                    Err(ConstantEvaluatorError::OverrideExpr)
+                    Ok(self.append_expr(expr, span, ExpressionKind::Override))
                 }
             },
             ExpressionKind::Runtime => {

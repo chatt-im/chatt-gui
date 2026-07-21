@@ -247,6 +247,9 @@ impl ToWgsl for crate::StorageFormat {
         use crate::StorageFormat as Sf;
 
         match self {
+            Sf::UnknownFloat => "__naga_formatless_float",
+            Sf::UnknownSint => "__naga_formatless_sint",
+            Sf::UnknownUint => "__naga_formatless_uint",
             Sf::R8Unorm => "r8unorm",
             Sf::R8Snorm => "r8snorm",
             Sf::R8Uint => "r8uint",
