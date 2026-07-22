@@ -29,7 +29,7 @@ contains the six enabled FFmpeg library descriptions, libplacebo, the libva
 and nv-codec header/loader shims, and copied-value descriptions for the system
 ALSA and Vulkan loaders. An inherited `PKG_CONFIG_PATH` is removed.
 
-Resolved libplacebo options on the 2026-07-20 verification build were:
+Resolved libplacebo options on the 2026-07-22 verification build were:
 
 ```text
 buildtype=release
@@ -38,9 +38,9 @@ auto_features=disabled
 prefer_static=true
 b_staticpic=true
 c_args=-ffunction-sections -fdata-sections
-cpp_args=-ffunction-sections -fdata-sections
 vulkan=enabled
 naga=enabled
+rust-num-convert=enabled
 vk-proc-addr=disabled
 opengl=disabled
 d3d11=disabled
@@ -58,10 +58,11 @@ fuzz=false
 debug-abort=false
 ```
 
-The normal static archive link extracts only referenced `libplacebo.a` and
-`libstdc++.a` members; neither archive is linked with `--whole-archive`. A
-missing static GCC C++ runtime is a hard build error. ALSA and Vulkan remain
-dynamic.
+The Chatt build supplies libplacebo's locale-independent numeric conversion
+symbols from Rust. `zmij` formats floats, `fast-float` parses them, and the
+integer paths use allocation-free stack buffers. The normal static archive
+link extracts only referenced `libplacebo.a` members, without
+`--whole-archive`; no C++ runtime is linked. ALSA and Vulkan remain dynamic.
 
 ## Compatibility and verification record
 
@@ -94,3 +95,9 @@ and `VK_LAYER_KHRONOS_validation` was not installed. Attachment interaction,
 hardware import, HDR frame comparison against the old compiler, and a
 validation-layer media run therefore remain device/session-level release
 checks rather than automated results.
+
+On the 2026-07-22 build host and release profile, the numeric C ABI benchmark
+parsed a synthetic 65³ RGB LUT in 9.66 ms with libstdc++ `from_chars` and
+9.05 ms with Rust `fast-float`. One million double formats took 35.82 ms with
+libstdc++ `to_chars` and 22.56 ms with Rust `zmij`. No cross-language LTO was
+enabled.

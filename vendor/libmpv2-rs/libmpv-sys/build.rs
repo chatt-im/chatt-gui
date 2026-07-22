@@ -225,7 +225,6 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-lib=static=chatt_vaapi_loader");
-    link_static_cxx_runtime();
     println!("cargo:rustc-link-lib=dylib=dl");
 }
 
@@ -361,10 +360,10 @@ fn build_vendored_libplacebo(source: &Path, out_path: &Path) -> LibplaceboBuild 
         .arg("-Dprefer_static=true")
         .arg("-Db_staticpic=true")
         .arg("-Dc_args=-ffunction-sections -fdata-sections")
-        .arg("-Dcpp_args=-ffunction-sections -fdata-sections")
         .arg("-Dvulkan=enabled")
         .arg("-Dvk-proc-addr=disabled")
         .arg("-Dnaga=enabled")
+        .arg("-Drust-num-convert=enabled")
         .arg("-Dopengl=disabled")
         .arg("-Dd3d11=disabled")
         .arg("-Dshaderc=disabled")
@@ -406,37 +405,6 @@ fn build_vendored_libplacebo(source: &Path, out_path: &Path) -> LibplaceboBuild 
         pkgconfig: library.join("pkgconfig"),
         library,
     }
-}
-
-#[cfg(feature = "vendored")]
-fn link_static_cxx_runtime() {
-    let compiler = env::var_os("CXX").unwrap_or_else(|| "c++".into());
-    let output = Command::new(&compiler)
-        .arg("-print-file-name=libstdc++.a")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to locate static libstdc++ with {compiler:?}: {error}"));
-    assert!(
-        output.status.success(),
-        "C++ compiler failed while locating static libstdc++: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let archive = PathBuf::from(
-        String::from_utf8(output.stdout)
-            .expect("C++ compiler returned a non-UTF-8 archive path")
-            .trim(),
-    );
-    assert!(
-        archive.is_absolute() && archive.is_file(),
-        "a usable static libstdc++.a is required, got {}",
-        archive.display()
-    );
-    let directory = archive
-        .parent()
-        .expect("static libstdc++ archive has no parent directory");
-    println!("cargo:rustc-link-search=native={}", directory.display());
-    // Normal static archive linking extracts only members needed by
-    // libplacebo's convert.cc; whole-archive is intentionally not used.
-    println!("cargo:rustc-link-lib=static=stdc++");
 }
 
 #[cfg(feature = "vendored")]

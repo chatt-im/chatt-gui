@@ -29,6 +29,9 @@ option('shaderc', type: 'feature', value: 'auto',
 option('naga', type: 'feature', value: 'disabled',
        description: 'chatt-gui Rust Naga SPIR-V compiler bridge')
 
+option('rust-num-convert', type: 'feature', value: 'disabled',
+       description: 'Externally supplied Rust numeric conversion backend')
+
 option('lcms', type: 'feature', value: 'auto',
        description: 'LittleCMS 2 support')
 

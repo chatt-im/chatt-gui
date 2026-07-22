@@ -1,4 +1,4 @@
-project('libplacebo', ['c', 'cpp'],
+project('libplacebo', 'c',
   license: 'LGPL2.1+',
   default_options: [
     'buildtype=debugoptimized',
@@ -407,7 +407,14 @@ build_opts = [
 link_args = []
 
 cc = meson.get_compiler('c')
-cxx = meson.get_compiler('cpp')
+rust_num_convert = get_option('rust-num-convert')
+needs_cpp = (not rust_num_convert.enabled() or
+             not get_option('glslang').disabled() or
+             get_option('tests'))
+if needs_cpp
+  add_languages('cpp', native: false)
+  cxx = meson.get_compiler('cpp')
+endif
 
 c_opts = [
   '-D_ISOC99_SOURCE', '-D_ISOC11_SOURCE', '-D_GNU_SOURCE', '-U__STRICT_ANSI__',
@@ -456,8 +463,11 @@ if host_machine.system() == 'windows'
 endif
 
 add_project_arguments(build_opts + c_opts, language: ['c'])
-add_project_arguments(build_opts, language: ['c', 'cpp'])
-add_project_link_arguments(link_args, language: ['c', 'cpp'])
+add_project_link_arguments(link_args, language: ['c'])
+if needs_cpp
+  add_project_arguments(build_opts, language: ['cpp'])
+  add_project_link_arguments(link_args, language: ['cpp'])
+endif
 
 
 # Global dependencies

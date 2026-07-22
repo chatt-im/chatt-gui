@@ -6,6 +6,7 @@ mod formatted_message;
 mod frame_stats;
 mod icons;
 mod image_cache;
+mod libplacebo_numeric;
 mod live_stream;
 mod logger;
 mod media_cache;

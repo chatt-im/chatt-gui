@@ -34,7 +34,10 @@ if host_machine.system() == 'windows' and mingw32 != '' and host_machine.cpu() i
   link_depends += ucrt_math
   # MinGW-w64 inlines functions like powf, rewriting them to pow. We want to use
   # the powf specialization from UCRT, so disable inlining.
-  add_project_arguments(['-D__CRT__NO_INLINE'], language: ['c', 'cpp'])
+  add_project_arguments(['-D__CRT__NO_INLINE'], language: ['c'])
+  if needs_cpp
+    add_project_arguments(['-D__CRT__NO_INLINE'], language: ['cpp'])
+  endif
 endif
 
 # Work around missing atomics on some (obscure) platforms
@@ -92,7 +95,6 @@ sources = [
   'cache.c',
   'colorspace.c',
   'common.c',
-  'convert.cc',
   'dither.c',
   'dispatch.c',
   'dummy.c',
@@ -112,6 +114,10 @@ sources = [
   'utils/frame_queue.c',
   'utils/upload.c',
 ]
+
+if not rust_num_convert.enabled()
+  sources += 'convert.cc'
+endif
 
 # Source files that may use GLSL pragmas, we need to use custom_target
 # to the proper environment and dependency information for these
@@ -238,7 +244,7 @@ if host_machine.system() == 'windows'
                                        include_directories: meson.project_source_root()/'win32')
 endif
 
-if fs.is_dir('../3rdparty/fast_float/include')
+if not rust_num_convert.enabled() and fs.is_dir('../3rdparty/fast_float/include')
   inc_dirs += include_directories('../3rdparty/fast_float/include')
 endif
 

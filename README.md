@@ -11,7 +11,7 @@ The current native build targets Linux. Install:
 
 - Rust and Cargo with Rust 2024 edition support.
 - Git, curl, tar with xz support, make, pkg-config, Meson, and Ninja.
-- A C and C++ toolchain with a static `libstdc++` archive.
+- A C toolchain.
 - Development metadata for ALSA and the Vulkan loader (`alsa.pc` and
   `vulkan.pc`).
 
