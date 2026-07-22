@@ -1,0 +1,21 @@
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -7665,7 +7665,7 @@ enabled libdrm &&
+     check_pkg_config libdrm_getfb2 libdrm "xf86drmMode.h" drmModeGetFB2
+ 
+ enabled vaapi &&
+-    check_pkg_config vaapi "libva >= 0.35.0" "va/va.h" vaInitialize
++    check_pkg_config_cpp vaapi "libva >= 0.35.0" "va/va.h" "VA_CHECK_VERSION(0, 35, 0)"
+ 
+ if enabled vaapi; then
+     case $target_os in
+@@ -7673,7 +7673,7 @@ if enabled vaapi; then
+             check_pkg_config vaapi_win32 "libva-win32" "va/va_win32.h" vaGetDisplayWin32
+             ;;
+         *)
+-            check_pkg_config vaapi_drm "libva-drm" "va/va_drm.h" vaGetDisplayDRM
++            check_pkg_config_cpp vaapi_drm "libva-drm" "va/va_drm.h" "defined VA_DRM_H"
+             ;;
+     esac
+ 

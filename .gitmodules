@@ -1,0 +1,3 @@
+[submodule "vendor/chatt"]
+	path = vendor/chatt
+	url = https://github.com/chatt-im/chatt.git

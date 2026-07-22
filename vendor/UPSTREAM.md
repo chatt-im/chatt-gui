@@ -1,10 +1,11 @@
 # Vendored media and graphics sources
 
-The following source trees were imported without Git metadata or build output:
+The following source trees were imported without Git metadata or build output,
+except for FFmpeg, which is downloaded during setup:
 
 - `mpv`: <https://github.com/mpv-player/mpv>, commit `94335ab` (GPL-2.0-or-later by default; see its license files).
 - `libmpv2-rs`: <https://github.com/kohsine/libmpv-rs>, commit `d7ccfaf` (LGPL-2.1; see its license file).
-- `ffmpeg`: <https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz> (LGPL-2.1-or-later in the vendored configuration; see its license files).
+- `ffmpeg`: <https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz>, SHA-256 `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c` (LGPL-2.1-or-later in the vendored configuration; see its license files). Run `scripts/fetch-ffmpeg.sh` to install the verified source and tracked VAAPI configure patch at the ignored `vendor/ffmpeg` path.
 - `wgpu`: <https://github.com/gfx-rs/wgpu>, commit `e99f530` from the v29 branch (MIT OR Apache-2.0; see its license files).
 - `libplacebo`: <https://code.videolan.org/videolan/libplacebo>, tag `v7.360.1`, commit `cee9b076f2c63104ccfd497fa79c39a867293ec4` (LGPL-2.1-or-later; see `libplacebo/LICENSE`). The release archive was verified with Arch Linux's SHA-512 `ea41f3852a5d877313d1969d771b0ba38338906a2a872abc67d2990f50c68848757616dc21cde1dbaa7e0fd46282e455bc7b3b14bfea14079935ff3afe7096e1` (archive SHA-256 `14c0a99f4b01557ec9826ce6b1d52f6de21be274ba03fd5aab7307f18766dc39`).
 - `libplacebo/3rdparty/Vulkan-Headers`: <https://github.com/KhronosGroup/Vulkan-Headers>, commit `450bd2232225d6c7728a4108055ac2e37cef6475` (Apache-2.0; archive SHA-256 `26df9841c30806a994e2fdf42f7c87bcb1ced9db9a06033469123939fb3fa075`; see its `LICENSE.md`).
@@ -37,7 +38,9 @@ tone-mapping paths remain available without the Dolby Vision reshaper.
 The FFmpeg build is a static decode-only profile for common attachment formats
 and the H.264/HEVC live-share bridge. Keeping it local prevents the binary from
 inheriting every codec and hardware integration enabled by the build host's
-distribution FFmpeg package.
+distribution FFmpeg package. Chatt-specific hardware discovery remains in the
+libmpv loader. The two header-only VAAPI configure probes are maintained as a
+small patch under `patches/`; the downloaded FFmpeg source tree is not tracked.
 
 The libva and nv-codec imports are build-time headers only. CUDA/NVDEC is
 loaded at runtime by FFmpeg/mpv. VAAPI calls go through chatt-gui's small lazy
