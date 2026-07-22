@@ -1,12 +1,8 @@
 use std::borrow::Cow;
 
-use gpui::{App, Font, Pixels, font, px};
-use theme::{ThemeSettingsProvider, UiDensity};
-
-const UI_FONT_FAMILY: &str = "IBM Plex Sans";
-const BUFFER_FONT_FAMILY: &str = "Lilex";
-const UI_FONT_SIZE: Pixels = px(16.);
-const BUFFER_FONT_SIZE: Pixels = px(16.);
+use gpui::App;
+pub(crate) const UI_FONT_FAMILY: &str = "IBM Plex Sans";
+pub(crate) const CODE_FONT_FAMILY: &str = "Lilex";
 
 const IBM_PLEX_SANS_REGULAR: &[u8] =
     include_bytes!("../vendor/zed/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
@@ -35,47 +31,10 @@ fn embedded_fonts() -> Vec<Cow<'static, [u8]>> {
     ]
 }
 
-struct ChattThemeSettings {
-    ui_font: Font,
-    buffer_font: Font,
-}
-
-impl ChattThemeSettings {
-    fn new() -> Self {
-        Self {
-            ui_font: font(UI_FONT_FAMILY),
-            buffer_font: font(BUFFER_FONT_FAMILY),
-        }
-    }
-}
-
-impl ThemeSettingsProvider for ChattThemeSettings {
-    fn ui_font<'a>(&'a self, _cx: &'a App) -> &'a Font {
-        &self.ui_font
-    }
-
-    fn buffer_font<'a>(&'a self, _cx: &'a App) -> &'a Font {
-        &self.buffer_font
-    }
-
-    fn ui_font_size(&self, _cx: &App) -> Pixels {
-        UI_FONT_SIZE
-    }
-
-    fn buffer_font_size(&self, _cx: &App) -> Pixels {
-        BUFFER_FONT_SIZE
-    }
-
-    fn ui_density(&self, _cx: &App) -> UiDensity {
-        UiDensity::Default
-    }
-}
-
 pub fn init(cx: &mut App) {
     cx.text_system()
         .add_fonts(embedded_fonts())
         .expect("failed to load Chatt's bundled UI fonts");
-    theme::set_theme_settings_provider(Box::new(ChattThemeSettings::new()), cx);
 }
 
 #[cfg(test)]
@@ -185,13 +144,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn theme_settings_use_bundled_ui_and_buffer_fonts() {
-        let settings = super::ChattThemeSettings::new();
-
-        assert_eq!(settings.ui_font.family.as_ref(), super::UI_FONT_FAMILY);
-        assert_eq!(settings.buffer_font.family.as_ref(), super::BUFFER_FONT_FAMILY);
-        assert_eq!(super::UI_FONT_SIZE, px(16.));
-        assert_eq!(super::BUFFER_FONT_SIZE, px(16.));
-    }
 }

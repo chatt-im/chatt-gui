@@ -390,7 +390,7 @@ impl IntoElement for SharedString {
 /// and just pass text directly.
 pub struct StyledText {
     text: SharedString,
-    runs: Option<Vec<TextRun>>,
+    runs: Option<Arc<[TextRun]>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     layout: TextLayout,
@@ -524,8 +524,19 @@ impl StyledText {
 
     /// Set the text runs for this piece of text.
     pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
+        self.set_runs(runs.into());
+        self
+    }
+
+    /// Set shared immutable text runs for this piece of text.
+    pub fn with_shared_runs(mut self, runs: Arc<[TextRun]>) -> Self {
+        self.set_runs(runs);
+        self
+    }
+
+    fn set_runs(&mut self, runs: Arc<[TextRun]>) {
         let mut text = &*self.text;
-        for run in &runs {
+        for run in runs.iter() {
             text = text.get(run.len..).unwrap_or_else(|| {
                 #[cfg(debug_assertions)]
                 panic!("invalid text run. Text: '{text}', run: {run:?}");
@@ -535,7 +546,6 @@ impl StyledText {
         }
         assert!(text.is_empty(), "invalid text run");
         self.runs = Some(runs);
-        self
     }
 }
 
@@ -561,14 +571,15 @@ impl Element for StyledText {
         let font_family_overrides = self.delayed_font_family_overrides.take();
         let mut runs = self.runs.take().or_else(|| {
             self.delayed_highlights.take().map(|delayed_highlights| {
-                Self::compute_runs(&self.text, &window.text_style(), delayed_highlights)
+                Self::compute_runs(&self.text, &window.text_style(), delayed_highlights).into()
             })
         });
 
         if let Some(ref overrides) = font_family_overrides {
-            let runs =
-                runs.get_or_insert_with(|| vec![window.text_style().to_run(self.text.len())]);
-            Self::apply_font_family_overrides(runs, overrides);
+            let runs = runs.get_or_insert_with(|| {
+                vec![window.text_style().to_run(self.text.len())].into()
+            });
+            Self::apply_font_family_overrides(Arc::make_mut(runs), overrides);
         }
 
         let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
@@ -627,7 +638,7 @@ impl TextLayout {
     fn layout(
         &self,
         text: SharedString,
-        runs: Option<Vec<TextRun>>,
+        runs: Option<Arc<[TextRun]>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -642,7 +653,7 @@ impl TextLayout {
         let runs = if let Some(runs) = runs {
             runs
         } else {
-            vec![text_style.to_run(text.len())]
+            vec![text_style.to_run(text.len())].into()
         };
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();

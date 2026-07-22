@@ -3,6 +3,7 @@ mod composer;
 mod daemon;
 mod fonts;
 mod frame_stats;
+mod formatted_message;
 mod icons;
 mod image_cache;
 mod live_stream;
@@ -33,7 +34,7 @@ fn main() {
         .with_assets(icons::IconAssets)
         .run(move |cx: &mut App| {
             fonts::init(cx);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            formatted_message::bind_keys(cx);
             app::bind_keys(cx);
             frame_stats::start(cx);
 

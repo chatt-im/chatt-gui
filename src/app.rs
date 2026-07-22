@@ -16,20 +16,19 @@ use gpui::{
     list, point, prelude::*, px, rgb, rgba,
 };
 use local_rpc::{
-    frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
+    frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
     ids::{RoomId, StreamId},
     model::{AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState},
 };
-use markdown::{
-    Markdown, MarkdownElement, MarkdownSelectionArea, MarkdownSelectionGroup, MarkdownSelectionKey,
-    MarkdownStyle,
-};
-
 use crate::{
     composer::Composer,
     daemon::{
         client::{DaemonClient, DaemonEvent},
         reducer,
+    },
+    formatted_message::{
+        FormattedMessage, FormattedMessageElement, MessageSelectionArea, MessageSelectionGroup,
+        MessageSelectionKey, PreparedFormattedMessage,
     },
     icons::{IconName, icon},
     image_cache::{PreviewImageLoader, TimelineImageLoader},
@@ -68,6 +67,51 @@ const MIN_LIVE_PANE_HEIGHT: f32 = 160.0;
 const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
+
+fn formatted_message_candidates(events: &[DaemonEvent]) -> Vec<(RoomId, u64, String)> {
+    let mut candidates = HashMap::new();
+    let mut add_message = |message: &local_rpc::model::Message| {
+        candidates.insert(
+            (message.room_id, message.message_id.0),
+            message.body.clone(),
+        );
+    };
+
+    for event in events {
+        let DaemonEvent::Frame(frame) = event else {
+            continue;
+        };
+        match frame {
+            DaemonFrame::Snapshot { snapshot, .. } => {
+                if let Some(room) = snapshot.room.as_ref() {
+                    for message in &room.messages {
+                        add_message(message);
+                    }
+                }
+            }
+            DaemonFrame::Event(event) => match &event.delta {
+                StateDelta::RoomSnapshot(room) => {
+                    for message in &room.messages {
+                        add_message(message);
+                    }
+                }
+                StateDelta::MessagesPrepended { messages, .. } => {
+                    for message in messages {
+                        add_message(message);
+                    }
+                }
+                StateDelta::MessageUpserted { message } => add_message(message),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    candidates
+        .into_iter()
+        .map(|((room_id, message_id), body)| (room_id, message_id, body))
+        .collect()
+}
 
 type EagerImageKey = AttachmentId;
 
@@ -325,7 +369,6 @@ actions!(
 pub fn bind_keys(cx: &mut App) {
     crate::composer::bind_keys(cx);
     cx.bind_keys([
-        KeyBinding::new("cmd-c", markdown::Copy, Some("Markdown")),
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
         KeyBinding::new("escape", ClosePreview, Some("Chatt && !ChattComposer")),
         KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
@@ -361,8 +404,8 @@ pub struct ChattView {
     pending_scroll: gpui::Pixels,
     scroll_animation_active: bool,
     last_scroll_frame: Option<Instant>,
-    message_markdown: HashMap<u64, gpui::Entity<Markdown>>,
-    timeline_selection: MarkdownSelectionGroup,
+    formatted_messages: HashMap<u64, Rc<FormattedMessage>>,
+    timeline_selection: MessageSelectionGroup,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
     video_scrub: Option<VideoScrub>,
@@ -396,22 +439,43 @@ impl ChattView {
         ));
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let composer = cx.new(Composer::new);
-        let timeline_selection = MarkdownSelectionGroup::new(cx.focus_handle());
+        let timeline_selection = MessageSelectionGroup::new(cx.focus_handle());
         let image_cache = LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         let preview_image_cache =
             LruImageCache::<PreviewImageLoader>::new(PREVIEW_IMAGE_CACHE_BYTES, cx);
         window.focus(&composer.focus_handle(cx), cx);
+        let formatting_executor = cx.background_executor().clone();
         let daemon_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(first_event) = daemon_events.recv().await {
                 let mut events = vec![first_event];
                 while let Ok(event) = daemon_events.try_recv() {
                     events.push(event);
                 }
+                let candidates = formatted_message_candidates(&events);
+                let prepared = if candidates.is_empty() {
+                    Vec::new()
+                } else {
+                    formatting_executor
+                        .spawn(async move {
+                            candidates
+                                .into_iter()
+                                .map(|(room_id, message_id, body)| {
+                                    (
+                                        room_id,
+                                        message_id,
+                                        FormattedMessage::prepare(body),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                };
                 if this
                     .update_in(cx, |this, window, cx| {
                         for event in events {
                             this.apply_daemon_event(event, window, cx);
                         }
+                        this.install_prepared_messages(prepared);
                         cx.notify();
                         log::debug!("daemon event batch notified ChattView");
                     })
@@ -464,7 +528,7 @@ impl ChattView {
             pending_scroll: px(0.),
             scroll_animation_active: false,
             last_scroll_frame: None,
-            message_markdown: HashMap::new(),
+            formatted_messages: HashMap::new(),
             timeline_selection,
             videos,
             video_thumbnails,
@@ -1005,6 +1069,38 @@ impl ChattView {
         }
     }
 
+    fn install_prepared_messages(
+        &mut self,
+        prepared: Vec<(RoomId, u64, PreparedFormattedMessage)>,
+    ) {
+        for (room_id, message_id, prepared) in prepared {
+            if self.model.selected_room != Some(room_id) {
+                continue;
+            }
+            let Ok(index) = self
+                .model
+                .messages
+                .binary_search_by_key(&message_id, |message| message.id)
+            else {
+                continue;
+            };
+            if self.model.messages[index].body.as_str() != prepared.source() {
+                continue;
+            }
+            if self
+                .formatted_messages
+                .get(&message_id)
+                .is_some_and(|formatted| formatted.source() == prepared.source())
+            {
+                continue;
+            }
+            self.formatted_messages.insert(
+                message_id,
+                Rc::new(FormattedMessage::from_prepared(prepared)),
+            );
+        }
+    }
+
     fn apply_daemon_state_frame(
         &mut self,
         frame: DaemonFrame,
@@ -1066,15 +1162,21 @@ impl ChattView {
                 self.model
                     .messages
                     .iter()
-                    .map(|message| MarkdownSelectionKey(message.id)),
+                    .map(|message| MessageSelectionKey(message.id)),
             );
         }
         if self.model.selected_room != old_selected_room {
             self.videos.clear_sessions();
             self.clear_video_interactions();
-            self.message_markdown.clear();
+            self.formatted_messages.clear();
             self.eager_image_fetches.reset_transient();
         } else if effect.messages_changed {
+            self.formatted_messages.retain(|message_id, _| {
+                self.model
+                    .messages
+                    .binary_search_by_key(message_id, |message| message.id)
+                    .is_ok()
+            });
             let retained = self
                 .model
                 .messages
@@ -1806,20 +1908,10 @@ impl ChattView {
         };
         let message_id = message.id;
         let room_id = message.room_id;
-        let message_markdown = match self.message_markdown.get(&message.id) {
-            Some(markdown) if markdown.read(cx).source().as_ref() == message.body.as_str() => {
-                markdown.clone()
-            }
-            _ => {
-                let markdown =
-                    cx.new(|cx| Markdown::new(message.body.clone().into(), None, None, cx));
-                self.message_markdown.insert(message.id, markdown.clone());
-                markdown
-            }
+        let formatted_message = match self.formatted_messages.get(&message.id) {
+            Some(formatted) if formatted.source() == message.body.as_str() => formatted.clone(),
+            _ => Rc::new(FormattedMessage::plain(message.body.clone())),
         };
-        let mut markdown_style = MarkdownStyle::simple(window, cx);
-        markdown_style.base_text_style.color = rgb(0xd7d9dd).into();
-        markdown_style.selection_background_color = rgba(0x5277a866).into();
         let sender = message.sender.clone();
         let edited = message.edited;
         let unverified = message.unverified;
@@ -1899,10 +1991,10 @@ impl ChattView {
                                 )
                             })
                             .child(
-                                MarkdownElement::new(message_markdown, markdown_style)
+                                FormattedMessageElement::new(formatted_message)
                                     .selection_group(
                                         self.timeline_selection.clone(),
-                                        MarkdownSelectionKey(message_id),
+                                        MessageSelectionKey(message_id),
                                     ),
                             )
                             .when_some(attachment, |content, attachment| {
@@ -3724,7 +3816,7 @@ impl Render for ChattView {
         let ready = self.model.is_ready();
         let timeline_view = cx.entity().downgrade();
         let selection_view = cx.entity().downgrade();
-        let timeline = MarkdownSelectionArea::new(
+        let timeline = MessageSelectionArea::new(
             capture_scroll(
                 list(self.list_state.clone(), cx.processor(Self::render_message))
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
