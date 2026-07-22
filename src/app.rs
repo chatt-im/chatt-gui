@@ -401,6 +401,8 @@ pub struct ChattView {
     preview_panel_width: Pixels,
     preview_pane_resize: Option<PreviewPaneResize>,
     list_state: ListState,
+    collapsed_sections: timeline::CollapsedSections,
+    message_list: Vec<timeline::MessageListItem>,
     pending_scroll: gpui::Pixels,
     scroll_animation_active: bool,
     last_scroll_frame: Option<Instant>,
@@ -525,6 +527,8 @@ impl ChattView {
             preview_panel_width: px(DEFAULT_PANEL_WIDTH),
             preview_pane_resize: None,
             list_state,
+            collapsed_sections: timeline::CollapsedSections::new(),
+            message_list: Vec::new(),
             pending_scroll: px(0.),
             scroll_animation_active: false,
             last_scroll_frame: None,
@@ -599,11 +603,12 @@ impl ChattView {
 
     fn update_video_visibility(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
         let mut visible = self
-            .model
-            .messages
+            .message_list
             .get(range)
             .unwrap_or_default()
             .iter()
+            .filter(|item| !item.is_collapsed())
+            .filter_map(|item| self.model.messages.get(item.message_index))
             .filter_map(message_video_key)
             .collect::<HashSet<_>>();
         if let Some(theater) = self.theater_video.as_ref() {
@@ -1101,6 +1106,49 @@ impl ChattView {
         }
     }
 
+    fn rebuild_message_list(&mut self) {
+        let next = timeline::build_message_list(&self.model.messages, &self.collapsed_sections);
+        let common_prefix = self
+            .message_list
+            .iter()
+            .zip(&next)
+            .take_while(|(old, new)| old.has_same_visible_state(**new))
+            .count();
+        let suffix_limit = self.message_list.len().min(next.len()) - common_prefix;
+        let common_suffix = self
+            .message_list
+            .iter()
+            .rev()
+            .zip(next.iter().rev())
+            .take(suffix_limit)
+            .take_while(|(old, new)| old.has_same_visible_state(**new))
+            .count();
+
+        if common_prefix + common_suffix < self.message_list.len()
+            || common_prefix + common_suffix < next.len()
+        {
+            self.list_state.splice(
+                common_prefix..self.message_list.len() - common_suffix,
+                next.len() - common_prefix - common_suffix,
+            );
+        }
+        self.message_list = next;
+        debug_assert_eq!(self.list_state.item_count(), self.message_list.len());
+    }
+
+    fn toggle_message_group(&mut self, message_id: u64, cx: &mut Context<Self>) {
+        if !timeline::toggle_collapsed_section(
+            &self.model.messages,
+            &mut self.collapsed_sections,
+            message_id,
+        ) {
+            return;
+        }
+        self.timeline_selection.clear();
+        self.rebuild_message_list();
+        cx.notify();
+    }
+
     fn apply_daemon_state_frame(
         &mut self,
         frame: DaemonFrame,
@@ -1113,11 +1161,13 @@ impl ChattView {
             }
             _ => None,
         };
-        let old_len = self.model.messages.len();
         let old_selected_room = self.model.selected_room;
         let old_daemon_instance = self.model.daemon_instance;
         let old_active_server = self.model.active_server.clone();
         let effect = reducer::apply(&mut self.model, frame);
+        if self.model.selected_room != old_selected_room {
+            self.collapsed_sections.clear();
+        }
         let media_namespace_changed = self.model.daemon_instance != old_daemon_instance
             || self.model.active_server != old_active_server;
         if media_namespace_changed {
@@ -1193,12 +1243,8 @@ impl ChattView {
                 self.clear_video_interactions();
             }
         }
-        if effect.replace_messages {
-            self.list_state
-                .splice(0..old_len, self.model.messages.len());
-        }
-        for (start, end, count) in effect.splices {
-            self.list_state.splice(start..end, count);
+        if self.model.selected_room != old_selected_room || effect.messages_changed {
+            self.rebuild_message_list();
         }
         if effect.messages_changed {
             self.enqueue_new_image_fetches(window, cx);
@@ -1894,12 +1940,19 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(message) = self.model.messages.get(index) else {
+        let Some(item) = self.message_list.get(index).copied() else {
             return div().into_any_element();
         };
-        let continuation = timeline::is_continuation(&self.model.messages, index);
+        let Some(message) = self.model.messages.get(item.message_index) else {
+            return div().into_any_element();
+        };
+        let continuation = item.continuation;
+        let collapsed_count = item.collapsed_count;
+        let collapsed = item.is_collapsed();
         let accent = sender_color(&message.sender, message.local);
-        let background = if message.notice {
+        let background = if collapsed {
+            0x202329
+        } else if message.notice {
             0x15181c
         } else if message.local {
             0x171a20
@@ -1908,16 +1961,18 @@ impl ChattView {
         };
         let message_id = message.id;
         let room_id = message.room_id;
-        let formatted_message = match self.formatted_messages.get(&message.id) {
-            Some(formatted) if formatted.source() == message.body.as_str() => formatted.clone(),
-            _ => Rc::new(FormattedMessage::plain(message.body.clone())),
-        };
+        let formatted_message = (!collapsed).then(|| {
+            match self.formatted_messages.get(&message.id) {
+                Some(formatted) if formatted.source() == message.body.as_str() => formatted.clone(),
+                _ => Rc::new(FormattedMessage::plain(message.body.clone())),
+            }
+        });
         let sender = message.sender.clone();
         let edited = message.edited;
         let unverified = message.unverified;
         let timestamp_ms = message.timestamp_ms;
         let hover_group: SharedString = format!("message-actions-{message_id}").into();
-        let actions = (message.local && !message.notice).then(|| {
+        let actions = (!collapsed && message.local && !message.notice).then(|| {
             (
                 message.room_id,
                 local_rpc::ids::MessageId(message.id),
@@ -1927,7 +1982,7 @@ impl ChattView {
                     .then(|| message.body.clone()),
             )
         });
-        let attachment = message.attachment.clone();
+        let attachment = (!collapsed).then(|| message.attachment.clone()).flatten();
         div()
             .id(("message", message_id as usize))
             .group(hover_group.clone())
@@ -1937,7 +1992,7 @@ impl ChattView {
             .pr(px(28.))
             .py(px(if continuation { 3. } else { 10. }))
             .bg(rgb(background))
-            .hover(|row| row.bg(rgb(0x1b1e24)))
+            .hover(move |row| row.bg(rgb(if collapsed { 0x292d34 } else { 0x1b1e24 })))
             .child(
                 div()
                     .absolute()
@@ -1964,14 +2019,14 @@ impl ChattView {
                                         .flex()
                                         .items_center()
                                         .gap_2()
-                                        .pr(px(66.))
+                                        .pr(px(100.))
                                         .child(
                                             div()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(accent))
                                                 .child(sender),
                                         )
-                                        .when(edited, |meta| {
+                                        .when(!collapsed && edited, |meta| {
                                             meta.child(
                                                 div()
                                                     .text_xs()
@@ -1979,12 +2034,29 @@ impl ChattView {
                                                     .child("edited"),
                                             )
                                         })
-                                        .when(unverified, |meta| {
+                                        .when(!collapsed && unverified, |meta| {
                                             meta.child(
                                                 div()
                                                     .text_xs()
                                                     .text_color(rgb(0xc49a74))
                                                     .child("unverified"),
+                                            )
+                                        })
+                                        .when_some(collapsed_count, |meta, count| {
+                                            meta.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x8b929d))
+                                                    .child(format!(
+                                                        "· {count} {} collapsed",
+                                                        if count == 1 {
+                                                            "message"
+                                                        } else {
+                                                            "messages"
+                                                        }
+                                                    )),
                                             )
                                         })
                                         .child(div().flex_1())
@@ -1993,32 +2065,49 @@ impl ChattView {
                                         )),
                                 )
                             })
-                            .child(
-                                FormattedMessageElement::new(formatted_message)
-                                    .selection_group(
-                                        self.timeline_selection.clone(),
-                                        MessageSelectionKey(message_id),
-                                    ),
-                            )
-                            .when_some(attachment, |content, attachment| {
-                                content.child(
-                                    self.render_attachment(
-                                        room_id, message_id, attachment, window, cx,
-                                    ),
-                                )
+                            .when_some(formatted_message, |content, formatted_message| {
+                                content
+                                    .child(
+                                        FormattedMessageElement::new(formatted_message)
+                                            .selection_group(
+                                                self.timeline_selection.clone(),
+                                                MessageSelectionKey(message_id),
+                                            ),
+                                    )
+                                    .when_some(attachment, |content, attachment| {
+                                        content.child(self.render_attachment(
+                                            room_id, message_id, attachment, window, cx,
+                                        ))
+                                    })
                             }),
                     ),
             )
-            .when_some(actions, |row, (room_id, message_id, edit_body)| {
-                row.child(
-                    div()
-                        .absolute()
-                        .top(px(if continuation { 1. } else { 7. }))
-                        .right(px(28.))
-                        .flex()
-                        .gap_1()
-                        .invisible()
-                        .group_hover(hover_group, |actions| actions.visible())
+            .child(
+                div()
+                    .absolute()
+                    .top(px(if continuation { 1. } else { 7. }))
+                    .right(px(28.))
+                    .flex()
+                    .gap_1()
+                    .invisible()
+                    .group_hover(hover_group, |actions| actions.visible())
+                    .when(collapsed, |actions| actions.visible())
+                    .child(
+                        message_action_button(
+                            ("collapse", message_id as usize),
+                            if collapsed {
+                                IconName::ListChevronsUpDown
+                            } else {
+                                IconName::ListChevronsDownUp
+                            },
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_message_group(message_id, cx)
+                        })),
+                    )
+                    .when_some(actions, |actions, (room_id, message_id, edit_body)| {
+                        actions
                         .when_some(edit_body, |actions, edit_body| {
                             actions.child(
                                 message_action_button(
@@ -2047,9 +2136,9 @@ impl ChattView {
                                     this.delete_message(room_id, message_id, cx)
                                 },
                             )),
-                        ),
-                )
-            })
+                        )
+                    }),
+            )
             .into_any_element()
     }
 

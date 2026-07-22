@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +25,28 @@ pub struct Message {
 #[derive(Clone, Debug)]
 pub struct Attachment {
     pub descriptor: AttachmentDescriptor,
+}
+
+pub type CollapsedSections = HashMap<u64, Option<u64>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MessageListItem {
+    pub message_index: usize,
+    pub message_id: u64,
+    pub continuation: bool,
+    pub collapsed_count: Option<usize>,
+}
+
+impl MessageListItem {
+    pub fn is_collapsed(self) -> bool {
+        self.collapsed_count.is_some()
+    }
+
+    pub fn has_same_visible_state(self, other: Self) -> bool {
+        self.message_id == other.message_id
+            && self.continuation == other.continuation
+            && self.collapsed_count == other.collapsed_count
+    }
 }
 
 impl Attachment {
@@ -80,8 +103,112 @@ pub fn is_continuation(messages: &[Message], index: usize) -> bool {
         && !previous.edited
         && !message.notice
         && !previous.notice
+        && message.unverified == previous.unverified
         && message.sender == previous.sender
         && message.timestamp_ms.saturating_sub(previous.timestamp_ms) < GROUP_WINDOW_MS
+}
+
+/// Projects the flat feed into visible rows. Collapse markers inside a sender
+/// group are sibling boundaries, so one collapsed range can never contain
+/// another.
+pub fn build_message_list(
+    messages: &[Message],
+    collapsed_sections: &CollapsedSections,
+) -> Vec<MessageListItem> {
+    let mut visible = Vec::new();
+
+    for group_start in message_group_starts(messages) {
+        let mut group_end = group_start + 1;
+        while group_end < messages.len() && is_continuation(messages, group_end) {
+            group_end += 1;
+        }
+
+        let mut sections = Vec::new();
+        for index in group_start..group_end {
+            let message_id = messages[index].id;
+            let Some(end_id) = collapsed_sections.get(&message_id) else {
+                continue;
+            };
+            let section_end = end_id
+                .and_then(|end_id| {
+                    (index + 1..group_end).find(|candidate| messages[*candidate].id == end_id)
+                })
+                .unwrap_or(group_end);
+            sections.push((index, section_end));
+        }
+
+        // Group edits or prepended history can bring previously separate
+        // sections together. Clamp each one at the next root boundary.
+        for section_index in 0..sections.len() {
+            let next_start = sections
+                .get(section_index + 1)
+                .map_or(group_end, |section| section.0);
+            sections[section_index].1 = sections[section_index].1.min(next_start);
+        }
+
+        let mut section_index = 0;
+        for index in group_start..group_end {
+            while sections
+                .get(section_index)
+                .is_some_and(|section| index >= section.1)
+            {
+                section_index += 1;
+            }
+            let collapsed_section = sections
+                .get(section_index)
+                .filter(|section| index >= section.0 && index < section.1);
+            if let Some((section_start, section_end)) = collapsed_section {
+                if index != *section_start {
+                    continue;
+                }
+                visible.push(MessageListItem {
+                    message_index: index,
+                    message_id: messages[index].id,
+                    continuation: false,
+                    collapsed_count: Some(section_end - section_start),
+                });
+            } else {
+                visible.push(MessageListItem {
+                    message_index: index,
+                    message_id: messages[index].id,
+                    continuation: index > group_start,
+                    collapsed_count: None,
+                });
+            }
+        }
+    }
+
+    visible
+}
+
+/// Adds or removes a collapse marker rooted at `message_id`. A newly added
+/// marker stops at the next existing marker in the same sender group.
+pub fn toggle_collapsed_section(
+    messages: &[Message],
+    collapsed_sections: &mut CollapsedSections,
+    message_id: u64,
+) -> bool {
+    if collapsed_sections.contains_key(&message_id) {
+        collapsed_sections.remove(&message_id);
+        return true;
+    }
+
+    let Some(selected) = messages.iter().position(|message| message.id == message_id) else {
+        return false;
+    };
+    let mut group_end = selected + 1;
+    while group_end < messages.len() && is_continuation(messages, group_end) {
+        group_end += 1;
+    }
+    let next_section = (selected + 1..group_end)
+        .map(|index| messages[index].id)
+        .find(|candidate| collapsed_sections.contains_key(candidate));
+    collapsed_sections.insert(message_id, next_section);
+    true
+}
+
+fn message_group_starts(messages: &[Message]) -> impl Iterator<Item = usize> + '_ {
+    (0..messages.len()).filter(|index| !is_continuation(messages, *index))
 }
 
 pub fn media_box_size(width: u32, height: u32) -> (f32, f32) {
@@ -149,6 +276,88 @@ mod tests {
         let messages = vec![message("Mara", 1_000), message("Mara", 60_000)];
         assert!(!is_continuation(&messages, 0));
         assert!(is_continuation(&messages, 1));
+    }
+
+    #[test]
+    fn collapses_from_selected_message_to_end_of_sender_group() {
+        let messages = vec![
+            message("Mara", 1_000),
+            message("Mara", 2_000),
+            message("Mara", 3_000),
+            message("Ivo", 4_000),
+        ];
+        let mut sections = CollapsedSections::new();
+
+        assert!(toggle_collapsed_section(&messages, &mut sections, 2_000));
+
+        let visible = build_message_list(&messages, &sections);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| (item.message_id, item.continuation, item.collapsed_count))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_000, false, None),
+                (2_000, false, Some(2)),
+                (4_000, false, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_sections_split_at_the_next_root_instead_of_nesting() {
+        let messages = vec![
+            message("Mara", 1_000),
+            message("Mara", 2_000),
+            message("Mara", 3_000),
+            message("Mara", 4_000),
+        ];
+        let mut sections = CollapsedSections::new();
+        toggle_collapsed_section(&messages, &mut sections, 3_000);
+        toggle_collapsed_section(&messages, &mut sections, 1_000);
+
+        let visible = build_message_list(&messages, &sections);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| (item.message_id, item.collapsed_count))
+                .collect::<Vec<_>>(),
+            vec![(1_000, Some(2)), (3_000, Some(2))]
+        );
+
+        toggle_collapsed_section(&messages, &mut sections, 1_000);
+        let visible = build_message_list(&messages, &sections);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| (item.message_id, item.continuation, item.collapsed_count))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_000, false, None),
+                (2_000, true, None),
+                (3_000, false, Some(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_never_crosses_a_sender_group_boundary() {
+        let messages = vec![
+            message("Mara", 1_000),
+            message("Mara", 2_000),
+            message("Ivo", 3_000),
+        ];
+        let mut sections = CollapsedSections::new();
+        toggle_collapsed_section(&messages, &mut sections, 1_000);
+
+        let visible = build_message_list(&messages, &sections);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| (item.message_id, item.collapsed_count))
+                .collect::<Vec<_>>(),
+            vec![(1_000, Some(2)), (3_000, None)]
+        );
     }
 
     #[test]

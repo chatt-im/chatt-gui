@@ -9,6 +9,8 @@ pub(crate) enum IconName {
     Close,
     Copy,
     Download,
+    ListChevronsDownUp,
+    ListChevronsUpDown,
     Maximize,
     Mic,
     MicOff,
@@ -35,6 +37,8 @@ impl IconName {
             Self::Close => "icons/close.svg",
             Self::Copy => "icons/copy.svg",
             Self::Download => "icons/download.svg",
+            Self::ListChevronsDownUp => "icons/list-chevrons-down-up.svg",
+            Self::ListChevronsUpDown => "icons/list-chevrons-up-down.svg",
             Self::Maximize => "icons/maximize.svg",
             Self::Mic => "icons/mic.svg",
             Self::MicOff => "icons/mic-off.svg",
@@ -91,6 +95,8 @@ const ICON_PATHS: &[&str] = &[
     "icons/close.svg",
     "icons/copy.svg",
     "icons/download.svg",
+    "icons/list-chevrons-down-up.svg",
+    "icons/list-chevrons-up-down.svg",
     "icons/maximize.svg",
     "icons/mic.svg",
     "icons/mic-off.svg",
@@ -123,6 +129,12 @@ fn icon_svg(path: &str) -> Option<String> {
         }
         "icons/download.svg" => {
             r#"<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>"#
+        }
+        "icons/list-chevrons-down-up.svg" => {
+            r#"<path d="M3 5h8"/><path d="M3 12h8"/><path d="M3 19h8"/><path d="m15 5 3 3 3-3"/><path d="m15 19 3-3 3 3"/>"#
+        }
+        "icons/list-chevrons-up-down.svg" => {
+            r#"<path d="M3 5h8"/><path d="M3 12h8"/><path d="M3 19h8"/><path d="m15 8 3-3 3 3"/><path d="m15 16 3 3 3-3"/>"#
         }
         "icons/maximize.svg" => {
             r#"<path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/><path d="M9 21H3v-6"/>"#
