@@ -143,5 +143,4 @@ mod tests {
                 .any(|glyph| glyph.index == missing_index && glyph.id.0 == 0)
         );
     }
-
 }

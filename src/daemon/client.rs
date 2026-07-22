@@ -10,7 +10,7 @@ use std::{
 
 use async_channel::{Receiver as EventReceiver, Sender as EventSender};
 use local_rpc::{
-    bulk::{BeginUpload, BulkChunk, BulkFinished},
+    bulk::{BeginUpload, BulkFinished},
     frame::{ClientFrame, ClientHello, DaemonFrame, Operation, RequestOutcome},
     model::{AttachmentDescriptor, BulkTransferId, RequestId},
     unix::{ConnectError, FrameReader, FrameWriter},
@@ -246,8 +246,12 @@ fn connection_loop(
                     }
                 };
                 let reason = 'connected: loop {
-                    match reader.recv_daemon_with_fds() {
-                        Ok(received) => {
+                    match reader.recv_daemon_with_fds_and_bulk(|transfer_id, bytes| {
+                        handle_bulk_chunk(transfer_id, bytes, &media_cache, &command_tx, &events);
+                        Ok(())
+                    }) {
+                        Ok(None) => {}
+                        Ok(Some(received)) => {
                             let frame = received.frame;
                             let mut fds = received.fds;
                             if let DaemonFrame::LiveShareOpened {
@@ -393,14 +397,13 @@ fn handle_bulk_frame(
 ) -> Option<DaemonFrame> {
     match frame {
         DaemonFrame::BulkChunk(chunk) => {
-            let transfer_id = chunk.transfer_id;
-            if let Err(reason) = media_cache
-                .lock()
-                .expect("media cache lock poisoned")
-                .chunk(chunk)
-            {
-                cancel_failed_download(transfer_id, reason, commands, events);
-            }
+            handle_bulk_chunk(
+                chunk.transfer_id,
+                &chunk.bytes,
+                media_cache,
+                commands,
+                events,
+            );
             None
         }
         DaemonFrame::BulkFinished(finished) => {
@@ -445,6 +448,22 @@ fn handle_bulk_frame(
             None
         }
         frame => Some(frame),
+    }
+}
+
+fn handle_bulk_chunk(
+    transfer_id: BulkTransferId,
+    bytes: &[u8],
+    media_cache: &std::sync::Mutex<crate::media_cache::MediaCache>,
+    commands: &SyncSender<ConnectorCommand>,
+    events: &EventSender<DaemonEvent>,
+) {
+    if let Err(reason) = media_cache
+        .lock()
+        .expect("media cache lock poisoned")
+        .chunk(transfer_id, bytes)
+    {
+        cancel_failed_download(transfer_id, reason, commands, events);
     }
 }
 
@@ -559,7 +578,7 @@ fn writer_loop(
                     }
                     active.push_back(ActiveUpload {
                         prepared: upload,
-                        buffer: Vec::with_capacity(chunk_bytes),
+                        buffer: vec![0; chunk_bytes],
                         sent: 0,
                     });
                 }
@@ -630,27 +649,31 @@ fn stream_upload_chunk(
     upload: &mut ActiveUpload,
     chunk_bytes: usize,
 ) -> Result<bool, String> {
-    upload.buffer.resize(chunk_bytes, 0);
-    let read = upload
-        .prepared
-        .file
-        .read(&mut upload.buffer)
-        .map_err(|error| error.to_string())?;
+    if chunk_bytes == 0 {
+        return Err("daemon negotiated an empty upload chunk size".into());
+    }
+    if upload.buffer.len() != chunk_bytes {
+        upload.buffer.resize(chunk_bytes, 0);
+    }
+    let read = loop {
+        match upload.prepared.file.read(&mut upload.buffer) {
+            Ok(read) => break read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    };
     if read != 0 {
-        upload.buffer.truncate(read);
-        let chunk = BulkChunk {
-            transfer_id: upload.prepared.upload.transfer_id,
-            bytes: std::mem::take(&mut upload.buffer),
-        };
-        let frame = ClientFrame::UploadChunk(chunk);
+        let next = upload
+            .sent
+            .checked_add(read as u64)
+            .ok_or_else(|| "upload byte count overflow".to_string())?;
+        if next > upload.prepared.upload.byte_len {
+            return Err("upload exceeds its declared length while being read".into());
+        }
         writer
-            .send_client(&frame)
+            .send_client_bulk_chunk(upload.prepared.upload.transfer_id, &upload.buffer[..read])
             .map_err(|error| error.to_string())?;
-        let ClientFrame::UploadChunk(mut chunk) = frame else {
-            unreachable!("constructed upload chunk frame")
-        };
-        upload.buffer = std::mem::take(&mut chunk.bytes);
-        upload.sent += read as u64;
+        upload.sent = next;
         return Ok(true);
     }
 
@@ -698,4 +721,67 @@ fn report_upload_error(
 
 fn drain_stale_commands(commands: &Receiver<ConnectorCommand>) {
     while commands.try_recv().is_ok() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, os::unix::net::UnixStream};
+
+    use super::*;
+
+    #[test]
+    fn upload_stream_reuses_buffer_and_sends_borrowed_bulk_chunks() {
+        let source_bytes = b"abcdefghij";
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(source_bytes).unwrap();
+        let transfer_id = BulkTransferId(17);
+        let finish_request = RequestId(19);
+        let mut upload = ActiveUpload {
+            prepared: PreparedUpload {
+                begin_request: RequestId(18),
+                finish_request,
+                upload: BeginUpload {
+                    transfer_id,
+                    room_id: local_rpc::ids::RoomId(3),
+                    file_name: "upload.bin".into(),
+                    byte_len: source_bytes.len() as u64,
+                },
+                file: source.reopen().unwrap(),
+            },
+            buffer: vec![0; 4],
+            sent: 0,
+        };
+        let allocation = upload.buffer.as_ptr();
+        let (writer_stream, reader_stream) = UnixStream::pair().unwrap();
+        let mut writer = FrameWriter::new(writer_stream);
+        let mut reader = FrameReader::new(reader_stream);
+
+        for expected in [b"abcd".as_slice(), b"efgh".as_slice(), b"ij".as_slice()] {
+            assert!(stream_upload_chunk(&mut writer, &mut upload, 4).unwrap());
+            assert_eq!(upload.buffer.as_ptr(), allocation);
+            assert_eq!(upload.buffer.len(), 4);
+            let mut handled = false;
+            assert!(
+                reader
+                    .recv_client_with_bulk(|received_id, bytes| {
+                        assert_eq!(received_id, transfer_id);
+                        assert_eq!(bytes, expected);
+                        handled = true;
+                        Ok(())
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(handled);
+        }
+
+        assert!(!stream_upload_chunk(&mut writer, &mut upload, 4).unwrap());
+        assert_eq!(
+            reader.recv_client().unwrap(),
+            ClientFrame::FinishUpload {
+                request_id: finish_request,
+                finished: BulkFinished { transfer_id },
+            }
+        );
+    }
 }

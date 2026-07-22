@@ -7,7 +7,7 @@ use std::{
 };
 
 use local_rpc::{
-    bulk::{BulkChunk, BulkFinished},
+    bulk::BulkFinished,
     model::{AttachmentDescriptor, AttachmentId, BulkTransferId},
 };
 
@@ -119,21 +119,21 @@ impl MediaCache {
         Ok(())
     }
 
-    pub fn chunk(&mut self, chunk: BulkChunk) -> Result<(), String> {
+    pub fn chunk(&mut self, transfer_id: BulkTransferId, bytes: &[u8]) -> Result<(), String> {
         let partial = self
             .partial
-            .get_mut(&chunk.transfer_id)
+            .get_mut(&transfer_id)
             .ok_or_else(|| "bulk chunk has no active transfer".to_string())?;
-        if partial.received.saturating_add(chunk.bytes.len() as u64) > partial.descriptor.byte_len {
-            self.cancel(chunk.transfer_id);
+        if partial.received.saturating_add(bytes.len() as u64) > partial.descriptor.byte_len {
+            self.cancel(transfer_id);
             return Err("bulk chunk exceeds declared attachment length".into());
         }
-        if let Err(error) = partial.file.write_all(&chunk.bytes) {
+        if let Err(error) = partial.file.write_all(bytes) {
             let reason = error.to_string();
-            self.cancel(chunk.transfer_id);
+            self.cancel(transfer_id);
             return Err(reason);
         }
-        partial.received += chunk.bytes.len() as u64;
+        partial.received += bytes.len() as u64;
         Ok(())
     }
 
@@ -270,14 +270,7 @@ mod tests {
         let mut cache = MediaCache::new(1024).unwrap();
         let descriptor = descriptor(1, 1, 4);
         cache.reserve(BulkTransferId(1), &descriptor).unwrap();
-        assert!(
-            cache
-                .chunk(BulkChunk {
-                    transfer_id: BulkTransferId(1),
-                    bytes: b"hello".to_vec(),
-                })
-                .is_err()
-        );
+        assert!(cache.chunk(BulkTransferId(1), b"hello").is_err());
         assert!(cache.partial.is_empty());
     }
 
@@ -285,14 +278,7 @@ mod tests {
     fn rejects_unrequested_and_duplicate_attachment_transfers() {
         let descriptor = descriptor(9, 9, 0);
         let mut cache = MediaCache::new(1024).unwrap();
-        assert!(
-            cache
-                .chunk(BulkChunk {
-                    transfer_id: BulkTransferId(9),
-                    bytes: vec![1],
-                })
-                .is_err()
-        );
+        assert!(cache.chunk(BulkTransferId(9), &[1]).is_err());
         cache.reserve(BulkTransferId(9), &descriptor).unwrap();
         assert!(cache.reserve(BulkTransferId(10), &descriptor).is_err());
     }
@@ -319,12 +305,7 @@ mod tests {
         let descriptor = descriptor(2, 3, bytes.len() as u64);
         let mut cache = MediaCache::new(1024).unwrap();
         cache.reserve(BulkTransferId(2), &descriptor).unwrap();
-        cache
-            .chunk(BulkChunk {
-                transfer_id: BulkTransferId(2),
-                bytes: bytes.to_vec(),
-            })
-            .unwrap();
+        cache.chunk(BulkTransferId(2), bytes).unwrap();
         cache
             .finish(BulkFinished {
                 transfer_id: BulkTransferId(2),
@@ -344,12 +325,7 @@ mod tests {
         let mut cache = MediaCache::new(1024).unwrap();
 
         cache.reserve(BulkTransferId(1), &first).unwrap();
-        cache
-            .chunk(BulkChunk {
-                transfer_id: BulkTransferId(1),
-                bytes: b"one".to_vec(),
-            })
-            .unwrap();
+        cache.chunk(BulkTransferId(1), b"one").unwrap();
         cache
             .finish(BulkFinished {
                 transfer_id: BulkTransferId(1),
@@ -357,12 +333,7 @@ mod tests {
             .unwrap();
 
         cache.reserve(BulkTransferId(2), &second).unwrap();
-        cache
-            .chunk(BulkChunk {
-                transfer_id: BulkTransferId(2),
-                bytes: b"two!".to_vec(),
-            })
-            .unwrap();
+        cache.chunk(BulkTransferId(2), b"two!").unwrap();
         cache
             .finish(BulkFinished {
                 transfer_id: BulkTransferId(2),

@@ -1815,9 +1815,9 @@ impl SharedPlaybackState {
             .store(state.duration.to_bits(), Ordering::Relaxed);
         self.paused.store(state.paused, Ordering::Relaxed);
         self.finished.store(state.finished, Ordering::Release);
-        let display_size = state
-            .display_size
-            .map_or(0, |(width, height)| (u64::from(width) << 32) | u64::from(height));
+        let display_size = state.display_size.map_or(0, |(width, height)| {
+            (u64::from(width) << 32) | u64::from(height)
+        });
         self.display_size.store(display_size, Ordering::Release);
     }
 

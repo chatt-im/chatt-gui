@@ -54,7 +54,10 @@ impl VideoControlsState {
 
     pub(crate) fn show(&mut self, key: VideoKey) -> Option<u64> {
         self.activate(key);
-        if matches!(self.phase, ControlsPhase::Visible | ControlsPhase::Showing(_)) {
+        if matches!(
+            self.phase,
+            ControlsPhase::Visible | ControlsPhase::Showing(_)
+        ) {
             return None;
         }
         self.animation_serial = self.animation_serial.wrapping_add(1);

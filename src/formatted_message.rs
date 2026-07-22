@@ -1,10 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    ops::Range,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::BTreeMap, ops::Range, rc::Rc, sync::Arc};
 
 use chatt_message_format::{
     Token, TokenKind,
@@ -15,8 +9,8 @@ use gpui::{
     Element, ElementId, FocusHandle, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, KeyBinding, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, StyledText, TextLayout, TextRun,
-    TextStyle, UnderlineStyle, WhiteSpace, Window, actions, div, prelude::*, px, quad,
-    point, rgb, rgba,
+    TextStyle, UnderlineStyle, WhiteSpace, Window, actions, div, point, prelude::*, px, quad, rgb,
+    rgba,
 };
 
 use crate::{
@@ -35,11 +29,7 @@ const MAX_VISIBLE_QUOTE_DEPTH: usize = 8;
 actions!(formatted_message, [Copy]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "cmd-c",
-        Copy,
-        Some("ChattFormattedText"),
-    )]);
+    cx.bind_keys([KeyBinding::new("cmd-c", Copy, Some("ChattFormattedText"))]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,9 +294,9 @@ fn project_document(
                 cursor = end.saturating_add(1);
             }
             TokenKind::CodeBlockStart { lang } => {
-                let tag = lang.as_ref().map(|range| {
-                    &source[range.start as usize..range.end as usize]
-                });
+                let tag = lang
+                    .as_ref()
+                    .map(|range| &source[range.start as usize..range.end as usize]);
                 cursor += 1;
                 let mut code = String::new();
                 let mut first = true;
@@ -448,12 +438,15 @@ fn append_piece(
     }
     let start = visible.len();
     visible.push_str(&projected.text);
-    links.extend(projected.links.into_iter().map(|(range, destination)| {
-        RenderedLink {
-            range: start + range.start..start + range.end,
-            destination,
-        }
-    }));
+    links.extend(
+        projected
+            .links
+            .into_iter()
+            .map(|(range, destination)| RenderedLink {
+                range: start + range.start..start + range.end,
+                destination,
+            }),
+    );
     TextPiece {
         range: start..visible.len(),
         text: projected.text.into(),
@@ -537,16 +530,14 @@ impl FormattedMessageElement {
                         &mut lines,
                         window,
                     ))
-                    .child(
-                        div().flex_1().w_0().child(render_piece(
-                            content,
-                            PiecePresentation::Body,
-                            block.quote_depth,
-                            true,
-                            &mut lines,
-                            window,
-                        )),
-                    )
+                    .child(div().flex_1().w_0().child(render_piece(
+                        content,
+                        PiecePresentation::Body,
+                        block.quote_depth,
+                        true,
+                        &mut lines,
+                        window,
+                    )))
                     .into_any_element(),
                 BlockKind::Code {
                     text,
@@ -566,9 +557,10 @@ impl FormattedMessageElement {
             let element = div()
                 .w_full()
                 .min_w_0()
-                .when(index > 0 && !matches!(block.kind, BlockKind::Blank), |this| {
-                    this.pt(px(5.))
-                })
+                .when(
+                    index > 0 && !matches!(block.kind, BlockKind::Blank),
+                    |this| this.pt(px(5.)),
+                )
                 .child(element)
                 .into_any_element();
             root = root.child(wrap_quote(element, block.quote_depth));
@@ -889,9 +881,7 @@ fn text_runs(
         runs.push(base_style.to_run(text.len() - cursor));
     }
     let runs: Arc<[TextRun]> = runs.into();
-    piece
-        .cached_runs
-        .replace(Some((base_style, runs.clone())));
+    piece.cached_runs.replace(Some((base_style, runs.clone())));
     runs
 }
 
@@ -901,7 +891,12 @@ fn base_text_style(
     window: &Window,
 ) -> TextStyle {
     let mut style = window.text_style();
-    style.color = rgb(if quote_depth > 0 { DIM_COLOR } else { BODY_COLOR }).into();
+    style.color = rgb(if quote_depth > 0 {
+        DIM_COLOR
+    } else {
+        BODY_COLOR
+    })
+    .into();
     style.font_family = match presentation {
         PiecePresentation::Code => CODE_FONT_FAMILY.into(),
         PiecePresentation::Body | PiecePresentation::Header => UI_FONT_FAMILY.into(),
@@ -1122,11 +1117,10 @@ impl RenderedText {
                     let row_selection_start = selected_start.max(row_start);
                     let row_selection_end = selected_end.min(row_end);
                     if row_selection_start < row_selection_end {
-                        let start_x = unwrapped
-                            .x_for_index(row_selection_start - physical_start)
+                        let start_x = unwrapped.x_for_index(row_selection_start - physical_start)
                             - row_start_x;
-                        let end_x = unwrapped.x_for_index(row_selection_end - physical_start)
-                            - row_start_x;
+                        let end_x =
+                            unwrapped.x_for_index(row_selection_end - physical_start) - row_start_x;
                         result.push(Bounds::from_corners(
                             point(layout_bounds.left() + start_x, row_top),
                             point(
@@ -1276,12 +1270,14 @@ impl MessageSelectionGroup {
         text: &RenderedText,
     ) {
         let state = &mut *self.0.borrow_mut();
-        let extending = extend
-            && click_count == 1
-            && state.active.is_some();
+        let extending = extend && click_count == 1 && state.active.is_some();
         let (anchor_key, anchor_range, mode) = if extending {
             let active = state.active.as_ref().unwrap();
-            let tail = if active.reversed { active.end } else { active.start };
+            let tail = if active.reversed {
+                active.end
+            } else {
+                active.start
+            };
             (tail.key, tail.offset..tail.offset, SelectMode::Character)
         } else {
             match click_count {
@@ -1539,8 +1535,7 @@ impl MessageSelectionGroupState {
     }
 }
 
-type SelectionAutoscrollHandler =
-    Box<dyn FnMut(Pixels, &mut Window, &mut App) + 'static>;
+type SelectionAutoscrollHandler = Box<dyn FnMut(Pixels, &mut Window, &mut App) + 'static>;
 
 /// Owns pointer and copy handling for all formatted messages in the timeline.
 pub struct MessageSelectionArea<E> {
@@ -1606,10 +1601,7 @@ where
         let prepaint = self
             .inner
             .prepaint(id, inspector_id, bounds, request, window, cx);
-        if self
-            .group
-            .update_head_for_position(window.mouse_position())
-        {
+        if self.group.update_head_for_position(window.mouse_position()) {
             cx.refresh_windows();
         }
         if self.group.is_pending() {
@@ -1691,15 +1683,8 @@ where
                 }
             }
         });
-        self.inner.paint(
-            id,
-            inspector_id,
-            bounds,
-            request,
-            prepaint,
-            window,
-            cx,
-        );
+        self.inner
+            .paint(id, inspector_id, bounds, request, prepaint, window, cx);
     }
 }
 
@@ -1875,5 +1860,4 @@ mod tests {
         assert_eq!(state.retained.len(), 2);
         assert!(!state.retained.contains_key(&MessageSelectionKey(3)));
     }
-
 }

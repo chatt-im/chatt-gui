@@ -1,16 +1,15 @@
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Div, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Stateful, Window, canvas, div, img,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, rgba, surface,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Div, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, Pixels, Stateful, Window, canvas, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, relative, rgb, rgba, surface,
 };
 
 use crate::{
     icons::{IconName, icon},
     video_controls::{
-        CONTROLS_ANIMATION_DURATION, ControlsPhase, VOLUME_ANIMATION_DURATION,
-        horizontal_fraction,
+        CONTROLS_ANIMATION_DURATION, ControlsPhase, VOLUME_ANIMATION_DURATION, horizontal_fraction,
     },
     video_manager::{VideoKey, VideoView},
     video_thumbnail::ThumbnailView,
@@ -38,8 +37,7 @@ pub(crate) enum VideoPlayerEvent {
     ToggleTheater,
 }
 
-pub(crate) type VideoPlayerHandler =
-    Rc<dyn Fn(VideoPlayerEvent, &mut Window, &mut App) + 'static>;
+pub(crate) type VideoPlayerHandler = Rc<dyn Fn(VideoPlayerEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) struct VideoPlayerConfig {
     pub key: VideoKey,
@@ -355,11 +353,7 @@ pub(crate) fn render_video_player(
                 .bg(rgba(0x111317f5))
                 .shadow_sm()
                 .on_hover(move |hovered, window, cx| {
-                    popup_hover(
-                        VideoPlayerEvent::VolumePopupHovered(*hovered),
-                        window,
-                        cx,
-                    )
+                    popup_hover(VideoPlayerEvent::VolumePopupHovered(*hovered), window, cx)
                 })
                 .child(
                     canvas(
@@ -397,9 +391,7 @@ pub(crate) fn render_video_player(
                         })
                         .child(
                             canvas(
-                                move |bounds, _, _| {
-                                    measured_volume_slider_bounds.set(Some(bounds))
-                                },
+                                move |bounds, _, _| measured_volume_slider_bounds.set(Some(bounds)),
                                 |_, _, _, _| {},
                             )
                             .absolute()
@@ -521,11 +513,7 @@ pub(crate) fn render_video_player(
                         ("video-controls-show", serial as usize),
                         Animation::new(CONTROLS_ANIMATION_DURATION)
                             .with_easing(gpui::ease_out_quint()),
-                        |controls, delta| {
-                            controls
-                                .opacity(delta)
-                                .bottom(px(-4.0 * (1.0 - delta)))
-                        },
+                        |controls, delta| controls.opacity(delta).bottom(px(-4.0 * (1.0 - delta))),
                     )
                     .into_any_element(),
                 ControlsPhase::Hiding(serial) => controls
@@ -533,9 +521,7 @@ pub(crate) fn render_video_player(
                         ("video-controls-hide", serial as usize),
                         Animation::new(CONTROLS_ANIMATION_DURATION)
                             .with_easing(gpui::ease_out_quint()),
-                        |controls, delta| {
-                            controls.opacity(1.0 - delta).bottom(px(-4.0 * delta))
-                        },
+                        |controls, delta| controls.opacity(1.0 - delta).bottom(px(-4.0 * delta)),
                     )
                     .into_any_element(),
                 _ => controls.into_any_element(),
@@ -558,10 +544,7 @@ pub(crate) fn render_video_player(
         .into_any_element()
 }
 
-fn video_control_button(
-    id: impl Into<gpui::ElementId>,
-    icon_name: IconName,
-) -> Stateful<Div> {
+fn video_control_button(id: impl Into<gpui::ElementId>, icon_name: IconName) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(36.0))

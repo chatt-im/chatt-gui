@@ -8,18 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui::{
-    AnyElement, App, Bounds, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight,
-    KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
-    list, point, prelude::*, px, rgb, rgba,
-};
-use local_rpc::{
-    frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
-    ids::{RoomId, StreamId},
-    model::{AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState},
-};
 use crate::{
     composer::Composer,
     daemon::{
@@ -47,10 +35,21 @@ use crate::{
     },
     video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
     video_player::{
-        VideoPlayerConfig, VideoPlayerEvent, VideoPlayerHandler, aspect_ratio,
-        render_video_player,
+        VideoPlayerConfig, VideoPlayerEvent, VideoPlayerHandler, aspect_ratio, render_video_player,
     },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
+};
+use gpui::{
+    AnyElement, App, Bounds, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight,
+    KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
+    list, point, prelude::*, px, rgb, rgba,
+};
+use local_rpc::{
+    frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
+    ids::{RoomId, StreamId},
+    model::{AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState},
 };
 
 const SIDEBAR_WIDTH: f32 = 232.0;
@@ -462,11 +461,7 @@ impl ChattView {
                             candidates
                                 .into_iter()
                                 .map(|(room_id, message_id, body)| {
-                                    (
-                                        room_id,
-                                        message_id,
-                                        FormattedMessage::prepare(body),
-                                    )
+                                    (room_id, message_id, FormattedMessage::prepare(body))
                                 })
                                 .collect::<Vec<_>>()
                         })
@@ -1961,12 +1956,11 @@ impl ChattView {
         };
         let message_id = message.id;
         let room_id = message.room_id;
-        let formatted_message = (!collapsed).then(|| {
-            match self.formatted_messages.get(&message.id) {
+        let formatted_message =
+            (!collapsed).then(|| match self.formatted_messages.get(&message.id) {
                 Some(formatted) if formatted.source() == message.body.as_str() => formatted.clone(),
                 _ => Rc::new(FormattedMessage::plain(message.body.clone())),
-            }
-        });
+            });
         let sender = message.sender.clone();
         let edited = message.edited;
         let unverified = message.unverified;
@@ -1976,10 +1970,7 @@ impl ChattView {
             (
                 message.room_id,
                 local_rpc::ids::MessageId(message.id),
-                message
-                    .attachment
-                    .is_none()
-                    .then(|| message.body.clone()),
+                message.attachment.is_none().then(|| message.body.clone()),
             )
         });
         let attachment = (!collapsed).then(|| message.attachment.clone()).flatten();
@@ -2003,84 +1994,75 @@ impl ChattView {
                     .bg(rgb(accent)),
             )
             .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .max_w(px(860.))
-                    .pl(px(15.))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .when(!continuation, |content| {
-                                content.child(
-                                    div()
-                                        .h(px(24.))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .pr(px(100.))
-                                        .child(
-                                            div()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(accent))
-                                                .child(sender),
-                                        )
-                                        .when(!collapsed && edited, |meta| {
-                                            meta.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(0x777d87))
-                                                    .child("edited"),
-                                            )
-                                        })
-                                        .when(!collapsed && unverified, |meta| {
-                                            meta.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(0xc49a74))
-                                                    .child("unverified"),
-                                            )
-                                        })
-                                        .when_some(collapsed_count, |meta, count| {
-                                            meta.child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_xs()
-                                                    .text_color(rgb(0x8b929d))
-                                                    .child(format!(
-                                                        "· {count} {} collapsed",
-                                                        if count == 1 {
-                                                            "message"
-                                                        } else {
-                                                            "messages"
-                                                        }
-                                                    )),
-                                            )
-                                        })
-                                        .child(div().flex_1())
-                                        .child(div().text_xs().text_color(rgb(0x777d87)).child(
-                                            timeline::format_age(timestamp_ms, timeline::now_ms()),
-                                        )),
-                                )
-                            })
-                            .when_some(formatted_message, |content, formatted_message| {
-                                content
+                div().relative().w_full().max_w(px(860.)).pl(px(15.)).child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .when(!continuation, |content| {
+                            content.child(
+                                div()
+                                    .h(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .pr(px(100.))
                                     .child(
-                                        FormattedMessageElement::new(formatted_message)
-                                            .selection_group(
-                                                self.timeline_selection.clone(),
-                                                MessageSelectionKey(message_id),
-                                            ),
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(accent))
+                                            .child(sender),
                                     )
-                                    .when_some(attachment, |content, attachment| {
-                                        content.child(self.render_attachment(
-                                            room_id, message_id, attachment, window, cx,
-                                        ))
+                                    .when(!collapsed && edited, |meta| {
+                                        meta.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x777d87))
+                                                .child("edited"),
+                                        )
                                     })
-                            }),
-                    ),
+                                    .when(!collapsed && unverified, |meta| {
+                                        meta.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0xc49a74))
+                                                .child("unverified"),
+                                        )
+                                    })
+                                    .when_some(collapsed_count, |meta, count| {
+                                        meta.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(rgb(0x8b929d))
+                                                .child(format!(
+                                                    "· {count} {} collapsed",
+                                                    if count == 1 { "message" } else { "messages" }
+                                                )),
+                                        )
+                                    })
+                                    .child(div().flex_1())
+                                    .child(div().text_xs().text_color(rgb(0x777d87)).child(
+                                        timeline::format_age(timestamp_ms, timeline::now_ms()),
+                                    )),
+                            )
+                        })
+                        .when_some(formatted_message, |content, formatted_message| {
+                            content
+                                .child(
+                                    FormattedMessageElement::new(formatted_message)
+                                        .selection_group(
+                                            self.timeline_selection.clone(),
+                                            MessageSelectionKey(message_id),
+                                        ),
+                                )
+                                .when_some(attachment, |content, attachment| {
+                                    content.child(self.render_attachment(
+                                        room_id, message_id, attachment, window, cx,
+                                    ))
+                                })
+                        }),
+                ),
             )
             .child(
                 div()
@@ -2108,35 +2090,37 @@ impl ChattView {
                     )
                     .when_some(actions, |actions, (room_id, message_id, edit_body)| {
                         actions
-                        .when_some(edit_body, |actions, edit_body| {
-                            actions.child(
-                                message_action_button(
-                                    ("edit", message_id.0 as usize),
-                                    IconName::Pencil,
-                                    false,
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.begin_edit(
-                                        room_id,
-                                        message_id,
-                                        edit_body.clone(),
-                                        cx,
+                            .when_some(edit_body, |actions, edit_body| {
+                                actions.child(
+                                    message_action_button(
+                                        ("edit", message_id.0 as usize),
+                                        IconName::Pencil,
+                                        false,
                                     )
-                                })),
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.begin_edit(
+                                                room_id,
+                                                message_id,
+                                                edit_body.clone(),
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                message_action_button(
+                                    ("delete", message_id.0 as usize),
+                                    IconName::Trash,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.delete_message(room_id, message_id, cx)
+                                    },
+                                )),
                             )
-                        })
-                        .child(
-                            message_action_button(
-                                ("delete", message_id.0 as usize),
-                                IconName::Trash,
-                                true,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.delete_message(room_id, message_id, cx)
-                                },
-                            )),
-                        )
                     }),
             )
             .into_any_element()
@@ -2800,11 +2784,13 @@ impl ChattView {
             || self.video_volume_drag.is_some_and(|drag| drag.key == key)
             || (active_controls
                 && (self.video_controls.bar_hovered || self.video_controls.volume_open));
-        let scrub_hover_fraction = active_controls.then(|| {
-            active_scrub
-                .map(|scrub| scrub.last_fraction)
-                .or(self.video_controls.scrub_hover_fraction)
-        }).flatten();
+        let scrub_hover_fraction = active_controls
+            .then(|| {
+                active_scrub
+                    .map(|scrub| scrub.last_fraction)
+                    .or(self.video_controls.scrub_hover_fraction)
+            })
+            .flatten();
         let source = TheaterVideo {
             key,
             descriptor: descriptor.clone(),
@@ -2854,17 +2840,13 @@ impl ChattView {
     ) {
         let key = source.key;
         match event {
-            VideoPlayerEvent::PlayerHovered(hovered) => {
-                self.hover_video_player(key, hovered, cx)
-            }
+            VideoPlayerEvent::PlayerHovered(hovered) => self.hover_video_player(key, hovered, cx),
             VideoPlayerEvent::PointerMoved => self.video_pointer_moved(key, cx),
             VideoPlayerEvent::SurfaceClicked(click_count) => {
                 self.click_video_surface(source, click_count, cx)
             }
             VideoPlayerEvent::Play => self.play_video(key, cx),
-            VideoPlayerEvent::ScrubHovered(fraction) => {
-                self.hover_video_scrub(key, fraction, cx)
-            }
+            VideoPlayerEvent::ScrubHovered(fraction) => self.hover_video_scrub(key, fraction, cx),
             VideoPlayerEvent::ScrubHoverCleared => self.clear_video_scrub_hover(key, cx),
             VideoPlayerEvent::ScrubPressed { bounds, event } => {
                 self.begin_video_scrub(key, duration, bounds, &event, cx)
@@ -2872,9 +2854,7 @@ impl ChattView {
             VideoPlayerEvent::ControlsHovered(hovered) => {
                 self.hover_video_controls(key, hovered, cx)
             }
-            VideoPlayerEvent::VolumeHovered(hovered) => {
-                self.hover_video_volume(key, hovered, cx)
-            }
+            VideoPlayerEvent::VolumeHovered(hovered) => self.hover_video_volume(key, hovered, cx),
             VideoPlayerEvent::VolumePopupHovered(hovered) => {
                 self.hover_video_volume_popup(key, hovered, cx)
             }
@@ -2977,9 +2957,7 @@ impl ChattView {
             cx.background_executor().timer(CONTROLS_HIDE_DELAY).await;
             let _ = this.update(cx, |this, cx| {
                 this.video_controls_hide_task.take();
-                if this.video_controls.active_key == Some(key)
-                    && !this.video_controls_pinned(key)
-                {
+                if this.video_controls.active_key == Some(key) && !this.video_controls_pinned(key) {
                     this.hide_video_controls(key, cx);
                 }
             });
@@ -3044,7 +3022,11 @@ impl ChattView {
     }
 
     fn toggle_video_theater(&mut self, source: TheaterVideo, cx: &mut Context<Self>) {
-        if self.theater_video.as_ref().is_some_and(|active| active.key == source.key) {
+        if self
+            .theater_video
+            .as_ref()
+            .is_some_and(|active| active.key == source.key)
+        {
             self.exit_video_theater(cx);
             return;
         }
@@ -3068,12 +3050,7 @@ impl ChattView {
         true
     }
 
-    fn hover_video_scrub(
-        &mut self,
-        key: VideoKey,
-        fraction: f64,
-        cx: &mut Context<Self>,
-    ) {
+    fn hover_video_scrub(&mut self, key: VideoKey, fraction: f64, cx: &mut Context<Self>) {
         self.show_video_controls(key, cx);
         if self.video_controls.scrub_hover_fraction != Some(fraction) {
             self.video_controls.scrub_hover_fraction = Some(fraction);
@@ -3136,12 +3113,9 @@ impl ChattView {
             self.video_scrub = Some(scrub);
             self.video_controls.scrub_hover_fraction = Some(fraction);
             if dispatch_seek
-                && let Err(error) = self.videos.scrub(
-                    scrub.key,
-                    fraction,
-                    scrub.duration,
-                    SeekMode::Keyframes,
-                )
+                && let Err(error) =
+                    self.videos
+                        .scrub(scrub.key, fraction, scrub.duration, SeekMode::Keyframes)
             {
                 log::error!(
                     "embedded video drag scrub failed key={:?} fraction={fraction}: {error:#}",
@@ -3224,7 +3198,9 @@ impl ChattView {
 
     fn set_video_volume(&mut self, key: VideoKey, volume: f64, cx: &mut Context<Self>) {
         if let Err(error) = self.videos.set_volume_for(key, volume) {
-            log::error!("embedded video volume change failed key={key:?} volume={volume}: {error:#}");
+            log::error!(
+                "embedded video volume change failed key={key:?} volume={volume}: {error:#}"
+            );
             self.status = format!("Volume failed: {error}").into();
         }
         self.show_video_controls(key, cx);
@@ -3844,13 +3820,11 @@ impl Render for ChattView {
                 .on_action(cx.listener(Self::seek_back))
                 .on_action(cx.listener(Self::seek_forward))
                 .on_action(cx.listener(Self::close_preview_action))
-                .on_scroll_wheel(cx.listener(
-                    |this, event: &ScrollWheelEvent, _, cx| {
-                        if this.scroll_video_volume(event, cx) {
-                            cx.stop_propagation();
-                        }
-                    },
-                ))
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    if this.scroll_video_volume(event, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                     if !this.drag_video_volume(event, cx) {
                         this.drag_video_scrub(event, cx);
