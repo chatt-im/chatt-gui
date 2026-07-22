@@ -1917,11 +1917,14 @@ impl ChattView {
         let unverified = message.unverified;
         let timestamp_ms = message.timestamp_ms;
         let hover_group: SharedString = format!("message-actions-{message_id}").into();
-        let edit = (message.local && !message.notice).then(|| {
+        let actions = (message.local && !message.notice).then(|| {
             (
                 message.room_id,
                 local_rpc::ids::MessageId(message.id),
-                message.body.clone(),
+                message
+                    .attachment
+                    .is_none()
+                    .then(|| message.body.clone()),
             )
         });
         let attachment = message.attachment.clone();
@@ -1937,19 +1940,19 @@ impl ChattView {
             .hover(|row| row.bg(rgb(0x1b1e24)))
             .child(
                 div()
+                    .absolute()
+                    .left(px(64.))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(rgb(accent)),
+            )
+            .child(
+                div()
                     .relative()
                     .w_full()
                     .max_w(px(860.))
                     .pl(px(15.))
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(3.))
-                            .bg(rgb(if continuation { background } else { accent })),
-                    )
                     .child(
                         div()
                             .w_full()
@@ -2006,7 +2009,7 @@ impl ChattView {
                             }),
                     ),
             )
-            .when_some(edit, |row, (room_id, edit_id, edit_body)| {
+            .when_some(actions, |row, (room_id, message_id, edit_body)| {
                 row.child(
                     div()
                         .absolute()
@@ -2016,26 +2019,33 @@ impl ChattView {
                         .gap_1()
                         .invisible()
                         .group_hover(hover_group, |actions| actions.visible())
-                        .child(
-                            message_action_button(
-                                ("edit", message_id as usize),
-                                IconName::Pencil,
-                                false,
+                        .when_some(edit_body, |actions, edit_body| {
+                            actions.child(
+                                message_action_button(
+                                    ("edit", message_id.0 as usize),
+                                    IconName::Pencil,
+                                    false,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.begin_edit(
+                                        room_id,
+                                        message_id,
+                                        edit_body.clone(),
+                                        cx,
+                                    )
+                                })),
                             )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.begin_edit(room_id, edit_id, edit_body.clone(), cx)
-                                },
-                            )),
-                        )
+                        })
                         .child(
                             message_action_button(
-                                ("delete", message_id as usize),
+                                ("delete", message_id.0 as usize),
                                 IconName::Trash,
                                 true,
                             )
                             .on_click(cx.listener(
-                                move |this, _, _, cx| this.delete_message(room_id, edit_id, cx),
+                                move |this, _, _, cx| {
+                                    this.delete_message(room_id, message_id, cx)
+                                },
                             )),
                         ),
                 )
