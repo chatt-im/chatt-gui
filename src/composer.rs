@@ -2,9 +2,9 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
-    MouseDownEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
-    Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, LayoutId,
+    MouseButton, MouseDownEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -29,23 +29,38 @@ pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("ChattComposer")),
+        KeyBinding::new("backspace", Backspace, Some("ChattCodeSearch")),
         KeyBinding::new("delete", Delete, Some("ChattComposer")),
+        KeyBinding::new("delete", Delete, Some("ChattCodeSearch")),
         KeyBinding::new("left", Left, Some("ChattComposer")),
+        KeyBinding::new("left", Left, Some("ChattCodeSearch")),
         KeyBinding::new("right", Right, Some("ChattComposer")),
+        KeyBinding::new("right", Right, Some("ChattCodeSearch")),
         KeyBinding::new("shift-left", SelectLeft, Some("ChattComposer")),
+        KeyBinding::new("shift-left", SelectLeft, Some("ChattCodeSearch")),
         KeyBinding::new("shift-right", SelectRight, Some("ChattComposer")),
+        KeyBinding::new("shift-right", SelectRight, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-a", SelectAll, Some("ChattComposer")),
+        KeyBinding::new("cmd-a", SelectAll, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-v", Paste, Some("ChattComposer")),
+        KeyBinding::new("cmd-v", Paste, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-c", Copy, Some("ChattComposer")),
+        KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-x", Cut, Some("ChattComposer")),
+        KeyBinding::new("cmd-x", Cut, Some("ChattCodeSearch")),
         KeyBinding::new("shift-enter", Newline, Some("ChattComposer")),
     ]);
 }
+
+pub struct ComposerChanged;
 
 pub struct Composer {
     focus: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
+    key_context: &'static str,
+    multiline: bool,
+    min_height: Pixels,
     selected: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
@@ -60,6 +75,26 @@ impl Composer {
             focus: cx.focus_handle(),
             content: "".into(),
             placeholder: "Message".into(),
+            key_context: "ChattComposer",
+            multiline: true,
+            min_height: px(42.),
+            selected: 0..0,
+            reversed: false,
+            marked: None,
+            last_layout: Vec::new(),
+            last_bounds: None,
+            last_line_height: None,
+        }
+    }
+
+    pub fn search(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            content: "".into(),
+            placeholder: "Find in file".into(),
+            key_context: "ChattCodeSearch",
+            multiline: false,
+            min_height: px(28.),
             selected: 0..0,
             reversed: false,
             marked: None,
@@ -72,6 +107,9 @@ impl Composer {
     pub fn text(&self) -> String {
         self.content.to_string()
     }
+    pub fn text_ref(&self) -> &str {
+        &self.content
+    }
     pub fn is_empty(&self) -> bool {
         self.content.trim().is_empty()
     }
@@ -81,6 +119,7 @@ impl Composer {
         self.reversed = false;
         self.marked = None;
         self.last_layout.clear();
+        cx.emit(ComposerChanged);
         cx.notify();
     }
     pub fn restore(&mut self, text: String, cx: &mut Context<Self>) {
@@ -90,6 +129,7 @@ impl Composer {
         self.reversed = false;
         self.marked = None;
         self.last_layout.clear();
+        cx.emit(ComposerChanged);
         cx.notify();
     }
 
@@ -209,6 +249,13 @@ impl Composer {
     fn normalize_range(&self, range: Range<usize>) -> Range<usize> {
         normalize_range(&self.content, range)
     }
+    fn accepted_text<'a>(&self, text: &'a str) -> &'a str {
+        if self.multiline {
+            text
+        } else {
+            text.split(['\r', '\n']).next().unwrap_or("")
+        }
+    }
 
     fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
         let local = self.last_bounds?.localize(&point)?;
@@ -315,12 +362,14 @@ impl EntityInputHandler for Composer {
             .or(self.marked.clone())
             .unwrap_or(self.selected.clone());
         let range = self.normalize_range(range);
+        let text = self.accepted_text(text);
         self.content =
             (self.content[..range.start].to_owned() + text + &self.content[range.end..]).into();
         let end = range.start + text.len();
         self.selected = end..end;
         self.marked = None;
         self.last_layout.clear();
+        cx.emit(ComposerChanged);
         cx.notify();
     }
     fn replace_and_mark_text_in_range(
@@ -331,6 +380,7 @@ impl EntityInputHandler for Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let text = self.accepted_text(text);
         self.replace_text_in_range(range, text, window, cx);
         let end = self.selected.end;
         let inserted = end - text.len()..end;
@@ -390,6 +440,8 @@ impl EntityInputHandler for Composer {
     }
 }
 
+impl EventEmitter<ComposerChanged> for Composer {}
+
 #[derive(Clone)]
 struct ComposerLine {
     range: Range<usize>,
@@ -434,7 +486,12 @@ impl Element for ComposerElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
-        let line_count = self.input.read(cx).content.split('\n').count().max(1);
+        let input = self.input.read(cx);
+        let line_count = if input.multiline {
+            input.content.split('\n').count().max(1)
+        } else {
+            1
+        };
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = (window.line_height() * line_count as f32).into();
@@ -592,7 +649,7 @@ impl Render for Composer {
         div()
             .flex()
             .items_center()
-            .key_context("ChattComposer")
+            .key_context(self.key_context)
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -605,7 +662,9 @@ impl Render for Composer {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
-            .on_action(cx.listener(Self::newline))
+            .when(self.multiline, |input| {
+                input.on_action(cx.listener(Self::newline))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -617,7 +676,7 @@ impl Render for Composer {
                 }),
             )
             .w_full()
-            .min_h(px(42.))
+            .min_h(self.min_height)
             .child(ComposerElement { input: cx.entity() })
     }
 }

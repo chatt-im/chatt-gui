@@ -9,7 +9,10 @@ use std::{
 };
 
 use crate::{
-    composer::Composer,
+    code_viewer::{
+        CodeDocument, CodeSearchResults, MAX_CODE_PREVIEW_BYTES, render_code_document,
+    },
+    composer::{Composer, ComposerChanged},
     daemon::{
         client::{DaemonClient, DaemonEvent},
         reducer,
@@ -24,8 +27,8 @@ use crate::{
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode},
     preview::{
-        DEFAULT_PANEL_WIDTH, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState,
-        PreviewHistory, PreviewItem, clamp_panel_width,
+        CodePreviewState, DEFAULT_PANEL_WIDTH, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH,
+        ImageViewState, PreviewContent, PreviewHistory, PreviewItem, clamp_panel_width,
     },
     scroll_capture::capture_scroll,
     timeline::{self, Attachment},
@@ -40,16 +43,20 @@ use crate::{
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, ExternalPaths, Focusable, FollowMode, FontWeight,
-    KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task, Window, actions, canvas, div, img,
-    list, point, prelude::*, px, rgb, rgba,
+    AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths, FocusHandle, Focusable,
+    FollowMode, FontWeight, KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString,
+    Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions,
+    canvas, div, img, list, point, prelude::*, px, rgb, rgba,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
     ids::{RoomId, StreamId},
-    model::{AttachmentDescriptor, AttachmentId, BulkTransferId, RequestId, RoomKind, TrustState},
+    model::{
+        AttachmentDescriptor, AttachmentId, BulkTransferId, MediaKind, RequestId, RoomKind,
+        TrustState,
+    },
 };
 
 const SIDEBAR_WIDTH: f32 = 232.0;
@@ -66,6 +73,10 @@ const MIN_LIVE_PANE_HEIGHT: f32 = 160.0;
 const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
+
+fn code_preview_size_error(byte_len: u64) -> Option<&'static str> {
+    (byte_len > MAX_CODE_PREVIEW_BYTES).then_some("file too large to preview")
+}
 
 fn formatted_message_candidates(events: &[DaemonEvent]) -> Vec<(RoomId, u64, String)> {
     let mut candidates = HashMap::new();
@@ -361,7 +372,11 @@ actions!(
         ToggleMute,
         ToggleDeafen,
         ToggleVoice,
-        ClosePreview
+        ClosePreview,
+        FindInCode,
+        NextCodeMatch,
+        PreviousCodeMatch,
+        CloseCodeSearch
     ]
 );
 
@@ -369,9 +384,25 @@ pub fn bind_keys(cx: &mut App) {
     crate::composer::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
-        KeyBinding::new("escape", ClosePreview, Some("Chatt && !ChattComposer")),
+        KeyBinding::new(
+            "escape",
+            ClosePreview,
+            Some("Chatt && !ChattComposer && !ChattCodeSearch"),
+        ),
+        KeyBinding::new(
+            "cmd-f",
+            FindInCode,
+            Some("ChattCodeViewer && !ChattCodeSearch"),
+        ),
+        KeyBinding::new("enter", NextCodeMatch, Some("ChattCodeSearch")),
+        KeyBinding::new("shift-enter", PreviousCodeMatch, Some("ChattCodeSearch")),
+        KeyBinding::new("escape", CloseCodeSearch, Some("ChattCodeSearch")),
         KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
-        KeyBinding::new("space", TogglePlayback, Some("Chatt && !ChattComposer")),
+        KeyBinding::new(
+            "space",
+            TogglePlayback,
+            Some("Chatt && !ChattComposer && !ChattCodeSearch"),
+        ),
         KeyBinding::new("left", SeekBack, Some("Chatt")),
         KeyBinding::new("right", SeekForward, Some("Chatt")),
         KeyBinding::new("=", LiveZoomIn, Some("Chatt")),
@@ -389,11 +420,23 @@ pub struct ChattView {
     next_transfer_id: u64,
     editing: Option<(RoomId, local_rpc::ids::MessageId, String)>,
     composer: gpui::Entity<Composer>,
+    code_search_input: gpui::Entity<Composer>,
+    code_viewer_focus: FocusHandle,
+    code_search_open: bool,
+    code_search_pending: bool,
+    code_search_generation: u64,
+    code_search_results: CodeSearchResults,
+    code_search_result_index: usize,
+    code_search_task: Option<Task<()>>,
     media_cache: Arc<Mutex<MediaCache>>,
     image_cache: gpui::Entity<LruImageCache<TimelineImageLoader>>,
     preview_image_cache: gpui::Entity<LruImageCache<PreviewImageLoader>>,
     eager_image_fetches: EagerImageFetches,
     preview_history: PreviewHistory,
+    next_code_load_id: u64,
+    code_load_tasks: HashMap<AttachmentId, (u64, Task<()>)>,
+    preview_tabs_scroll: ScrollHandle,
+    preview_return_focus: Option<WeakFocusHandle>,
     preview_image: ImageViewState,
     preview_image_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     preview_last_mouse_position: Option<Point<Pixels>>,
@@ -426,6 +469,7 @@ pub struct ChattView {
     live_pane_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     live_pane_resize: Option<LivePaneResize>,
     status: SharedString,
+    _code_search_subscription: Subscription,
     _daemon_task: Task<()>,
     _video_task: Task<()>,
 }
@@ -440,6 +484,12 @@ impl ChattView {
         ));
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let composer = cx.new(Composer::new);
+        let code_search_input = cx.new(Composer::search);
+        let code_search_subscription =
+            cx.subscribe(&code_search_input, |this, _, _: &ComposerChanged, cx| {
+                this.update_code_search(cx);
+            });
+        let code_viewer_focus = cx.focus_handle();
         let timeline_selection = MessageSelectionGroup::new(cx.focus_handle());
         let image_cache = LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         let preview_image_cache =
@@ -511,11 +561,23 @@ impl ChattView {
             next_transfer_id: 1,
             editing: None,
             composer,
+            code_search_input,
+            code_viewer_focus,
+            code_search_open: false,
+            code_search_pending: false,
+            code_search_generation: 0,
+            code_search_results: CodeSearchResults::default(),
+            code_search_result_index: 0,
+            code_search_task: None,
             media_cache,
             image_cache,
             preview_image_cache,
             eager_image_fetches: EagerImageFetches::default(),
             preview_history: PreviewHistory::default(),
+            next_code_load_id: 1,
+            code_load_tasks: HashMap::new(),
+            preview_tabs_scroll: ScrollHandle::new(),
+            preview_return_focus: None,
             preview_image: ImageViewState::default(),
             preview_image_viewport: Rc::new(Cell::new(None)),
             preview_last_mouse_position: None,
@@ -548,6 +610,7 @@ impl ChattView {
             live_pane_bounds: Rc::new(Cell::new(None)),
             live_pane_resize: None,
             status: "Discovering Chatt daemon…".into(),
+            _code_search_subscription: code_search_subscription,
             _daemon_task: daemon_task,
             _video_task: video_task,
         }
@@ -962,6 +1025,7 @@ impl ChattView {
                     .expect("media cache lock poisoned")
                     .cancel_all();
                 self.eager_image_fetches.reset_transient();
+                self.preview_history.fail_code_fetches(&reason);
                 self.model.resync_requested = false;
                 self.model.phase = ConnectionPhase::Disconnected {
                     reason: reason.clone(),
@@ -1007,6 +1071,7 @@ impl ChattView {
                 );
                 self.status = format!("Cached {}", descriptor.file_name).into();
                 self.eager_image_fetches.cached(&descriptor);
+                self.resume_code_preview_load(&descriptor, cx);
                 self.pump_eager_image_fetches(cx);
             }
             DaemonEvent::MediaTransferFailed {
@@ -1022,6 +1087,8 @@ impl ChattView {
                     .expect("media cache lock poisoned")
                     .cancel(transfer_id);
                 self.eager_image_fetches.failed(transfer_id, reason.clone());
+                self.preview_history
+                    .fail_code_transfer(transfer_id, &reason);
                 self.status = reason.into();
                 self.pump_eager_image_fetches(cx);
             }
@@ -1166,6 +1233,7 @@ impl ChattView {
         let media_namespace_changed = self.model.daemon_instance != old_daemon_instance
             || self.model.active_server != old_active_server;
         if media_namespace_changed {
+            let preview_was_open = self.preview_history.active().is_some();
             self.media_cache
                 .lock()
                 .expect("media cache lock poisoned")
@@ -1175,7 +1243,14 @@ impl ChattView {
             self.preview_image_cache
                 .update(cx, |cache, cx| cache.clear(window, cx));
             self.eager_image_fetches.clear();
+            self.code_load_tasks.clear();
+            self.close_code_search(cx);
             self.preview_history.clear();
+            if preview_was_open {
+                self.restore_preview_focus(window, cx);
+            } else {
+                self.preview_return_focus = None;
+            }
             self.preview_image_viewport.set(None);
             self.preview_last_mouse_position = None;
             self.preview_pane_resize = None;
@@ -1288,6 +1363,8 @@ impl ChattView {
                             .cancel(transfer_id);
                         self.eager_image_fetches
                             .failed(transfer_id, message.clone());
+                        self.preview_history
+                            .fail_code_transfer(transfer_id, &message);
                         self.pump_eager_image_fetches(cx);
                     }
                     self.status = if pending.as_ref().is_some_and(|pending| {
@@ -1703,7 +1780,54 @@ impl ChattView {
         cx.notify();
     }
 
-    fn open_image_preview(&mut self, descriptor: AttachmentDescriptor, cx: &mut Context<Self>) {
+    fn begin_preview_session(&mut self, window: &Window, cx: &App) {
+        if self.preview_history.active().is_none() {
+            self.preview_return_focus = window.focused(cx).map(|focus| focus.downgrade());
+        }
+    }
+
+    fn restore_preview_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(focus) = self
+            .preview_return_focus
+            .take()
+            .and_then(|focus| focus.upgrade())
+        {
+            window.focus(&focus, cx);
+        } else {
+            window.blur();
+        }
+    }
+
+    fn reveal_active_preview_tab(&self) {
+        let Some(active_key) = self.preview_history.active_key() else {
+            return;
+        };
+        if let Some(index) = self
+            .preview_history
+            .items()
+            .iter()
+            .position(|item| item.key() == active_key)
+        {
+            self.preview_tabs_scroll.scroll_to_item(index);
+        }
+    }
+
+    fn cancel_code_load(&mut self, key: AttachmentId) {
+        self.code_load_tasks.remove(&key);
+    }
+
+    fn apply_preview_eviction(&mut self, evicted: Option<AttachmentId>) {
+        if let Some(evicted) = evicted {
+            self.cancel_code_load(evicted);
+        }
+    }
+
+    fn open_image_preview(
+        &mut self,
+        descriptor: AttachmentDescriptor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = self
             .media_cache
             .lock()
@@ -1718,48 +1842,436 @@ impl ChattView {
             (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
             _ => image::image_dimensions(&path).unwrap_or((640, 480)),
         };
-        let item = PreviewItem::new(descriptor, natural_size);
-        if self.preview_history.open(item.clone()) {
-            self.preview_image.reset(item.natural_size);
+        self.begin_preview_session(window, cx);
+        let item = PreviewItem::image(descriptor, natural_size);
+        let opened = self.preview_history.open(item);
+        self.apply_preview_eviction(opened.evicted);
+        self.reveal_active_preview_tab();
+        self.close_code_search(cx);
+        window.focus(&self.code_viewer_focus, cx);
+        if opened.active_changed {
+            self.preview_image.reset(
+                self.preview_history
+                    .active()
+                    .and_then(PreviewItem::image_size)
+                    .expect("new image preview has image content"),
+            );
             self.preview_image_viewport.set(None);
             self.preview_last_mouse_position = None;
         }
         cx.notify();
     }
 
-    fn select_preview(&mut self, key: AttachmentId, cx: &mut Context<Self>) {
-        if self.preview_history.select(key) {
-            if let Some(item) = self.preview_history.active() {
-                self.preview_image.reset(item.natural_size);
+    fn open_code_preview(
+        &mut self,
+        room_id: RoomId,
+        descriptor: AttachmentDescriptor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (cache_path, active_transfer) = {
+            let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
+            (
+                cache.path_for(&descriptor),
+                cache.active_transfer(&descriptor),
+            )
+        };
+        self.begin_preview_session(window, cx);
+        let opened = self
+            .preview_history
+            .open(PreviewItem::code(descriptor.clone(), active_transfer));
+        self.apply_preview_eviction(opened.evicted);
+        self.reveal_active_preview_tab();
+        self.close_code_search(cx);
+        self.preview_image_viewport.set(None);
+        self.preview_last_mouse_position = None;
+        window.focus(&self.code_viewer_focus, cx);
+
+        if let Some(reason) = code_preview_size_error(descriptor.byte_len) {
+            self.cancel_code_load(descriptor.id);
+            if let Some(preview) = self
+                .preview_history
+                .item_mut(descriptor.id)
+                .and_then(PreviewItem::code_preview_mut)
+            {
+                preview.state = CodePreviewState::Error(reason.into());
             }
+            cx.notify();
+            return;
+        }
+
+        let ready_or_preparing = self
+            .preview_history
+            .item(descriptor.id)
+            .and_then(PreviewItem::code_preview)
+            .is_some_and(|preview| {
+                matches!(
+                    preview.state,
+                    CodePreviewState::Ready(_) | CodePreviewState::Preparing { .. }
+                )
+            });
+        if ready_or_preparing {
+            cx.notify();
+            return;
+        }
+
+        if let Some(path) = cache_path {
+            self.start_code_preview_load(descriptor.id, path, cx);
+        } else if let Some(transfer_id) = active_transfer {
+            if let Some(preview) = self
+                .preview_history
+                .item_mut(descriptor.id)
+                .and_then(PreviewItem::code_preview_mut)
+            {
+                preview.state = CodePreviewState::Fetching {
+                    transfer_id: Some(transfer_id),
+                };
+            }
+        } else {
+            match self.begin_attachment_read(room_id, descriptor.clone(), cx) {
+                Ok(Some(transfer_id)) => {
+                    if let Some(preview) = self
+                        .preview_history
+                        .item_mut(descriptor.id)
+                        .and_then(PreviewItem::code_preview_mut)
+                    {
+                        preview.state = CodePreviewState::Fetching {
+                            transfer_id: Some(transfer_id),
+                        };
+                    }
+                }
+                Ok(None) => {
+                    let path = self
+                        .media_cache
+                        .lock()
+                        .expect("media cache lock poisoned")
+                        .path_for(&descriptor);
+                    if let Some(path) = path {
+                        self.start_code_preview_load(descriptor.id, path, cx);
+                    } else if let Some(preview) = self
+                        .preview_history
+                        .item_mut(descriptor.id)
+                        .and_then(PreviewItem::code_preview_mut)
+                    {
+                        preview.state = CodePreviewState::Error("attachment was not cached".into());
+                    }
+                }
+                Err(reason) => {
+                    if let Some(preview) = self
+                        .preview_history
+                        .item_mut(descriptor.id)
+                        .and_then(PreviewItem::code_preview_mut)
+                    {
+                        preview.state = CodePreviewState::Error(reason.clone());
+                    }
+                    self.status = reason.into();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_code_preview_load(
+        &mut self,
+        key: AttachmentId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.preview_history.item(key) else {
+            return;
+        };
+        let file_name = item.descriptor.file_name.clone();
+        self.cancel_code_load(key);
+        let load_id = self.next_code_load_id;
+        self.next_code_load_id = self.next_code_load_id.wrapping_add(1).max(1);
+        let Some(preview) = self
+            .preview_history
+            .item_mut(key)
+            .and_then(PreviewItem::code_preview_mut)
+        else {
+            return;
+        };
+        preview.state = CodePreviewState::Preparing { load_id };
+
+        let executor = cx.background_executor().clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move { CodeDocument::load(&path, &file_name, load_id) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this
+                    .code_load_tasks
+                    .get(&key)
+                    .is_some_and(|(active_load, _)| *active_load == load_id)
+                {
+                    return;
+                }
+                this.code_load_tasks.remove(&key);
+                let Some(preview) = this
+                    .preview_history
+                    .item_mut(key)
+                    .and_then(PreviewItem::code_preview_mut)
+                else {
+                    return;
+                };
+                if !matches!(
+                    preview.state,
+                    CodePreviewState::Preparing {
+                        load_id: active_load
+                    } if active_load == load_id
+                ) {
+                    return;
+                }
+                preview.state = match result {
+                    Ok(document) => CodePreviewState::Ready(document),
+                    Err(reason) => CodePreviewState::Error(reason),
+                };
+                cx.notify();
+            });
+        });
+        self.code_load_tasks.insert(key, (load_id, task));
+    }
+
+    fn resume_code_preview_load(
+        &mut self,
+        descriptor: &AttachmentDescriptor,
+        cx: &mut Context<Self>,
+    ) {
+        let should_load = self
+            .preview_history
+            .item(descriptor.id)
+            .and_then(PreviewItem::code_preview)
+            .is_some_and(|preview| {
+                matches!(
+                    preview.state,
+                    CodePreviewState::Fetching { .. } | CodePreviewState::Error(_)
+                )
+            });
+        if !should_load {
+            return;
+        }
+        let path = self
+            .media_cache
+            .lock()
+            .expect("media cache lock poisoned")
+            .path_for(descriptor);
+        if let Some(path) = path {
+            self.start_code_preview_load(descriptor.id, path, cx);
+        }
+    }
+
+    fn active_code_document(&self) -> Option<(Arc<CodeDocument>, UniformListScrollHandle)> {
+        let preview = self.preview_history.active()?.code_preview()?;
+        let CodePreviewState::Ready(document) = &preview.state else {
+            return None;
+        };
+        Some((document.clone(), preview.scroll_handle.clone()))
+    }
+
+    fn update_code_search(&mut self, cx: &mut Context<Self>) {
+        if !self.code_search_open {
+            return;
+        }
+        let Some((document, _)) = self.active_code_document() else {
+            self.close_code_search(cx);
+            return;
+        };
+        let query = {
+            let input = self.code_search_input.read(cx);
+            input.text_ref().to_string()
+        };
+        self.code_search_generation = self.code_search_generation.wrapping_add(1);
+        let generation = self.code_search_generation;
+        self.code_search_task.take();
+        self.code_search_results = CodeSearchResults::default();
+        self.code_search_result_index = 0;
+        self.code_search_pending = !query.is_empty();
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+
+        let executor = cx.background_executor().clone();
+        self.code_search_task = Some(cx.spawn(async move |this, cx| {
+            executor.timer(Duration::from_millis(75)).await;
+            let results = executor
+                .spawn(async move { document.search(&query) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.code_search_open || this.code_search_generation != generation {
+                    return;
+                }
+                this.code_search_task.take();
+                this.code_search_pending = false;
+                this.code_search_results = results;
+                this.code_search_result_index = 0;
+                this.scroll_to_code_match(ScrollStrategy::Center);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn scroll_to_code_match(&self, strategy: ScrollStrategy) {
+        let Some(line) = self
+            .code_search_results
+            .line_for_match(self.code_search_result_index)
+        else {
+            return;
+        };
+        if let Some((_, scroll_handle)) = self.active_code_document() {
+            scroll_handle.scroll_to_item_strict(line, strategy);
+        }
+    }
+
+    fn open_code_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_code_document().is_none() {
+            return;
+        }
+        self.code_search_open = true;
+        self.update_code_search(cx);
+        window.focus(&self.code_search_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn next_code_match(&mut self, cx: &mut Context<Self>) {
+        if self.code_search_results.is_empty() {
+            return;
+        }
+        self.code_search_result_index =
+            (self.code_search_result_index + 1) % self.code_search_results.len();
+        self.scroll_to_code_match(ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn previous_code_match(&mut self, cx: &mut Context<Self>) {
+        if self.code_search_results.is_empty() {
+            return;
+        }
+        self.code_search_result_index = self
+            .code_search_result_index
+            .checked_sub(1)
+            .unwrap_or(self.code_search_results.len() - 1);
+        self.scroll_to_code_match(ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn close_code_search(&mut self, cx: &mut Context<Self>) {
+        if !self.code_search_open
+            && !self.code_search_pending
+            && self.code_search_results.is_empty()
+        {
+            return;
+        }
+        self.code_search_generation = self.code_search_generation.wrapping_add(1);
+        self.code_search_task.take();
+        self.code_search_open = false;
+        self.code_search_pending = false;
+        self.code_search_results = CodeSearchResults::default();
+        self.code_search_result_index = 0;
+        cx.notify();
+    }
+
+    fn find_in_code_action(&mut self, _: &FindInCode, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.open_code_search(window, cx);
+    }
+
+    fn next_code_match_action(
+        &mut self,
+        _: &NextCodeMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.next_code_match(cx);
+    }
+
+    fn previous_code_match_action(
+        &mut self,
+        _: &PreviousCodeMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.previous_code_match(cx);
+    }
+
+    fn close_code_search_action(
+        &mut self,
+        _: &CloseCodeSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.close_code_search(cx);
+        window.focus(&self.code_viewer_focus, cx);
+    }
+
+    fn select_preview(&mut self, key: AttachmentId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview_history.select(key) {
+            self.close_code_search(cx);
+            if let Some(natural_size) = self
+                .preview_history
+                .active()
+                .and_then(PreviewItem::image_size)
+            {
+                self.preview_image.reset(natural_size);
+            }
+            window.focus(&self.code_viewer_focus, cx);
+            self.reveal_active_preview_tab();
             self.preview_image_viewport.set(None);
             self.preview_last_mouse_position = None;
             cx.notify();
         }
     }
 
-    fn close_preview(&mut self, cx: &mut Context<Self>) {
+    fn close_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview_history.active().is_none() {
             return;
         }
         self.preview_history.close_panel();
+        self.close_code_search(cx);
         self.preview_image_viewport.set(None);
         self.preview_last_mouse_position = None;
         self.preview_pane_resize = None;
+        self.restore_preview_focus(window, cx);
         cx.notify();
     }
 
-    fn close_preview_action(&mut self, _: &ClosePreview, _: &mut Window, cx: &mut Context<Self>) {
+    fn close_preview_action(
+        &mut self,
+        _: &ClosePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.exit_video_theater(cx) {
             return;
         }
-        self.close_preview(cx);
+        self.close_preview(window, cx);
     }
 
-    fn close_preview_tab(&mut self, key: AttachmentId, cx: &mut Context<Self>) {
+    fn close_preview_tab(
+        &mut self,
+        key: AttachmentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_code_load(key);
         if self.preview_history.close_tab(key) {
-            if let Some(item) = self.preview_history.active() {
-                self.preview_image.reset(item.natural_size);
+            self.close_code_search(cx);
+            if let Some(natural_size) = self
+                .preview_history
+                .active()
+                .and_then(PreviewItem::image_size)
+            {
+                self.preview_image.reset(natural_size);
+            }
+            if self.preview_history.active().is_some() {
+                window.focus(&self.code_viewer_focus, cx);
+                self.reveal_active_preview_tab();
+            } else {
+                self.restore_preview_focus(window, cx);
             }
             self.preview_image_viewport.set(None);
             self.preview_last_mouse_position = None;
@@ -1767,7 +2279,7 @@ impl ChattView {
         cx.notify();
     }
 
-    fn save_preview_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_preview_attachment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.preview_history.active().cloned() else {
             return;
         };
@@ -1794,14 +2306,31 @@ impl ChattView {
             let _ = this.update_in(cx, |this, _, cx| {
                 match result {
                     Ok(destination) => {
-                        this.status = format!("Saved image to {}", destination.display()).into()
+                        this.status = format!("Saved to {}", destination.display()).into()
                     }
-                    Err(error) => this.status = format!("Could not save image · {error}").into(),
+                    Err(error) => this.status = format!("Could not save file · {error}").into(),
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn copy_preview_code(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self
+            .preview_history
+            .active()
+            .and_then(PreviewItem::code_preview)
+            .and_then(|preview| match &preview.state {
+                CodePreviewState::Ready(document) => Some(document),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(document.source().to_string()));
+        self.status = "Copied file".into();
+        cx.notify();
     }
 
     fn preview_viewport(&self) -> Option<Bounds<Pixels>> {
@@ -2153,7 +2682,9 @@ impl ChattView {
                 .cursor_pointer()
                 .hover(|image| image.opacity(0.88))
                 .on_click(
-                    cx.listener(move |this, _, _, cx| this.open_image_preview(preview.clone(), cx)),
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_image_preview(preview.clone(), window, cx)
+                    }),
                 )
                 .child(
                     img(path)
@@ -2202,6 +2733,50 @@ impl ChattView {
                 format!("Loading {}…", descriptor.file_name),
                 None,
             );
+        }
+        if descriptor.media_kind == MediaKind::File && !attachment.is_video() {
+            let open = descriptor.clone();
+            let label = if cache_path.is_some() {
+                format!(
+                    "{} · {} bytes · click to preview",
+                    descriptor.file_name, descriptor.byte_len
+                )
+            } else if active_transfer.is_some() {
+                format!("Fetching {}…", descriptor.file_name)
+            } else {
+                format!(
+                    "{} · {} bytes · click to preview",
+                    descriptor.file_name, descriptor.byte_len
+                )
+            };
+            return div()
+                .id(("file-attachment", message_id as usize))
+                .mt_2()
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_3()
+                .bg(rgb(0x171a20))
+                .cursor_pointer()
+                .hover(|item| item.bg(rgb(0x20242a)))
+                .text_sm()
+                .text_color(rgb(0x9aa1ac))
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .when_some(active_transfer, |card, transfer_id| {
+                    card.child(
+                        mini_button(("cancel-read", transfer_id.0 as usize), "Cancel").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.cancel_bulk_read(transfer_id, cx)
+                            }),
+                        ),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_code_preview(room_id, open.clone(), window, cx)
+                }))
+                .into_any_element();
         }
         if let Some(transfer_id) = active_transfer {
             return div()
@@ -2458,14 +3033,11 @@ impl ChattView {
         Ok(Some(transfer_id))
     }
 
-    fn render_preview_panel(
+    fn render_preview_tabs(
         &mut self,
-        active: PreviewItem,
-        width: Pixels,
-        window: &mut Window,
+        active_key: AttachmentId,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let active_key = active.key();
         let history = self.preview_history.items().to_vec();
         let mut tabs = div()
             .id("preview-tabs")
@@ -2473,7 +3045,8 @@ impl ChattView {
             .flex_1()
             .min_w_0()
             .flex()
-            .overflow_x_scroll();
+            .overflow_x_scroll()
+            .track_scroll(&self.preview_tabs_scroll);
         for item in history {
             let key = item.key();
             let selected = key == active_key;
@@ -2513,7 +3086,10 @@ impl ChattView {
                             .pl_3()
                             .pr_1()
                             .cursor_pointer()
-                            .child(div().flex_none().text_xs().child("▧"))
+                            .child(div().flex_none().text_xs().child(match item.content {
+                                PreviewContent::Image { .. } => "▧",
+                                PreviewContent::Code(_) => "{}",
+                            }))
                             .child(
                                 div()
                                     .min_w_0()
@@ -2521,8 +3097,8 @@ impl ChattView {
                                     .text_xs()
                                     .child(item.descriptor.file_name),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_preview(select_key, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_preview(select_key, window, cx)
                             })),
                     )
                     .child(
@@ -2538,13 +3114,26 @@ impl ChattView {
                             .text_sm()
                             .hover(|button| button.bg(rgb(0x20242a)).text_color(rgb(0xe4e6ea)))
                             .child("×")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_preview_tab(close_key, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_preview_tab(close_key, window, cx)
                             })),
                     ),
             );
         }
+        tabs
+    }
 
+    fn render_preview_panel(
+        &mut self,
+        active: PreviewItem,
+        width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        if matches!(active.content, PreviewContent::Code(_)) {
+            return self.render_code_preview_panel(active, width, cx);
+        }
+        let tabs = self.render_preview_tabs(active.key(), cx);
         let cache_path = self
             .media_cache
             .lock()
@@ -2676,6 +3265,7 @@ impl ChattView {
             .flex_col()
             .overflow_hidden()
             .bg(rgb(0x111317))
+            .track_focus(&self.code_viewer_focus)
             .child(
                 div()
                     .h(px(39.0))
@@ -2699,13 +3289,16 @@ impl ChattView {
                             .child(
                                 preview_action_button("preview-save", IconName::Download).on_click(
                                     cx.listener(|this, _, window, cx| {
-                                        this.save_preview_image(window, cx)
+                                        this.save_preview_attachment(window, cx)
                                     }),
                                 ),
                             )
                             .child(
-                                preview_action_button("preview-close", IconName::Close)
-                                    .on_click(cx.listener(|this, _, _, cx| this.close_preview(cx))),
+                                preview_action_button("preview-close", IconName::Close).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.close_preview(window, cx)
+                                    }),
+                                ),
                             ),
                     ),
             )
@@ -2749,6 +3342,182 @@ impl ChattView {
                     ),
             )
             .child(viewport_element)
+    }
+
+    fn render_code_preview_panel(
+        &mut self,
+        active: PreviewItem,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let tabs = self.render_preview_tabs(active.key(), cx);
+        let preview = active
+            .code_preview()
+            .expect("code preview panel requires code content")
+            .clone();
+        let ready = matches!(&preview.state, CodePreviewState::Ready(_));
+        let active_match = self
+            .code_search_open
+            .then(|| {
+                self.code_search_results
+                    .line_for_match(self.code_search_result_index)
+            })
+            .flatten();
+        let search_status: SharedString = if self.code_search_input.read(cx).text_ref().is_empty() {
+            "".into()
+        } else if self.code_search_pending {
+            "Searching…".into()
+        } else if self.code_search_results.is_empty() {
+            "No matches".into()
+        } else {
+            format!(
+                "{} / {}",
+                self.code_search_result_index + 1,
+                self.code_search_results.len()
+            )
+            .into()
+        };
+        let body = match preview.state {
+            CodePreviewState::Fetching { .. } => preview_status("loading…"),
+            CodePreviewState::Preparing { .. } => preview_status("highlighting…"),
+            CodePreviewState::Error(reason) => preview_status(reason),
+            CodePreviewState::Ready(document) => div()
+                .id("preview-code-viewport")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .bg(rgb(0x08090b))
+                .child(render_code_document(
+                    document,
+                    preview.scroll_handle.clone(),
+                    active_match,
+                ))
+                .into_any_element(),
+        };
+
+        div()
+            .id("preview-panel")
+            .w(width)
+            .h_full()
+            .min_w_0()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(0x111317))
+            .key_context("ChattCodeViewer")
+            .track_focus(&self.code_viewer_focus)
+            .child(
+                div()
+                    .h(px(39.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .border_b_1()
+                    .border_color(rgb(0x272a30))
+                    .bg(rgb(0x191c21))
+                    .child(tabs)
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .bg(rgb(0x191c21))
+                            .when(ready, |actions| {
+                                actions
+                                    .child(
+                                        preview_action_button(
+                                            "preview-find-code",
+                                            IconName::Search,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.open_code_search(window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        preview_action_button("preview-copy-code", IconName::Copy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.copy_preview_code(cx)
+                                            })),
+                                    )
+                            })
+                            .child(
+                                preview_action_button("preview-save", IconName::Download).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.save_preview_attachment(window, cx)
+                                    }),
+                                ),
+                            )
+                            .child(
+                                preview_action_button("preview-close", IconName::Close).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.close_preview(window, cx)
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+            .when(self.code_search_open && ready, |panel| {
+                panel.child(
+                    div()
+                        .h(px(39.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .border_b_1()
+                        .border_color(rgb(0x272a30))
+                        .bg(rgb(0x111317))
+                        .child(
+                            div()
+                                .h(px(30.0))
+                                .min_w(px(120.0))
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .px_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x343943))
+                                .bg(rgb(0x0d0f12))
+                                .text_sm()
+                                .child(self.code_search_input.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(70.0))
+                                .flex_none()
+                                .text_right()
+                                .text_xs()
+                                .text_color(rgb(0x8b929d))
+                                .child(search_status),
+                        )
+                        .child(
+                            preview_control_button("preview-find-previous", "↑").on_click(
+                                cx.listener(|this, _, _, cx| this.previous_code_match(cx)),
+                            ),
+                        )
+                        .child(
+                            preview_control_button("preview-find-next", "↓")
+                                .on_click(cx.listener(|this, _, _, cx| this.next_code_match(cx))),
+                        )
+                        .child(preview_control_button("preview-find-close", "×").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.close_code_search(cx);
+                                window.focus(&this.code_viewer_focus, cx);
+                            }),
+                        )),
+                )
+            })
+            .child(body)
     }
 
     fn render_attachment_video(
@@ -3934,6 +4703,10 @@ impl Render for ChattView {
             .on_action(cx.listener(Self::toggle_deafen))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::close_preview_action))
+            .on_action(cx.listener(Self::find_in_code_action))
+            .on_action(cx.listener(Self::next_code_match_action))
+            .on_action(cx.listener(Self::previous_code_match_action))
+            .on_action(cx.listener(Self::close_code_search_action))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.queue_uploads(paths.0.to_vec(), cx)
             }))
@@ -4492,6 +5265,21 @@ fn preview_action_button(id: &'static str, icon_name: IconName) -> Stateful<Div>
         .child(icon(icon_name, 17.0, 0x9ba1ab))
 }
 
+fn preview_status(message: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x08090b))
+        .text_sm()
+        .text_color(rgb(0x8b929d))
+        .child(message.into())
+        .into_any_element()
+}
+
 fn preview_control_button(id: &'static str, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
@@ -4544,6 +5332,15 @@ mod tests {
                 height: Some(300),
             },
         )
+    }
+
+    #[test]
+    fn code_preview_rejects_oversized_descriptors_before_transport() {
+        assert_eq!(code_preview_size_error(MAX_CODE_PREVIEW_BYTES), None);
+        assert_eq!(
+            code_preview_size_error(MAX_CODE_PREVIEW_BYTES + 1),
+            Some("file too large to preview")
+        );
     }
 
     #[test]

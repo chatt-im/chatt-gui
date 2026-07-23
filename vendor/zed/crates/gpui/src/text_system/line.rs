@@ -5,7 +5,7 @@ use crate::{
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
 /// Pre-computed glyph data for efficient painting without per-glyph cache lookups.
 ///
@@ -252,6 +252,39 @@ impl ShapedLine {
     }
 }
 
+impl LineLayout {
+    /// Paints this layout with lazily supplied decoration runs.
+    ///
+    /// This is useful when the caller already owns an indexed style buffer and
+    /// does not need a second collection solely to satisfy the painter.
+    pub fn paint_with_decorations<I, R>(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        decoration_runs: I,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = R>,
+        R: Borrow<DecorationRun>,
+    {
+        paint_line(
+            origin,
+            self,
+            line_height,
+            align,
+            align_width,
+            decoration_runs,
+            &[],
+            window,
+            cx,
+        )
+    }
+}
+
 /// A line of text that has been shaped, decorated, and wrapped by the text layout system.
 #[derive(Default, Debug, Deref, DerefMut)]
 pub struct WrappedLine {
@@ -331,17 +364,21 @@ impl WrappedLine {
     }
 }
 
-fn paint_line(
+fn paint_line<I, R>(
     origin: Point<Pixels>,
     layout: &LineLayout,
     line_height: Pixels,
     align: TextAlign,
     align_width: Option<Pixels>,
-    decoration_runs: &[DecorationRun],
+    decoration_runs: I,
     wrap_boundaries: &[WrapBoundary],
     window: &mut Window,
     cx: &mut App,
-) -> Result<()> {
+) -> Result<()>
+where
+    I: IntoIterator<Item = R>,
+    R: Borrow<DecorationRun>,
+{
     let line_bounds = Bounds::new(
         origin,
         size(
@@ -352,7 +389,7 @@ fn paint_line(
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
-        let mut decoration_runs = decoration_runs.iter();
+        let mut decoration_runs = decoration_runs.into_iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
         let mut color = black();
@@ -437,7 +474,8 @@ fn paint_line(
                     let mut style_run = decoration_runs.next();
 
                     // ignore style runs that apply to a partial glyph
-                    while let Some(run) = style_run {
+                    while let Some(run) = style_run.as_ref() {
+                        let run = run.borrow();
                         if glyph.index < run_end + (run.len as usize) {
                             break;
                         }
@@ -446,6 +484,7 @@ fn paint_line(
                     }
 
                     if let Some(style_run) = style_run {
+                        let style_run = style_run.borrow();
                         if let Some((_, underline_style)) = &mut current_underline
                             && style_run.underline.as_ref() != Some(underline_style)
                         {

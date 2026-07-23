@@ -597,6 +597,7 @@ dependencies = [
  "naga",
  "tempfile",
  "unicode-segmentation",
+ "unicode-width",
  "zmij",
 ]
 

@@ -412,6 +412,8 @@ struct FrameCache {
     wrapped_lines_by_hash: FxHashMap<Arc<HashedCacheKey>, Arc<WrappedLineLayout>>,
     used_lines_by_hash: Vec<Arc<HashedCacheKey>>,
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
+    borrowed_lines: FxHashMap<Arc<BorrowedCacheKey>, Arc<LineLayout>>,
+    used_borrowed_lines: Vec<Arc<BorrowedCacheKey>>,
 }
 
 #[derive(Clone, Default)]
@@ -420,6 +422,7 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_index: usize,
     lines_by_hash_index: usize,
     wrapped_lines_by_hash_index: usize,
+    borrowed_lines_index: usize,
 }
 
 impl LineLayoutCache {
@@ -438,6 +441,7 @@ impl LineLayoutCache {
             wrapped_lines_index: frame.used_wrapped_lines.len(),
             lines_by_hash_index: frame.used_lines_by_hash.len(),
             wrapped_lines_by_hash_index: frame.used_wrapped_lines_by_hash.len(),
+            borrowed_lines_index: frame.used_borrowed_lines.len(),
         }
     }
 
@@ -478,6 +482,15 @@ impl LineLayoutCache {
             }
             current_frame.used_wrapped_lines_by_hash.push(key.clone());
         }
+
+        for key in &previous_frame.used_borrowed_lines
+            [range.start.borrowed_lines_index..range.end.borrowed_lines_index]
+        {
+            if let Some((key, line)) = previous_frame.borrowed_lines.remove_entry(key) {
+                current_frame.borrowed_lines.insert(key, line);
+            }
+            current_frame.used_borrowed_lines.push(key.clone());
+        }
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
@@ -492,6 +505,9 @@ impl LineLayoutCache {
         current_frame
             .used_wrapped_lines_by_hash
             .truncate(index.wrapped_lines_by_hash_index);
+        current_frame
+            .used_borrowed_lines
+            .truncate(index.borrowed_lines_index);
     }
 
     pub fn finish_frame(&self) {
@@ -507,6 +523,8 @@ impl LineLayoutCache {
         curr_frame.wrapped_lines_by_hash.clear();
         curr_frame.used_lines_by_hash.clear();
         curr_frame.used_wrapped_lines_by_hash.clear();
+        curr_frame.borrowed_lines.clear();
+        curr_frame.used_borrowed_lines.clear();
     }
 
     pub fn layout_wrapped_line<Text>(
@@ -777,6 +795,62 @@ impl LineLayoutCache {
         current_frame.used_lines_by_hash.push(key);
         layout
     }
+
+    /// Lays out borrowed text under caller-provided content and style hashes.
+    ///
+    /// The hashes let the cache probe without copying either the text or its
+    /// font runs. `build_layout` is invoked only on a cache miss.
+    ///
+    /// Callers must guarantee that an equal pair of hashes and equal layout
+    /// parameters represents identical text and font runs.
+    pub fn layout_borrowed_line(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        style_hash: u64,
+        font_size: Pixels,
+        force_width: Option<Pixels>,
+        build_layout: impl FnOnce() -> LineLayout,
+    ) -> Arc<LineLayout> {
+        let key = BorrowedCacheKey {
+            text_hash,
+            text_len,
+            style_hash,
+            font_size,
+            force_width,
+        };
+
+        let current_frame = self.current_frame.upgradable_read();
+        if let Some(layout) = current_frame.borrowed_lines.get(&key) {
+            return layout.clone();
+        }
+
+        let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+        if let Some((key, layout)) = self
+            .previous_frame
+            .lock()
+            .borrowed_lines
+            .remove_entry(&key)
+        {
+            current_frame
+                .borrowed_lines
+                .insert(key.clone(), layout.clone());
+            current_frame.used_borrowed_lines.push(key);
+            return layout;
+        }
+
+        let key = Arc::new(key);
+        let mut layout = build_layout();
+        if let Some(force_width) = force_width {
+            apply_force_width_to_layout(&mut layout, force_width);
+        }
+        let layout = Arc::new(layout);
+        current_frame
+            .borrowed_lines
+            .insert(key.clone(), layout.clone());
+        current_frame.used_borrowed_lines.push(key);
+        layout
+    }
 }
 
 // Combining marks (e.g. Thai vowel signs, Arabic diacritics) are shaped by
@@ -846,6 +920,15 @@ struct HashedCacheKey {
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
+    force_width: Option<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct BorrowedCacheKey {
+    text_hash: u64,
+    text_len: usize,
+    style_hash: u64,
+    font_size: Pixels,
     force_width: Option<Pixels>,
 }
 
@@ -959,8 +1042,10 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
-    use crate::GlyphId;
+    use crate::{GlyphId, platform::NoopTextSystem};
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
@@ -991,6 +1076,26 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn borrowed_layout_cache_builds_once_and_reuses_across_frames() {
+        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
+        let builds = Cell::new(0);
+        let build = || {
+            builds.set(builds.get() + 1);
+            LineLayout::default()
+        };
+
+        let first = cache.layout_borrowed_line(7, 4, 11, px(14.0), None, build);
+        let second = cache.layout_borrowed_line(7, 4, 11, px(14.0), None, build);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(builds.get(), 1);
+
+        cache.finish_frame();
+        let third = cache.layout_borrowed_line(7, 4, 11, px(14.0), None, build);
+        assert!(Arc::ptr_eq(&first, &third));
+        assert_eq!(builds.get(), 1);
     }
 
     #[test]

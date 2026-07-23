@@ -20,6 +20,7 @@ pub(crate) enum IconName {
     Play,
     Plus,
     RotateCcw,
+    Search,
     Stop,
     Trash,
     VolumeHigh,
@@ -48,6 +49,7 @@ impl IconName {
             Self::Play => "icons/play.svg",
             Self::Plus => "icons/plus.svg",
             Self::RotateCcw => "icons/rotate-ccw.svg",
+            Self::Search => "icons/search.svg",
             Self::Stop => "icons/stop.svg",
             Self::Trash => "icons/trash.svg",
             Self::VolumeHigh => "icons/volume-high.svg",
@@ -106,6 +108,7 @@ const ICON_PATHS: &[&str] = &[
     "icons/play.svg",
     "icons/plus.svg",
     "icons/rotate-ccw.svg",
+    "icons/search.svg",
     "icons/stop.svg",
     "icons/trash.svg",
     "icons/volume-high.svg",
@@ -159,6 +162,7 @@ fn icon_svg(path: &str) -> Option<String> {
         }
         "icons/plus.svg" => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
         "icons/rotate-ccw.svg" => r#"<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>"#,
+        "icons/search.svg" => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>"#,
         "icons/stop.svg" => r#"<rect x="4" y="4" width="16" height="16" rx="2"/>"#,
         "icons/trash.svg" => {
             r#"<path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>"#

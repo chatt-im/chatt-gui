@@ -1,4 +1,5 @@
 mod app;
+mod code_viewer;
 mod composer;
 mod daemon;
 mod fonts;

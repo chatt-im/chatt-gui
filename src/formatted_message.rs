@@ -950,7 +950,7 @@ fn apply_span_style(style: &mut TextStyle, span: FormatSpan) {
     }
 }
 
-const fn syntax_color(role: PaletteRole) -> u32 {
+pub(crate) const fn syntax_color(role: PaletteRole) -> u32 {
     match role {
         PaletteRole::Foreground => 0xbdc0be,
         PaletteRole::Type => 0xebc782,

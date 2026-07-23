@@ -838,6 +838,49 @@ impl WindowTextSystem {
 
         layout
     }
+
+    /// Lays out a borrowed line without materializing text or font-run buffers
+    /// at the call site.
+    ///
+    /// `font_runs` is evaluated only when the content/style hash misses the
+    /// line-layout cache. The platform-facing run buffer comes from the text
+    /// system's existing pool and is returned after shaping.
+    ///
+    /// Callers must guarantee that equal content/style hashes and layout
+    /// parameters represent identical text and font runs.
+    pub fn layout_borrowed_line(
+        &self,
+        text_hash: u64,
+        style_hash: u64,
+        text: &str,
+        font_size: Pixels,
+        force_width: Option<Pixels>,
+        font_runs: impl FnOnce(&mut dyn FnMut(FontRun)),
+    ) -> Arc<LineLayout> {
+        self.line_layout_cache.layout_borrowed_line(
+            text_hash,
+            text.len(),
+            style_hash,
+            font_size,
+            force_width,
+            || {
+                let mut runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+                runs.clear();
+                font_runs(&mut |run| runs.push(run));
+                debug_assert_eq!(
+                    runs.iter().map(|run| run.len).sum::<usize>(),
+                    text.len(),
+                    "font runs must cover the borrowed line"
+                );
+
+                let layout = self
+                    .platform_text_system
+                    .layout_line(text, font_size, &runs);
+                self.font_runs_pool.lock().push(runs);
+                layout
+            },
+        )
+    }
 }
 
 #[derive(Hash, Eq, PartialEq)]

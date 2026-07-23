@@ -1,5 +1,9 @@
-use gpui::{Bounds, Pixels, Point, point, px, size};
-use local_rpc::model::{AttachmentDescriptor, AttachmentId};
+use std::sync::Arc;
+
+use gpui::{Bounds, Pixels, Point, UniformListScrollHandle, point, px, size};
+use local_rpc::model::{AttachmentDescriptor, AttachmentId, BulkTransferId};
+
+use crate::code_viewer::CodeDocument;
 
 pub const HISTORY_LIMIT: usize = 16;
 pub const DEFAULT_PANEL_WIDTH: f32 = 560.0;
@@ -11,29 +15,88 @@ const MANUAL_ZOOM_MIN: f32 = 0.1;
 const MANUAL_ZOOM_MAX: f32 = 8.0;
 const DEFAULT_AUTO_FIT_MAX: f32 = 3.0;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PreviewItem {
     pub descriptor: AttachmentDescriptor,
-    pub natural_size: (u32, u32),
+    pub content: PreviewContent,
 }
 
 impl PreviewItem {
-    pub fn new(descriptor: AttachmentDescriptor, natural_size: (u32, u32)) -> Self {
+    pub fn image(descriptor: AttachmentDescriptor, natural_size: (u32, u32)) -> Self {
         Self {
             descriptor,
-            natural_size: (natural_size.0.max(1), natural_size.1.max(1)),
+            content: PreviewContent::Image {
+                natural_size: (natural_size.0.max(1), natural_size.1.max(1)),
+            },
+        }
+    }
+
+    pub fn code(descriptor: AttachmentDescriptor, transfer_id: Option<BulkTransferId>) -> Self {
+        Self {
+            descriptor,
+            content: PreviewContent::Code(CodePreview {
+                state: CodePreviewState::Fetching { transfer_id },
+                scroll_handle: UniformListScrollHandle::new(),
+            }),
         }
     }
 
     pub fn key(&self) -> AttachmentId {
         self.descriptor.id
     }
+
+    pub fn image_size(&self) -> Option<(u32, u32)> {
+        match self.content {
+            PreviewContent::Image { natural_size } => Some(natural_size),
+            PreviewContent::Code(_) => None,
+        }
+    }
+
+    pub fn code_preview(&self) -> Option<&CodePreview> {
+        match &self.content {
+            PreviewContent::Code(preview) => Some(preview),
+            PreviewContent::Image { .. } => None,
+        }
+    }
+
+    pub fn code_preview_mut(&mut self) -> Option<&mut CodePreview> {
+        match &mut self.content {
+            PreviewContent::Code(preview) => Some(preview),
+            PreviewContent::Image { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PreviewContent {
+    Image { natural_size: (u32, u32) },
+    Code(CodePreview),
+}
+
+#[derive(Clone, Debug)]
+pub struct CodePreview {
+    pub state: CodePreviewState,
+    pub scroll_handle: UniformListScrollHandle,
+}
+
+#[derive(Clone, Debug)]
+pub enum CodePreviewState {
+    Fetching { transfer_id: Option<BulkTransferId> },
+    Preparing { load_id: u64 },
+    Ready(Arc<CodeDocument>),
+    Error(String),
 }
 
 #[derive(Default)]
 pub struct PreviewHistory {
     items: Vec<PreviewItem>,
     active: Option<AttachmentId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreviewOpenResult {
+    pub active_changed: bool,
+    pub evicted: Option<AttachmentId>,
 }
 
 impl PreviewHistory {
@@ -50,7 +113,48 @@ impl PreviewHistory {
         self.active().map(PreviewItem::key)
     }
 
-    pub fn open(&mut self, item: PreviewItem) -> bool {
+    pub fn item(&self, key: AttachmentId) -> Option<&PreviewItem> {
+        self.items.iter().find(|item| item.key() == key)
+    }
+
+    pub fn item_mut(&mut self, key: AttachmentId) -> Option<&mut PreviewItem> {
+        self.items.iter_mut().find(|item| item.key() == key)
+    }
+
+    pub fn fail_code_transfer(&mut self, transfer_id: BulkTransferId, reason: &str) -> bool {
+        let mut changed = false;
+        for item in &mut self.items {
+            let Some(preview) = item.code_preview_mut() else {
+                continue;
+            };
+            if matches!(
+                preview.state,
+                CodePreviewState::Fetching {
+                    transfer_id: Some(active)
+                } if active == transfer_id
+            ) {
+                preview.state = CodePreviewState::Error(reason.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn fail_code_fetches(&mut self, reason: &str) -> bool {
+        let mut changed = false;
+        for item in &mut self.items {
+            let Some(preview) = item.code_preview_mut() else {
+                continue;
+            };
+            if matches!(preview.state, CodePreviewState::Fetching { .. }) {
+                preview.state = CodePreviewState::Error(reason.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn open(&mut self, item: PreviewItem) -> PreviewOpenResult {
         let key = item.key();
         let active_changed = self.active_key() != Some(key);
         let promoted = self
@@ -61,9 +165,13 @@ impl PreviewHistory {
             .unwrap_or(item);
         self.items.retain(|candidate| candidate.key() != key);
         self.items.insert(0, promoted);
-        self.items.truncate(HISTORY_LIMIT);
+        let evicted = (self.items.len() > HISTORY_LIMIT)
+            .then(|| self.items.pop().expect("preview history exceeded its limit").key());
         self.active = Some(key);
-        active_changed
+        PreviewOpenResult {
+            active_changed,
+            evicted,
+        }
     }
 
     pub fn select(&mut self, key: AttachmentId) -> bool {
@@ -281,7 +389,7 @@ mod tests {
     use super::*;
 
     fn item(message_id: u64) -> PreviewItem {
-        PreviewItem::new(
+        PreviewItem::image(
             AttachmentDescriptor {
                 id: AttachmentId {
                     timestamp_ms: message_id,
@@ -298,6 +406,24 @@ mod tests {
         )
     }
 
+    fn code_item(message_id: u64, transfer_id: BulkTransferId) -> PreviewItem {
+        PreviewItem::code(
+            AttachmentDescriptor {
+                id: AttachmentId {
+                    timestamp_ms: message_id,
+                    transfer_id: FileTransferId(message_id),
+                },
+                file_name: format!("source-{message_id}.rs"),
+                media_kind: MediaKind::File,
+                content_type: "text/rust".into(),
+                byte_len: 10,
+                width: None,
+                height: None,
+            },
+            Some(transfer_id),
+        )
+    }
+
     fn viewport(width: f32, height: f32) -> Bounds<Pixels> {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -308,13 +434,15 @@ mod tests {
     #[test]
     fn direct_open_promotes_existing_tab_and_bounds_history() {
         let mut history = PreviewHistory::default();
+        let mut evicted = None;
         for id in 0..HISTORY_LIMIT as u64 + 2 {
-            history.open(item(id));
+            evicted = history.open(item(id)).evicted;
         }
         assert_eq!(history.items().len(), HISTORY_LIMIT);
         assert_eq!(history.active_key(), Some(item(17).key()));
+        assert_eq!(evicted, Some(item(1).key()));
 
-        history.open(item(5));
+        assert_eq!(history.open(item(5)).evicted, None);
         assert_eq!(history.items()[0].key(), item(5).key());
         assert_eq!(history.items().len(), HISTORY_LIMIT);
     }
@@ -332,6 +460,37 @@ mod tests {
         history.close_panel();
         assert!(history.active().is_none());
         assert_eq!(history.items().len(), 2);
+    }
+
+    #[test]
+    fn code_transfer_failure_updates_only_the_matching_fetch() {
+        let mut history = PreviewHistory::default();
+        history.open(code_item(1, BulkTransferId(11)));
+        history.open(code_item(2, BulkTransferId(22)));
+
+        assert!(!history.fail_code_transfer(BulkTransferId(33), "wrong transfer"));
+        assert!(history.fail_code_transfer(BulkTransferId(11), "network lost"));
+
+        assert!(matches!(
+            &history
+                .item(code_item(1, BulkTransferId(11)).key())
+                .unwrap()
+                .code_preview()
+                .unwrap()
+                .state,
+            CodePreviewState::Error(reason) if reason == "network lost"
+        ));
+        assert!(matches!(
+            history
+                .item(code_item(2, BulkTransferId(22)).key())
+                .unwrap()
+                .code_preview()
+                .unwrap()
+                .state,
+            CodePreviewState::Fetching {
+                transfer_id: Some(BulkTransferId(22))
+            }
+        ));
     }
 
     #[test]
