@@ -16,6 +16,7 @@ mod mpv_player;
 mod naga_bridge;
 mod preview;
 mod scroll_capture;
+mod scrollbar;
 mod timeline;
 mod video_controls;
 mod video_manager;

@@ -3,7 +3,10 @@ use std::sync::Arc;
 use gpui::{Bounds, Pixels, Point, UniformListScrollHandle, point, px, size};
 use local_rpc::model::{AttachmentDescriptor, AttachmentId, BulkTransferId};
 
-use crate::code_viewer::{CodeDocument, CodeViewState};
+use crate::{
+    code_viewer::{CodeDocument, CodeViewState},
+    scrollbar::OverlayScrollbarState,
+};
 
 // TODO: Preview history is count-bounded rather than byte-bounded. Ready code
 // previews can retain disproportionately large source and highlighting buffers;
@@ -41,6 +44,7 @@ impl PreviewItem {
                 state: CodePreviewState::Fetching { transfer_id },
                 scroll_handle: UniformListScrollHandle::new(),
                 view_state: CodeViewState::default(),
+                scrollbar_state: OverlayScrollbarState::default(),
             }),
         }
     }
@@ -82,6 +86,7 @@ pub struct CodePreview {
     pub state: CodePreviewState,
     pub scroll_handle: UniformListScrollHandle,
     pub view_state: CodeViewState,
+    pub scrollbar_state: OverlayScrollbarState,
 }
 
 #[derive(Clone, Debug)]

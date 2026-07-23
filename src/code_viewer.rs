@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::Read,
@@ -8,22 +9,37 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use unicode_width::UnicodeWidthChar;
 
 use chatt_message_format::highlight::{self, HlClass};
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardItem, Corners, CursorStyle, DecorationRun, DispatchPhase,
-    Edges, Element, ElementId, FocusHandle, FontId, FontRun, FontStyle, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, KeyBinding, KeyContext, LayoutId, LineLayout,
-    ListHorizontalSizingBehavior, ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Position, SharedString, Style, TextAlign, UniformListScrollHandle,
-    Window, actions, div, point, prelude::*, px, quad, relative, rgb, rgba, size, uniform_list,
+    App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DecorationRun, DispatchPhase, Edges,
+    Element, ElementId, FocusHandle, FontRun, FontStyle, GlobalElementId, Hitbox, HitboxBehavior,
+    Hsla, KeyBinding, KeyContext, LayoutId, LineLayout, ListHorizontalSizingBehavior,
+    ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    SharedString, Style, TextAlign, UniformListScrollHandle, Window, actions, div, point,
+    prelude::*, px, quad, rgb, rgba, uniform_list,
 };
 
-use crate::{fonts::CODE_FONT_FAMILY, formatted_message::syntax_color};
+use crate::{
+    fonts::CODE_FONT_FAMILY,
+    formatted_message::syntax_color,
+    scrollbar::{OverlayScrollbarColors, OverlayScrollbarState, OverlayScrollbars},
+};
 
 pub const MAX_CODE_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
-pub const MAX_CODE_PREVIEW_LINE_BYTES: usize = 32 * 1024;
 pub const MAX_CODE_PREVIEW_LINES: usize = 200_000;
+pub const MAX_CODE_RENDERED_LINE_BYTES: usize = 1024;
+
+const CODE_TRUNCATION_MARKER: &str = " … line truncated";
+const CODE_HIDDEN_MATCH_MARKER: &str = " … match in truncated text";
+
+// Cosmic Text, used by GPUI off macOS, shapes tabs at four columns. Core Text
+// uses the platform's conventional eight-column tab stops.
+#[cfg(target_os = "macos")]
+const CODE_TAB_WIDTH: usize = 8;
+#[cfg(not(target_os = "macos"))]
+const CODE_TAB_WIDTH: usize = 4;
 
 actions!(code_viewer, [Copy, SelectAll]);
 
@@ -43,6 +59,7 @@ enum CodeRecord {
     Line {
         source_start: u32,
         source_end: u32,
+        rendered_end: u32,
         spans_start: u32,
         spans_end: u32,
     },
@@ -67,6 +84,7 @@ pub struct CodeDocument {
     source: String,
     records: Box<[CodeRecord]>,
     line_count: usize,
+    widest_line: usize,
     cache_key: u64,
 }
 
@@ -76,22 +94,10 @@ struct CodeWidthMeasurement {
     width: Pixels,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CodeScrollbarAxis {
-    Horizontal,
-    Vertical,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CodeScrollbarDrag {
-    axis: CodeScrollbarAxis,
-    pointer_offset: Pixels,
-}
-
 #[derive(Debug)]
 struct CodeViewStateInner {
     width: Cell<CodeWidthMeasurement>,
-    scrollbar_drag: Cell<Option<CodeScrollbarDrag>>,
+    pending_reveal: Cell<Option<CodeSearchMatch>>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +110,7 @@ impl Default for CodeViewState {
                 line: 0,
                 width: Pixels::ZERO,
             }),
-            scrollbar_drag: Cell::new(None),
+            pending_reveal: Cell::new(None),
         }))
     }
 }
@@ -115,11 +121,16 @@ impl CodeViewState {
             line: 0,
             width: Pixels::ZERO,
         });
-        self.0.scrollbar_drag.set(None);
+        self.0.pending_reveal.set(None);
     }
 
-    fn widest_line(&self) -> usize {
-        self.0.width.get().line
+    fn widest_line(&self, document: &CodeDocument) -> usize {
+        let measurement = self.0.width.get();
+        if measurement.width == Pixels::ZERO {
+            document.widest_line()
+        } else {
+            measurement.line
+        }
     }
 
     fn record_width(&self, line: usize, width: Pixels) -> bool {
@@ -130,56 +141,42 @@ impl CodeViewState {
         self.0.width.set(CodeWidthMeasurement { line, width });
         true
     }
+
+    pub fn request_match_reveal(&self, search_match: CodeSearchMatch) {
+        self.0.pending_reveal.set(Some(search_match));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeSearchMatch {
+    start: u32,
+    end: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeMatchTarget {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CodeSearchResults {
-    matching_lines: Vec<CodeSearchLine>,
-    match_count: usize,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CodeSearchLine {
-    line: u32,
-    matches_through_line: u32,
+    matches: Box<[CodeSearchMatch]>,
 }
 
 impl CodeSearchResults {
     pub fn is_empty(&self) -> bool {
-        self.match_count == 0
+        self.matches.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.match_count
+        self.matches.len()
     }
 
-    pub fn line_for_match(&self, match_index: usize) -> Option<usize> {
-        if match_index >= self.match_count {
-            return None;
-        }
-        let ordinal = u32::try_from(match_index + 1).ok()?;
-        let index = self
-            .matching_lines
-            .partition_point(|line| line.matches_through_line < ordinal);
-        self.matching_lines
-            .get(index)
-            .map(|line| line.line as usize)
-    }
-
-    fn push(&mut self, line: usize) {
-        self.match_count += 1;
-        let matches_through_line =
-            u32::try_from(self.match_count).expect("preview source bounds match count to u32");
-        if let Some(last) = self.matching_lines.last_mut()
-            && last.line as usize == line
-        {
-            last.matches_through_line = matches_through_line;
-        } else {
-            self.matching_lines.push(CodeSearchLine {
-                line: u32::try_from(line).expect("preview source bounds line count to u32"),
-                matches_through_line,
-            });
-        }
+    pub fn get(&self, match_index: usize) -> Option<CodeSearchMatch> {
+        self.matches.get(match_index).copied()
     }
 }
 
@@ -220,6 +217,7 @@ impl CodeDocument {
             CodeRecord::Line {
                 source_start: 0,
                 source_end: 0,
+                rendered_end: 0,
                 spans_start: 0,
                 spans_end: 0,
             },
@@ -229,22 +227,28 @@ impl CodeDocument {
         let mut line_index = 0usize;
         let mut line_start = 0usize;
         let mut run_index = 0usize;
+        let mut widest_line = 0usize;
+        let mut widest_columns = 0usize;
 
         loop {
             let line_end = bytes[line_start..]
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(bytes.len(), |offset| line_start + offset);
+            let mut rendered_end = (line_start + MAX_CODE_RENDERED_LINE_BYTES).min(line_end);
+            while !source.is_char_boundary(rendered_end) {
+                rendered_end -= 1;
+            }
             while run_index < runs.len() && runs[run_index].1 as usize <= line_start {
                 run_index += 1;
             }
 
             let spans_start = records.len();
             let mut candidate = run_index;
-            while candidate < runs.len() && (runs[candidate].0 as usize) < line_end {
+            while candidate < runs.len() && (runs[candidate].0 as usize) < rendered_end {
                 let (run_start, run_end, class) = runs[candidate];
                 let start = (run_start as usize).max(line_start);
-                let end = (run_end as usize).min(line_end);
+                let end = (run_end as usize).min(rendered_end);
                 if end > start {
                     let can_merge = records.len() > spans_start;
                     match records.last_mut() {
@@ -271,9 +275,18 @@ impl CodeDocument {
             records[line_index] = CodeRecord::Line {
                 source_start: line_start as u32,
                 source_end: line_end as u32,
+                rendered_end: rendered_end as u32,
                 spans_start: spans_start as u32,
                 spans_end: records.len() as u32,
             };
+            let mut columns = display_columns(&source[line_start..rendered_end]);
+            if rendered_end < line_end {
+                columns += display_columns(CODE_HIDDEN_MATCH_MARKER);
+            }
+            if columns > widest_columns {
+                widest_columns = columns;
+                widest_line = line_index;
+            }
             line_index += 1;
 
             if line_end == bytes.len() {
@@ -290,6 +303,7 @@ impl CodeDocument {
             source,
             records: records.into_boxed_slice(),
             line_count,
+            widest_line,
             cache_key,
         }
     }
@@ -302,15 +316,21 @@ impl CodeDocument {
         self.line_count
     }
 
-    fn line(&self, index: usize) -> (Range<usize>, Range<usize>) {
+    pub fn widest_line(&self) -> usize {
+        self.widest_line
+    }
+
+    fn line(&self, index: usize) -> (Range<usize>, Range<usize>, Range<usize>) {
         match self.records[index] {
             CodeRecord::Line {
                 source_start,
                 source_end,
+                rendered_end,
                 spans_start,
                 spans_end,
             } => (
                 source_start as usize..source_end as usize,
+                source_start as usize..rendered_end as usize,
                 spans_start as usize..spans_end as usize,
             ),
             CodeRecord::Span { .. } => unreachable!("line table precedes span records"),
@@ -318,7 +338,12 @@ impl CodeDocument {
     }
 
     fn line_text(&self, index: usize) -> &str {
-        let (source, _) = self.line(index);
+        let (_, rendered, _) = self.line(index);
+        &self.source[rendered]
+    }
+
+    fn full_line_text(&self, index: usize) -> &str {
+        let (source, _, _) = self.line(index);
         &self.source[source]
     }
 
@@ -326,18 +351,29 @@ impl CodeDocument {
         self.line(index).0
     }
 
+    fn line_rendered_range(&self, index: usize) -> Range<usize> {
+        self.line(index).1
+    }
+
+    fn line_is_truncated(&self, index: usize) -> bool {
+        self.line_rendered_range(index).end < self.line_source_range(index).end
+    }
+
     fn line_selection_range(&self, index: usize) -> Range<usize> {
-        let source = self.line_source_range(index);
+        let rendered = self.line_rendered_range(index);
+        if self.line_is_truncated(index) {
+            return rendered;
+        }
         let end = if index + 1 < self.line_count {
             self.line_source_range(index + 1).start
         } else {
             self.source.len()
         };
-        source.start..end
+        rendered.start..end
     }
 
     fn line_spans(&self, index: usize) -> impl Iterator<Item = CodeSpan> + '_ {
-        let (_, spans) = self.line(index);
+        let (_, _, spans) = self.line(index);
         self.records[spans].iter().map(|record| match *record {
             CodeRecord::Span { start, end, class } => CodeSpan {
                 start: start as usize,
@@ -353,6 +389,28 @@ impl CodeDocument {
         self.cache_key.hash(&mut hash);
         line.hash(&mut hash);
         hash.finish()
+    }
+
+    pub fn match_target(&self, search_match: CodeSearchMatch) -> CodeMatchTarget {
+        let offset = search_match.start as usize;
+        let line = self.line_for_offset(offset);
+        let source = self.line_source_range(line);
+        let rendered = self.line_rendered_range(line);
+        CodeMatchTarget {
+            line,
+            start: offset.saturating_sub(source.start),
+            end: (search_match.end as usize).saturating_sub(source.start),
+            hidden: search_match.end as usize > rendered.end,
+        }
+    }
+
+    fn line_for_offset(&self, offset: usize) -> usize {
+        self.records[..self.line_count]
+            .partition_point(|record| match record {
+                CodeRecord::Line { source_start, .. } => *source_start as usize <= offset,
+                CodeRecord::Span { .. } => unreachable!("line table precedes span records"),
+            })
+            .saturating_sub(1)
     }
 
     pub fn search(&self, query: &str) -> CodeSearchResults {
@@ -372,25 +430,49 @@ impl CodeDocument {
             prefix[index] = matched;
         }
 
-        let mut results = CodeSearchResults::default();
+        let mut matches = Vec::new();
+        let mut source_ranges = VecDeque::with_capacity(needle.len());
         for line in 0..self.line_count {
             let mut matched = 0usize;
-            for character in self.line_text(line).chars().flat_map(char::to_lowercase) {
-                while matched > 0 && character != needle[matched] {
-                    matched = prefix[matched - 1];
-                }
-                if character == needle[matched] {
-                    matched += 1;
-                }
-                if matched == needle.len() {
-                    results.push(line);
-                    // Match the web viewer and conventional find behavior by
-                    // counting non-overlapping occurrences.
-                    matched = 0;
+            source_ranges.clear();
+            let line_start = self.line_source_range(line).start;
+            for (local_start, original) in self.full_line_text(line).char_indices() {
+                let absolute_start = line_start + local_start;
+                let absolute_end = absolute_start + original.len_utf8();
+                let absolute_start = u32::try_from(absolute_start)
+                    .expect("preview source bounds match offset to u32");
+                let absolute_end =
+                    u32::try_from(absolute_end).expect("preview source bounds match offset to u32");
+                for character in original.to_lowercase() {
+                    source_ranges.push_back((absolute_start, absolute_end));
+                    if source_ranges.len() > needle.len() {
+                        source_ranges.pop_front();
+                    }
+                    while matched > 0 && character != needle[matched] {
+                        matched = prefix[matched - 1];
+                    }
+                    if character == needle[matched] {
+                        matched += 1;
+                    }
+                    if matched == needle.len() {
+                        let start = source_ranges
+                            .front()
+                            .expect("matching source window covers the needle")
+                            .0;
+                        matches.push(CodeSearchMatch {
+                            start,
+                            end: absolute_end,
+                        });
+                        // Match the web viewer and conventional find behavior by
+                        // counting non-overlapping occurrences.
+                        matched = 0;
+                    }
                 }
             }
         }
-        results
+        CodeSearchResults {
+            matches: matches.into_boxed_slice(),
+        }
     }
 }
 
@@ -403,9 +485,6 @@ fn validate_source_geometry(source: &str) -> Result<(), String> {
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(bytes.len(), |offset| line_start + offset);
-        if line_end - line_start > MAX_CODE_PREVIEW_LINE_BYTES {
-            return Err("line too long to preview".into());
-        }
         line_count += 1;
         if line_count > MAX_CODE_PREVIEW_LINES {
             return Err("too many lines to preview".into());
@@ -419,6 +498,31 @@ fn validate_source_geometry(source: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn display_columns(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut byte_offset = 0usize;
+    let mut column = 0usize;
+    while byte_offset < bytes.len() {
+        let byte = bytes[byte_offset];
+        if byte.is_ascii() {
+            column += match byte {
+                b'\t' => CODE_TAB_WIDTH - column % CODE_TAB_WIDTH,
+                b' '..=b'~' => 1,
+                _ => 0,
+            };
+            byte_offset += 1;
+        } else {
+            let character = line[byte_offset..]
+                .chars()
+                .next()
+                .expect("non-ASCII byte begins a UTF-8 character");
+            column += UnicodeWidthChar::width(character).unwrap_or(0);
+            byte_offset += character.len_utf8();
+        }
+    }
+    column
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -447,6 +551,7 @@ struct CodeSelectionParticipant {
     bounds: Bounds<Pixels>,
     text_bounds: Bounds<Pixels>,
     layout: Arc<LineLayout>,
+    marker_x: Option<Range<Pixels>>,
 }
 
 struct CodeSelectionState {
@@ -507,12 +612,14 @@ impl CodeSelection {
         bounds: Bounds<Pixels>,
         text_bounds: Bounds<Pixels>,
         layout: Arc<LineLayout>,
+        marker_x: Option<Range<Pixels>>,
     ) {
         self.0.borrow_mut().current.push(CodeSelectionParticipant {
             line,
             bounds,
             text_bounds,
             layout,
+            marker_x,
         });
     }
 
@@ -725,11 +832,42 @@ impl CodeSelectionState {
         if active.start >= active.end {
             return None;
         }
-        self.document
-            .as_ref()?
-            .source
-            .get(active.start..active.end)
-            .map(ToOwned::to_owned)
+        let document = self.document.as_ref()?;
+        if active.mode == CodeSelectMode::All {
+            return Some(document.source.clone());
+        }
+
+        let start_line = document.line_for_offset(active.start);
+        let end_line = document.line_for_offset(active.end.saturating_sub(1));
+        let mut selected = String::with_capacity(active.end - active.start);
+        for line in start_line..=end_line {
+            let rendered = document.line_rendered_range(line);
+            let start = active.start.max(rendered.start).min(rendered.end);
+            let end = active.end.min(rendered.end).max(rendered.start);
+            if start < end {
+                selected.push_str(
+                    document
+                        .source
+                        .get(start..end)
+                        .expect("selection endpoints remain UTF-8 boundaries"),
+                );
+            }
+            let source = document.line_source_range(line);
+            let logical_end = if line + 1 < document.line_count {
+                document.line_source_range(line + 1).start
+            } else {
+                document.source.len()
+            };
+            if logical_end > source.end && active.start <= source.end && active.end > source.end {
+                selected.push_str(
+                    document
+                        .source
+                        .get(source.end..active.end.min(logical_end))
+                        .expect("line ending is valid UTF-8"),
+                );
+            }
+        }
+        (!selected.is_empty()).then_some(selected)
     }
 
     fn selected_line_range(&self, line: usize) -> Option<(Range<usize>, bool)> {
@@ -738,15 +876,20 @@ impl CodeSelectionState {
             return None;
         }
         let document = self.document.as_ref()?;
-        let content = document.line_source_range(line);
-        let selectable = document.line_selection_range(line);
-        if active.end <= selectable.start || active.start >= selectable.end {
+        let content = document.line_rendered_range(line);
+        let logical_end = if line + 1 < document.line_count {
+            document.line_source_range(line + 1).start
+        } else {
+            document.source.len()
+        };
+        if active.end <= content.start || active.start >= logical_end {
             return None;
         }
         let start = active.start.max(content.start).min(content.end);
         let end = active.end.min(content.end).max(content.start);
-        let newline_selected =
-            selectable.end > content.end && active.start <= content.end && active.end > content.end;
+        let newline_selected = logical_end > document.line_source_range(line).end
+            && active.start <= content.end
+            && active.end >= logical_end;
         if start >= end && !newline_selected {
             return None;
         }
@@ -813,6 +956,7 @@ struct CodeSelectionArea<E> {
     document: Arc<CodeDocument>,
     selection: CodeSelection,
     scroll_handle: UniformListScrollHandle,
+    view_state: CodeViewState,
 }
 
 impl<E> CodeSelectionArea<E> {
@@ -821,12 +965,14 @@ impl<E> CodeSelectionArea<E> {
         document: Arc<CodeDocument>,
         selection: CodeSelection,
         scroll_handle: UniformListScrollHandle,
+        view_state: CodeViewState,
     ) -> Self {
         Self {
             inner,
             document,
             selection,
             scroll_handle,
+            view_state,
         }
     }
 }
@@ -870,6 +1016,15 @@ where
         let prepaint = self
             .inner
             .prepaint(id, inspector_id, bounds, request, window, cx);
+        if reveal_pending_match(
+            &self.document,
+            &self.selection,
+            &self.scroll_handle,
+            &self.view_state,
+            bounds,
+        ) {
+            cx.refresh_windows();
+        }
         if self
             .selection
             .update_head_for_position(window.mouse_position())
@@ -961,6 +1116,79 @@ where
     }
 }
 
+fn reveal_pending_match(
+    document: &CodeDocument,
+    selection: &CodeSelection,
+    scroll_handle: &UniformListScrollHandle,
+    view_state: &CodeViewState,
+    viewport: Bounds<Pixels>,
+) -> bool {
+    let Some(search_match) = view_state.0.pending_reveal.get() else {
+        return false;
+    };
+    let target = document.match_target(search_match);
+    let participant = {
+        let state = selection.0.borrow();
+        state
+            .current
+            .iter()
+            .find(|participant| participant.line == target.line)
+            .cloned()
+    };
+    let Some(participant) = participant else {
+        return false;
+    };
+    view_state.0.pending_reveal.set(None);
+
+    let (start_x, end_x) = if target.hidden {
+        participant
+            .marker_x
+            .as_ref()
+            .map(|range| (range.start, range.end))
+            .unwrap_or((participant.layout.width, participant.layout.width))
+    } else {
+        (
+            participant.layout.x_for_index(target.start),
+            participant.layout.x_for_index(target.end),
+        )
+    };
+    let absolute_start = participant.text_bounds.left() + start_x.min(end_x);
+    let absolute_end = participant.text_bounds.left() + start_x.max(end_x);
+    let margin = px(16.0).min(viewport.size.width / 4.0);
+    let visible_left = viewport.left() + margin;
+    let visible_right = viewport.right() - margin;
+
+    let base_handle = scroll_handle.0.borrow().base_handle.clone();
+    let offset = base_handle.offset();
+    let max_offset = base_handle.max_offset();
+    let next_x = horizontal_offset_to_reveal(
+        visible_left..visible_right,
+        absolute_start..absolute_end,
+        offset.x,
+        max_offset.x,
+    );
+    if next_x == offset.x {
+        return false;
+    }
+    base_handle.set_offset(point(next_x, offset.y));
+    true
+}
+
+fn horizontal_offset_to_reveal(
+    viewport: Range<Pixels>,
+    target: Range<Pixels>,
+    current_offset: Pixels,
+    max_offset: Pixels,
+) -> Pixels {
+    let mut next = current_offset;
+    if target.start < viewport.start {
+        next += viewport.start - target.start;
+    } else if target.end > viewport.end {
+        next -= target.end - viewport.end;
+    }
+    next.max(-max_offset).min(Pixels::ZERO)
+}
+
 impl<E> IntoElement for CodeSelectionArea<E>
 where
     E: Element + IntoElement<Element = E>,
@@ -1031,378 +1259,16 @@ fn selection_autoscroll_delta(distance: Pixels, line_height: Pixels) -> Pixels {
     line_height * lines
 }
 
-const CODE_SCROLLBAR_SIZE: Pixels = px(12.0);
-const CODE_SCROLLBAR_PADDING: Pixels = px(2.0);
-const CODE_SCROLLBAR_MIN_THUMB: Pixels = px(28.0);
-
-#[derive(Clone, Copy, Debug)]
-struct CodeScrollbarGeometry {
-    axis: CodeScrollbarAxis,
-    track_bounds: Bounds<Pixels>,
-    thumb_bounds: Bounds<Pixels>,
-    thumb_track_start: Pixels,
-    thumb_travel: Pixels,
-    max_offset: Pixels,
-}
-
-#[derive(Clone)]
-struct CodeScrollbarLayout {
-    geometry: CodeScrollbarGeometry,
-    hitbox: Hitbox,
-}
-
-struct CodeScrollbarsElement {
-    scroll_handle: UniformListScrollHandle,
-    view_state: CodeViewState,
-}
-
-impl IntoElement for CodeScrollbarsElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for CodeScrollbarsElement {
-    type RequestLayoutState = ();
-    type PrepaintState = Vec<CodeScrollbarLayout>;
-
-    fn id(&self) -> Option<ElementId> {
-        Some("code-viewer-scrollbars".into())
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let style = Style {
-            position: Position::Absolute,
-            size: size(relative(1.0), relative(1.0)).map(Into::into),
-            ..Default::default()
-        };
-        (window.request_layout(style, None, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        _: &mut App,
-    ) -> Self::PrepaintState {
-        let base_handle = self.scroll_handle.0.borrow().base_handle.clone();
-        code_scrollbar_geometries(bounds, base_handle.max_offset(), base_handle.offset())
-            .into_iter()
-            .map(|geometry| CodeScrollbarLayout {
-                hitbox: window.insert_hitbox(
-                    geometry.track_bounds,
-                    HitboxBehavior::BlockMouseExceptScroll,
-                ),
-                geometry,
-            })
-            .collect()
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        layouts: &mut Self::PrepaintState,
-        window: &mut Window,
-        _cx: &mut App,
-    ) {
-        let active_drag = self.view_state.0.scrollbar_drag.get();
-        for layout in layouts.iter() {
-            let hovered = layout.hitbox.is_hovered(window)
-                || active_drag.is_some_and(|drag| drag.axis == layout.geometry.axis);
-            window.paint_quad(quad(
-                layout.geometry.track_bounds,
-                Pixels::ZERO,
-                rgba(0x111317dd),
-                Edges::default(),
-                Hsla::transparent_black(),
-                BorderStyle::default(),
-            ));
-            window.paint_quad(quad(
-                layout.geometry.thumb_bounds,
-                Corners::all(px(3.0)),
-                rgba(if hovered { 0x8b929ddd } else { 0x5f6670cc }),
-                Edges::default(),
-                Hsla::transparent_black(),
-                BorderStyle::default(),
-            ));
-            window.set_cursor_style(CursorStyle::Arrow, &layout.hitbox);
-        }
-        if active_drag.is_some() {
-            window.set_window_cursor_style(CursorStyle::Arrow);
-        }
-
-        let capture_phase = if active_drag.is_some() {
-            DispatchPhase::Capture
-        } else {
-            DispatchPhase::Bubble
-        };
-        window.on_mouse_event({
-            let layouts = layouts.clone();
-            let scroll_handle = self.scroll_handle.clone();
-            let view_state = self.view_state.clone();
-            move |event: &MouseDownEvent, phase, window, cx| {
-                if phase != capture_phase || event.button != MouseButton::Left {
-                    return;
-                }
-                let Some(layout) = layouts
-                    .iter()
-                    .find(|layout| layout.hitbox.is_hovered(window))
-                else {
-                    return;
-                };
-                let geometry = layout.geometry;
-                if geometry.thumb_bounds.contains(&event.position) {
-                    view_state.0.scrollbar_drag.set(Some(CodeScrollbarDrag {
-                        axis: geometry.axis,
-                        pointer_offset: scrollbar_axis_position(geometry.axis, event.position)
-                            - scrollbar_axis_origin(geometry.axis, geometry.thumb_bounds),
-                    }));
-                    window.capture_pointer(layout.hitbox.id);
-                } else {
-                    let pointer_offset =
-                        scrollbar_axis_size(geometry.axis, geometry.thumb_bounds.size) / 2.0;
-                    set_code_scrollbar_offset(
-                        &scroll_handle,
-                        geometry.axis,
-                        scrollbar_offset_for_position(geometry, event.position, pointer_offset),
-                    );
-                }
-                window.prevent_default();
-                cx.stop_propagation();
-                cx.refresh_windows();
-            }
-        });
-        window.on_mouse_event({
-            let layouts = layouts.clone();
-            let scroll_handle = self.scroll_handle.clone();
-            let view_state = self.view_state.clone();
-            move |event: &MouseMoveEvent, phase, _window, cx| {
-                if phase != capture_phase {
-                    return;
-                }
-                let Some(drag) = view_state.0.scrollbar_drag.get() else {
-                    return;
-                };
-                if !event.dragging() {
-                    view_state.0.scrollbar_drag.set(None);
-                    cx.refresh_windows();
-                    return;
-                }
-                let Some(layout) = layouts
-                    .iter()
-                    .find(|layout| layout.geometry.axis == drag.axis)
-                else {
-                    return;
-                };
-                set_code_scrollbar_offset(
-                    &scroll_handle,
-                    drag.axis,
-                    scrollbar_offset_for_position(
-                        layout.geometry,
-                        event.position,
-                        drag.pointer_offset,
-                    ),
-                );
-                cx.stop_propagation();
-                cx.refresh_windows();
-            }
-        });
-        window.on_mouse_event({
-            let view_state = self.view_state.clone();
-            move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase == capture_phase
-                    && event.button == MouseButton::Left
-                    && view_state.0.scrollbar_drag.take().is_some()
-                {
-                    cx.stop_propagation();
-                    cx.refresh_windows();
-                }
-            }
-        });
-    }
-}
-
-fn code_scrollbar_geometries(
-    bounds: Bounds<Pixels>,
-    max_offset: Point<Pixels>,
-    offset: Point<Pixels>,
-) -> Vec<CodeScrollbarGeometry> {
-    let horizontal = max_offset.x > Pixels::ZERO;
-    let vertical = max_offset.y > Pixels::ZERO;
-    let corner = if horizontal && vertical {
-        CODE_SCROLLBAR_SIZE
-    } else {
-        Pixels::ZERO
-    };
-    let mut geometries = Vec::with_capacity(2);
-    if vertical
-        && let Some(geometry) = code_scrollbar_geometry(
-            CodeScrollbarAxis::Vertical,
-            Bounds::new(
-                point(bounds.right() - CODE_SCROLLBAR_SIZE, bounds.top()),
-                size(
-                    CODE_SCROLLBAR_SIZE,
-                    (bounds.size.height - corner).max(Pixels::ZERO),
-                ),
-            ),
-            bounds.size.height,
-            max_offset.y,
-            offset.y,
-        )
-    {
-        geometries.push(geometry);
-    }
-    if horizontal
-        && let Some(geometry) = code_scrollbar_geometry(
-            CodeScrollbarAxis::Horizontal,
-            Bounds::new(
-                point(bounds.left(), bounds.bottom() - CODE_SCROLLBAR_SIZE),
-                size(
-                    (bounds.size.width - corner).max(Pixels::ZERO),
-                    CODE_SCROLLBAR_SIZE,
-                ),
-            ),
-            bounds.size.width,
-            max_offset.x,
-            offset.x,
-        )
-    {
-        geometries.push(geometry);
-    }
-    geometries
-}
-
-fn code_scrollbar_geometry(
-    axis: CodeScrollbarAxis,
-    track_bounds: Bounds<Pixels>,
-    viewport_length: Pixels,
-    max_offset: Pixels,
-    offset: Pixels,
-) -> Option<CodeScrollbarGeometry> {
-    let track_length = scrollbar_axis_size(axis, track_bounds.size);
-    let available = track_length - 2.0 * CODE_SCROLLBAR_PADDING;
-    if available <= Pixels::ZERO || viewport_length <= Pixels::ZERO || max_offset <= Pixels::ZERO {
-        return None;
-    }
-    let content_length = viewport_length + max_offset;
-    let thumb_length = (available * (viewport_length / content_length))
-        .max(CODE_SCROLLBAR_MIN_THUMB)
-        .min(available);
-    let thumb_travel = (available - thumb_length).max(Pixels::ZERO);
-    let fraction = (-offset / max_offset).clamp(0.0, 1.0);
-    let thumb_offset = thumb_travel * fraction;
-    let thumb_track_start = scrollbar_axis_origin(axis, track_bounds) + CODE_SCROLLBAR_PADDING;
-    let thumb_bounds = match axis {
-        CodeScrollbarAxis::Horizontal => Bounds::new(
-            point(
-                thumb_track_start + thumb_offset,
-                track_bounds.top() + CODE_SCROLLBAR_PADDING,
-            ),
-            size(
-                thumb_length,
-                CODE_SCROLLBAR_SIZE - 2.0 * CODE_SCROLLBAR_PADDING,
-            ),
-        ),
-        CodeScrollbarAxis::Vertical => Bounds::new(
-            point(
-                track_bounds.left() + CODE_SCROLLBAR_PADDING,
-                thumb_track_start + thumb_offset,
-            ),
-            size(
-                CODE_SCROLLBAR_SIZE - 2.0 * CODE_SCROLLBAR_PADDING,
-                thumb_length,
-            ),
-        ),
-    };
-    Some(CodeScrollbarGeometry {
-        axis,
-        track_bounds,
-        thumb_bounds,
-        thumb_track_start,
-        thumb_travel,
-        max_offset,
-    })
-}
-
-fn scrollbar_offset_for_position(
-    geometry: CodeScrollbarGeometry,
-    position: Point<Pixels>,
-    pointer_offset: Pixels,
-) -> Pixels {
-    if geometry.thumb_travel <= Pixels::ZERO {
-        return Pixels::ZERO;
-    }
-    let thumb_position = (scrollbar_axis_position(geometry.axis, position)
-        - geometry.thumb_track_start
-        - pointer_offset)
-        .clamp(Pixels::ZERO, geometry.thumb_travel);
-    if thumb_position <= px(0.01) {
-        return Pixels::ZERO;
-    }
-    if geometry.thumb_travel - thumb_position <= px(0.01) {
-        return -geometry.max_offset;
-    }
-    -geometry.max_offset * (thumb_position / geometry.thumb_travel)
-}
-
-fn set_code_scrollbar_offset(
-    handle: &UniformListScrollHandle,
-    axis: CodeScrollbarAxis,
-    value: Pixels,
-) {
-    let base_handle = handle.0.borrow().base_handle.clone();
-    let offset = base_handle.offset();
-    base_handle.set_offset(match axis {
-        CodeScrollbarAxis::Horizontal => point(value, offset.y),
-        CodeScrollbarAxis::Vertical => point(offset.x, value),
-    });
-}
-
-fn scrollbar_axis_position(axis: CodeScrollbarAxis, point: Point<Pixels>) -> Pixels {
-    match axis {
-        CodeScrollbarAxis::Horizontal => point.x,
-        CodeScrollbarAxis::Vertical => point.y,
-    }
-}
-
-fn scrollbar_axis_origin(axis: CodeScrollbarAxis, bounds: Bounds<Pixels>) -> Pixels {
-    scrollbar_axis_position(axis, bounds.origin)
-}
-
-fn scrollbar_axis_size(axis: CodeScrollbarAxis, size: gpui::Size<Pixels>) -> Pixels {
-    match axis {
-        CodeScrollbarAxis::Horizontal => size.width,
-        CodeScrollbarAxis::Vertical => size.height,
-    }
-}
-
 pub fn render_code_document(
     document: Arc<CodeDocument>,
     scroll_handle: UniformListScrollHandle,
     view_state: CodeViewState,
+    scrollbar_state: OverlayScrollbarState,
     selection: CodeSelection,
-    active_match: Option<usize>,
+    active_match: Option<CodeMatchTarget>,
 ) -> impl IntoElement {
     let line_count = document.line_count();
-    let widest_line = view_state.widest_line();
+    let widest_line = view_state.widest_line(&document);
     let digits = line_count.max(1).ilog10() as f32 + 1.0;
     let gutter_width = px(18.0 + digits * 8.5);
     let list_document = document.clone();
@@ -1422,7 +1288,10 @@ pub fn render_code_document(
                         .flex()
                         .items_center()
                         .whitespace_nowrap()
-                        .when(active_match == Some(line), |row| row.bg(rgb(0x242832)))
+                        .when(
+                            active_match.is_some_and(|target| target.line == line),
+                            |row| row.bg(rgb(0x242832)),
+                        )
                         .child(
                             div()
                                 .w(gutter_width)
@@ -1437,6 +1306,7 @@ pub fn render_code_document(
                             line,
                             view_state: list_view_state.clone(),
                             selection: list_selection.clone(),
+                            active_match,
                         })
                 })
                 .collect::<Vec<_>>()
@@ -1456,11 +1326,13 @@ pub fn render_code_document(
             chatt_message_format::highlight::PaletteRole::Foreground,
         )))
         .child(list)
-        .child(CodeScrollbarsElement {
-            scroll_handle: scroll_handle.clone(),
-            view_state,
-        });
-    CodeSelectionArea::new(contents, document, selection, scroll_handle)
+        .child(OverlayScrollbars::new(
+            "code-viewer-scrollbars",
+            scroll_handle.clone(),
+            scrollbar_state,
+            OverlayScrollbarColors::default(),
+        ));
+    CodeSelectionArea::new(contents, document, selection, scroll_handle, view_state)
 }
 
 struct CodeLineElement {
@@ -1468,6 +1340,19 @@ struct CodeLineElement {
     line: usize,
     view_state: CodeViewState,
     selection: CodeSelection,
+    active_match: Option<CodeMatchTarget>,
+}
+
+struct CodeLineLayout {
+    text: Arc<LineLayout>,
+    marker: Option<Arc<LineLayout>>,
+    marker_width: Pixels,
+}
+
+impl CodeLineLayout {
+    fn width(&self) -> Pixels {
+        self.text.width + self.marker_width
+    }
 }
 
 impl gpui::IntoElement for CodeLineElement {
@@ -1479,7 +1364,7 @@ impl gpui::IntoElement for CodeLineElement {
 }
 
 impl Element for CodeLineElement {
-    type RequestLayoutState = Arc<LineLayout>;
+    type RequestLayoutState = CodeLineLayout;
     type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
@@ -1504,12 +1389,10 @@ impl Element for CodeLineElement {
         italic_font.style = FontStyle::Italic;
         let normal_id = window.text_system().resolve_font(&normal_font);
         let italic_id = window.text_system().resolve_font(&italic_font);
-        let style_hash = line_style_hash(&self.document, self.line, normal_id, italic_id);
         let document = self.document.clone();
         let line = self.line;
-        let layout = window.text_system().layout_borrowed_line(
+        let text_layout = window.text_system().layout_line_by_hash_with_font_runs(
             self.document.content_hash(self.line),
-            style_hash,
             text,
             font_size,
             None,
@@ -1526,11 +1409,31 @@ impl Element for CodeLineElement {
                 }
             },
         );
-        if self.view_state.record_width(self.line, layout.width) {
+        let active_hidden = self
+            .active_match
+            .is_some_and(|target| target.line == self.line && target.hidden);
+        let (marker, marker_width) = if self.document.line_is_truncated(self.line) {
+            let hidden_marker =
+                layout_marker(CODE_HIDDEN_MATCH_MARKER, normal_id, font_size, window);
+            let marker = if active_hidden {
+                hidden_marker.clone()
+            } else {
+                layout_marker(CODE_TRUNCATION_MARKER, normal_id, font_size, window)
+            };
+            (Some(marker), hidden_marker.width)
+        } else {
+            (None, Pixels::ZERO)
+        };
+        let layout = CodeLineLayout {
+            text: text_layout,
+            marker,
+            marker_width,
+        };
+        if self.view_state.record_width(self.line, layout.width()) {
             cx.refresh_windows();
         }
         let mut style = Style::default();
-        style.size.width = layout.width.into();
+        style.size.width = layout.width().into();
         style.size.height = window.line_height().into();
         (window.request_layout(style, [], cx), layout)
     }
@@ -1552,8 +1455,17 @@ impl Element for CodeLineElement {
             });
         let selectable_bounds = Bounds::from_corners(bounds.origin, point(right, bounds.bottom()));
         let hitbox = window.insert_hitbox(selectable_bounds, HitboxBehavior::Normal);
-        self.selection
-            .register(self.line, selectable_bounds, bounds, layout.clone());
+        let marker_x = layout
+            .marker
+            .as_ref()
+            .map(|marker| layout.text.width..layout.text.width + marker.width);
+        self.selection.register(
+            self.line,
+            selectable_bounds,
+            bounds,
+            layout.text.clone(),
+            marker_x,
+        );
         hitbox
     }
 
@@ -1573,7 +1485,7 @@ impl Element for CodeLineElement {
             let selection = self.selection.clone();
             let line = self.line;
             let line_start = self.document.line_source_range(line).start;
-            let layout = layout.clone();
+            let text_layout = layout.text.clone();
             move |event: &MouseDownEvent, phase, window, cx| {
                 if !phase.bubble()
                     || event.button != MouseButton::Left
@@ -1582,13 +1494,36 @@ impl Element for CodeLineElement {
                     return;
                 }
                 let offset =
-                    line_start + layout.closest_index_for_x(event.position.x - bounds.left());
+                    line_start + text_layout.closest_index_for_x(event.position.x - bounds.left());
                 selection.begin_selection(line, offset, event.click_count, event.modifiers.shift);
                 window.focus(&selection.focus_handle(), cx);
                 window.prevent_default();
                 cx.refresh_windows();
             }
         });
+        if let Some(target) = self
+            .active_match
+            .filter(|target| target.line == self.line && !target.hidden)
+        {
+            let start_x = layout.text.x_for_index(target.start.min(layout.text.len));
+            let end_x = layout.text.x_for_index(target.end.min(layout.text.len));
+            let left_x = start_x.min(end_x);
+            let right_x = start_x.max(end_x);
+            window.paint_quad(quad(
+                Bounds::from_corners(
+                    point(bounds.left() + left_x, bounds.top()),
+                    point(
+                        bounds.left() + right_x.max(left_x + px(1.0)),
+                        bounds.bottom(),
+                    ),
+                ),
+                px(2.0),
+                rgba(0xd9a44166),
+                Edges::default(),
+                Hsla::transparent_black(),
+                BorderStyle::default(),
+            ));
+        }
         let line = self.line;
         let document = self.document.clone();
         let decorations = document.line_spans(line).map(|span| DecorationRun {
@@ -1599,6 +1534,7 @@ impl Element for CodeLineElement {
             strikethrough: None,
         });
         layout
+            .text
             .paint_with_decorations(
                 bounds.origin,
                 window.line_height(),
@@ -1609,11 +1545,51 @@ impl Element for CodeLineElement {
                 cx,
             )
             .expect("code line painting failed");
+        if let Some(marker) = &layout.marker {
+            let active_hidden = self
+                .active_match
+                .is_some_and(|target| target.line == self.line && target.hidden);
+            if active_hidden {
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(bounds.left() + layout.text.width, bounds.top()),
+                        gpui::size(marker.width, bounds.size.height),
+                    ),
+                    px(2.0),
+                    rgba(0xd9a44144),
+                    Edges::default(),
+                    Hsla::transparent_black(),
+                    BorderStyle::default(),
+                ));
+            }
+            let marker_color = if active_hidden {
+                rgb(0xd9a441)
+            } else {
+                rgb(0x6f7680)
+            };
+            marker
+                .paint_with_decorations(
+                    point(bounds.left() + layout.text.width, bounds.top()),
+                    window.line_height(),
+                    TextAlign::Left,
+                    None,
+                    [DecorationRun {
+                        len: marker.len as u32,
+                        color: marker_color.into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    window,
+                    cx,
+                )
+                .expect("code truncation marker painting failed");
+        }
         if let Some((range, newline_selected)) = self.selection.selected_line_range(line) {
-            let start_x = layout.x_for_index(range.start);
-            let mut end_x = layout.x_for_index(range.end);
+            let start_x = layout.text.x_for_index(range.start);
+            let mut end_x = layout.text.x_for_index(range.end);
             if newline_selected {
-                end_x = end_x.max(layout.width + px(4.0));
+                end_x = end_x.max(layout.text.width + px(4.0));
             } else {
                 end_x = end_x.max(start_x + px(1.0));
             }
@@ -1632,15 +1608,31 @@ impl Element for CodeLineElement {
     }
 }
 
-fn line_style_hash(document: &CodeDocument, line: usize, normal: FontId, italic: FontId) -> u64 {
+fn marker_content_hash(marker: &str) -> u64 {
     let mut hash = DefaultHasher::new();
-    normal.hash(&mut hash);
-    italic.hash(&mut hash);
-    for span in document.line_spans(line) {
-        (span.end - span.start).hash(&mut hash);
-        is_comment(span.class).hash(&mut hash);
-    }
+    "chatt-code-truncation-marker".hash(&mut hash);
+    marker.hash(&mut hash);
     hash.finish()
+}
+
+fn layout_marker(
+    marker: &'static str,
+    font_id: gpui::FontId,
+    font_size: Pixels,
+    window: &mut Window,
+) -> Arc<LineLayout> {
+    window.text_system().layout_line_by_hash_with_font_runs(
+        marker_content_hash(marker),
+        marker,
+        font_size,
+        None,
+        |push| {
+            push(FontRun {
+                len: marker.len(),
+                font_id,
+            });
+        },
+    )
 }
 
 const fn is_comment(class: HlClass) -> bool {
@@ -1664,7 +1656,9 @@ mod tests {
         document: Arc<CodeDocument>,
         scroll_handle: UniformListScrollHandle,
         view_state: CodeViewState,
+        scrollbar_state: OverlayScrollbarState,
         selection: CodeSelection,
+        active_match: Option<CodeMatchTarget>,
         focus: FocusHandle,
     }
 
@@ -1677,8 +1671,9 @@ mod tests {
                     self.document.clone(),
                     self.scroll_handle.clone(),
                     self.view_state.clone(),
+                    self.scrollbar_state.clone(),
                     self.selection.clone(),
-                    None,
+                    self.active_match,
                 )))
         }
     }
@@ -1702,7 +1697,7 @@ mod tests {
         );
         assert_eq!(document.line_count(), 3);
         for line in 0..document.line_count() {
-            let text_range = document.line(line).0;
+            let text_range = document.line(line).1;
             let covered = document
                 .line_spans(line)
                 .map(|span| span.end - span.start)
@@ -1727,76 +1722,94 @@ mod tests {
         let alpha = document.search("alpha");
         assert_eq!(
             (0..alpha.len())
-                .map(|index| alpha.line_for_match(index).unwrap())
+                .map(|index| document.match_target(alpha.get(index).unwrap()).line)
                 .collect::<Vec<_>>(),
             [0, 0, 2]
         );
-        assert_eq!(alpha.matching_lines.len(), 2);
+        assert_eq!(
+            alpha
+                .matches
+                .iter()
+                .map(|search_match| {
+                    &document.source()[search_match.start as usize..search_match.end as usize]
+                })
+                .collect::<Vec<_>>(),
+            ["Alpha", "alpha", "ALPHA"]
+        );
         let street = document.search("straße");
         assert_eq!(street.len(), 1);
-        assert_eq!(street.line_for_match(0), Some(1));
+        assert_eq!(document.match_target(street.get(0).unwrap()).line, 1);
         assert!(document.search("").is_empty());
         assert!(document.search("ha\nst").is_empty());
 
         let overlapping = CodeDocument::prepare("aaa".to_string(), "notes.txt", 2).search("aa");
         assert_eq!(overlapping.len(), 1);
-        assert_eq!(overlapping.line_for_match(0), Some(0));
+        assert_eq!(
+            overlapping.get(0),
+            Some(CodeSearchMatch { start: 0, end: 2 })
+        );
+
+        let expanded = CodeDocument::prepare("İ".to_string(), "notes.txt", 3);
+        let dotted_i = expanded.search("i");
+        assert_eq!(dotted_i.get(0), Some(CodeSearchMatch { start: 0, end: 2 }));
     }
 
     #[test]
     fn shaped_width_tracker_only_ratchets_to_wider_lines() {
+        let document = CodeDocument::prepare("x\nwidest".to_string(), "notes.txt", 1);
         let tracker = CodeViewState::default();
-        assert_eq!(tracker.widest_line(), 0);
+        assert_eq!(tracker.widest_line(&document), 1);
         assert!(tracker.record_width(0, px(80.0)));
         assert!(!tracker.record_width(1, px(60.0)));
         assert!(!tracker.record_width(2, px(80.0)));
-        assert_eq!(tracker.widest_line(), 0);
+        assert_eq!(tracker.widest_line(&document), 0);
         assert!(tracker.record_width(3, px(81.0)));
-        assert_eq!(tracker.widest_line(), 3);
+        assert_eq!(tracker.widest_line(&document), 3);
 
         tracker.reset();
-        assert_eq!(tracker.widest_line(), 0);
+        assert_eq!(tracker.widest_line(&document), 1);
         assert!(tracker.record_width(1, px(1.0)));
-        assert_eq!(tracker.widest_line(), 1);
+        assert_eq!(tracker.widest_line(&document), 1);
     }
 
     #[test]
-    fn scrollbar_geometry_maps_tracks_to_the_full_scroll_range() {
-        let bounds = Bounds::new(point(px(10.0), px(20.0)), gpui::size(px(240.0), px(120.0)));
-        let geometries = code_scrollbar_geometries(
-            bounds,
-            point(px(480.0), px(360.0)),
-            point(px(-240.0), px(-180.0)),
+    fn horizontal_match_reveal_scrolls_minimally_and_clamps() {
+        assert_eq!(
+            horizontal_offset_to_reveal(
+                px(10.0)..px(90.0),
+                px(30.0)..px(60.0),
+                px(-40.0),
+                px(200.0)
+            ),
+            px(-40.0)
         );
-        assert_eq!(geometries.len(), 2);
-        for geometry in geometries {
-            assert!(bounds.contains(&geometry.thumb_bounds.center()));
-            let pointer_offset =
-                scrollbar_axis_size(geometry.axis, geometry.thumb_bounds.size) / 2.0;
-            let mut start = geometry.thumb_bounds.center();
-            match geometry.axis {
-                CodeScrollbarAxis::Horizontal => {
-                    start.x = geometry.thumb_track_start + pointer_offset
-                }
-                CodeScrollbarAxis::Vertical => {
-                    start.y = geometry.thumb_track_start + pointer_offset
-                }
-            }
-            assert_eq!(
-                scrollbar_offset_for_position(geometry, start, pointer_offset),
-                Pixels::ZERO
-            );
-            let mut end = start;
-            match geometry.axis {
-                CodeScrollbarAxis::Horizontal => end.x += geometry.thumb_travel,
-                CodeScrollbarAxis::Vertical => end.y += geometry.thumb_travel,
-            }
-            assert_eq!(
-                scrollbar_offset_for_position(geometry, end, pointer_offset),
-                -geometry.max_offset
-            );
-        }
-        assert!(code_scrollbar_geometries(bounds, Point::default(), Point::default()).is_empty());
+        assert_eq!(
+            horizontal_offset_to_reveal(
+                px(10.0)..px(90.0),
+                px(0.0)..px(20.0),
+                px(-40.0),
+                px(200.0)
+            ),
+            px(-30.0)
+        );
+        assert_eq!(
+            horizontal_offset_to_reveal(
+                px(10.0)..px(90.0),
+                px(80.0)..px(120.0),
+                px(-40.0),
+                px(200.0)
+            ),
+            px(-70.0)
+        );
+        assert_eq!(
+            horizontal_offset_to_reveal(
+                px(10.0)..px(90.0),
+                px(250.0)..px(280.0),
+                Pixels::ZERO,
+                px(120.0)
+            ),
+            px(-120.0)
+        );
     }
 
     #[test]
@@ -1824,6 +1837,13 @@ mod tests {
         assert_eq!(&document.source()[cafe], "café_value");
         let punctuation = document.word_range_at(0, document.source().find('=').unwrap());
         assert_eq!(&document.source()[punctuation], "=");
+    }
+
+    #[test]
+    fn display_columns_handles_ascii_and_tabs_before_unicode_fallback() {
+        assert_eq!(display_columns("ascii"), 5);
+        assert_eq!(display_columns("\tx"), CODE_TAB_WIDTH + 1);
+        assert_eq!(display_columns("界x"), 3);
     }
 
     #[gpui::test]
@@ -1885,6 +1905,32 @@ mod tests {
     }
 
     #[gpui::test]
+    fn truncated_mouse_selection_copies_only_visible_segments(cx: &mut gpui::TestAppContext) {
+        let prefix = "x".repeat(MAX_CODE_RENDERED_LINE_BYTES);
+        let source = format!("{prefix}hidden\nnext");
+        let document = Arc::new(CodeDocument::prepare(source.clone(), "notes.txt", 1));
+        let selection = CodeSelection::new(cx.update(|cx| cx.focus_handle()));
+        selection.begin_frame(document.clone(), Bounds::default());
+
+        selection.begin_selection(0, 0, 1, false);
+        let next_end = document.line_source_range(1).start + "next".len();
+        assert!(selection.update_head(1, next_end));
+        assert_eq!(
+            selection.finish_selection().as_deref(),
+            Some(format!("{prefix}\nnext").as_str())
+        );
+
+        selection.begin_selection(0, 10, 3, false);
+        assert_eq!(
+            selection.finish_selection().as_deref(),
+            Some(prefix.as_str())
+        );
+
+        assert!(selection.select_all());
+        assert_eq!(selection.selected_text().as_deref(), Some(source.as_str()));
+    }
+
+    #[gpui::test]
     fn rendered_viewer_ratchets_to_shaped_width_and_handles_copy_actions(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1902,15 +1948,37 @@ mod tests {
                 document: drawn_document,
                 scroll_handle: UniformListScrollHandle::new(),
                 view_state: CodeViewState::default(),
+                scrollbar_state: OverlayScrollbarState::default(),
                 selection: CodeSelection::new(focus.clone()),
+                active_match: None,
                 focus,
             }
         });
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.view_state.widest_line(), 1);
+        let first_layout = view.read_with(cx, |view, _| {
+            assert_eq!(view.view_state.widest_line(&view.document), 1);
+            view.selection
+                .0
+                .borrow()
+                .current
+                .iter()
+                .find(|participant| participant.line == 0)
+                .expect("first line is visible")
+                .layout
+                .clone()
         });
         view.update(cx, |_, cx| cx.notify());
         view.read_with(cx, |view, _| {
+            let current_layout = view
+                .selection
+                .0
+                .borrow()
+                .current
+                .iter()
+                .find(|participant| participant.line == 0)
+                .expect("first line remains visible")
+                .layout
+                .clone();
+            assert!(Arc::ptr_eq(&first_layout, &current_layout));
             let item_size = view
                 .scroll_handle
                 .0
@@ -1931,6 +1999,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn hidden_search_match_reveals_the_truncation_marker(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let document = Arc::new(CodeDocument::prepare(
+            format!("{} hidden-needle", "x".repeat(MAX_CODE_RENDERED_LINE_BYTES)),
+            "notes.txt",
+            1,
+        ));
+        let search_match = document
+            .search("hidden-needle")
+            .get(0)
+            .expect("hidden search match");
+        let target = document.match_target(search_match);
+        assert!(target.hidden);
+        let view_state = CodeViewState::default();
+        view_state.request_match_reveal(search_match);
+        let drawn_document = document.clone();
+        let drawn_view_state = view_state.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            TestCodeView {
+                document: drawn_document,
+                scroll_handle: UniformListScrollHandle::new(),
+                view_state: drawn_view_state,
+                scrollbar_state: OverlayScrollbarState::default(),
+                selection: CodeSelection::new(focus.clone()),
+                active_match: Some(target),
+                focus,
+            }
+        });
+
+        view.read_with(cx, |view, _| {
+            let base_handle = view.scroll_handle.0.borrow().base_handle.clone();
+            assert!(base_handle.offset().x < Pixels::ZERO);
+            assert!(view.view_state.0.pending_reveal.get().is_none());
+        });
+    }
+
+    #[gpui::test]
     fn rendered_viewer_drag_selects_across_virtualized_rows(cx: &mut gpui::TestAppContext) {
         cx.update(crate::fonts::init);
         let document = Arc::new(CodeDocument::prepare(
@@ -1946,7 +2053,9 @@ mod tests {
                 document: drawn_document,
                 scroll_handle: UniformListScrollHandle::new(),
                 view_state: CodeViewState::default(),
+                scrollbar_state: OverlayScrollbarState::default(),
                 selection: CodeSelection::new(focus.clone()),
+                active_match: None,
                 focus,
             }
         });
@@ -2005,18 +2114,23 @@ mod tests {
                 document: drawn_document,
                 scroll_handle: UniformListScrollHandle::new(),
                 view_state: CodeViewState::default(),
+                scrollbar_state: OverlayScrollbarState::default(),
                 selection: CodeSelection::new(focus.clone()),
+                active_match: None,
                 focus,
             }
         });
         let (start, end, maximum) = view.read_with(cx, |view, _| {
             let base_handle = view.scroll_handle.0.borrow().base_handle.clone();
             let maximum = base_handle.max_offset();
-            let geometry =
-                code_scrollbar_geometries(base_handle.bounds(), maximum, base_handle.offset())
-                    .into_iter()
-                    .find(|geometry| geometry.axis == CodeScrollbarAxis::Vertical)
-                    .expect("long code document has a vertical scrollbar");
+            let geometry = crate::scrollbar::scrollbar_geometries(
+                base_handle.bounds(),
+                maximum,
+                base_handle.offset(),
+            )
+            .into_iter()
+            .find(|geometry| geometry.axis == crate::scrollbar::ScrollbarAxis::Vertical)
+            .expect("long code document has a vertical scrollbar");
             let start = geometry.thumb_bounds.center();
             let end = point(
                 start.x,
@@ -2034,7 +2148,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             let state = view.scroll_handle.0.borrow();
             assert_eq!(state.base_handle.offset().y, -maximum);
-            assert!(view.view_state.0.scrollbar_drag.get().is_none());
+            assert!(!view.scrollbar_state.is_dragging());
         });
     }
 
@@ -2062,29 +2176,27 @@ mod tests {
     fn bounded_load_accepts_a_file_at_the_limit() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("limit.txt");
-        let mut contents = vec![b'x'; MAX_CODE_PREVIEW_BYTES as usize];
-        for index in
-            (MAX_CODE_PREVIEW_LINE_BYTES..contents.len()).step_by(MAX_CODE_PREVIEW_LINE_BYTES)
-        {
-            contents[index] = b'\n';
-        }
+        let contents = vec![b'x'; MAX_CODE_PREVIEW_BYTES as usize];
         fs::write(&path, contents).expect("write limit-sized file");
 
         let document = CodeDocument::load(&path, "limit.txt", 1).expect("load text at limit");
         assert_eq!(document.source().len(), MAX_CODE_PREVIEW_BYTES as usize);
-        assert_eq!(document.line_count(), 64);
+        assert_eq!(document.line_count(), 1);
+        assert!(document.line_is_truncated(0));
+        assert_eq!(document.line_text(0).len(), MAX_CODE_RENDERED_LINE_BYTES);
     }
 
     #[test]
-    fn bounded_load_rejects_pathological_line_and_line_count_geometry() {
+    fn bounded_load_truncates_pathological_lines_and_rejects_excessive_line_counts() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let long_line = directory.path().join("long-line.txt");
-        fs::write(&long_line, vec![b'x'; MAX_CODE_PREVIEW_LINE_BYTES + 1])
-            .expect("write long line");
-        assert_eq!(
-            CodeDocument::load(&long_line, "long-line.txt", 1).unwrap_err(),
-            "line too long to preview"
-        );
+        let long_line_source = vec![b'x'; MAX_CODE_RENDERED_LINE_BYTES * 2];
+        fs::write(&long_line, &long_line_source).expect("write long line");
+        let document =
+            CodeDocument::load(&long_line, "long-line.txt", 1).expect("load truncated line");
+        assert_eq!(document.source().as_bytes(), long_line_source);
+        assert_eq!(document.line_text(0).len(), MAX_CODE_RENDERED_LINE_BYTES);
+        assert!(document.line_is_truncated(0));
 
         let many_lines = directory.path().join("many-lines.txt");
         fs::write(&many_lines, vec![b'\n'; MAX_CODE_PREVIEW_LINES + 1]).expect("write many lines");
@@ -2092,5 +2204,25 @@ mod tests {
             CodeDocument::load(&many_lines, "many-lines.txt", 2).unwrap_err(),
             "too many lines to preview"
         );
+    }
+
+    #[test]
+    fn rendered_prefix_stops_at_a_utf8_boundary_and_keeps_full_search_results() {
+        let source = format!(
+            "{}é hidden-needle",
+            "x".repeat(MAX_CODE_RENDERED_LINE_BYTES - 1)
+        );
+        let document = CodeDocument::prepare(source.clone(), "notes.txt", 1);
+        assert_eq!(document.source(), source);
+        assert_eq!(
+            document.line_text(0).len(),
+            MAX_CODE_RENDERED_LINE_BYTES - 1
+        );
+        assert!(document.line_is_truncated(0));
+
+        let results = document.search("hidden-needle");
+        let target = document.match_target(results.get(0).expect("hidden match"));
+        assert_eq!(target.line, 0);
+        assert!(target.hidden);
     }
 }

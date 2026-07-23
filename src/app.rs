@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     code_viewer::{
-        CodeDocument, CodeSearchResults, CodeSelection, MAX_CODE_PREVIEW_BYTES,
+        CodeDocument, CodeSearchResults, CodeSelection, CodeViewState, MAX_CODE_PREVIEW_BYTES,
         render_code_document,
     },
     composer::{Composer, ComposerChanged},
@@ -2004,6 +2004,7 @@ impl ChattView {
             return;
         };
         preview.view_state.reset();
+        preview.scrollbar_state.reset();
         preview.state = CodePreviewState::Preparing { load_id };
         if self.preview_history.active_key() == Some(key) {
             self.code_selection.clear();
@@ -2076,19 +2077,25 @@ impl ChattView {
         }
     }
 
-    fn active_code_document(&self) -> Option<(Arc<CodeDocument>, UniformListScrollHandle)> {
+    fn active_code_document(
+        &self,
+    ) -> Option<(Arc<CodeDocument>, UniformListScrollHandle, CodeViewState)> {
         let preview = self.preview_history.active()?.code_preview()?;
         let CodePreviewState::Ready(document) = &preview.state else {
             return None;
         };
-        Some((document.clone(), preview.scroll_handle.clone()))
+        Some((
+            document.clone(),
+            preview.scroll_handle.clone(),
+            preview.view_state.clone(),
+        ))
     }
 
     fn update_code_search(&mut self, cx: &mut Context<Self>) {
         if !self.code_search_open {
             return;
         }
-        let Some((document, _)) = self.active_code_document() else {
+        let Some((document, _, _)) = self.active_code_document() else {
             self.close_code_search(cx);
             return;
         };
@@ -2127,14 +2134,13 @@ impl ChattView {
     }
 
     fn scroll_to_code_match(&self, strategy: ScrollStrategy) {
-        let Some(line) = self
-            .code_search_results
-            .line_for_match(self.code_search_result_index)
-        else {
+        let Some(search_match) = self.code_search_results.get(self.code_search_result_index) else {
             return;
         };
-        if let Some((_, scroll_handle)) = self.active_code_document() {
-            scroll_handle.scroll_to_item_strict(line, strategy);
+        if let Some((document, scroll_handle, view_state)) = self.active_code_document() {
+            let target = document.match_target(search_match);
+            view_state.request_match_reveal(search_match);
+            scroll_handle.scroll_to_item_strict(target.line, strategy);
         }
     }
 
@@ -3375,10 +3381,15 @@ impl ChattView {
         let active_match = self
             .code_search_open
             .then(|| {
+                let CodePreviewState::Ready(document) = &preview.state else {
+                    return None;
+                };
                 self.code_search_results
-                    .line_for_match(self.code_search_result_index)
+                    .get(self.code_search_result_index)
+                    .map(|search_match| document.match_target(search_match))
             })
             .flatten();
+        let active_match_hidden = active_match.is_some_and(|target| target.hidden);
         let search_status: SharedString = if self.code_search_input.read(cx).text_ref().is_empty() {
             "".into()
         } else if self.code_search_pending {
@@ -3396,16 +3407,22 @@ impl ChattView {
         } else {
             if compact_search {
                 format!(
-                    "{}/{}",
+                    "{}/{}{}",
                     self.code_search_result_index + 1,
-                    self.code_search_results.len()
+                    self.code_search_results.len(),
+                    if active_match_hidden { "*" } else { "" }
                 )
                 .into()
             } else {
                 format!(
-                    "{} / {}",
+                    "{} / {}{}",
                     self.code_search_result_index + 1,
-                    self.code_search_results.len()
+                    self.code_search_results.len(),
+                    if active_match_hidden {
+                        " · hidden"
+                    } else {
+                        ""
+                    }
                 )
                 .into()
             }
@@ -3425,6 +3442,7 @@ impl ChattView {
                     document,
                     preview.scroll_handle.clone(),
                     preview.view_state.clone(),
+                    preview.scrollbar_state.clone(),
                     self.code_selection.clone(),
                     active_match,
                 ))
@@ -3528,7 +3546,13 @@ impl ChattView {
                         )
                         .child(
                             div()
-                                .w(if compact_search { px(40.0) } else { px(70.0) })
+                                .w(if compact_search {
+                                    px(48.0)
+                                } else if active_match_hidden {
+                                    px(112.0)
+                                } else {
+                                    px(70.0)
+                                })
                                 .flex_none()
                                 .text_right()
                                 .text_xs()

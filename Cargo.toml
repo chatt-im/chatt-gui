@@ -25,6 +25,7 @@ log = "0.4"
 naga = { path = "vendor/wgpu/naga", features = ["glsl-in", "spv-out"] }
 local_rpc = { package = "chatt-local-rpc", git = "https://github.com/chatt-im/chatt.git", rev = "48dce93ab20db84f3bfdce933dd6704e0dfc9eaa" }
 unicode-segmentation = "1"
+unicode-width = "0.2"
 tempfile = "3"
 zmij = "1.0.23"
 

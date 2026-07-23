@@ -839,47 +839,38 @@ impl WindowTextSystem {
         layout
     }
 
-    /// Lays out a borrowed line without materializing text or font-run buffers
-    /// at the call site.
+    /// Lays out borrowed text through the existing content-addressed line
+    /// cache, using the text system's pooled font-run buffer.
     ///
-    /// `font_runs` is evaluated only when the content/style hash misses the
-    /// line-layout cache. The platform-facing run buffer comes from the text
-    /// system's existing pool and is returned after shaping.
-    ///
-    /// Callers must guarantee that equal content/style hashes and layout
-    /// parameters represent identical text and font runs.
-    pub fn layout_borrowed_line(
+    /// The font runs are rebuilt for an exact cache probe. Text is copied only
+    /// if the existing hashed layout cache misses.
+    pub fn layout_line_by_hash_with_font_runs(
         &self,
         text_hash: u64,
-        style_hash: u64,
         text: &str,
         font_size: Pixels,
         force_width: Option<Pixels>,
         font_runs: impl FnOnce(&mut dyn FnMut(FontRun)),
     ) -> Arc<LineLayout> {
-        self.line_layout_cache.layout_borrowed_line(
+        let mut runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        runs.clear();
+        font_runs(&mut |run| runs.push(run));
+        debug_assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            text.len(),
+            "font runs must cover the borrowed line"
+        );
+
+        let layout = self.line_layout_cache.layout_line_by_hash(
             text_hash,
             text.len(),
-            style_hash,
             font_size,
+            &runs,
             force_width,
-            || {
-                let mut runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-                runs.clear();
-                font_runs(&mut |run| runs.push(run));
-                debug_assert_eq!(
-                    runs.iter().map(|run| run.len).sum::<usize>(),
-                    text.len(),
-                    "font runs must cover the borrowed line"
-                );
-
-                let layout = self
-                    .platform_text_system
-                    .layout_line(text, font_size, &runs);
-                self.font_runs_pool.lock().push(runs);
-                layout
-            },
-        )
+            || SharedString::from(text),
+        );
+        self.font_runs_pool.lock().push(runs);
+        layout
     }
 }
 
