@@ -382,6 +382,8 @@ actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
+    const NON_INPUT_CONTEXT: &str = "Chatt && !ChattComposer && !ChattCodeSearch";
+
     crate::composer::bind_keys(cx);
     crate::code_viewer::bind_keys(cx);
     cx.bind_keys([
@@ -389,7 +391,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "escape",
             ClosePreview,
-            Some("Chatt && !ChattComposer && !ChattCodeSearch"),
+            Some(NON_INPUT_CONTEXT),
         ),
         KeyBinding::new(
             "cmd-f",
@@ -403,15 +405,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "space",
             TogglePlayback,
-            Some("Chatt && !ChattComposer && !ChattCodeSearch"),
+            Some(NON_INPUT_CONTEXT),
         ),
-        KeyBinding::new("left", SeekBack, Some("Chatt")),
-        KeyBinding::new("right", SeekForward, Some("Chatt")),
-        KeyBinding::new("=", LiveZoomIn, Some("Chatt")),
-        KeyBinding::new("-", LiveZoomOut, Some("Chatt")),
-        KeyBinding::new("home", LiveReset, Some("Chatt")),
-        KeyBinding::new("up", LivePanUp, Some("Chatt")),
-        KeyBinding::new("down", LivePanDown, Some("Chatt")),
+        KeyBinding::new("left", SeekBack, Some(NON_INPUT_CONTEXT)),
+        KeyBinding::new("right", SeekForward, Some(NON_INPUT_CONTEXT)),
+        KeyBinding::new("=", LiveZoomIn, Some(NON_INPUT_CONTEXT)),
+        KeyBinding::new("-", LiveZoomOut, Some(NON_INPUT_CONTEXT)),
+        KeyBinding::new("home", LiveReset, Some(NON_INPUT_CONTEXT)),
+        KeyBinding::new("up", LivePanUp, Some(NON_INPUT_CONTEXT)),
+        KeyBinding::new("down", LivePanDown, Some(NON_INPUT_CONTEXT)),
     ]);
 }
 
@@ -2517,6 +2519,7 @@ impl ChattView {
         let edited = message.edited;
         let unverified = message.unverified;
         let timestamp_ms = message.timestamp_ms;
+        let timestamp = timeline::format_age(timestamp_ms, timeline::now_ms());
         let hover_group: SharedString = format!("message-actions-{message_id}").into();
         let actions = (!collapsed && message.local && !message.notice).then(|| {
             (
@@ -2544,6 +2547,25 @@ impl ChattView {
                     .bottom_0()
                     .w(px(3.))
                     .bg(rgb(accent)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(if continuation { 3. } else { 10. }))
+                    .h(px(24.))
+                    .w(px(64.))
+                    .pr(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .text_xs()
+                    .text_color(rgb(0x777d87))
+                    .when(continuation, |time| {
+                        time.invisible()
+                            .group_hover(hover_group.clone(), |time| time.visible())
+                    })
+                    .child(timestamp),
             )
             .child(
                 div().relative().w_full().max_w(px(860.)).pl(px(15.)).child(
@@ -2593,10 +2615,6 @@ impl ChattView {
                                                 )),
                                         )
                                     })
-                                    .child(div().flex_1())
-                                    .child(div().text_xs().text_color(rgb(0x777d87)).child(
-                                        timeline::format_age(timestamp_ms, timeline::now_ms()),
-                                    )),
                             )
                         })
                         .when_some(formatted_message, |content, formatted_message| {
@@ -2626,20 +2644,6 @@ impl ChattView {
                     .invisible()
                     .group_hover(hover_group, |actions| actions.visible())
                     .when(collapsed, |actions| actions.visible())
-                    .child(
-                        message_action_button(
-                            ("collapse", message_id as usize),
-                            if collapsed {
-                                IconName::ListChevronsUpDown
-                            } else {
-                                IconName::ListChevronsDownUp
-                            },
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_message_group(message_id, cx)
-                        })),
-                    )
                     .when_some(actions, |actions, (room_id, message_id, edit_body)| {
                         actions
                             .when_some(edit_body, |actions, edit_body| {
@@ -2673,7 +2677,21 @@ impl ChattView {
                                     },
                                 )),
                             )
-                    }),
+                    })
+                    .child(
+                        message_action_button(
+                            ("collapse", message_id as usize),
+                            if collapsed {
+                                IconName::ListChevronsUpDown
+                            } else {
+                                IconName::ListChevronsDownUp
+                            },
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_message_group(message_id, cx)
+                        })),
+                    ),
             )
             .into_any_element()
     }

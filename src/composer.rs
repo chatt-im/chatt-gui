@@ -21,6 +21,7 @@ actions!(
         Paste,
         Copy,
         Cut,
+        InsertTab,
         Newline
     ]
 );
@@ -48,6 +49,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-x", Cut, Some("ChattComposer")),
         KeyBinding::new("cmd-x", Cut, Some("ChattCodeSearch")),
+        KeyBinding::new("tab", InsertTab, Some("ChattComposer")),
         KeyBinding::new("shift-enter", Newline, Some("ChattComposer")),
     ]);
 }
@@ -227,6 +229,9 @@ impl Composer {
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, window, cx);
         self.replace_text_in_range(None, "", window, cx);
+    }
+    fn insert_tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, "    ", window, cx);
     }
     fn offset_from_utf16(&self, offset: usize) -> usize {
         offset_from_utf16(&self.content, offset)
@@ -663,7 +668,9 @@ impl Render for Composer {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .when(self.multiline, |input| {
-                input.on_action(cx.listener(Self::newline))
+                input
+                    .on_action(cx.listener(Self::insert_tab))
+                    .on_action(cx.listener(Self::newline))
             })
             .on_mouse_down(
                 MouseButton::Left,
