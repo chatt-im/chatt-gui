@@ -2,19 +2,23 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, Window, actions, div, fill, point, prelude::*,
-    px, relative, rgb, rgba, size,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
+    GlobalElementId, Hsla, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 mod buffer;
 mod cursor;
+mod highlight;
 mod history;
 mod mode;
 mod vim;
 mod visual;
 
+use crate::{fonts::CODE_FONT_FAMILY, formatted_message::syntax_color};
+use chatt_message_format::highlight::PaletteRole;
+use highlight::{ComposerColor, ComposerSyntax, ComposerTextStyle, ComposerTypeface};
 use mode::Mode;
 use vim::{VimEditor, VimKey};
 
@@ -83,6 +87,7 @@ pub struct Composer {
     last_layout: Vec<ComposerLine>,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Option<Pixels>,
+    syntax: Option<ComposerSyntax>,
 }
 
 impl Composer {
@@ -101,6 +106,7 @@ impl Composer {
             last_layout: Vec::new(),
             last_bounds: None,
             last_line_height: None,
+            syntax: Some(ComposerSyntax::default()),
         }
     }
 
@@ -121,6 +127,7 @@ impl Composer {
             last_layout: Vec::new(),
             last_bounds: None,
             last_line_height: None,
+            syntax: None,
         }
     }
 
@@ -136,6 +143,7 @@ impl Composer {
         self.reversed = false;
         self.marked = None;
         self.last_layout.clear();
+        self.refresh_syntax();
         cx.emit(ComposerChanged);
         cx.notify();
     }
@@ -152,6 +160,7 @@ impl Composer {
         self.reversed = false;
         self.marked = None;
         self.last_layout.clear();
+        self.refresh_syntax();
         cx.emit(ComposerChanged);
         cx.notify();
     }
@@ -234,7 +243,7 @@ impl Composer {
     }
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text, window, cx);
+            self.replace_text(None, &text, false, window, cx);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -281,6 +290,58 @@ impl Composer {
         }
     }
 
+    fn replace_text(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        auto_close_fence: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range
+            .as_ref()
+            .map(|range| self.range_from_utf16(range))
+            .or(self.marked.clone())
+            .unwrap_or(self.selected.clone());
+        let range = self.normalize_range(range);
+        let text = self.accepted_text(text);
+        let before = self.editor.slice(0..range.start);
+        let after = self.editor.slice(range.end..self.editor.len());
+        let close_fence = auto_close_fence
+            && self.multiline
+            && self.marked.is_none()
+            && should_auto_close_code_fence(&before, text, &after);
+        let replacement;
+        let text = if close_fence {
+            replacement = format!("{text}\n```");
+            replacement.as_str()
+        } else {
+            text
+        };
+        self.editor.replace_offsets(range.clone(), text);
+        let end = if close_fence {
+            range.start + 1
+        } else {
+            range.start + text.len()
+        };
+        self.selected = end..end;
+        self.editor.set_cursor_offset(end);
+        self.marked = None;
+        self.last_layout.clear();
+        self.refresh_syntax();
+        cx.emit(ComposerChanged);
+        cx.notify();
+    }
+
+    fn refresh_syntax(&mut self) {
+        let Some(syntax) = &mut self.syntax else {
+            return;
+        };
+        let version = self.editor.text_version();
+        let text = self.editor.text();
+        syntax.refresh(version, &text);
+    }
+
     fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
         let local = self.last_bounds?.localize(&point)?;
         let line_height = self.last_line_height?;
@@ -316,6 +377,7 @@ impl Composer {
         self.marked = None;
         self.last_layout.clear();
         if self.editor.text_version() != version {
+            self.refresh_syntax();
             cx.emit(ComposerChanged);
         }
         window.prevent_default();
@@ -336,6 +398,14 @@ fn normalize_range(text: &str, range: Range<usize>) -> Range<usize> {
     let start = clamp_offset(text, range.start);
     let end = clamp_offset(text, range.end);
     start.min(end)..start.max(end)
+}
+
+fn should_auto_close_code_fence(before: &str, inserted: &str, after: &str) -> bool {
+    inserted == "`"
+        && before.ends_with("``")
+        && !before.ends_with("```")
+        && (after.is_empty() || after.starts_with('\n'))
+        && !after.starts_with("\n```")
 }
 
 fn offset_from_utf16(text: &str, offset: usize) -> usize {
@@ -419,24 +489,10 @@ impl EntityInputHandler for Composer {
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or(self.marked.clone())
-            .unwrap_or(self.selected.clone());
-        let range = self.normalize_range(range);
-        let text = self.accepted_text(text);
-        self.editor.replace_offsets(range.clone(), text);
-        let end = range.start + text.len();
-        self.selected = end..end;
-        self.editor.set_cursor_offset(end);
-        self.marked = None;
-        self.last_layout.clear();
-        cx.emit(ComposerChanged);
-        cx.notify();
+        self.replace_text(range, text, true, window, cx);
     }
     fn replace_and_mark_text_in_range(
         &mut self,
@@ -447,7 +503,7 @@ impl EntityInputHandler for Composer {
         cx: &mut Context<Self>,
     ) {
         let text = self.accepted_text(text);
-        self.replace_text_in_range(range, text, window, cx);
+        self.replace_text(range, text, false, window, cx);
         let end = self.selected.end;
         let inserted = end - text.len()..end;
         self.marked = (!text.is_empty()).then_some(inserted.clone());
@@ -544,6 +600,88 @@ impl ComposerLine {
     }
 }
 
+fn composer_text_runs(
+    syntax: Option<&ComposerSyntax>,
+    range: Range<usize>,
+    base_font: &Font,
+    base_color: Hsla,
+) -> Vec<TextRun> {
+    let mut runs = Vec::new();
+    let mut cursor = range.start;
+    if let Some(syntax) = syntax {
+        for styled in syntax.runs_for(range.clone()) {
+            if cursor < styled.range.start {
+                runs.push(composer_text_run(
+                    styled.range.start - cursor,
+                    ComposerTextStyle::default(),
+                    base_font,
+                    base_color,
+                ));
+            }
+            runs.push(composer_text_run(
+                styled.range.len(),
+                styled.style,
+                base_font,
+                base_color,
+            ));
+            cursor = styled.range.end;
+        }
+    }
+    if cursor < range.end {
+        runs.push(composer_text_run(
+            range.end - cursor,
+            ComposerTextStyle::default(),
+            base_font,
+            base_color,
+        ));
+    }
+    if runs.is_empty() {
+        runs.push(composer_text_run(
+            0,
+            ComposerTextStyle::default(),
+            base_font,
+            base_color,
+        ));
+    }
+    runs
+}
+
+fn composer_text_run(
+    len: usize,
+    style: ComposerTextStyle,
+    base_font: &Font,
+    base_color: Hsla,
+) -> TextRun {
+    let mut font = base_font.clone();
+    if style.typeface == ComposerTypeface::Code {
+        font.family = CODE_FONT_FAMILY.into();
+    }
+    if style.bold {
+        font.weight = FontWeight::BOLD;
+    }
+    if style.italic {
+        font.style = FontStyle::Italic;
+    }
+    let color = match style.color {
+        ComposerColor::Default => base_color,
+        ComposerColor::Dim => rgb(syntax_color(PaletteRole::Comment)).into(),
+        ComposerColor::Link => rgb(0xf0f0f0).into(),
+        ComposerColor::Syntax(role) => rgb(syntax_color(role)).into(),
+    };
+    TextRun {
+        len,
+        font,
+        color,
+        background_color: style.code_background.then(|| rgba(0xffffff14).into()),
+        underline: style.underline.then(|| UnderlineStyle {
+            color: Some(color),
+            thickness: px(1.),
+            ..Default::default()
+        }),
+        strikethrough: None,
+    }
+}
+
 struct ComposerElement {
     input: Entity<Composer>,
 }
@@ -603,20 +741,24 @@ impl Element for ComposerElement {
         };
         let font = window.text_style().font();
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        let shape_line = |range, text: SharedString| {
-            let run = TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
+        let shape_line = |range: Range<usize>, text: SharedString| {
+            let runs = if is_placeholder {
+                vec![TextRun {
+                    len: text.len(),
+                    font: font.clone(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }]
+            } else {
+                composer_text_runs(input.syntax.as_ref(), range.clone(), &font, color)
             };
             ComposerLine {
                 range,
                 layout: window
                     .text_system()
-                    .shape_line(text, font_size, &[run], None),
+                    .shape_line(text, font_size, &runs, None),
             }
         };
         let cursor_row = input.editor.offset_to_rowcol(input.cursor()).0;
@@ -858,7 +1000,7 @@ impl Focusable for Composer {
 mod tests {
     use super::{
         ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16,
-        visible_line_range,
+        should_auto_close_code_fence, visible_line_range,
     };
 
     #[test]
@@ -912,5 +1054,15 @@ mod tests {
         assert_eq!(visible_line_range(10_000, 0), 0..8);
         assert_eq!(visible_line_range(10_000, 5_000), 4_993..5_001);
         assert_eq!(visible_line_range(10_000, 9_999), 9_992..10_000);
+    }
+
+    #[test]
+    fn typed_third_backtick_auto_closes_only_at_a_line_tail() {
+        assert!(should_auto_close_code_fence("``", "`", ""));
+        assert!(should_auto_close_code_fence("Hello ``", "`", "\nnext"));
+        assert!(!should_auto_close_code_fence("```", "`", ""));
+        assert!(!should_auto_close_code_fence("``", "`", "tail"));
+        assert!(!should_auto_close_code_fence("``", "```", ""));
+        assert!(!should_auto_close_code_fence("``", "`", "\n```"));
     }
 }
