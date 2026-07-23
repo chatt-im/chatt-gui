@@ -101,9 +101,8 @@ impl History {
         }
     }
 
-    /// Discard every recorded edit. Used by `set_lines` / `clear`,
-    /// which perform wholesale replacements for which undo doesn't
-    /// make sense.
+    /// Discard every recorded edit. Used by whole-buffer replacements
+    /// and editor-mode changes for which undo doesn't make sense.
     pub fn reset(&mut self) {
         self.undo.clear();
         self.redo.clear();

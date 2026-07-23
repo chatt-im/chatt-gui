@@ -123,11 +123,6 @@ impl VimEditor {
             }
 
             VimAction::ExitInsert => self.exec_exit_insert(),
-            VimAction::InsertChar => {
-                if let Some(c) = captured {
-                    self.exec_insert_char(c);
-                }
-            }
             VimAction::InsertNewline => self.exec_insert_newline(),
             VimAction::InsertTab => self.exec_insert_tab(),
             VimAction::BackspaceDelete => self.exec_backspace(),
@@ -141,8 +136,6 @@ impl VimEditor {
                 }
             }
             VimAction::SelectTextObject(obj) => self.exec_select_text_object(obj, count),
-
-            VimAction::NoOp => {}
         }
         if self.single_line {
             self.scroll_offset = 0;
@@ -376,14 +369,6 @@ impl VimEditor {
         }
 
         cursor
-    }
-
-    /// Puts the editor into Insert mode at the current cursor position.
-    ///
-    /// Use when the host wants "new buffer, start typing" semantics
-    /// without synthesizing a keypress.
-    pub fn enter_insert_mode(&mut self) {
-        self.enter_insert_at_cursor();
     }
 
     fn enter_insert_at_cursor(&mut self) {
@@ -666,14 +651,6 @@ impl VimEditor {
         if apply_len > 0 {
             self.commit(Edit::delete(apply_start, apply_len));
         }
-    }
-
-    fn exec_insert_char(&mut self, c: char) {
-        if self.single_line && matches!(c, '\n' | '\r') {
-            return;
-        }
-        self.commit_insert_at_cursor(c.to_string());
-        self.update_desired_display_col();
     }
 
     fn exec_insert_tab(&mut self) {
@@ -1683,7 +1660,6 @@ pub enum VimAction {
     DecrementNumber,
     SetMark,
     ExitInsert,
-    InsertChar,
     InsertNewline,
     InsertTab,
     BackspaceDelete,
@@ -1692,7 +1668,6 @@ pub enum VimAction {
     YankSelection,
     SurroundSelection,
     SelectTextObject(TextObject),
-    NoOp,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2606,8 +2581,21 @@ impl VimEditor {
         }
     }
 
+    pub fn set_single_line(&mut self, single_line: bool) {
+        if self.single_line == single_line {
+            return;
+        }
+        self.single_line = single_line;
+        if single_line {
+            self.enforce_single_line_mode();
+        } else {
+            self.dirty = true;
+        }
+    }
+
     pub fn set_text(&mut self, text: &str, mode: Mode, at_end: bool) {
-        self.buf.set_text(text);
+        let text = self.normalize_text_for_mode(text).into_owned();
+        self.buf.set_text(&text);
         self.cursor = if at_end {
             let (row, col) = self.buf.offset_to_rowcol(self.buf.len() as u32);
             Cursor { row, col }
@@ -2632,25 +2620,14 @@ impl VimEditor {
         self.last_viewport_h = viewport_rows.max(1);
     }
 
-    pub fn insert_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let text = self.normalize_text_for_mode(text).into_owned();
-        let offset = self.cursor_offset() as u32;
-        self.commit(Edit::insert(offset, text.clone()));
-        let (row, col) = self.buf.offset_to_rowcol(offset + text.len() as u32);
-        self.cursor = Cursor { row, col };
-        self.update_desired_display_col();
-    }
-
     pub fn replace_offsets(&mut self, range: Range<usize>, text: &str) {
         let start = range.start.min(self.buf.len());
         let end = range.end.min(self.buf.len()).max(start);
+        let text = self.normalize_text_for_mode(text).into_owned();
         self.commit(Edit::replace(
             start as u32,
             (end - start) as u32,
-            text.to_string(),
+            text.clone(),
         ));
         let (row, col) = self.buf.offset_to_rowcol((start + text.len()) as u32);
         self.cursor = Cursor { row, col };
@@ -2666,10 +2643,6 @@ impl VimEditor {
 
     pub fn offset_to_rowcol(&self, offset: usize) -> (usize, usize) {
         self.buf.offset_to_rowcol(offset.min(self.buf.len()) as u32)
-    }
-
-    pub fn rowcol_to_offset(&self, row: usize, col: usize) -> usize {
-        self.buf.rowcol_to_offset(row, col) as usize
     }
 
     pub fn text_version(&self) -> u64 {
@@ -3237,7 +3210,8 @@ mod tests {
         keys(&mut editor, "ciw");
         assert_eq!(editor.mode(), Mode::Insert);
 
-        editor.insert_text("changed");
+        let cursor = editor.cursor_offset();
+        editor.replace_offsets(cursor..cursor, "changed");
         assert!(editor.send_key(VimKey::Escape));
         assert_eq!(editor.text(), "changed two");
         assert_eq!(editor.mode(), Mode::Normal);
@@ -3246,6 +3220,25 @@ mod tests {
         assert_eq!(editor.text(), "one two");
         assert!(editor.send_key(VimKey::Control('r')));
         assert_eq!(editor.text(), "changed two");
+    }
+
+    #[test]
+    fn single_line_mode_normalizes_existing_and_future_text() {
+        let mut editor = normal("one\ntwo\rthree");
+        editor.set_cursor_offset(6);
+
+        editor.set_single_line(true);
+
+        assert_eq!(editor.text(), "onetwothree");
+        assert_eq!(editor.cursor_offset(), 5);
+
+        editor.replace_offsets(3..3, "\nX\r");
+        assert_eq!(editor.text(), "oneXtwothree");
+        assert_eq!(editor.cursor_offset(), 4);
+
+        editor.set_text("left\nright", Mode::Insert, true);
+        assert_eq!(editor.text(), "leftright");
+        assert_eq!(editor.cursor_offset(), "leftright".len());
     }
 
     #[test]

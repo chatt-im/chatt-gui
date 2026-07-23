@@ -245,31 +245,6 @@ impl TextBuffer {
         offset
     }
 
-    /// Returns a contiguous byte page starting at or after `offset`,
-    /// paired with the page's base offset in the buffer.
-    ///
-    /// The buffer holds its text in at most two contiguous pages, so
-    /// a forward-walking reader encounters at most one page boundary.
-    /// An empty returned slice signals end-of-buffer.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use extui_editor::TextBuffer;
-    /// # let buf: TextBuffer = unimplemented!();
-    /// let mut offset = 0;
-    /// loop {
-    ///     let (base, page) = buf.page(offset);
-    ///     if page.is_empty() { break; }
-    ///     // ... consume page[..] starting at `base` ...
-    ///     offset = base + page.len() as u32;
-    /// }
-    /// ```
-    pub fn page(&self, offset: u32) -> (u32, &[u8]) {
-        let (base, page) = self.text.page(offset as usize);
-        (base as u32, page)
-    }
-
     /// Returns the number of lines, always at least 1.
     pub fn line_count(&self) -> usize {
         self.line_starts.len()
@@ -356,11 +331,6 @@ impl TextBuffer {
     pub fn set_text(&mut self, s: &str) {
         self.text = GapBuffer::with_text(s);
         self.rebuild_line_starts();
-    }
-
-    /// Resets the buffer to a single empty line.
-    pub fn clear(&mut self) {
-        *self = Self::default();
     }
 
     /// Applies `edit` to the buffer and returns its inverse, suitable

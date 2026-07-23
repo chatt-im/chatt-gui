@@ -43,13 +43,14 @@ use crate::{
     },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
+use dbus_message::{FileChooserResponse, OpenFileOptions, open_files};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths, FocusHandle, Focusable,
     FollowMode, FontWeight, KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels,
-    Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString,
-    Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions,
-    canvas, div, img, list, point, prelude::*, px, rgb, rgba,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
+    Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions, canvas, div,
+    img, list, point, prelude::*, px, rgb, rgba,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
@@ -1564,17 +1565,31 @@ impl ChattView {
             cx.notify();
             return;
         }
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Upload files through Chatt".into()),
+
+        let chooser = cx.background_executor().spawn(async {
+            open_files(OpenFileOptions {
+                title: "Upload files through Chatt".into(),
+                accept_label: Some("Upload".into()),
+                multiple: true,
+                directory: false,
+                current_folder: None,
+                parent_window: String::new(),
+            })
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else {
-                return;
-            };
-            let _ = this.update_in(cx, |this, _, cx| this.queue_uploads(paths, cx));
+            let response = chooser.await;
+            let _ = this.update_in(cx, |this, _, cx| match response {
+                Ok(FileChooserResponse::Selected(paths)) => this.queue_uploads(paths, cx),
+                Ok(FileChooserResponse::Cancelled) => {}
+                Ok(FileChooserResponse::Other) => {
+                    this.status = "File chooser closed without a selection".into();
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.status = format!("Could not open file chooser · {error}").into();
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }

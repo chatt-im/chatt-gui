@@ -112,6 +112,7 @@ impl Composer {
 
     pub fn search(cx: &mut Context<Self>) -> Self {
         let mut editor = VimEditor::new();
+        editor.set_single_line(true);
         editor.set_text("", Mode::Insert, true);
         Self {
             focus: cx.focus_handle(),
