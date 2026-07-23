@@ -3,8 +3,11 @@ use std::sync::Arc;
 use gpui::{Bounds, Pixels, Point, UniformListScrollHandle, point, px, size};
 use local_rpc::model::{AttachmentDescriptor, AttachmentId, BulkTransferId};
 
-use crate::code_viewer::CodeDocument;
+use crate::code_viewer::{CodeDocument, CodeViewState};
 
+// TODO: Preview history is count-bounded rather than byte-bounded. Ready code
+// previews can retain disproportionately large source and highlighting buffers;
+// consider byte-accounted eviction if preview limits grow.
 pub const HISTORY_LIMIT: usize = 16;
 pub const DEFAULT_PANEL_WIDTH: f32 = 560.0;
 pub const MIN_PANEL_WIDTH: f32 = 320.0;
@@ -37,6 +40,7 @@ impl PreviewItem {
             content: PreviewContent::Code(CodePreview {
                 state: CodePreviewState::Fetching { transfer_id },
                 scroll_handle: UniformListScrollHandle::new(),
+                view_state: CodeViewState::default(),
             }),
         }
     }
@@ -77,6 +81,7 @@ pub enum PreviewContent {
 pub struct CodePreview {
     pub state: CodePreviewState,
     pub scroll_handle: UniformListScrollHandle,
+    pub view_state: CodeViewState,
 }
 
 #[derive(Clone, Debug)]
@@ -165,8 +170,12 @@ impl PreviewHistory {
             .unwrap_or(item);
         self.items.retain(|candidate| candidate.key() != key);
         self.items.insert(0, promoted);
-        let evicted = (self.items.len() > HISTORY_LIMIT)
-            .then(|| self.items.pop().expect("preview history exceeded its limit").key());
+        let evicted = (self.items.len() > HISTORY_LIMIT).then(|| {
+            self.items
+                .pop()
+                .expect("preview history exceeded its limit")
+                .key()
+        });
         self.active = Some(key);
         PreviewOpenResult {
             active_changed,

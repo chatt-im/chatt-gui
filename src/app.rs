@@ -10,7 +10,8 @@ use std::{
 
 use crate::{
     code_viewer::{
-        CodeDocument, CodeSearchResults, MAX_CODE_PREVIEW_BYTES, render_code_document,
+        CodeDocument, CodeSearchResults, CodeSelection, MAX_CODE_PREVIEW_BYTES,
+        render_code_document,
     },
     composer::{Composer, ComposerChanged},
     daemon::{
@@ -382,6 +383,7 @@ actions!(
 
 pub fn bind_keys(cx: &mut App) {
     crate::composer::bind_keys(cx);
+    crate::code_viewer::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
         KeyBinding::new(
@@ -422,6 +424,7 @@ pub struct ChattView {
     composer: gpui::Entity<Composer>,
     code_search_input: gpui::Entity<Composer>,
     code_viewer_focus: FocusHandle,
+    code_selection: CodeSelection,
     code_search_open: bool,
     code_search_pending: bool,
     code_search_generation: u64,
@@ -490,6 +493,7 @@ impl ChattView {
                 this.update_code_search(cx);
             });
         let code_viewer_focus = cx.focus_handle();
+        let code_selection = CodeSelection::new(code_viewer_focus.clone());
         let timeline_selection = MessageSelectionGroup::new(cx.focus_handle());
         let image_cache = LruImageCache::<TimelineImageLoader>::new(DECODED_IMAGE_CACHE_BYTES, cx);
         let preview_image_cache =
@@ -563,6 +567,7 @@ impl ChattView {
             composer,
             code_search_input,
             code_viewer_focus,
+            code_selection,
             code_search_open: false,
             code_search_pending: false,
             code_search_generation: 0,
@@ -1245,6 +1250,7 @@ impl ChattView {
             self.eager_image_fetches.clear();
             self.code_load_tasks.clear();
             self.close_code_search(cx);
+            self.code_selection.clear();
             self.preview_history.clear();
             if preview_was_open {
                 self.restore_preview_focus(window, cx);
@@ -1846,6 +1852,9 @@ impl ChattView {
         let item = PreviewItem::image(descriptor, natural_size);
         let opened = self.preview_history.open(item);
         self.apply_preview_eviction(opened.evicted);
+        if opened.active_changed {
+            self.code_selection.clear();
+        }
         self.reveal_active_preview_tab();
         self.close_code_search(cx);
         window.focus(&self.code_viewer_focus, cx);
@@ -1881,6 +1890,9 @@ impl ChattView {
             .preview_history
             .open(PreviewItem::code(descriptor.clone(), active_transfer));
         self.apply_preview_eviction(opened.evicted);
+        if opened.active_changed {
+            self.code_selection.clear();
+        }
         self.reveal_active_preview_tab();
         self.close_code_search(cx);
         self.preview_image_viewport.set(None);
@@ -1991,7 +2003,11 @@ impl ChattView {
         else {
             return;
         };
+        preview.view_state.reset();
         preview.state = CodePreviewState::Preparing { load_id };
+        if self.preview_history.active_key() == Some(key) {
+            self.code_selection.clear();
+        }
 
         let executor = cx.background_executor().clone();
         let task = cx.spawn(async move |this, cx| {
@@ -2094,9 +2110,7 @@ impl ChattView {
         let executor = cx.background_executor().clone();
         self.code_search_task = Some(cx.spawn(async move |this, cx| {
             executor.timer(Duration::from_millis(75)).await;
-            let results = executor
-                .spawn(async move { document.search(&query) })
-                .await;
+            let results = executor.spawn(async move { document.search(&query) }).await;
             let _ = this.update(cx, |this, cx| {
                 if !this.code_search_open || this.code_search_generation != generation {
                     return;
@@ -2210,6 +2224,7 @@ impl ChattView {
 
     fn select_preview(&mut self, key: AttachmentId, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview_history.select(key) {
+            self.code_selection.clear();
             self.close_code_search(cx);
             if let Some(natural_size) = self
                 .preview_history
@@ -2231,6 +2246,7 @@ impl ChattView {
             return;
         }
         self.preview_history.close_panel();
+        self.code_selection.clear();
         self.close_code_search(cx);
         self.preview_image_viewport.set(None);
         self.preview_last_mouse_position = None;
@@ -2259,6 +2275,7 @@ impl ChattView {
     ) {
         self.cancel_code_load(key);
         if self.preview_history.close_tab(key) {
+            self.code_selection.clear();
             self.close_code_search(cx);
             if let Some(natural_size) = self
                 .preview_history
@@ -2681,11 +2698,9 @@ impl ChattView {
                 .overflow_hidden()
                 .cursor_pointer()
                 .hover(|image| image.opacity(0.88))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| {
-                        this.open_image_preview(preview.clone(), window, cx)
-                    }),
-                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_image_preview(preview.clone(), window, cx)
+                }))
                 .child(
                     img(path)
                         .image_cache(&self.image_cache)
@@ -3356,6 +3371,7 @@ impl ChattView {
             .expect("code preview panel requires code content")
             .clone();
         let ready = matches!(&preview.state, CodePreviewState::Ready(_));
+        let compact_search = width < px(360.0);
         let active_match = self
             .code_search_open
             .then(|| {
@@ -3366,16 +3382,33 @@ impl ChattView {
         let search_status: SharedString = if self.code_search_input.read(cx).text_ref().is_empty() {
             "".into()
         } else if self.code_search_pending {
-            "Searching…".into()
+            if compact_search {
+                "…".into()
+            } else {
+                "Searching…".into()
+            }
         } else if self.code_search_results.is_empty() {
-            "No matches".into()
+            if compact_search {
+                "0".into()
+            } else {
+                "No matches".into()
+            }
         } else {
-            format!(
-                "{} / {}",
-                self.code_search_result_index + 1,
-                self.code_search_results.len()
-            )
-            .into()
+            if compact_search {
+                format!(
+                    "{}/{}",
+                    self.code_search_result_index + 1,
+                    self.code_search_results.len()
+                )
+                .into()
+            } else {
+                format!(
+                    "{} / {}",
+                    self.code_search_result_index + 1,
+                    self.code_search_results.len()
+                )
+                .into()
+            }
         };
         let body = match preview.state {
             CodePreviewState::Fetching { .. } => preview_status("loading…"),
@@ -3391,6 +3424,8 @@ impl ChattView {
                 .child(render_code_document(
                     document,
                     preview.scroll_handle.clone(),
+                    preview.view_state.clone(),
+                    self.code_selection.clone(),
                     active_match,
                 ))
                 .into_any_element(),
@@ -3471,15 +3506,15 @@ impl ChattView {
                         .flex_none()
                         .flex()
                         .items_center()
-                        .gap_2()
-                        .px_2()
+                        .gap(if compact_search { px(4.0) } else { px(8.0) })
+                        .px(if compact_search { px(4.0) } else { px(8.0) })
                         .border_b_1()
                         .border_color(rgb(0x272a30))
                         .bg(rgb(0x111317))
                         .child(
                             div()
                                 .h(px(30.0))
-                                .min_w(px(120.0))
+                                .min_w_0()
                                 .flex_1()
                                 .flex()
                                 .items_center()
@@ -3493,7 +3528,7 @@ impl ChattView {
                         )
                         .child(
                             div()
-                                .w(px(70.0))
+                                .w(if compact_search { px(40.0) } else { px(70.0) })
                                 .flex_none()
                                 .text_right()
                                 .text_xs()
