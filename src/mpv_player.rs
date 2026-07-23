@@ -1921,7 +1921,7 @@ mod tests {
                 "-frames:v",
                 "1",
                 "-c:v",
-                "ffv1",
+                "mjpeg",
                 "-y",
             ])
             .arg(&path)
@@ -1994,7 +1994,7 @@ mod tests {
                 "-map",
                 "2:s:0",
                 "-c:v",
-                "ffv1",
+                "mjpeg",
                 "-c:a",
                 "pcm_s16le",
                 "-c:s",

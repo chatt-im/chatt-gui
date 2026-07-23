@@ -592,7 +592,7 @@ mod tests {
                 "-frames:v",
                 "1",
                 "-c:v",
-                "ffv1",
+                "mjpeg",
                 "-y",
             ])
             .arg(&path)

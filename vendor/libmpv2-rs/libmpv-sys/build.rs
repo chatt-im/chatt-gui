@@ -525,7 +525,7 @@ fn build_vendored_ffmpeg(crate_path: &Path, out_path: &Path) -> PathBuf {
         .arg("--enable-cuda")
         .arg("--enable-nvdec")
         .arg("--enable-vaapi")
-        .arg("--enable-decoder=aac,aac_fixed,aac_latm,ac3,alac,av1,dca,eac3,ffv1,flac,gif,h264,hevc,mjpeg,mp3,mp3float,opus,pcm_alaw,pcm_f32le,pcm_f64le,pcm_mulaw,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32be,pcm_s32le,pcm_u8,png,vorbis,vp8,vp9,webp")
+        .arg("--enable-decoder=aac,aac_fixed,aac_latm,ac3,alac,av1,dca,eac3,flac,gif,h264,hevc,mjpeg,mp3,mp3float,opus,pcm_alaw,pcm_f32le,pcm_f64le,pcm_mulaw,pcm_s16be,pcm_s16le,pcm_s24be,pcm_s24le,pcm_s32be,pcm_s32le,pcm_u8,png,vorbis,vp8,vp9,webp")
         .arg("--enable-hwaccel=av1_nvdec,av1_vaapi,av1_vulkan,h264_nvdec,h264_vaapi,h264_vulkan,hevc_nvdec,hevc_vaapi,hevc_vulkan,mjpeg_nvdec,mjpeg_vaapi,vp8_nvdec,vp8_vaapi,vp9_nvdec,vp9_vaapi,vp9_vulkan")
         .arg("--enable-demuxer=aac,ac3,aiff,ape,asf,avi,eac3,flac,flv,h264,hevc,image2,matroska,mov,mp3,mpegps,mpegts,mpegvideo,nut,ogg,rm,wav")
         .arg("--enable-parser=aac,aac_latm,ac3,av1,dca,flac,h264,hevc,mpegaudio,opus,vorbis,vp8,vp9")
