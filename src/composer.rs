@@ -2,11 +2,24 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, LayoutId,
-    MouseButton, MouseDownEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun,
-    UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, Window, actions, div, fill, point, prelude::*,
+    px, relative, rgb, rgba, size,
 };
-use unicode_segmentation::UnicodeSegmentation;
+
+mod buffer;
+mod cursor;
+mod history;
+mod mode;
+mod vim;
+mod visual;
+
+use mode::Mode;
+use vim::{VimEditor, VimKey};
+
+const VIM_MODE: bool = true;
+const MAX_VISIBLE_LINES: usize = 8;
 
 actions!(
     composer,
@@ -29,28 +42,28 @@ actions!(
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
     cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, Some("ChattComposer")),
+        KeyBinding::new("backspace", Backspace, Some("ComposerInsert")),
         KeyBinding::new("backspace", Backspace, Some("ChattCodeSearch")),
-        KeyBinding::new("delete", Delete, Some("ChattComposer")),
+        KeyBinding::new("delete", Delete, Some("ComposerInsert")),
         KeyBinding::new("delete", Delete, Some("ChattCodeSearch")),
-        KeyBinding::new("left", Left, Some("ChattComposer")),
+        KeyBinding::new("left", Left, Some("ComposerInsert")),
         KeyBinding::new("left", Left, Some("ChattCodeSearch")),
-        KeyBinding::new("right", Right, Some("ChattComposer")),
+        KeyBinding::new("right", Right, Some("ComposerInsert")),
         KeyBinding::new("right", Right, Some("ChattCodeSearch")),
-        KeyBinding::new("shift-left", SelectLeft, Some("ChattComposer")),
+        KeyBinding::new("shift-left", SelectLeft, Some("ComposerInsert")),
         KeyBinding::new("shift-left", SelectLeft, Some("ChattCodeSearch")),
-        KeyBinding::new("shift-right", SelectRight, Some("ChattComposer")),
+        KeyBinding::new("shift-right", SelectRight, Some("ComposerInsert")),
         KeyBinding::new("shift-right", SelectRight, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-a", SelectAll, Some("ChattComposer")),
+        KeyBinding::new("cmd-a", SelectAll, Some("ComposerInsert")),
         KeyBinding::new("cmd-a", SelectAll, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-v", Paste, Some("ChattComposer")),
+        KeyBinding::new("cmd-v", Paste, Some("ComposerInsert")),
         KeyBinding::new("cmd-v", Paste, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-c", Copy, Some("ChattComposer")),
+        KeyBinding::new("cmd-c", Copy, Some("ComposerInsert")),
         KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-x", Cut, Some("ChattComposer")),
+        KeyBinding::new("cmd-x", Cut, Some("ComposerInsert")),
         KeyBinding::new("cmd-x", Cut, Some("ChattCodeSearch")),
-        KeyBinding::new("tab", InsertTab, Some("ChattComposer")),
-        KeyBinding::new("shift-enter", Newline, Some("ChattComposer")),
+        KeyBinding::new("tab", InsertTab, Some("ComposerInsert")),
+        KeyBinding::new("shift-enter", Newline, Some("ComposerInsert")),
     ]);
 }
 
@@ -58,10 +71,11 @@ pub struct ComposerChanged;
 
 pub struct Composer {
     focus: FocusHandle,
-    content: SharedString,
+    editor: VimEditor,
     placeholder: SharedString,
     key_context: &'static str,
     multiline: bool,
+    vim_enabled: bool,
     min_height: Pixels,
     selected: Range<usize>,
     reversed: bool,
@@ -75,10 +89,11 @@ impl Composer {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus: cx.focus_handle(),
-            content: "".into(),
+            editor: VimEditor::new(),
             placeholder: "Message".into(),
             key_context: "ChattComposer",
             multiline: true,
+            vim_enabled: VIM_MODE,
             min_height: px(42.),
             selected: 0..0,
             reversed: false,
@@ -90,12 +105,15 @@ impl Composer {
     }
 
     pub fn search(cx: &mut Context<Self>) -> Self {
+        let mut editor = VimEditor::new();
+        editor.set_text("", Mode::Insert, true);
         Self {
             focus: cx.focus_handle(),
-            content: "".into(),
+            editor,
             placeholder: "Find in file".into(),
             key_context: "ChattCodeSearch",
             multiline: false,
+            vim_enabled: false,
             min_height: px(28.),
             selected: 0..0,
             reversed: false,
@@ -107,16 +125,13 @@ impl Composer {
     }
 
     pub fn text(&self) -> String {
-        self.content.to_string()
-    }
-    pub fn text_ref(&self) -> &str {
-        &self.content
+        self.editor.text()
     }
     pub fn is_empty(&self) -> bool {
-        self.content.trim().is_empty()
+        self.editor.is_blank()
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.content = "".into();
+        self.editor.set_text("", Mode::Insert, true);
         self.selected = 0..0;
         self.reversed = false;
         self.marked = None;
@@ -125,9 +140,15 @@ impl Composer {
         cx.notify();
     }
     pub fn restore(&mut self, text: String, cx: &mut Context<Self>) {
-        let end = text.len();
-        self.content = text.into();
-        self.selected = end..end;
+        let at_end = !self.vim_enabled;
+        let mode = if self.vim_enabled {
+            Mode::Normal
+        } else {
+            Mode::Insert
+        };
+        self.editor.set_text(&text, mode, at_end);
+        let cursor = self.editor.cursor_offset();
+        self.selected = cursor..cursor;
         self.reversed = false;
         self.marked = None;
         self.last_layout.clear();
@@ -136,6 +157,9 @@ impl Composer {
     }
 
     fn cursor(&self) -> usize {
+        if self.vim_enabled && self.editor.mode() != Mode::Insert {
+            return self.editor.cursor_offset();
+        }
         if self.reversed {
             self.selected.start
         } else {
@@ -143,6 +167,8 @@ impl Composer {
         }
     }
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.editor.set_cursor_offset(offset);
+        let offset = self.editor.cursor_offset();
         self.selected = offset..offset;
         self.reversed = false;
         cx.notify();
@@ -160,17 +186,10 @@ impl Composer {
         cx.notify();
     }
     fn previous(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(index, _)| (index < offset).then_some(index))
-            .unwrap_or(0)
+        self.editor.previous_offset(offset)
     }
     fn next(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .find_map(|(index, _)| (index > offset).then_some(index))
-            .unwrap_or(self.content.len())
+        self.editor.next_offset(offset)
     }
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         let to = if self.selected.is_empty() {
@@ -195,7 +214,7 @@ impl Composer {
         self.select_to(self.next(self.cursor()), cx);
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.selected = 0..self.content.len();
+        self.selected = 0..self.editor.len();
         cx.notify();
     }
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -222,7 +241,7 @@ impl Composer {
         if !self.selected.is_empty() {
             let selected = self.normalize_range(self.selected.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[selected].to_string(),
+                self.editor.slice(selected).into_owned(),
             ));
         }
     }
@@ -234,12 +253,10 @@ impl Composer {
         self.replace_text_in_range(None, "    ", window, cx);
     }
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        offset_from_utf16(&self.content, offset)
+        self.editor.offset_from_utf16(offset)
     }
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        self.content[..self.clamp_offset(offset)]
-            .encode_utf16()
-            .count()
+        self.editor.offset_to_utf16(self.clamp_offset(offset))
     }
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.normalize_range(self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end))
@@ -249,10 +266,12 @@ impl Composer {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
     fn clamp_offset(&self, offset: usize) -> usize {
-        clamp_offset(&self.content, offset)
+        self.editor.clamp_offset(offset)
     }
     fn normalize_range(&self, range: Range<usize>) -> Range<usize> {
-        normalize_range(&self.content, range)
+        let start = self.clamp_offset(range.start);
+        let end = self.clamp_offset(range.end);
+        start.min(end)..start.max(end)
     }
     fn accepted_text<'a>(&self, text: &'a str) -> &'a str {
         if self.multiline {
@@ -270,6 +289,38 @@ impl Composer {
         let line = &self.last_layout[line_index];
         let offset = line.layout.closest_index_for_x(local.x);
         Some(line.range.start + offset)
+    }
+
+    fn handle_vim_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.vim_enabled {
+            return;
+        }
+        let Some(key) = vim_key(event) else {
+            return;
+        };
+        if self.editor.mode() == Mode::Insert && key != VimKey::Escape {
+            return;
+        }
+        let version = self.editor.text_version();
+        if !self.editor.send_key(key) {
+            return;
+        }
+        let cursor = self.editor.cursor_offset();
+        self.selected = cursor..cursor;
+        self.reversed = false;
+        self.marked = None;
+        self.last_layout.clear();
+        if self.editor.text_version() != version {
+            cx.emit(ComposerChanged);
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
     }
 }
 
@@ -308,6 +359,7 @@ fn range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
     )
 }
 
+#[cfg(test)]
 fn logical_lines(text: &str) -> impl Iterator<Item = (Range<usize>, &str)> {
     let mut start = 0;
     text.split('\n').map(move |line| {
@@ -316,6 +368,15 @@ fn logical_lines(text: &str) -> impl Iterator<Item = (Range<usize>, &str)> {
         start = end + 1;
         (range, line)
     })
+}
+
+fn visible_line_range(line_count: usize, cursor_row: usize) -> Range<usize> {
+    let visible_count = line_count.clamp(1, MAX_VISIBLE_LINES);
+    let start = cursor_row
+        .saturating_add(1)
+        .saturating_sub(visible_count)
+        .min(line_count.saturating_sub(visible_count));
+    start..start + visible_count
 }
 
 fn line_for_offset(lines: &[ComposerLine], offset: usize) -> Option<&ComposerLine> {
@@ -335,7 +396,7 @@ impl EntityInputHandler for Composer {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range);
         actual.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        Some(self.editor.slice(range).into_owned())
     }
     fn selected_text_range(
         &mut self,
@@ -368,10 +429,10 @@ impl EntityInputHandler for Composer {
             .unwrap_or(self.selected.clone());
         let range = self.normalize_range(range);
         let text = self.accepted_text(text);
-        self.content =
-            (self.content[..range.start].to_owned() + text + &self.content[range.end..]).into();
+        self.editor.replace_offsets(range.clone(), text);
         let end = range.start + text.len();
         self.selected = end..end;
+        self.editor.set_cursor_offset(end);
         self.marked = None;
         self.last_layout.clear();
         cx.emit(ComposerChanged);
@@ -393,6 +454,7 @@ impl EntityInputHandler for Composer {
         if let Some(selected) = selected {
             let selected = range_from_utf16(text, &selected);
             self.selected = inserted.start + selected.start..inserted.start + selected.end;
+            self.editor.set_cursor_offset(self.selected.end);
         }
     }
     fn bounds_for_range(
@@ -442,6 +504,27 @@ impl EntityInputHandler for Composer {
     ) -> Option<usize> {
         self.offset_for_point(point)
             .map(|offset| self.offset_to_utf16(offset))
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.range_from_utf16(&range);
+        self.selected = range.clone();
+        self.reversed = false;
+        self.editor.set_cursor_offset(range.end);
+        cx.notify();
+    }
+
+    fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        Some(self.offset_to_utf16(self.editor.len()))
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        !self.vim_enabled || self.editor.mode() == Mode::Insert
     }
 }
 
@@ -493,7 +576,7 @@ impl Element for ComposerElement {
     ) -> (LayoutId, ()) {
         let input = self.input.read(cx);
         let line_count = if input.multiline {
-            input.content.split('\n').count().max(1)
+            input.editor.line_count().clamp(1, MAX_VISIBLE_LINES)
         } else {
             1
         };
@@ -512,7 +595,7 @@ impl Element for ComposerElement {
         cx: &mut App,
     ) -> Prepaint {
         let input = self.input.read(cx);
-        let is_placeholder = input.content.is_empty();
+        let is_placeholder = input.editor.len() == 0;
         let color = if is_placeholder {
             rgb(0x747a84).into()
         } else {
@@ -536,11 +619,18 @@ impl Element for ComposerElement {
                     .shape_line(text, font_size, &[run], None),
             }
         };
+        let cursor_row = input.editor.offset_to_rowcol(input.cursor()).0;
+        let visible_rows = visible_line_range(input.editor.line_count(), cursor_row);
         let lines = if is_placeholder {
             vec![shape_line(0..0, input.placeholder.clone())]
         } else {
-            logical_lines(&input.content)
-                .map(|(range, text)| shape_line(range, text.to_string().into()))
+            visible_rows
+                .map(|row| {
+                    let start = input.editor.line_start(row);
+                    let text = input.editor.line(row);
+                    let range = start..start + text.len();
+                    shape_line(range, text.into_owned().into())
+                })
                 .collect::<Vec<_>>()
         };
         let line_height = window.line_height();
@@ -552,50 +642,75 @@ impl Element for ComposerElement {
         let cursor_x = cursor_line
             .layout
             .x_for_index(cursor_line.local_offset(input.cursor()));
-        let (selection, cursor) = if input.selected.is_empty() {
-            (
-                Vec::new(),
-                Some(fill(
-                    Bounds::new(
-                        point(
-                            bounds.left() + cursor_x,
-                            bounds.top() + line_height * cursor_line_offset as f32,
-                        ),
-                        size(px(2.), line_height),
-                    ),
-                    rgb(0x8ca9d8),
-                )),
-            )
+        let selection_ranges = if input.vim_enabled && input.editor.mode().is_visual() {
+            input.editor.visual_ranges()
         } else {
-            let mut line_top = bounds.top();
-            let selection = lines
-                .iter()
-                .filter_map(|line| {
-                    let top = line_top;
-                    line_top += line_height;
-                    let selects_text = input.selected.start < line.range.end
-                        && input.selected.end > line.range.start;
-                    let selects_newline = line.range.end < input.content.len()
-                        && input.selected.start <= line.range.end
-                        && input.selected.end > line.range.end;
-                    if !selects_text && !selects_newline {
-                        return None;
-                    }
-                    let start = line.local_offset(input.selected.start);
-                    let end = line.local_offset(input.selected.end);
-                    let left = bounds.left() + line.layout.x_for_index(start);
-                    let mut right = bounds.left() + line.layout.x_for_index(end);
-                    if selects_newline {
-                        right += px(4.);
-                    }
-                    Some(fill(
-                        Bounds::from_corners(point(left, top), point(right, top + line_height)),
-                        rgba(0x6f8fc044),
-                    ))
-                })
-                .collect();
-            (selection, None)
+            (!input.selected.is_empty())
+                .then(|| vec![input.selected.clone()])
+                .unwrap_or_default()
         };
+        let selection = selection_ranges
+            .iter()
+            .flat_map(|selected| {
+                let mut line_top = bounds.top();
+                lines
+                    .iter()
+                    .filter_map(|line| {
+                        let top = line_top;
+                        line_top += line_height;
+                        let selects_text =
+                            selected.start < line.range.end && selected.end > line.range.start;
+                        let selects_newline = line.range.end < input.editor.len()
+                            && selected.start <= line.range.end
+                            && selected.end > line.range.end;
+                        if !selects_text && !selects_newline {
+                            return None;
+                        }
+                        let start = line.local_offset(selected.start);
+                        let end = line.local_offset(selected.end);
+                        let left = bounds.left() + line.layout.x_for_index(start);
+                        let mut right = bounds.left() + line.layout.x_for_index(end);
+                        if selects_newline {
+                            right += px(4.);
+                        }
+                        Some(fill(
+                            Bounds::from_corners(point(left, top), point(right, top + line_height)),
+                            rgba(0x6f8fc044),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let cursor_width = if input.vim_enabled && input.editor.mode() != Mode::Insert {
+            let next = input.editor.next_offset(input.cursor());
+            let width = if next <= cursor_line.range.end {
+                cursor_line
+                    .layout
+                    .x_for_index(cursor_line.local_offset(next))
+                    - cursor_x
+            } else {
+                px(8.)
+            };
+            if width > px(2.) { width } else { px(8.) }
+        } else {
+            px(2.)
+        };
+        let cursor = (input.vim_enabled || input.selected.is_empty()).then(|| {
+            fill(
+                Bounds::new(
+                    point(
+                        bounds.left() + cursor_x,
+                        bounds.top() + line_height * cursor_line_offset as f32,
+                    ),
+                    size(cursor_width, line_height),
+                ),
+                if input.vim_enabled && input.editor.mode() != Mode::Insert {
+                    rgba(0x8ca9d888)
+                } else {
+                    rgba(0x8ca9d8ff)
+                },
+            )
+        });
         Prepaint {
             lines,
             cursor,
@@ -645,18 +760,30 @@ impl Element for ComposerElement {
             input.last_layout = state.lines.clone();
             input.last_bounds = Some(bounds);
             input.last_line_height = Some(line_height);
+            let columns = (bounds.size.width / px(8.)).max(1.) as u16;
+            input
+                .editor
+                .set_layout(columns, state.lines.len().max(1) as u16);
         });
     }
 }
 
 impl Render for Composer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let key_context = if self.key_context == "ChattCodeSearch" {
+            self.key_context
+        } else if !self.vim_enabled || self.editor.mode() == Mode::Insert {
+            "ChattComposer ComposerInsert"
+        } else {
+            "ChattComposer VimMode"
+        };
         div()
             .flex()
             .items_center()
-            .key_context(self.key_context)
+            .key_context(key_context)
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
+            .on_key_down(cx.listener(Self::handle_vim_key))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
@@ -678,13 +805,46 @@ impl Render for Composer {
                     window.focus(&this.focus, cx);
                     let offset = this
                         .offset_for_point(event.position)
-                        .unwrap_or(this.content.len());
+                        .unwrap_or(this.editor.len());
                     this.move_to(offset, cx);
                 }),
             )
             .w_full()
             .min_h(self.min_height)
             .child(ComposerElement { input: cx.entity() })
+    }
+}
+
+fn vim_key(event: &KeyDownEvent) -> Option<VimKey> {
+    let keystroke = &event.keystroke;
+    let modifiers = keystroke.modifiers;
+    if modifiers.platform || modifiers.alt || modifiers.function {
+        return None;
+    }
+    if modifiers.control {
+        let ch = keystroke.key.chars().next()?.to_ascii_lowercase();
+        return Some(VimKey::Control(ch));
+    }
+    match keystroke.key.as_str() {
+        "escape" => Some(VimKey::Escape),
+        "backspace" => Some(VimKey::Backspace),
+        "enter" => Some(VimKey::Enter),
+        "tab" => Some(VimKey::Tab),
+        "left" => Some(VimKey::Left),
+        "right" => Some(VimKey::Right),
+        "up" => Some(VimKey::Up),
+        "down" => Some(VimKey::Down),
+        "home" => Some(VimKey::Home),
+        "end" => Some(VimKey::End),
+        _ => keystroke
+            .key_char
+            .as_deref()
+            .or(Some(keystroke.key.as_str()))
+            .and_then(|text| {
+                let mut chars = text.chars();
+                let ch = chars.next()?;
+                chars.next().is_none().then_some(VimKey::Char(ch))
+            }),
     }
 }
 
@@ -696,7 +856,10 @@ impl Focusable for Composer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16};
+    use super::{
+        ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16,
+        visible_line_range,
+    };
 
     #[test]
     fn splits_multiline_content_before_single_line_shaping() {
@@ -742,5 +905,12 @@ mod tests {
     #[test]
     fn maps_utf16_ranges_relative_to_composition_text() {
         assert_eq!(range_from_utf16("a😀b", &(1..3)), 1..5);
+    }
+
+    #[test]
+    fn bounds_the_shaped_viewport_for_ten_thousand_line_messages() {
+        assert_eq!(visible_line_range(10_000, 0), 0..8);
+        assert_eq!(visible_line_range(10_000, 5_000), 4_993..5_001);
+        assert_eq!(visible_line_range(10_000, 9_999), 9_992..10_000);
     }
 }

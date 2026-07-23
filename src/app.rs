@@ -388,11 +388,7 @@ pub fn bind_keys(cx: &mut App) {
     crate::code_viewer::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
-        KeyBinding::new(
-            "escape",
-            ClosePreview,
-            Some(NON_INPUT_CONTEXT),
-        ),
+        KeyBinding::new("escape", ClosePreview, Some(NON_INPUT_CONTEXT)),
         KeyBinding::new(
             "cmd-f",
             FindInCode,
@@ -401,12 +397,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", NextCodeMatch, Some("ChattCodeSearch")),
         KeyBinding::new("shift-enter", PreviousCodeMatch, Some("ChattCodeSearch")),
         KeyBinding::new("escape", CloseCodeSearch, Some("ChattCodeSearch")),
-        KeyBinding::new("enter", SendMessage, Some("ChattComposer")),
         KeyBinding::new(
-            "space",
-            TogglePlayback,
-            Some(NON_INPUT_CONTEXT),
+            "enter",
+            SendMessage,
+            Some("ChattComposer && ComposerInsert"),
         ),
+        KeyBinding::new("space", TogglePlayback, Some(NON_INPUT_CONTEXT)),
         KeyBinding::new("left", SeekBack, Some(NON_INPUT_CONTEXT)),
         KeyBinding::new("right", SeekForward, Some(NON_INPUT_CONTEXT)),
         KeyBinding::new("=", LiveZoomIn, Some(NON_INPUT_CONTEXT)),
@@ -2103,7 +2099,7 @@ impl ChattView {
         };
         let query = {
             let input = self.code_search_input.read(cx);
-            input.text_ref().to_string()
+            input.text()
         };
         self.code_search_generation = self.code_search_generation.wrapping_add(1);
         let generation = self.code_search_generation;
@@ -2614,7 +2610,7 @@ impl ChattView {
                                                     if count == 1 { "message" } else { "messages" }
                                                 )),
                                         )
-                                    })
+                                    }),
                             )
                         })
                         .when_some(formatted_message, |content, formatted_message| {
@@ -3408,7 +3404,7 @@ impl ChattView {
             })
             .flatten();
         let active_match_hidden = active_match.is_some_and(|target| target.hidden);
-        let search_status: SharedString = if self.code_search_input.read(cx).text_ref().is_empty() {
+        let search_status: SharedString = if self.code_search_input.read(cx).text().is_empty() {
             "".into()
         } else if self.code_search_pending {
             if compact_search {
