@@ -549,10 +549,10 @@ impl VimEditor {
         end: (usize, usize),
     ) {
         let text = extract_charwise(&self.buf, start, end);
-        self.yank = Yank {
+        self.replace_yank(Yank {
             lines: split_to_lines(&text),
             kind: YankKind::Charwise,
-        };
+        });
         self.cursor = Cursor {
             row: start.0,
             col: start.1,
@@ -595,10 +595,10 @@ impl VimEditor {
         for r in rs..=re {
             lines.push(self.buf.line(r).to_string());
         }
-        self.yank = Yank {
+        self.replace_yank(Yank {
             lines,
             kind: YankKind::Linewise,
-        };
+        });
         self.cursor = Cursor { row: rs, col: 0 };
         match op {
             Operator::Yank => {}
@@ -1153,10 +1153,10 @@ impl VimEditor {
             block_lines.push(line[lo..hi].to_string());
         }
 
-        self.yank = Yank {
+        self.replace_yank(Yank {
             lines: block_lines,
             kind: YankKind::Blockwise,
-        };
+        });
         self.cursor = Cursor { row: r0, col: c_lo };
         if matches!(op, Operator::Delete | Operator::Change) {
             self.checkpoint();
@@ -2465,6 +2465,7 @@ pub struct VimEditor {
     mode: Mode,
     selection: Option<Selection>,
     yank: Yank,
+    yank_revision: u64,
     history: History,
     width: u16,
     wrap: bool,
@@ -2489,6 +2490,7 @@ impl VimEditor {
             mode: Mode::Insert,
             selection: None,
             yank: Yank::default(),
+            yank_revision: 0,
             history: History::new(),
             width: 1,
             wrap: true,
@@ -2628,15 +2630,53 @@ impl VimEditor {
     }
 
     pub fn set_paste_text(&mut self, text: &str) {
+        self.set_paste_text_with_metadata(text, None);
+    }
+
+    pub fn set_paste_text_with_metadata(&mut self, text: &str, metadata: Option<&str>) {
         let text = self.normalize_text_for_mode(text);
-        self.yank = if text.is_empty() {
+        let kind = match metadata {
+            Some("chatt-vim-register:linewise") => YankKind::Linewise,
+            Some("chatt-vim-register:blockwise") => YankKind::Blockwise,
+            _ => YankKind::Charwise,
+        };
+        self.yank = if text.is_empty() && kind == YankKind::Charwise {
             Yank::default()
         } else {
             Yank {
                 lines: split_to_lines(&text),
-                kind: YankKind::Charwise,
+                kind,
             }
         };
+    }
+
+    fn replace_yank(&mut self, yank: Yank) {
+        self.yank = yank;
+        self.yank_revision = self.yank_revision.wrapping_add(1);
+    }
+
+    pub fn yank_revision(&self) -> u64 {
+        self.yank_revision
+    }
+
+    pub fn yank_text_for_clipboard(&self) -> String {
+        self.yank_text_joined()
+    }
+
+    pub fn yank_clipboard_metadata(&self) -> &'static str {
+        match self.yank.kind {
+            YankKind::Charwise => "chatt-vim-register:charwise",
+            YankKind::Linewise => "chatt-vim-register:linewise",
+            YankKind::Blockwise => "chatt-vim-register:blockwise",
+        }
+    }
+
+    pub fn visual_clipboard_metadata(&self) -> &'static str {
+        match self.selection.as_ref().map(|selection| selection.kind) {
+            Some(VisualKind::Line) => "chatt-vim-register:linewise",
+            Some(VisualKind::Block) => "chatt-vim-register:blockwise",
+            _ => "chatt-vim-register:charwise",
+        }
     }
 
     pub fn set_layout(&mut self, width: u16, viewport_rows: u16) {
@@ -3069,6 +3109,14 @@ impl VimEditor {
                     .collect()
             }
         }
+    }
+
+    pub fn delete_visual_selection(&mut self) -> bool {
+        if !self.mode.is_visual() || self.selection.is_none() {
+            return false;
+        }
+        self.execute(VimAction::DeleteSelection, 1, None);
+        true
     }
 }
 

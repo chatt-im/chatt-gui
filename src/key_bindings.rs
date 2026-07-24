@@ -698,10 +698,14 @@ fn install_fixed_settings_bindings(cx: &mut App) {
             composer::SelectRight,
             Some("ChattSettingsInput"),
         ),
-        KeyBinding::new("cmd-a", composer::SelectAll, Some("ChattSettingsInput")),
+        KeyBinding::new(
+            "secondary-a",
+            composer::SelectAll,
+            Some("ChattSettingsInput"),
+        ),
         KeyBinding::new("secondary-v", composer::Paste, Some("ChattSettingsInput")),
-        KeyBinding::new("cmd-c", composer::Copy, Some("ChattSettingsInput")),
-        KeyBinding::new("cmd-x", composer::Cut, Some("ChattSettingsInput")),
+        KeyBinding::new("secondary-c", composer::Copy, Some("ChattSettingsInput")),
+        KeyBinding::new("secondary-x", composer::Cut, Some("ChattSettingsInput")),
     ]);
 }
 

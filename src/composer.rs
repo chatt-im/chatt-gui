@@ -4,8 +4,9 @@ use gpui::{
     App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
     FontStyle, FontWeight, GlobalElementId, Hsla, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
-    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*,
+    px, relative, rgb, rgba, size,
 };
 
 mod buffer;
@@ -25,7 +26,7 @@ use crate::{
 };
 use chatt_message_format::highlight::PaletteRole;
 use highlight::{ComposerColor, ComposerSyntax, ComposerTextStyle, ComposerTypeface};
-use mode::Mode;
+pub(crate) use mode::Mode;
 use vim::{VimEditor, VimKey};
 
 const MAX_VISIBLE_LINES: usize = 8;
@@ -70,7 +71,7 @@ pub struct ComposerSnapshot {
     pub composing: bool,
 }
 
-pub struct Composer {
+pub struct TextEditor {
     focus: FocusHandle,
     editor: VimEditor,
     placeholder: SharedString,
@@ -81,6 +82,8 @@ pub struct Composer {
     min_height: Pixels,
     selected: Range<usize>,
     reversed: bool,
+    mouse_anchor: Option<usize>,
+    last_yank_revision: u64,
     marked: Option<Range<usize>>,
     completion_open: bool,
     last_layout: Vec<ComposerLine>,
@@ -89,7 +92,9 @@ pub struct Composer {
     syntax: Option<ComposerSyntax>,
 }
 
-impl Composer {
+pub use TextEditor as Composer;
+
+impl TextEditor {
     #[cfg(test)]
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self::with_binding_mode(crate::config::schema::BindingMode::Vim, cx)
@@ -110,6 +115,8 @@ impl Composer {
             min_height: px(42.),
             selected: 0..0,
             reversed: false,
+            mouse_anchor: None,
+            last_yank_revision: 0,
             marked: None,
             completion_open: false,
             last_layout: Vec::new(),
@@ -134,6 +141,8 @@ impl Composer {
             min_height: px(28.),
             selected: 0..0,
             reversed: false,
+            mouse_anchor: None,
+            last_yank_revision: 0,
             marked: None,
             completion_open: false,
             last_layout: Vec::new(),
@@ -145,12 +154,33 @@ impl Composer {
 
     pub(crate) fn settings_input(
         placeholder: impl Into<SharedString>,
+        binding_mode: crate::config::schema::BindingMode,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut input = Self::search(cx);
         input.placeholder = placeholder.into();
         input.key_context = "ChattSettingsInput";
+        input.vim_enabled = binding_mode == crate::config::schema::BindingMode::Vim;
         input
+            .editor
+            .set_primary_mode_preserving_history(if input.vim_enabled {
+                Mode::Normal
+            } else {
+                Mode::Insert
+            });
+        input
+    }
+
+    pub(crate) fn mode(&self) -> Mode {
+        self.editor.mode()
+    }
+
+    pub(crate) fn enter_insert_mode(&mut self, cx: &mut Context<Self>) {
+        if self.vim_enabled && self.editor.mode() == Mode::Normal {
+            self.editor
+                .set_primary_mode_preserving_history(Mode::Insert);
+            self.finish_vim_action(self.editor.text_version(), cx);
+        }
     }
 
     pub fn text(&self) -> String {
@@ -224,7 +254,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         let vim_enabled = mode == crate::config::schema::BindingMode::Vim;
-        if self.key_context != "ChattComposer" || self.vim_enabled == vim_enabled {
+        if self.vim_enabled == vim_enabled {
             return;
         }
         self.vim_enabled = vim_enabled;
@@ -327,6 +357,7 @@ impl Composer {
             log::info!("clipboard paste returned no clipboard item");
             return;
         };
+        let metadata = item.metadata().cloned();
         let item = match self.emit_clipboard_images(item, cx) {
             Ok(()) => return,
             Err(item) => item,
@@ -336,22 +367,45 @@ impl Composer {
             return;
         };
         if self.vim_enabled && self.editor.mode() != Mode::Insert {
-            self.paste_in_vim_mode(&text, VimKey::Char('p'), cx);
+            self.paste_in_vim_mode(&text, metadata.as_deref(), VimKey::Char('p'), cx);
         } else {
             self.replace_text(None, &text, false, window, cx);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
-            let selected = self.normalize_range(self.selected.clone());
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.editor.slice(selected).into_owned(),
-            ));
+        let ranges = if self.vim_enabled && self.editor.mode().is_visual() {
+            self.editor.visual_ranges()
+        } else if !self.selected.is_empty() {
+            vec![self.normalize_range(self.selected.clone())]
+        } else {
+            Vec::new()
+        };
+        if !ranges.is_empty() {
+            let text = ranges
+                .into_iter()
+                .map(|range| self.editor.slice(range).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if self.vim_enabled && self.editor.mode().is_visual() {
+                cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+                    text,
+                    self.editor.visual_clipboard_metadata().to_string(),
+                ));
+            } else {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, window, cx);
-        self.replace_text_in_range(None, "", window, cx);
+        if self.vim_enabled && self.editor.mode().is_visual() {
+            let version = self.editor.text_version();
+            if self.editor.delete_visual_selection() {
+                self.finish_vim_action(version, cx);
+            }
+        } else if !self.selected.is_empty() {
+            self.replace_text_in_range(None, "", window, cx);
+        }
     }
     fn insert_tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text_in_range(None, "    ", window, cx);
@@ -448,6 +502,76 @@ impl Composer {
         Some(line.range.start + offset)
     }
 
+    fn set_mouse_selection(&mut self, anchor: usize, head: usize, cx: &mut Context<Self>) {
+        let anchor = self.clamp_offset(anchor);
+        let head = self.clamp_offset(head);
+        self.selected = anchor.min(head)..anchor.max(head);
+        self.reversed = head < anchor;
+        self.editor.set_cursor_offset(head);
+        self.marked = None;
+        cx.emit(ComposerStateChanged);
+        cx.notify();
+    }
+
+    fn begin_mouse_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        let offset = self
+            .offset_for_point(event.position)
+            .unwrap_or(self.editor.len());
+        let text = self.editor.text();
+        if event.click_count >= 3 {
+            let range = logical_line_range(&text, offset);
+            self.mouse_anchor = Some(range.start);
+            self.set_mouse_selection(range.start, range.end, cx);
+        } else if event.click_count == 2 {
+            let range = word_range(&text, offset);
+            self.mouse_anchor = Some(range.start);
+            self.set_mouse_selection(range.start, range.end, cx);
+        } else if event.modifiers.shift {
+            let anchor = if self.reversed {
+                self.selected.end
+            } else {
+                self.selected.start
+            };
+            self.mouse_anchor = Some(anchor);
+            self.set_mouse_selection(anchor, offset, cx);
+        } else {
+            self.mouse_anchor = Some(offset);
+            self.set_mouse_selection(offset, offset, cx);
+        }
+    }
+
+    fn drag_mouse_selection(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            self.mouse_anchor = None;
+            return;
+        }
+        let Some(anchor) = self.mouse_anchor else {
+            return;
+        };
+        let offset = self.offset_for_point(event.position).unwrap_or_else(|| {
+            self.last_bounds.map_or(self.editor.len(), |bounds| {
+                if event.position.y < bounds.top()
+                    || (event.position.y <= bounds.bottom() && event.position.x < bounds.left())
+                {
+                    0
+                } else {
+                    self.editor.len()
+                }
+            })
+        });
+        self.set_mouse_selection(anchor, offset, cx);
+    }
+
+    fn finish_mouse_selection(&mut self, _: &MouseUpEvent, _: &mut Context<Self>) {
+        self.mouse_anchor = None;
+    }
+
     fn handle_vim_key(
         &mut self,
         event: &KeyDownEvent,
@@ -472,6 +596,7 @@ impl Composer {
                 log::info!("Vim clipboard paste returned no clipboard item");
             }
             let item = if let Some(item) = item {
+                let metadata = item.metadata().cloned();
                 match self.emit_clipboard_images(item, cx) {
                     Ok(()) => {
                         self.editor.set_paste_text("");
@@ -483,13 +608,16 @@ impl Composer {
                         cx.stop_propagation();
                         return;
                     }
-                    Err(item) => Some(item),
+                    Err(item) => Some((item, metadata)),
                 }
             } else {
                 None
             };
-            let text = item.and_then(|item| item.text()).unwrap_or_default();
-            self.editor.set_paste_text(&text);
+            let (text, metadata) = item
+                .map(|(item, metadata)| (item.text().unwrap_or_default(), metadata))
+                .unwrap_or_default();
+            self.editor
+                .set_paste_text_with_metadata(&text, metadata.as_deref());
         }
         let version = self.editor.text_version();
         if !self.editor.send_key(key) {
@@ -534,8 +662,14 @@ impl Composer {
         Ok(())
     }
 
-    fn paste_in_vim_mode(&mut self, text: &str, key: VimKey, cx: &mut Context<Self>) {
-        self.editor.set_paste_text(text);
+    fn paste_in_vim_mode(
+        &mut self,
+        text: &str,
+        metadata: Option<&str>,
+        key: VimKey,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.set_paste_text_with_metadata(text, metadata);
         let version = self.editor.text_version();
         if self.editor.send_key(key) {
             self.finish_vim_action(version, cx);
@@ -543,6 +677,14 @@ impl Composer {
     }
 
     fn finish_vim_action(&mut self, version: u64, cx: &mut Context<Self>) {
+        let yank_revision = self.editor.yank_revision();
+        if yank_revision != self.last_yank_revision {
+            self.last_yank_revision = yank_revision;
+            cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+                self.editor.yank_text_for_clipboard(),
+                self.editor.yank_clipboard_metadata().to_string(),
+            ));
+        }
         let cursor = self.editor.cursor_offset();
         self.selected = cursor..cursor;
         self.reversed = false;
@@ -569,6 +711,58 @@ fn normalize_range(text: &str, range: Range<usize>) -> Range<usize> {
     let start = clamp_offset(text, range.start);
     let end = clamp_offset(text, range.end);
     start.min(end)..start.max(end)
+}
+
+fn logical_line_range(text: &str, offset: usize) -> Range<usize> {
+    let offset = clamp_offset(text, offset);
+    let start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |index| offset + index);
+    start..end
+}
+
+fn word_range(text: &str, offset: usize) -> Range<usize> {
+    if text.is_empty() {
+        return 0..0;
+    }
+    let mut offset = clamp_offset(text, offset);
+    if offset == text.len() {
+        offset = text[..offset]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+    }
+    let Some(ch) = text[offset..].chars().next() else {
+        return offset..offset;
+    };
+    let class = word_class(ch);
+    let mut start = offset;
+    for (index, candidate) in text[..offset].char_indices().rev() {
+        if word_class(candidate) != class {
+            break;
+        }
+        start = index;
+    }
+    let mut end = offset + ch.len_utf8();
+    let suffix_start = end;
+    for (index, candidate) in text[suffix_start..].char_indices() {
+        if word_class(candidate) != class {
+            break;
+        }
+        end = suffix_start + index + candidate.len_utf8();
+    }
+    start..end.min(text.len())
+}
+
+fn word_class(ch: char) -> u8 {
+    if ch.is_whitespace() {
+        0
+    } else if ch.is_alphanumeric() || ch == '_' {
+        1
+    } else {
+        2
+    }
 }
 
 fn should_auto_close_code_fence(before: &str, inserted: &str, after: &str) -> bool {
@@ -627,7 +821,7 @@ fn line_for_offset(lines: &[ComposerLine], offset: usize) -> Option<&ComposerLin
         .or_else(|| lines.last())
 }
 
-impl EntityInputHandler for Composer {
+impl EntityInputHandler for TextEditor {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -757,9 +951,9 @@ impl EntityInputHandler for Composer {
     }
 }
 
-impl EventEmitter<ComposerChanged> for Composer {}
-impl EventEmitter<ComposerStateChanged> for Composer {}
-impl EventEmitter<ComposerImagePaste> for Composer {}
+impl EventEmitter<ComposerChanged> for TextEditor {}
+impl EventEmitter<ComposerStateChanged> for TextEditor {}
+impl EventEmitter<ComposerImagePaste> for TextEditor {}
 
 #[derive(Clone)]
 struct ComposerLine {
@@ -876,7 +1070,7 @@ fn composer_text_run(
 }
 
 struct ComposerElement {
-    input: Entity<Composer>,
+    input: Entity<TextEditor>,
 }
 struct Prepaint {
     lines: Vec<ComposerLine>,
@@ -1126,7 +1320,7 @@ impl Element for ComposerElement {
     }
 }
 
-impl Render for Composer {
+impl Render for TextEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let fonts = cx
             .try_global::<AppliedSettings>()
@@ -1182,11 +1376,22 @@ impl Render for Composer {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus, cx);
-                    let offset = this
-                        .offset_for_point(event.position)
-                        .unwrap_or(this.editor.len());
-                    this.move_to(offset, cx);
+                    this.begin_mouse_selection(event, window, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_mouse_selection(event, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.finish_mouse_selection(event, cx)
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.finish_mouse_selection(event, cx)
                 }),
             )
             .w_full()
@@ -1228,7 +1433,7 @@ fn vim_key(event: &KeyDownEvent) -> Option<VimKey> {
     }
 }
 
-impl Focusable for Composer {
+impl Focusable for TextEditor {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
@@ -1238,9 +1443,12 @@ impl Focusable for Composer {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
+    use gpui::{MouseButton, point};
+
     use super::{
-        Composer, ComposerImagePaste, ComposerLine, line_for_offset, logical_lines,
-        normalize_range, range_from_utf16, should_auto_close_code_fence, visible_line_range,
+        Composer, ComposerImagePaste, ComposerLine, line_for_offset, logical_line_range,
+        logical_lines, normalize_range, range_from_utf16, should_auto_close_code_fence,
+        visible_line_range, word_range,
     };
 
     #[gpui::test]
@@ -1353,6 +1561,119 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn vim_yanks_and_deletes_replace_the_system_clipboard(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let mut composer = Composer::new(cx);
+            composer.set_value("alpha beta", cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        cx.simulate_keystrokes("y i w");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("alpha")
+        );
+
+        cx.simulate_keystrokes("w d i w");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "alpha "
+        );
+    }
+
+    #[gpui::test]
+    fn vim_clipboard_preserves_linewise_paste_shape(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let mut composer = Composer::new(cx);
+            composer.set_value("one\ntwo", cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.simulate_keystrokes("d d");
+        let clipboard = cx
+            .read_from_clipboard()
+            .expect("delete populates clipboard");
+        assert_eq!(clipboard.text().as_deref(), Some("one"));
+        assert_eq!(
+            clipboard.metadata().map(String::as_str),
+            Some("chatt-vim-register:linewise")
+        );
+
+        cx.simulate_keystrokes("p");
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "two\none"
+        );
+    }
+
+    #[gpui::test]
+    fn mouse_drag_selects_text_for_platform_copy(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let mut editor = Composer::settings_input(
+                "Edit value",
+                crate::config::schema::BindingMode::Standard,
+                cx,
+            );
+            editor.set_value("alpha beta", cx);
+            window.focus(&editor.focus, cx);
+            editor
+        });
+        let (start, end) = editor.read_with(cx, |editor, _| {
+            let bounds = editor.last_bounds.expect("editor has been painted");
+            let line = &editor.last_layout[0];
+            (
+                point(
+                    bounds.left() + line.layout.x_for_index(0),
+                    bounds.center().y,
+                ),
+                point(
+                    bounds.left() + line.layout.x_for_index("alpha".len()),
+                    bounds.center().y,
+                ),
+            )
+        });
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.snapshot().selection),
+            0.."alpha".len()
+        );
+
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("alpha")
+        );
+    }
+
     #[test]
     fn splits_multiline_content_before_single_line_shaping() {
         let text = "first\n\nthird\n";
@@ -1397,6 +1718,15 @@ mod tests {
     #[test]
     fn maps_utf16_ranges_relative_to_composition_text() {
         assert_eq!(range_from_utf16("a😀b", &(1..3)), 1..5);
+    }
+
+    #[test]
+    fn mouse_word_and_line_ranges_follow_text_boundaries() {
+        assert_eq!(word_range("éclair ++", 2), 0.."éclair".len());
+        assert_eq!(word_range("éclair ++", "éclair ".len()), 8..10);
+        assert_eq!(word_range("alpha", "alpha".len()), 0..5);
+        assert_eq!(logical_line_range("one\ntwo\nthree", 5), 4..7);
+        assert_eq!(logical_line_range("one\ntwo\n", 8), 8..8);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::{
-    composer::{Composer, ComposerChanged},
+    composer::{ComposerChanged, Mode, TextEditor},
     config::{
         io::{self, LoadedConfig, SaveError, SourceStatus},
         schema::{BindCommand, BindingMode, FontRendering, GuiConfig, Rgba8},
@@ -39,11 +39,49 @@ struct PendingSave {
     bindings: Vec<KeyBinding>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsFocus {
+    Search,
+    Row(RowRef),
+    ResetAll,
+    ResetSection,
+    Reload,
+    Cancel,
+    Save,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorTarget {
+    Search,
+    Row(RowRef),
+}
+
+struct ActiveEditor {
+    target: EditorTarget,
+    entity: Entity<TextEditor>,
+    _subscription: Subscription,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InvalidEdit {
+    row: RowRef,
+    text: String,
+    error: SharedString,
+}
+
+#[derive(Clone)]
+enum RowAction {
+    Reset,
+    Record(BindingScope, BindCommand),
+    Font(FontRole, String),
+}
+
 pub(crate) struct SettingsView {
     focus: FocusHandle,
-    search: Entity<Composer>,
-    editor: Entity<Composer>,
-    active_editor: Option<RowRef>,
+    focused: SettingsFocus,
+    editor: Option<ActiveEditor>,
+    invalid_edits: Vec<InvalidEdit>,
+    action_menu: Option<(RowRef, usize)>,
     active_section: usize,
     query: String,
     draft: GuiConfig,
@@ -54,19 +92,17 @@ pub(crate) struct SettingsView {
     path: Option<std::path::PathBuf>,
     committed: Arc<theme::ResolvedSettings>,
     available_families: Vec<String>,
-    editor_error: Option<SharedString>,
     status_message: Option<SharedString>,
     saving: bool,
     confirm_reload: bool,
     confirm_replace: bool,
     pending_save: Option<PendingSave>,
     pending_reload_draft: Option<GuiConfig>,
+    pending_reload_invalid_edits: Option<Vec<InvalidEdit>>,
     recording: Option<(BindingScope, BindCommand)>,
     key_interceptor: Option<Subscription>,
     scroll: UniformListScrollHandle,
     _save_task: Option<Task<()>>,
-    _search_subscription: Subscription,
-    _editor_subscription: Subscription,
 }
 
 impl EventEmitter<SettingsClosed> for SettingsView {}
@@ -75,17 +111,6 @@ impl SettingsView {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let loaded = cx.global::<ConfigurationState>().0.clone();
         let committed = AppliedSettings::get(cx);
-        let search = cx.new(|cx| Composer::settings_input("Search settings", cx));
-        let editor = cx.new(|cx| Composer::settings_input("Edit value", cx));
-        let search_subscription = cx.subscribe(&search, |this, search, _: &ComposerChanged, cx| {
-            this.query = search.read(cx).text();
-            this.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
-            cx.notify();
-        });
-        let editor_subscription = cx.subscribe(&editor, |this, editor, _: &ComposerChanged, cx| {
-            let value = editor.read(cx).text();
-            this.apply_editor_text(&value, cx);
-        });
         let mut system_families = cx.text_system().all_font_names();
         system_families.sort_by_key(|name| name.to_ascii_lowercase());
         system_families.dedup();
@@ -98,11 +123,16 @@ impl SettingsView {
         ];
         available_families.extend(system_families);
 
-        Self {
+        let first_row = rows(&SETTINGS_SECTIONS[0], loaded.diagnostics.len())
+            .into_iter()
+            .find(|row| !matches!(row, RowRef::Diagnostic(_)))
+            .expect("appearance settings contain an editable row");
+        let mut this = Self {
             focus: cx.focus_handle(),
-            search,
-            editor,
-            active_editor: None,
+            focused: SettingsFocus::Row(first_row),
+            editor: None,
+            invalid_edits: Vec::new(),
+            action_menu: None,
             active_section: 0,
             query: String::new(),
             draft: loaded.config.clone(),
@@ -113,24 +143,24 @@ impl SettingsView {
             path: loaded.path,
             committed,
             available_families,
-            editor_error: None,
             status_message: None,
             saving: false,
             confirm_reload: false,
             confirm_replace: false,
             pending_save: None,
             pending_reload_draft: None,
+            pending_reload_invalid_edits: None,
             recording: None,
             key_interceptor: None,
             scroll: UniformListScrollHandle::new(),
             _save_task: None,
-            _search_subscription: search_subscription,
-            _editor_subscription: editor_subscription,
-        }
+        };
+        this.materialize_editor(EditorTarget::Row(first_row), cx);
+        this
     }
 
     fn dirty(&self) -> bool {
-        self.draft != self.baseline || self.editor_error.is_some()
+        self.draft != self.baseline || !self.invalid_edits.is_empty()
     }
 
     fn section(&self) -> &'static SettingsSection {
@@ -145,31 +175,242 @@ impl SettingsView {
             .collect()
     }
 
-    fn select_section(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn invalid_edit(&self, row: RowRef) -> Option<&InvalidEdit> {
+        self.invalid_edits.iter().find(|edit| edit.row == row)
+    }
+
+    fn clear_invalid_edit(&mut self, row: RowRef) {
+        self.invalid_edits.retain(|edit| edit.row != row);
+    }
+
+    fn set_invalid_edit(&mut self, row: RowRef, text: &str, error: String) {
+        let error: SharedString = error.into();
+        if let Some(edit) = self.invalid_edits.iter_mut().find(|edit| edit.row == row) {
+            edit.text.clear();
+            edit.text.push_str(text);
+            edit.error = error.clone();
+        } else {
+            self.invalid_edits.push(InvalidEdit {
+                row,
+                text: text.to_string(),
+                error: error.clone(),
+            });
+        }
+    }
+
+    fn row_has_editor(row: RowRef) -> bool {
+        matches!(
+            row,
+            RowRef::Theme(_) | RowRef::FontFamily(_) | RowRef::FontSize(_) | RowRef::Binding(_, _)
+        )
+    }
+
+    fn editor_value(&self, target: EditorTarget) -> String {
+        match target {
+            EditorTarget::Search => self.query.clone(),
+            EditorTarget::Row(row) => self
+                .invalid_edit(row)
+                .map(|edit| edit.text.clone())
+                .unwrap_or_else(|| self.edit_text(row)),
+        }
+    }
+
+    fn materialize_editor(&mut self, target: EditorTarget, cx: &mut Context<Self>) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.target == target)
+        {
+            return;
+        }
+        self.editor = None;
+        let value = self.editor_value(target);
+        let binding_mode = self.draft.input.default_binding_mode;
+        let placeholder = match target {
+            EditorTarget::Search => "Search settings",
+            EditorTarget::Row(_) => "Edit value",
+        };
+        let entity = cx.new(|cx| {
+            let mut editor = TextEditor::settings_input(placeholder, binding_mode, cx);
+            editor.set_value(value, cx);
+            editor
+        });
+        let subscription = cx.subscribe(&entity, move |this, editor, _: &ComposerChanged, cx| {
+            let value = editor.read(cx).text();
+            match target {
+                EditorTarget::Search => {
+                    this.query = value;
+                    this.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                    this.reconcile_focus_after_filter(cx);
+                }
+                EditorTarget::Row(row) if this.focused == SettingsFocus::Row(row) => {
+                    this.apply_editor_text(&value, cx);
+                }
+                EditorTarget::Row(_) => {}
+            }
+        });
+        self.editor = Some(ActiveEditor {
+            target,
+            entity,
+            _subscription: subscription,
+        });
+    }
+
+    fn focus_order(&self) -> Vec<SettingsFocus> {
+        let mut order = Vec::with_capacity(self.visible_rows().len() + 7);
+        order.push(SettingsFocus::Search);
+        order.extend(
+            self.visible_rows()
+                .into_iter()
+                .filter(|row| !matches!(row, RowRef::Diagnostic(_)))
+                .map(SettingsFocus::Row),
+        );
+        order.extend([
+            SettingsFocus::ResetAll,
+            SettingsFocus::ResetSection,
+            SettingsFocus::Reload,
+            SettingsFocus::Cancel,
+            SettingsFocus::Save,
+        ]);
+        order
+    }
+
+    fn focus_target(
+        &mut self,
+        target: SettingsFocus,
+        enter_insert: bool,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.action_menu = None;
+        self.focused = target;
+        match target {
+            SettingsFocus::Search => {
+                self.materialize_editor(EditorTarget::Search, cx);
+                if enter_insert {
+                    if let Some(editor) = &self.editor {
+                        editor
+                            .entity
+                            .update(cx, |editor, cx| editor.enter_insert_mode(cx));
+                    }
+                }
+                if let Some(editor) = &self.editor {
+                    window.focus(&editor.entity.focus_handle(cx), cx);
+                }
+            }
+            SettingsFocus::Row(row) if Self::row_has_editor(row) => {
+                self.materialize_editor(EditorTarget::Row(row), cx);
+                if enter_insert {
+                    if let Some(editor) = &self.editor {
+                        editor
+                            .entity
+                            .update(cx, |editor, cx| editor.enter_insert_mode(cx));
+                    }
+                }
+                if let Some(index) = self
+                    .visible_rows()
+                    .iter()
+                    .position(|candidate| *candidate == row)
+                {
+                    self.scroll
+                        .scroll_to_item(index, gpui::ScrollStrategy::Center);
+                }
+                if let Some(editor) = &self.editor {
+                    window.focus(&editor.entity.focus_handle(cx), cx);
+                }
+            }
+            SettingsFocus::Row(row) => {
+                self.editor = None;
+                if let Some(index) = self
+                    .visible_rows()
+                    .iter()
+                    .position(|candidate| *candidate == row)
+                {
+                    self.scroll
+                        .scroll_to_item(index, gpui::ScrollStrategy::Center);
+                }
+                window.focus(&self.focus, cx);
+            }
+            _ => {
+                self.editor = None;
+                window.focus(&self.focus, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn move_focus(
+        &mut self,
+        delta: isize,
+        enter_insert: bool,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let current = order
+            .iter()
+            .position(|target| *target == self.focused)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(order.len() as isize) as usize;
+        self.focus_target(order[next], enter_insert, window, cx);
+    }
+
+    fn reconcile_focus_after_filter(&mut self, cx: &mut Context<Self>) {
+        let order = self.focus_order();
+        if order.contains(&self.focused) {
+            cx.notify();
+            return;
+        }
+        self.focused = order
+            .iter()
+            .copied()
+            .find(|target| matches!(target, SettingsFocus::Row(_)))
+            .unwrap_or(SettingsFocus::Search);
+        self.editor = None;
+        match self.focused {
+            SettingsFocus::Search => self.materialize_editor(EditorTarget::Search, cx),
+            SettingsFocus::Row(row) if Self::row_has_editor(row) => {
+                self.materialize_editor(EditorTarget::Row(row), cx)
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn select_section(&mut self, index: usize, window: &mut gpui::Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
         self.active_section = index;
-        self.active_editor = None;
-        self.editor_error = None;
         self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
-        cx.notify();
+        let target = if matches!(
+            self.focused,
+            SettingsFocus::Search
+                | SettingsFocus::ResetAll
+                | SettingsFocus::ResetSection
+                | SettingsFocus::Reload
+                | SettingsFocus::Cancel
+                | SettingsFocus::Save
+        ) {
+            self.focused
+        } else {
+            self.visible_rows()
+                .into_iter()
+                .find(|row| !matches!(row, RowRef::Diagnostic(_)))
+                .map(SettingsFocus::Row)
+                .unwrap_or(SettingsFocus::Search)
+        };
+        self.focus_target(target, false, window, cx);
     }
 
-    fn select_row(&mut self, row: RowRef, cx: &mut Context<Self>) {
+    fn select_row(&mut self, row: RowRef, window: &mut gpui::Window, cx: &mut Context<Self>) {
         if self.saving || matches!(row, RowRef::Diagnostic(_)) {
             return;
         }
-        self.active_editor = Some(row);
-        self.editor_error = None;
-        if matches!(row, RowRef::Choice(_)) {
-            cx.notify();
-            return;
-        }
-        let value = self.edit_text(row);
-        self.editor
-            .update(cx, |editor, cx| editor.set_value(value, cx));
-        cx.notify();
+        self.focus_target(SettingsFocus::Row(row), false, window, cx);
     }
 
     fn edit_text(&self, row: RowRef) -> String {
@@ -184,8 +425,28 @@ impl SettingsView {
         }
     }
 
+    fn sync_row_editor(&mut self, row: RowRef, cx: &mut Context<Self>) {
+        let entity = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.target == EditorTarget::Row(row))
+            .map(|editor| editor.entity.clone());
+        if let Some(entity) = entity {
+            let value = self.editor_value(EditorTarget::Row(row));
+            entity.update(cx, |editor, cx| editor.set_value(value, cx));
+        }
+    }
+
+    fn sync_editor_binding_mode(&mut self, cx: &mut Context<Self>) {
+        let entity = self.editor.as_ref().map(|editor| editor.entity.clone());
+        if let Some(entity) = entity {
+            let binding_mode = self.draft.input.default_binding_mode;
+            entity.update(cx, |editor, cx| editor.set_binding_mode(binding_mode, cx));
+        }
+    }
+
     fn apply_editor_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(row) = self.active_editor else {
+        let SettingsFocus::Row(row) = self.focused else {
             return;
         };
         let result = match row {
@@ -246,7 +507,7 @@ impl SettingsView {
         };
         match result {
             Ok(changed) => {
-                self.editor_error = None;
+                self.clear_invalid_edit(row);
                 if changed
                     && matches!(
                         row,
@@ -256,7 +517,7 @@ impl SettingsView {
                     self.preview(cx);
                 }
             }
-            Err(error) => self.editor_error = Some(error.into()),
+            Err(error) => self.set_invalid_edit(row, text, error),
         }
         cx.notify();
     }
@@ -298,6 +559,7 @@ impl SettingsView {
                 } else {
                     BindingMode::Standard
                 };
+                self.sync_editor_binding_mode(cx);
             }
         }
         cx.notify();
@@ -308,10 +570,11 @@ impl SettingsView {
             return;
         }
         let changed = self.draft.fonts.family(role) != family;
-        self.draft.fonts.set_family(role, family.clone());
-        self.active_editor = Some(RowRef::FontFamily(role));
-        self.editor
-            .update(cx, |editor, cx| editor.set_value(family, cx));
+        let row = RowRef::FontFamily(role);
+        self.draft.fonts.set_family(role, family);
+        self.clear_invalid_edit(row);
+        self.sync_row_editor(row, cx);
+        self.action_menu = None;
         if changed {
             self.preview(cx);
         }
@@ -324,12 +587,12 @@ impl SettingsView {
         }
         let defaults = GuiConfig::default();
         let appearance_changed = self.reset_row_value(row, &defaults);
-        self.editor_error = None;
-        if self.active_editor == Some(row) {
-            let value = self.edit_text(row);
-            self.editor
-                .update(cx, |editor, cx| editor.set_value(value, cx));
+        if row == RowRef::Choice(ScalarSetting::BindingMode) {
+            self.sync_editor_binding_mode(cx);
         }
+        self.clear_invalid_edit(row);
+        self.sync_row_editor(row, cx);
+        self.action_menu = None;
         if appearance_changed {
             self.preview(cx);
         }
@@ -378,13 +641,13 @@ impl SettingsView {
         let mut appearance_changed = false;
         for row in section_rows {
             appearance_changed |= self.reset_row_value(row, &defaults);
+            self.clear_invalid_edit(row);
         }
-        self.editor_error = None;
-        if let Some(row) = self.active_editor {
-            let value = self.edit_text(row);
-            self.editor
-                .update(cx, |editor, cx| editor.set_value(value, cx));
+        self.sync_editor_binding_mode(cx);
+        if let SettingsFocus::Row(row) = self.focused {
+            self.sync_row_editor(row, cx);
         }
+        self.action_menu = None;
         if appearance_changed {
             self.preview(cx);
         }
@@ -396,8 +659,12 @@ impl SettingsView {
             return;
         }
         self.draft = GuiConfig::default();
-        self.active_editor = None;
-        self.editor_error = None;
+        self.invalid_edits.clear();
+        self.sync_editor_binding_mode(cx);
+        if let SettingsFocus::Row(row) = self.focused {
+            self.sync_row_editor(row, cx);
+        }
+        self.action_menu = None;
         self.preview(cx);
         cx.notify();
     }
@@ -449,16 +716,21 @@ impl SettingsView {
             let mut candidate = self.draft.clone();
             key_bindings::set_sequences(&mut candidate, scope, command, &sequences);
             if let Some(error) = key_bindings::validate(&candidate).first() {
-                self.editor_error = Some(error.message.clone().into());
-                self.status_message = Some("Recorded chord conflicts with another action.".into());
+                self.status_message = Some(
+                    format!(
+                        "Recorded chord conflicts with another action: {}",
+                        error.message
+                    )
+                    .into(),
+                );
                 cx.notify();
                 return;
             }
             self.draft = candidate;
-            self.active_editor = Some(RowRef::Binding(scope, command));
-            let value = sequences.join(", ");
-            self.editor
-                .update(cx, |editor, cx| editor.set_value(value, cx));
+            let row = RowRef::Binding(scope, command);
+            self.clear_invalid_edit(row);
+            self.sync_row_editor(row, cx);
+            self.action_menu = None;
             self.status_message = Some("Recorded chord. Save to commit the keymap.".into());
         } else {
             self.status_message = Some("Key recording cancelled.".into());
@@ -470,7 +742,7 @@ impl SettingsView {
         if self.saving {
             return;
         }
-        if self.editor_error.is_some() {
+        if !self.invalid_edits.is_empty() {
             self.status_message =
                 Some("Fix or discard the invalid editor value before saving.".into());
             cx.notify();
@@ -609,6 +881,7 @@ impl SettingsView {
         let executor = cx.background_executor().clone();
         self.saving = true;
         self.pending_reload_draft = Some(self.draft.clone());
+        self.pending_reload_invalid_edits = Some(self.invalid_edits.clone());
         self.status_message = Some("Reloading…".into());
         self._save_task = Some(cx.spawn(async move |this, cx| {
             let loaded = executor.spawn(async move { io::load_path(path) }).await;
@@ -623,7 +896,11 @@ impl SettingsView {
             .pending_reload_draft
             .take()
             .expect("reload retains the draft it was started from");
-        if self.draft != draft_at_start || self.editor_error.is_some() {
+        let invalid_edits_at_start = self
+            .pending_reload_invalid_edits
+            .take()
+            .expect("reload retains invalid edits present when it started");
+        if self.draft != draft_at_start || self.invalid_edits != invalid_edits_at_start {
             self.status_message =
                 Some("Reload finished, but newer editor changes were kept. Reload again to discard them.".into());
             cx.notify();
@@ -644,7 +921,12 @@ impl SettingsView {
                     self.source = loaded.source.clone();
                     self.source_status = loaded.status;
                     self.diagnostics = diagnostics;
-                    self.active_editor = None;
+                    self.invalid_edits.clear();
+                    self.action_menu = None;
+                    self.sync_editor_binding_mode(cx);
+                    if let SettingsFocus::Row(row) = self.focused {
+                        self.sync_row_editor(row, cx);
+                    }
                     self.committed = theme::apply_appearance(
                         &self.draft,
                         loaded.status,
@@ -676,96 +958,279 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn choice_value(&self, setting: ScalarSetting) -> usize {
+        match setting {
+            ScalarSetting::FontRendering => match self.draft.fonts.rendering {
+                FontRendering::PlatformDefault => 0,
+                FontRendering::Subpixel => 1,
+                FontRendering::Grayscale => 2,
+            },
+            ScalarSetting::BindingMode => {
+                usize::from(self.draft.input.default_binding_mode == BindingMode::Vim)
+            }
+        }
+    }
+
+    fn cycle_choice(&mut self, setting: ScalarSetting, delta: isize, cx: &mut Context<Self>) {
+        let count = match setting {
+            ScalarSetting::FontRendering => 3,
+            ScalarSetting::BindingMode => 2,
+        };
+        let next = (self.choice_value(setting) as isize + delta).rem_euclid(count) as usize;
+        self.choose(setting, next, cx);
+    }
+
+    fn row_actions(&self, row: RowRef) -> Vec<(SharedString, RowAction)> {
+        let mut actions = vec![("Reset".into(), RowAction::Reset)];
+        match row {
+            RowRef::Binding(scope, command) => actions.push((
+                if self.recording == Some((scope, command)) {
+                    "Recording…".into()
+                } else {
+                    "Record one chord".into()
+                },
+                RowAction::Record(scope, command),
+            )),
+            RowRef::FontFamily(role) => {
+                let query = self
+                    .editor_value(EditorTarget::Row(row))
+                    .trim()
+                    .to_ascii_lowercase();
+                actions.extend(
+                    self.available_families
+                        .iter()
+                        .filter(|family| {
+                            query.is_empty() || family.to_ascii_lowercase().contains(&query)
+                        })
+                        .take(8)
+                        .cloned()
+                        .map(|family| {
+                            (
+                                SharedString::from(family.clone()),
+                                RowAction::Font(role, family),
+                            )
+                        }),
+                );
+            }
+            _ => {}
+        }
+        actions
+    }
+
+    fn run_row_action(&mut self, row: RowRef, index: usize, cx: &mut Context<Self>) {
+        let Some((_, action)) = self.row_actions(row).get(index).cloned() else {
+            return;
+        };
+        match action {
+            RowAction::Reset => self.reset_row(row, cx),
+            RowAction::Record(scope, command) => self.start_recording(scope, command, cx),
+            RowAction::Font(role, family) => self.choose_font(role, family, cx),
+        }
+    }
+
+    fn activate_focused(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        match self.focused {
+            SettingsFocus::Search => self.focus_target(SettingsFocus::Search, true, window, cx),
+            SettingsFocus::Row(RowRef::Choice(setting)) => self.cycle_choice(setting, 1, cx),
+            SettingsFocus::Row(row) if Self::row_has_editor(row) => {
+                self.focus_target(SettingsFocus::Row(row), true, window, cx)
+            }
+            SettingsFocus::Row(_) => {}
+            SettingsFocus::ResetAll => self.reset_all(cx),
+            SettingsFocus::ResetSection => self.reset_section(cx),
+            SettingsFocus::Reload => self.reload(cx),
+            SettingsFocus::Cancel => self.cancel(cx),
+            SettingsFocus::Save => {
+                let replace = self.confirm_replace
+                    || matches!(
+                        self.source_status,
+                        SourceStatus::Invalid | SourceStatus::ReadFailed
+                    );
+                self.save(replace, cx);
+            }
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _: &mut gpui::Window,
+        window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        if event.keystroke.key == "escape" && !self.saving {
-            self.cancel(cx);
+        if self.saving || self.recording.is_some() {
+            return;
         }
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+
+        if key == "tab" {
+            let delta = if modifiers.shift { -1 } else { 1 };
+            let next = (self.active_section as isize + delta)
+                .rem_euclid(SETTINGS_SECTIONS.len() as isize) as usize;
+            self.select_section(next, window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
+        if let Some((row, selected)) = self.action_menu {
+            match key {
+                "escape" => {
+                    self.action_menu = None;
+                    cx.notify();
+                }
+                "j" | "down" => {
+                    let count = self.row_actions(row).len();
+                    self.action_menu = Some((row, (selected + 1) % count.max(1)));
+                    cx.notify();
+                }
+                "k" | "up" => {
+                    let count = self.row_actions(row).len().max(1);
+                    self.action_menu = Some((row, (selected + count - 1) % count));
+                    cx.notify();
+                }
+                "enter" => self.run_row_action(row, selected, cx),
+                _ => return,
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "enter" && modifiers.secondary() {
+            if let SettingsFocus::Row(row) = self.focused {
+                if !matches!(row, RowRef::Diagnostic(_)) {
+                    self.action_menu = Some((row, 0));
+                    cx.notify();
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }
+            return;
+        }
+
+        let binding_mode = self.draft.input.default_binding_mode;
+        let editor_mode = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.entity.read(cx).mode());
+        let editor_focused = matches!(
+            (
+                self.focused,
+                self.editor.as_ref().map(|editor| editor.target)
+            ),
+            (SettingsFocus::Search, Some(EditorTarget::Search))
+                | (SettingsFocus::Row(_), Some(EditorTarget::Row(_)))
+        );
+
+        if editor_focused && binding_mode == BindingMode::Vim {
+            match editor_mode {
+                Some(Mode::Normal) => match key {
+                    "j" | "down" => self.move_focus(1, false, window, cx),
+                    "k" | "up" => self.move_focus(-1, false, window, cx),
+                    "enter" => self.activate_focused(window, cx),
+                    "escape" => self.cancel(cx),
+                    _ => return,
+                },
+                Some(Mode::Insert) if key == "enter" => self.move_focus(1, true, window, cx),
+                Some(Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::VisualBlock) => return,
+                None => return,
+            }
+        } else if editor_focused {
+            match key {
+                "down" => self.move_focus(1, false, window, cx),
+                "up" => self.move_focus(-1, false, window, cx),
+                "enter" => self.move_focus(1, false, window, cx),
+                "escape" => self.cancel(cx),
+                _ => return,
+            }
+        } else {
+            match key {
+                "j" | "down" if binding_mode == BindingMode::Vim => {
+                    self.move_focus(1, false, window, cx)
+                }
+                "k" | "up" if binding_mode == BindingMode::Vim => {
+                    self.move_focus(-1, false, window, cx)
+                }
+                "down" => self.move_focus(1, false, window, cx),
+                "up" => self.move_focus(-1, false, window, cx),
+                "h" if binding_mode == BindingMode::Vim => {
+                    if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
+                        self.cycle_choice(setting, -1, cx);
+                    } else {
+                        return;
+                    }
+                }
+                "left" => {
+                    if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
+                        self.cycle_choice(setting, -1, cx);
+                    } else {
+                        return;
+                    }
+                }
+                "l" if binding_mode == BindingMode::Vim => {
+                    if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
+                        self.cycle_choice(setting, 1, cx);
+                    } else {
+                        return;
+                    }
+                }
+                "right" => {
+                    if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
+                        self.cycle_choice(setting, 1, cx);
+                    } else {
+                        return;
+                    }
+                }
+                "enter" => self.activate_focused(window, cx),
+                "i" if binding_mode == BindingMode::Vim => self.activate_focused(window, cx),
+                "escape" => self.cancel(cx),
+                _ => return,
+            }
+        }
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
-    fn render_choice_controls(&self, setting: ScalarSetting, view: WeakEntity<Self>) -> Div {
+    fn render_action_menu(&self, row: RowRef, selected: usize, view: WeakEntity<Self>) -> Div {
         let palette = ThemePalette::from_config(&self.draft.theme);
-        let choices: &[(&str, usize, bool)] = match setting {
-            ScalarSetting::FontRendering => &[
-                (
-                    "Platform default",
-                    0,
-                    self.draft.fonts.rendering == FontRendering::PlatformDefault,
-                ),
-                (
-                    "Subpixel",
-                    1,
-                    self.draft.fonts.rendering == FontRendering::Subpixel,
-                ),
-                (
-                    "Grayscale",
-                    2,
-                    self.draft.fonts.rendering == FontRendering::Grayscale,
-                ),
-            ],
-            ScalarSetting::BindingMode => &[
-                (
-                    "Standard",
-                    0,
-                    self.draft.input.default_binding_mode == BindingMode::Standard,
-                ),
-                (
-                    "Vim",
-                    1,
-                    self.draft.input.default_binding_mode == BindingMode::Vim,
-                ),
-            ],
-        };
-        let mut controls = div().flex().gap_2();
-        for (title, value, selected) in choices {
-            let title = *title;
-            let value = *value;
-            let selected = *selected;
-            let view = view.clone();
-            controls = controls.child(
+        let mut menu = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_5()
+            .py_2()
+            .border_b_1()
+            .border_color(palette.color(ThemeRole::BorderSubtle))
+            .bg(palette.color(ThemeRole::Window))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(palette.color(ThemeRole::TextMuted))
+                    .child(format!("{} actions", label(row))),
+            );
+        for (index, (title, _)) in self.row_actions(row).into_iter().enumerate() {
+            let action_view = view.clone();
+            menu = menu.child(
                 setting_button(
-                    ("choice", setting as usize * 10 + value),
+                    ("row-action", row_id(row) * 16 + index),
                     title,
-                    selected,
+                    index == selected,
                     &palette,
                 )
                 .on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.choose(setting, value, cx));
+                    let _ = action_view.update(cx, |this, cx| this.run_row_action(row, index, cx));
                 }),
             );
         }
-        controls
-    }
-
-    fn render_font_suggestions(&self, role: FontRole, query: &str, view: WeakEntity<Self>) -> Div {
-        let palette = ThemePalette::from_config(&self.draft.theme);
-        let query = query.trim().to_ascii_lowercase();
-        let mut suggestions = div().mt_2().flex().flex_wrap().gap_2();
-        for (index, family) in self
-            .available_families
-            .iter()
-            .filter(|family| query.is_empty() || family.to_ascii_lowercase().contains(&query))
-            .take(8)
-            .cloned()
-            .enumerate()
-        {
-            let selected = self.draft.fonts.family(role) == family;
-            let title = family.clone();
-            let view = view.clone();
-            suggestions = suggestions.child(
-                setting_button(("font-suggestion", index), title, selected, &palette).on_click(
-                    move |_, _, cx| {
-                        let family = family.clone();
-                        let _ = view.update(cx, |this, cx| this.choose_font(role, family, cx));
-                    },
-                ),
-            );
-        }
-        suggestions
+        menu.child(
+            div()
+                .ml_auto()
+                .text_xs()
+                .text_color(palette.color(ThemeRole::TextDim))
+                .child("⌘/Ctrl+Enter · j/k · Enter · Esc"),
+        )
     }
 }
 
@@ -775,14 +1240,20 @@ impl Render for SettingsView {
         let palette = ThemePalette::from_config(&self.draft.theme);
         let section = self.section();
         let visible_rows = self.visible_rows();
+        let focused = self.focused;
         let draft = self.draft.clone();
         let diagnostics = self.diagnostics.clone();
+        let invalid_edits = self.invalid_edits.clone();
+        let active_editor = self
+            .editor
+            .as_ref()
+            .map(|editor| (editor.target, editor.entity.clone()));
+        let row_editor = active_editor.clone();
         let diagnostic_source = self
             .source
             .as_deref()
             .and_then(|source| std::str::from_utf8(source).ok())
             .map(ToOwned::to_owned);
-        let active = self.active_editor;
         let row_view = view.clone();
         let row_palette = palette.clone();
         let list_rows = visible_rows.clone();
@@ -792,11 +1263,19 @@ impl Render for SettingsView {
             move |range, _, _| {
                 range
                     .map(|index| {
+                        let row = list_rows[index];
+                        let editor = row_editor.as_ref().and_then(|(target, entity)| {
+                            (*target == EditorTarget::Row(row)).then(|| entity.clone())
+                        });
+                        let invalid = invalid_edits.iter().find(|edit| edit.row == row);
                         render_row(
-                            list_rows[index],
+                            row,
                             &draft,
                             &diagnostics,
-                            active,
+                            focused == SettingsFocus::Row(row),
+                            editor,
+                            invalid.map(|edit| edit.text.clone()),
+                            invalid.map(|edit| edit.error.clone()),
                             row_view.clone(),
                             &row_palette,
                             diagnostic_source.as_deref(),
@@ -820,92 +1299,80 @@ impl Render for SettingsView {
             .border_color(palette.color(ThemeRole::BorderSubtle));
         for (index, candidate) in SETTINGS_SECTIONS.iter().enumerate() {
             let selected = index == self.active_section;
-            let view = view.clone();
+            let section_view = view.clone();
             navigation = navigation.child(
                 setting_button(candidate.id, candidate.title, selected, &palette)
                     .w_full()
-                    .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.select_section(index, cx));
+                    .on_click(move |_, window, cx| {
+                        let _ = section_view
+                            .update(cx, |this, cx| this.select_section(index, window, cx));
                     }),
             );
         }
         let reset_all_view = view.clone();
         navigation = navigation.child(div().flex_1()).child(
-            setting_button("reset-all", "Reset all", false, &palette).on_click(move |_, _, cx| {
-                let _ = reset_all_view.update(cx, |this, cx| this.reset_all(cx));
+            setting_button(
+                "reset-all",
+                "Reset all",
+                focused == SettingsFocus::ResetAll,
+                &palette,
+            )
+            .on_click(move |_, window, cx| {
+                let _ = reset_all_view.update(cx, |this, cx| {
+                    this.focus_target(SettingsFocus::ResetAll, false, window, cx);
+                    this.reset_all(cx);
+                });
             }),
         );
 
-        let editor_query = self.editor.read(cx).text();
-        let editor = self.active_editor.map(|row| {
-            div()
-                .flex_none()
-                .p_3()
-                .border_b_1()
-                .border_color(palette.color(ThemeRole::BorderSubtle))
-                .bg(palette.color(ThemeRole::Window))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(format!("Edit {}", label(row))),
-                )
-                .child(
-                    div()
-                        .mt_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if self.editor_error.is_some() {
-                            palette.color(ThemeRole::StateDanger)
-                        } else {
-                            palette.color(ThemeRole::BorderStrong)
-                        })
-                        .bg(palette.color(ThemeRole::Input))
-                        .child(self.editor.clone()),
-                )
-                .when_some(self.editor_error.clone(), |editor, error| {
-                    editor.child(
+        let search_editor = active_editor
+            .as_ref()
+            .and_then(|(target, entity)| (*target == EditorTarget::Search).then(|| entity.clone()));
+        let search_view = view.clone();
+        let search = div()
+            .id("settings-search")
+            .w(px(360.))
+            .min_h(px(38.))
+            .flex()
+            .items_center()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if focused == SettingsFocus::Search {
+                palette.color(ThemeRole::BorderFocus)
+            } else {
+                palette.color(ThemeRole::BorderStrong)
+            })
+            .bg(palette.color(ThemeRole::Input))
+            .cursor_text()
+            .on_click(move |_, window, cx| {
+                let _ = search_view.update(cx, |this, cx| {
+                    this.focus_target(SettingsFocus::Search, false, window, cx)
+                });
+            })
+            .when_some(search_editor, |search, editor| search.child(editor))
+            .when(
+                active_editor
+                    .as_ref()
+                    .is_none_or(|(target, _)| *target != EditorTarget::Search),
+                |search| {
+                    search.child(
                         div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(palette.color(ThemeRole::StateDanger))
-                            .child(error),
-                    )
-                })
-                .when(matches!(row, RowRef::Binding(_, _)), |editor| {
-                    let RowRef::Binding(scope, command) = row else {
-                        unreachable!()
-                    };
-                    let record_view = view.clone();
-                    editor.child(
-                        div().mt_2().child(
-                            setting_button(
-                                ("record-binding", row_id(row)),
-                                if self.recording == Some((scope, command)) {
-                                    "Recording…"
-                                } else {
-                                    "Record one chord"
-                                },
-                                self.recording == Some((scope, command)),
-                                &palette,
-                            )
-                            .on_click(move |_, _, cx| {
-                                let _ = record_view.update(cx, |this, cx| {
-                                    this.start_recording(scope, command, cx)
-                                });
+                            .text_sm()
+                            .text_color(if self.query.is_empty() {
+                                palette.color(ThemeRole::TextDim)
+                            } else {
+                                palette.color(ThemeRole::TextPrimary)
+                            })
+                            .child(if self.query.is_empty() {
+                                "Search settings".to_string()
+                            } else {
+                                self.query.clone()
                             }),
-                        ),
                     )
-                })
-                .when(matches!(row, RowRef::FontFamily(_)), |editor| {
-                    let RowRef::FontFamily(role) = row else {
-                        unreachable!()
-                    };
-                    editor.child(self.render_font_suggestions(role, &editor_query, view.clone()))
-                })
-        });
+                },
+            );
 
         let reset_section_view = view.clone();
         let reload_view = view.clone();
@@ -931,7 +1398,7 @@ impl Render for SettingsView {
             .id("settings")
             .key_context("ChattSettings")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::handle_key_down))
+            .capture_key_down(cx.listener(Self::handle_key_down))
             .absolute()
             .inset_0()
             .p_6()
@@ -964,17 +1431,7 @@ impl Render for SettingsView {
                                     .font_weight(FontWeight::BOLD)
                                     .child("Settings"),
                             )
-                            .child(
-                                div()
-                                    .w(px(360.))
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(palette.color(ThemeRole::BorderStrong))
-                                    .bg(palette.color(ThemeRole::Input))
-                                    .child(self.search.clone()),
-                            )
+                            .child(search)
                             .child(div().flex_1())
                             .when(self.dirty(), |header| {
                                 header.child(
@@ -1011,33 +1468,13 @@ impl Render for SettingsView {
                                                 .child(section.help),
                                         ),
                                 )
-                                .when_some(editor, |content, editor| content.child(editor))
-                                .when(
-                                    matches!(
-                                        active,
-                                        Some(RowRef::Choice(ScalarSetting::FontRendering))
-                                            | Some(RowRef::Choice(ScalarSetting::BindingMode))
-                                    ),
-                                    |content| {
-                                        let RowRef::Choice(setting) = active.unwrap() else {
-                                            unreachable!()
-                                        };
-                                        content.child(
-                                            div()
-                                                .p_3()
-                                                .border_b_1()
-                                                .border_color(
-                                                    palette.color(ThemeRole::BorderSubtle),
-                                                )
-                                                .child(
-                                                    self.render_choice_controls(
-                                                        setting,
-                                                        view.clone(),
-                                                    ),
-                                                ),
-                                        )
-                                    },
-                                )
+                                .when_some(self.action_menu, |content, (row, selected)| {
+                                    content.child(self.render_action_menu(
+                                        row,
+                                        selected,
+                                        view.clone(),
+                                    ))
+                                })
                                 .child(list),
                         ),
                     )
@@ -1064,11 +1501,23 @@ impl Render for SettingsView {
                                 footer.child(div().flex_1())
                             })
                             .child(
-                                setting_button("reset-section", "Reset section", false, &palette)
-                                    .on_click(move |_, _, cx| {
-                                        let _ = reset_section_view
-                                            .update(cx, |this, cx| this.reset_section(cx));
-                                    }),
+                                setting_button(
+                                    "reset-section",
+                                    "Reset section",
+                                    focused == SettingsFocus::ResetSection,
+                                    &palette,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = reset_section_view.update(cx, |this, cx| {
+                                        this.focus_target(
+                                            SettingsFocus::ResetSection,
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                        this.reset_section(cx);
+                                    });
+                                }),
                             )
                             .child(
                                 setting_button(
@@ -1078,25 +1527,43 @@ impl Render for SettingsView {
                                     } else {
                                         "Reload from disk"
                                     },
-                                    self.confirm_reload,
+                                    focused == SettingsFocus::Reload || self.confirm_reload,
                                     &palette,
                                 )
-                                .on_click(move |_, _, cx| {
-                                    let _ = reload_view.update(cx, |this, cx| this.reload(cx));
+                                .on_click(move |_, window, cx| {
+                                    let _ = reload_view.update(cx, |this, cx| {
+                                        this.focus_target(SettingsFocus::Reload, false, window, cx);
+                                        this.reload(cx);
+                                    });
                                 }),
                             )
                             .child(
-                                setting_button("cancel-settings", "Cancel", false, &palette)
-                                    .on_click(move |_, _, cx| {
-                                        let _ = cancel_view.update(cx, |this, cx| this.cancel(cx));
-                                    }),
+                                setting_button(
+                                    "cancel-settings",
+                                    "Cancel",
+                                    focused == SettingsFocus::Cancel,
+                                    &palette,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = cancel_view.update(cx, |this, cx| {
+                                        this.focus_target(SettingsFocus::Cancel, false, window, cx);
+                                        this.cancel(cx);
+                                    });
+                                }),
                             )
                             .child(
-                                setting_button("save-settings", save_label, true, &palette)
-                                    .on_click(move |_, _, cx| {
-                                        let _ =
-                                            save_view.update(cx, |this, cx| this.save(replace, cx));
-                                    }),
+                                setting_button(
+                                    "save-settings",
+                                    save_label,
+                                    focused == SettingsFocus::Save,
+                                    &palette,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    let _ = save_view.update(cx, |this, cx| {
+                                        this.focus_target(SettingsFocus::Save, false, window, cx);
+                                        this.save(replace, cx);
+                                    });
+                                }),
                             ),
                     ),
             )
@@ -1104,8 +1571,11 @@ impl Render for SettingsView {
 }
 
 impl Focusable for SettingsView {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor
+            .as_ref()
+            .map(|editor| editor.entity.focus_handle(cx))
+            .unwrap_or_else(|| self.focus.clone())
     }
 }
 
@@ -1113,7 +1583,10 @@ fn render_row(
     row: RowRef,
     draft: &GuiConfig,
     diagnostics: &[ConfigDiagnostic],
-    active: Option<RowRef>,
+    focused: bool,
+    editor: Option<Entity<TextEditor>>,
+    invalid_text: Option<String>,
+    editor_error: Option<SharedString>,
     view: WeakEntity<SettingsView>,
     palette: &ThemePalette,
     source: Option<&str>,
@@ -1128,7 +1601,7 @@ fn render_row(
             .unwrap_or("diagnostic"),
         _ => label(row),
     };
-    let row_value = match row {
+    let row_value = invalid_text.unwrap_or_else(|| match row {
         RowRef::Theme(role) => draft.theme.color(role).to_string(),
         RowRef::FontFamily(role) => draft.fonts.family(role).to_string(),
         RowRef::FontSize(role) => format!("{:.1} px", draft.fonts.size(role)),
@@ -1148,10 +1621,11 @@ fn render_row(
             .get(index)
             .map(|diagnostic| diagnostic.message.clone())
             .unwrap_or_default(),
-    };
+    });
     let path_text = path(row);
     let reset_view = view.clone();
     let select_view = view.clone();
+    let choice_view = view.clone();
     let diagnostic_color = match row {
         RowRef::Diagnostic(index)
             if diagnostics
@@ -1163,9 +1637,55 @@ fn render_row(
         RowRef::Diagnostic(_) => palette.color(ThemeRole::StateWarning),
         _ => palette.color(ThemeRole::TextMuted),
     };
+    let value = if let Some(editor) = editor {
+        div()
+            .w(px(330.))
+            .min_h(px(36.))
+            .flex()
+            .items_center()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if editor_error.is_some() {
+                palette.color(ThemeRole::StateDanger)
+            } else {
+                palette.color(ThemeRole::BorderFocus)
+            })
+            .bg(palette.color(ThemeRole::Input))
+            .child(editor)
+            .into_any_element()
+    } else if let RowRef::Choice(setting) = row {
+        div()
+            .id(("settings-choice", setting as usize))
+            .max_w(px(330.))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(palette.color(ThemeRole::ControlSurface))
+            .text_sm()
+            .text_color(palette.color(ThemeRole::TextSecondary))
+            .child(format!("‹  {row_value}  ›"))
+            .on_click(move |_, window, cx| {
+                let _ = choice_view.update(cx, |this, cx| {
+                    this.focus_target(SettingsFocus::Row(row), false, window, cx);
+                    this.cycle_choice(setting, 1, cx);
+                });
+            })
+            .into_any_element()
+    } else {
+        div()
+            .max_w(px(330.))
+            .truncate()
+            .text_sm()
+            .text_color(diagnostic_color)
+            .child(row_value)
+            .into_any_element()
+    };
     div()
         .id(("settings-row", row_id(row)))
-        .h(px(72.))
+        .h(px(84.))
         .w_full()
         .flex()
         .items_center()
@@ -1173,7 +1693,7 @@ fn render_row(
         .px_5()
         .border_b_1()
         .border_color(palette.color(ThemeRole::BorderSubtle))
-        .bg(if active == Some(row) {
+        .bg(if focused {
             palette.color(ThemeRole::Panel)
         } else {
             palette.color(ThemeRole::Raised)
@@ -1182,8 +1702,8 @@ fn render_row(
             let hover = palette.color(ThemeRole::StateRowHover);
             move |row| row.bg(hover)
         })
-        .on_click(move |_, _, cx| {
-            let _ = select_view.update(cx, |this, cx| this.select_row(row, cx));
+        .on_click(move |_, window, cx| {
+            let _ = select_view.update(cx, |this, cx| this.select_row(row, window, cx));
         })
         .when_some(
             match row {
@@ -1229,11 +1749,21 @@ fn render_row(
         )
         .child(
             div()
-                .max_w(px(330.))
-                .truncate()
-                .text_sm()
-                .text_color(diagnostic_color)
-                .child(row_value),
+                .w(px(330.))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(value)
+                .when_some(editor_error, |column, error| {
+                    column.child(
+                        div()
+                            .mt_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(palette.color(ThemeRole::StateDanger))
+                            .child(error),
+                    )
+                }),
         )
         .when(!matches!(row, RowRef::Diagnostic(_)), |row_element| {
             row_element.child(
@@ -1457,7 +1987,8 @@ mod tests {
 
         cx.update(|cx| {
             settings.update(cx, |settings, cx| {
-                settings.editor_error = Some("invalid color".into());
+                settings.apply_editor_text("invalid color", cx);
+                assert_eq!(settings.invalid_edits.len(), 1);
                 settings.save(false, cx);
                 assert!(settings.pending_save.is_none());
                 assert!(!settings.saving);
@@ -1468,6 +1999,122 @@ mod tests {
                         .is_some_and(|message| message.contains("invalid editor value"))
                 );
             });
+        });
+    }
+
+    #[gpui::test]
+    fn invalid_text_survives_editor_materialization_changes(cx: &mut gpui::TestAppContext) {
+        let settings = create_settings(cx);
+
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                let SettingsFocus::Row(row) = settings.focused else {
+                    panic!("settings opens on the first editable row");
+                };
+                settings.apply_editor_text("not a valid value", cx);
+                assert_eq!(
+                    settings.invalid_edit(row).map(|edit| edit.text.as_str()),
+                    Some("not a valid value")
+                );
+
+                settings.focused = SettingsFocus::Search;
+                settings.materialize_editor(EditorTarget::Search, cx);
+                assert_eq!(
+                    settings.editor.as_ref().map(|editor| editor.target),
+                    Some(EditorTarget::Search)
+                );
+
+                settings.focused = SettingsFocus::Row(row);
+                settings.materialize_editor(EditorTarget::Row(row), cx);
+                let editor = settings
+                    .editor
+                    .as_ref()
+                    .expect("focused editable row materializes an editor")
+                    .entity
+                    .clone();
+                assert_eq!(editor.read(cx).text(), "not a valid value");
+                assert_eq!(settings.invalid_edits.len(), 1);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn vim_settings_navigation_preserves_editor_modes_and_tabs(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            let config = GuiConfig::default();
+            let available_families = cx.text_system().all_font_names();
+            theme::apply_appearance(&config, SourceStatus::Missing, &[], &available_families, cx);
+            key_bindings::install(&config, cx).unwrap();
+            install_loaded(
+                LoadedConfig {
+                    path: None,
+                    config,
+                    source: None,
+                    status: SourceStatus::Missing,
+                    diagnostics: Vec::new(),
+                },
+                cx,
+            );
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let settings = SettingsView::new(cx);
+            let focus = settings.focus_handle(cx);
+            window.focus(&focus, cx);
+            settings
+        });
+
+        let first = settings.read_with(cx, |settings, cx| {
+            assert_eq!(settings.draft.input.default_binding_mode, BindingMode::Vim);
+            assert_eq!(
+                settings
+                    .editor
+                    .as_ref()
+                    .expect("first row has an editor")
+                    .entity
+                    .read(cx)
+                    .mode(),
+                Mode::Normal
+            );
+            settings.focused
+        });
+
+        cx.simulate_keystrokes("enter");
+        settings.read_with(cx, |settings, cx| {
+            assert_eq!(settings.focused, first);
+            assert_eq!(
+                settings.editor.as_ref().unwrap().entity.read(cx).mode(),
+                Mode::Insert
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        settings.read_with(cx, |settings, cx| {
+            assert_eq!(settings.focused, first);
+            assert_eq!(
+                settings.editor.as_ref().unwrap().entity.read(cx).mode(),
+                Mode::Normal
+            );
+        });
+
+        cx.simulate_keystrokes("j");
+        let second = settings.read_with(cx, |settings, _| settings.focused);
+        assert_ne!(second, first);
+        cx.simulate_keystrokes("enter enter");
+        settings.read_with(cx, |settings, cx| {
+            assert_ne!(settings.focused, second);
+            assert_eq!(
+                settings.editor.as_ref().unwrap().entity.read(cx).mode(),
+                Mode::Insert
+            );
+        });
+
+        let section = settings.read_with(cx, |settings, _| settings.active_section);
+        cx.simulate_keystrokes("tab");
+        settings.read_with(cx, |settings, _| {
+            assert_eq!(
+                settings.active_section,
+                (section + 1) % SETTINGS_SECTIONS.len()
+            );
         });
     }
 
@@ -1512,6 +2159,7 @@ mod tests {
         cx.update(|cx| {
             settings.update(cx, |settings, cx| {
                 settings.pending_reload_draft = Some(settings.draft.clone());
+                settings.pending_reload_invalid_edits = Some(settings.invalid_edits.clone());
                 settings.saving = true;
                 settings.draft.fonts.interface_size = 20.0;
                 settings.finish_reload(
@@ -1526,6 +2174,47 @@ mod tests {
                 );
                 assert_eq!(settings.draft.fonts.interface_size, 20.0);
                 assert_ne!(settings.baseline.fonts.interface_size, 18.0);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn confirmed_reload_discards_invalid_text_present_when_read_started(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings(cx);
+
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                settings.apply_editor_text("invalid before reload", cx);
+                assert!(!settings.invalid_edits.is_empty());
+                settings.pending_reload_draft = Some(settings.draft.clone());
+                settings.pending_reload_invalid_edits = Some(settings.invalid_edits.clone());
+                settings.saving = true;
+                settings.finish_reload(
+                    LoadedConfig {
+                        path: None,
+                        config: GuiConfig::default(),
+                        source: None,
+                        status: SourceStatus::Missing,
+                        diagnostics: Vec::new(),
+                    },
+                    cx,
+                );
+                assert!(settings.invalid_edits.is_empty());
+                assert_eq!(
+                    settings
+                        .editor
+                        .as_ref()
+                        .expect("focused row editor remains materialized")
+                        .entity
+                        .read(cx)
+                        .text(),
+                    settings.edit_text(match settings.focused {
+                        SettingsFocus::Row(row) => row,
+                        _ => panic!("settings remains focused on its row"),
+                    })
+                );
             });
         });
     }
