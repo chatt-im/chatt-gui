@@ -135,6 +135,17 @@ fn formatted_message_candidates(events: &[DaemonEvent]) -> Vec<(RoomId, u64, Str
         .collect()
 }
 
+fn timeline_selection_key(item: timeline::MessageListItem) -> MessageSelectionKey {
+    match item.source {
+        timeline::MessageListSource::Message { message_id, .. } => {
+            MessageSelectionKey::Message(message_id)
+        }
+        timeline::MessageListSource::Command { local_id, .. } => {
+            MessageSelectionKey::Command(local_id)
+        }
+    }
+}
+
 type EagerImageKey = AttachmentId;
 
 #[derive(Clone, Debug)]
@@ -574,6 +585,7 @@ pub struct ChattView {
     scroll_animation_active: bool,
     last_scroll_frame: Option<Instant>,
     formatted_messages: HashMap<u64, Rc<FormattedMessage>>,
+    formatted_command_messages: HashMap<u64, Rc<FormattedMessage>>,
     timeline_selection: MessageSelectionGroup,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
@@ -750,6 +762,7 @@ impl ChattView {
             scroll_animation_active: false,
             last_scroll_frame: None,
             formatted_messages: HashMap::new(),
+            formatted_command_messages: HashMap::new(),
             timeline_selection,
             videos,
             video_thumbnails,
@@ -936,6 +949,7 @@ impl ChattView {
     fn clear_command_surface(&mut self, cx: &mut Context<Self>) {
         self.pending_command = None;
         self.clear_completion(cx);
+        self.formatted_command_messages.clear();
         if !self.command_rows.is_empty() {
             self.command_rows.clear();
             self.rebuild_message_list();
@@ -955,10 +969,15 @@ impl ChattView {
             } else {
                 local_id + 1
             };
+            let body = line.text;
+            self.formatted_command_messages.insert(
+                local_id,
+                Rc::new(FormattedMessage::plain(body.clone())),
+            );
             self.command_rows.push(timeline::LocalCommandRow {
                 local_id,
                 anchor_message_id,
-                body: line.text,
+                body,
                 error: line.error,
                 timestamp_ms,
             });
@@ -1994,6 +2013,12 @@ impl ChattView {
             );
         }
         self.message_list = next;
+        self.timeline_selection.retain_items(
+            self.message_list
+                .iter()
+                .copied()
+                .map(timeline_selection_key),
+        );
         debug_assert_eq!(self.list_state.item_count(), self.message_list.len());
     }
 
@@ -2087,13 +2112,6 @@ impl ChattView {
         }
         if self.model.selected_room != old_selected_room || effect.replace_messages {
             self.timeline_selection.clear();
-        } else if !effect.splices.is_empty() {
-            self.timeline_selection.retain_items(
-                self.model
-                    .messages
-                    .iter()
-                    .map(|message| MessageSelectionKey(message.id)),
-            );
         }
         if self.model.selected_room != old_selected_room {
             self.videos.clear_sessions();
@@ -3511,8 +3529,13 @@ impl ChattView {
             return div().into_any_element();
         };
         let accent = if row.error { 0xc27070 } else { 0x7895bd };
+        let body_color = if row.error { 0xe0a3a3 } else { 0xd2d5da };
         let timestamp = timeline::format_age(row.timestamp_ms, timeline::now_ms());
-        let body = row.body.clone();
+        let formatted = self
+            .formatted_command_messages
+            .get(&local_id)
+            .cloned()
+            .unwrap_or_else(|| Rc::new(FormattedMessage::plain(row.body.clone())));
         div()
             .id(("command-output", local_id as usize))
             .relative()
@@ -3579,10 +3602,12 @@ impl ChattView {
                             ),
                     )
                     .child(
-                        div()
-                            .min_w_0()
-                            .text_color(rgb(if row.error { 0xe0a3a3 } else { 0xd2d5da }))
-                            .child(body),
+                        FormattedMessageElement::new(formatted)
+                            .body_color(body_color)
+                            .selection_group(
+                                self.timeline_selection.clone(),
+                                MessageSelectionKey::Command(local_id),
+                            ),
                     ),
             )
             .into_any_element()
@@ -3738,7 +3763,7 @@ impl ChattView {
                                     FormattedMessageElement::new(formatted_message)
                                         .selection_group(
                                             self.timeline_selection.clone(),
-                                            MessageSelectionKey(message_id),
+                                            MessageSelectionKey::Message(message_id),
                                         ),
                                 )
                                 .when_some(attachment, |content, attachment| {

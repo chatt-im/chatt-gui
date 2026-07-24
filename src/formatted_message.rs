@@ -1,4 +1,11 @@
-use std::{cell::RefCell, collections::BTreeMap, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    collections::HashMap,
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
 
 use chatt_message_format::{
     Token, TokenKind,
@@ -29,7 +36,10 @@ const MAX_VISIBLE_QUOTE_DEPTH: usize = 8;
 actions!(formatted_message, [Copy]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-c", Copy, Some("ChattFormattedText"))]);
+    cx.bind_keys([
+        KeyBinding::new("secondary-c", Copy, Some("ChattFormattedText")),
+        KeyBinding::new("y", Copy, Some("ChattFormattedText")),
+    ]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,6 +481,7 @@ pub struct RenderedMessage {
 pub struct FormattedMessageElement {
     message: Rc<FormattedMessage>,
     selection: Option<(MessageSelectionGroup, MessageSelectionKey)>,
+    body_color: u32,
 }
 
 impl FormattedMessageElement {
@@ -478,6 +489,7 @@ impl FormattedMessageElement {
         Self {
             message,
             selection: None,
+            body_color: BODY_COLOR,
         }
     }
 
@@ -487,6 +499,11 @@ impl FormattedMessageElement {
         key: MessageSelectionKey,
     ) -> Self {
         self.selection = Some((group, key));
+        self
+    }
+
+    pub fn body_color(mut self, color: u32) -> Self {
+        self.body_color = color;
         self
     }
 
@@ -501,6 +518,7 @@ impl FormattedMessageElement {
                     PiecePresentation::Body,
                     block.quote_depth,
                     true,
+                    self.body_color,
                     &mut lines,
                     window,
                 ),
@@ -513,6 +531,7 @@ impl FormattedMessageElement {
                         PiecePresentation::Header,
                         block.quote_depth,
                         true,
+                        self.body_color,
                         &mut lines,
                         window,
                     ))
@@ -527,6 +546,7 @@ impl FormattedMessageElement {
                         PiecePresentation::Body,
                         block.quote_depth,
                         false,
+                        self.body_color,
                         &mut lines,
                         window,
                     ))
@@ -535,6 +555,7 @@ impl FormattedMessageElement {
                         PiecePresentation::Body,
                         block.quote_depth,
                         true,
+                        self.body_color,
                         &mut lines,
                         window,
                     )))
@@ -548,6 +569,7 @@ impl FormattedMessageElement {
                     scroll_handle,
                     hover_group,
                     block.quote_depth,
+                    self.body_color,
                     &mut lines,
                     window,
                 ),
@@ -634,7 +656,6 @@ impl FormattedMessageElement {
                         event.modifiers.shift,
                         &rendered,
                     );
-                    window.focus(&group.focus_handle(), cx);
                     window.prevent_default();
                     cx.refresh_windows();
                 }
@@ -750,11 +771,12 @@ fn render_piece(
     presentation: PiecePresentation,
     quote_depth: usize,
     fill_width: bool,
+    body_color: u32,
     lines: &mut Vec<RenderedLine>,
     window: &Window,
 ) -> AnyElement {
     let text = piece.text.clone();
-    let runs = text_runs(piece, presentation, quote_depth, window);
+    let runs = text_runs(piece, presentation, quote_depth, body_color, window);
     let styled = StyledText::new(text).with_shared_runs(runs);
     lines.push(RenderedLine {
         layout: styled.layout().clone(),
@@ -772,6 +794,7 @@ fn render_code_block(
     scroll_handle: &ScrollHandle,
     hover_group: &SharedString,
     quote_depth: usize,
+    body_color: u32,
     lines: &mut Vec<RenderedLine>,
     window: &Window,
 ) -> AnyElement {
@@ -779,7 +802,13 @@ fn render_code_block(
     let content = if code.is_empty() {
         div().h(px(20.)).into_any_element()
     } else {
-        let runs = text_runs(piece, PiecePresentation::Code, quote_depth, window);
+        let runs = text_runs(
+            piece,
+            PiecePresentation::Code,
+            quote_depth,
+            body_color,
+            window,
+        );
         let styled = StyledText::new(code.clone()).with_shared_runs(runs);
         lines.push(RenderedLine {
             layout: styled.layout().clone(),
@@ -854,9 +883,10 @@ fn text_runs(
     piece: &TextPiece,
     presentation: PiecePresentation,
     quote_depth: usize,
+    body_color: u32,
     window: &Window,
 ) -> Arc<[TextRun]> {
-    let base_style = base_text_style(presentation, quote_depth, window);
+    let base_style = base_text_style(presentation, quote_depth, body_color, window);
     if let Some((cached_style, cached_runs)) = piece.cached_runs.borrow().as_ref()
         && cached_style == &base_style
     {
@@ -888,13 +918,14 @@ fn text_runs(
 fn base_text_style(
     presentation: PiecePresentation,
     quote_depth: usize,
+    body_color: u32,
     window: &Window,
 ) -> TextStyle {
     let mut style = window.text_style();
     style.color = rgb(if quote_depth > 0 {
         DIM_COLOR
     } else {
-        BODY_COLOR
+        body_color
     })
     .into();
     style.font_family = match presentation {
@@ -1150,8 +1181,11 @@ fn word_class(character: char) -> u8 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct MessageSelectionKey(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MessageSelectionKey {
+    Message(u64),
+    Command(u64),
+}
 
 #[derive(Clone)]
 pub struct MessageSelectionGroup(Rc<RefCell<MessageSelectionGroupState>>);
@@ -1162,13 +1196,13 @@ struct MessageSelectionParticipant {
     text: RenderedText,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MessageSelectionEndpoint {
     key: MessageSelectionKey,
     offset: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum SelectMode {
     Character,
     Word,
@@ -1191,8 +1225,10 @@ struct ActiveMessageSelection {
 
 struct MessageSelectionGroupState {
     focus_handle: FocusHandle,
+    order: Vec<MessageSelectionKey>,
+    ranks: HashMap<MessageSelectionKey, usize>,
     current: Vec<(MessageSelectionKey, MessageSelectionParticipant)>,
-    retained: BTreeMap<MessageSelectionKey, MessageSelectionParticipant>,
+    retained: HashMap<MessageSelectionKey, MessageSelectionParticipant>,
     active: Option<ActiveMessageSelection>,
 }
 
@@ -1200,8 +1236,10 @@ impl MessageSelectionGroup {
     pub fn new(focus_handle: FocusHandle) -> Self {
         Self(Rc::new(RefCell::new(MessageSelectionGroupState {
             focus_handle,
+            order: Vec::new(),
+            ranks: HashMap::new(),
             current: Vec::new(),
-            retained: BTreeMap::new(),
+            retained: HashMap::new(),
             active: None,
         })))
     }
@@ -1214,24 +1252,28 @@ impl MessageSelectionGroup {
     }
 
     pub fn retain_items(&self, keys: impl IntoIterator<Item = MessageSelectionKey>) {
-        let mut keys = keys.into_iter().collect::<Vec<_>>();
-        keys.sort_unstable();
-        keys.dedup();
+        let mut order = Vec::new();
+        let mut ranks = HashMap::new();
+        for key in keys {
+            if ranks.contains_key(&key) {
+                continue;
+            }
+            ranks.insert(key, order.len());
+            order.push(key);
+        }
         let state = &mut *self.0.borrow_mut();
         if state.active.as_ref().is_some_and(|active| {
-            keys.binary_search(&active.anchor_key).is_err()
-                || keys.binary_search(&active.head_key).is_err()
+            !ranks.contains_key(&active.anchor_key) || !ranks.contains_key(&active.head_key)
         }) {
             state.active = None;
             state.retained.clear();
         } else {
-            state
-                .retained
-                .retain(|key, _| keys.binary_search(key).is_ok());
+            state.retained.retain(|key, _| ranks.contains_key(key));
         }
-        state
-            .current
-            .retain(|(key, _)| keys.binary_search(key).is_ok());
+        state.current.retain(|(key, _)| ranks.contains_key(key));
+        state.order = order;
+        state.ranks = ranks;
+        state.recompute_active_selection();
     }
 
     fn focus_handle(&self) -> FocusHandle {
@@ -1244,11 +1286,13 @@ impl MessageSelectionGroup {
 
     fn register(&self, key: MessageSelectionKey, bounds: Bounds<Pixels>, text: RenderedText) {
         let state = &mut *self.0.borrow_mut();
+        state.ensure_key(key);
         let participant = MessageSelectionParticipant { bounds, text };
         state.current.push((key, participant.clone()));
-        if state.active.as_ref().is_some_and(|active| {
-            active.pending || (key >= active.start.key && key <= active.end.key)
-        }) {
+        let retain = state.active.as_ref().is_some_and(|active| {
+            active.pending || state.key_is_between(key, active.start.key, active.end.key)
+        });
+        if retain {
             state.retained.insert(key, participant);
         }
     }
@@ -1348,23 +1392,32 @@ impl MessageSelectionGroup {
 
     fn finish_selection(&self) -> Option<String> {
         let state = &mut *self.0.borrow_mut();
-        let Some(active) = state.active.as_mut() else {
+        let Some(active) = state.active.as_ref() else {
             return None;
         };
         if !active.pending {
             return None;
         }
-        active.pending = false;
-        if active.start >= active.end {
-            let anchor_key = active.anchor_key;
+        let start = active.start;
+        let end = active.end;
+        let anchor_key = active.anchor_key;
+        state.active.as_mut().unwrap().pending = false;
+        if state.compare_endpoints(start, end) != Some(Ordering::Less) {
             state.retained.retain(|key, _| *key == anchor_key);
             return None;
         }
-        let start_key = active.start.key;
-        let end_key = active.end.key;
-        state
-            .retained
-            .retain(|key, _| *key >= start_key && *key <= end_key);
+        let Some(start_rank) = state.ranks.get(&start.key).copied() else {
+            return None;
+        };
+        let Some(end_rank) = state.ranks.get(&end.key).copied() else {
+            return None;
+        };
+        state.retained.retain(|key, _| {
+            state
+                .ranks
+                .get(key)
+                .is_some_and(|rank| *rank >= start_rank && *rank <= end_rank)
+        });
         state.selected_text()
     }
 
@@ -1401,6 +1454,46 @@ impl MessageSelectionGroup {
 }
 
 impl MessageSelectionGroupState {
+    fn ensure_key(&mut self, key: MessageSelectionKey) {
+        if self.ranks.contains_key(&key) {
+            return;
+        }
+        self.ranks.insert(key, self.order.len());
+        self.order.push(key);
+    }
+
+    fn compare_endpoints(
+        &self,
+        left: MessageSelectionEndpoint,
+        right: MessageSelectionEndpoint,
+    ) -> Option<Ordering> {
+        let left_rank = self.ranks.get(&left.key)?;
+        let right_rank = self.ranks.get(&right.key)?;
+        Some(
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.offset.cmp(&right.offset)),
+        )
+    }
+
+    fn key_is_between(
+        &self,
+        key: MessageSelectionKey,
+        start: MessageSelectionKey,
+        end: MessageSelectionKey,
+    ) -> bool {
+        let Some(rank) = self.ranks.get(&key) else {
+            return false;
+        };
+        let Some(start) = self.ranks.get(&start) else {
+            return false;
+        };
+        let Some(end) = self.ranks.get(&end) else {
+            return false;
+        };
+        rank >= start && rank <= end
+    }
+
     fn participant_nearest(
         &self,
         position: Point<Pixels>,
@@ -1420,7 +1513,7 @@ impl MessageSelectionGroupState {
     }
 
     fn recompute_active_selection(&mut self) {
-        let Some(active) = self.active.as_mut() else {
+        let Some(active) = self.active.clone() else {
             return;
         };
         let Some(head) = self.retained.get(&active.head_key) else {
@@ -1443,16 +1536,12 @@ impl MessageSelectionGroupState {
             offset: active.head_offset,
         };
 
-        match active.mode {
+        let (start, end, reversed) = match active.mode {
             SelectMode::Character => {
-                if head_point < anchor_start {
-                    active.start = head_point;
-                    active.end = anchor_start;
-                    active.reversed = true;
+                if self.compare_endpoints(head_point, anchor_start) == Some(Ordering::Less) {
+                    (head_point, anchor_start, true)
                 } else {
-                    active.start = anchor_start;
-                    active.end = head_point;
-                    active.reversed = false;
+                    (anchor_start, head_point, false)
                 }
             }
             SelectMode::Word | SelectMode::Line => {
@@ -1461,37 +1550,47 @@ impl MessageSelectionGroupState {
                 } else {
                     head.text.surrounding_line_range(active.head_offset)
                 };
-                if head_point < anchor_start {
-                    active.start = MessageSelectionEndpoint {
-                        key: active.head_key,
-                        offset: head_range.start,
-                    };
-                    active.end = anchor_end_point;
-                    active.reversed = true;
-                } else if head_point >= anchor_end_point {
-                    active.start = anchor_start;
-                    active.end = MessageSelectionEndpoint {
-                        key: active.head_key,
-                        offset: head_range.end,
-                    };
-                    active.reversed = false;
+                if self.compare_endpoints(head_point, anchor_start) == Some(Ordering::Less) {
+                    (
+                        MessageSelectionEndpoint {
+                            key: active.head_key,
+                            offset: head_range.start,
+                        },
+                        anchor_end_point,
+                        true,
+                    )
+                } else if matches!(
+                    self.compare_endpoints(head_point, anchor_end_point),
+                    Some(Ordering::Equal | Ordering::Greater)
+                ) {
+                    (
+                        anchor_start,
+                        MessageSelectionEndpoint {
+                            key: active.head_key,
+                            offset: head_range.end,
+                        },
+                        false,
+                    )
                 } else {
-                    active.start = anchor_start;
-                    active.end = anchor_end_point;
-                    active.reversed = false;
+                    (anchor_start, anchor_end_point, false)
                 }
             }
-            SelectMode::All => {
-                active.start = MessageSelectionEndpoint {
+            SelectMode::All => (
+                MessageSelectionEndpoint {
                     key: active.anchor_key,
                     offset: 0,
-                };
-                active.end = MessageSelectionEndpoint {
+                },
+                MessageSelectionEndpoint {
                     key: active.anchor_key,
                     offset: anchor_end,
-                };
-                active.reversed = false;
-            }
+                },
+                false,
+            ),
+        };
+        if let Some(active) = self.active.as_mut() {
+            active.start = start;
+            active.end = end;
+            active.reversed = reversed;
         }
     }
 
@@ -1499,7 +1598,7 @@ impl MessageSelectionGroupState {
         let Some(active) = self.active.as_ref() else {
             return None;
         };
-        if key < active.start.key || key > active.end.key {
+        if !self.key_is_between(key, active.start.key, active.end.key) {
             return None;
         }
         let end = self.retained.get(&key)?.text.source_end();
@@ -1516,12 +1615,17 @@ impl MessageSelectionGroupState {
 
     fn selected_text(&self) -> Option<String> {
         let active = self.active.as_ref()?;
-        if active.start >= active.end {
+        if self.compare_endpoints(active.start, active.end) != Some(Ordering::Less) {
             return None;
         }
+        let start_rank = *self.ranks.get(&active.start.key)?;
+        let end_rank = *self.ranks.get(&active.end.key)?;
         let mut selected = String::new();
         let mut first = true;
-        for (key, participant) in self.retained.range(active.start.key..=active.end.key) {
+        for key in &self.order[start_rank..=end_rank] {
+            let Some(participant) = self.retained.get(key) else {
+                continue;
+            };
             let Some(range) = self.selected_range(*key) else {
                 continue;
             };
@@ -1651,14 +1755,13 @@ where
         });
         window.on_mouse_event({
             let group = self.group.clone();
-            move |event: &MouseDownEvent, phase, _window, cx| {
-                if phase.capture()
-                    && event.button == MouseButton::Left
-                    && !group.contains_position(event.position)
-                    && group.is_active()
-                {
-                    group.clear();
-                    cx.refresh_windows();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if phase.capture() && event.button == MouseButton::Left {
+                    window.focus(&group.focus_handle(), cx);
+                    if !group.contains_position(event.position) && group.is_active() {
+                        group.clear();
+                        cx.refresh_windows();
+                    }
                 }
             }
         });
@@ -1827,7 +1930,7 @@ mod tests {
     #[gpui::test]
     fn empty_selection_retains_only_its_shift_click_anchor(cx: &mut gpui::TestAppContext) {
         let group = MessageSelectionGroup::new(cx.update(|cx| cx.focus_handle()));
-        let key = MessageSelectionKey(1);
+        let key = MessageSelectionKey::Message(1);
         let text = rendered_text("alpha");
         group.register(key, Bounds::default(), text.clone());
         group.begin_selection(key, 2, 1, false, &text);
@@ -1849,15 +1952,161 @@ mod tests {
         let first = rendered_text("alpha");
         let second = rendered_text("second");
         let third = rendered_text("third");
-        group.register(MessageSelectionKey(1), Bounds::default(), first.clone());
-        group.register(MessageSelectionKey(2), Bounds::default(), second.clone());
-        group.register(MessageSelectionKey(3), Bounds::default(), third);
-        group.begin_selection(MessageSelectionKey(1), 2, 1, false, &first);
-        assert!(group.update_head(MessageSelectionKey(2), 3));
+        group.register(
+            MessageSelectionKey::Message(1),
+            Bounds::default(),
+            first.clone(),
+        );
+        group.register(
+            MessageSelectionKey::Message(2),
+            Bounds::default(),
+            second.clone(),
+        );
+        group.register(
+            MessageSelectionKey::Message(3),
+            Bounds::default(),
+            third,
+        );
+        group.begin_selection(MessageSelectionKey::Message(1), 2, 1, false, &first);
+        assert!(group.update_head(MessageSelectionKey::Message(2), 3));
 
         assert_eq!(group.finish_selection().as_deref(), Some("pha\n\nsec"));
         let state = group.0.borrow();
         assert_eq!(state.retained.len(), 2);
-        assert!(!state.retained.contains_key(&MessageSelectionKey(3)));
+        assert!(
+            !state
+                .retained
+                .contains_key(&MessageSelectionKey::Message(3))
+        );
+    }
+
+    #[gpui::test]
+    fn mixed_message_and_command_selection_uses_projected_timeline_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let group = MessageSelectionGroup::new(cx.update(|cx| cx.focus_handle()));
+        let first_key = MessageSelectionKey::Message(100);
+        let command_key = MessageSelectionKey::Command(9_000);
+        let last_key = MessageSelectionKey::Message(101);
+        group.retain_items([first_key, command_key, last_key]);
+
+        let first = rendered_text("alpha");
+        let command = rendered_text("command output");
+        let last = rendered_text("omega");
+        group.register(first_key, Bounds::default(), first.clone());
+        group.register(command_key, Bounds::default(), command);
+        group.register(last_key, Bounds::default(), last);
+        group.begin_selection(first_key, 1, 1, false, &first);
+        assert!(group.update_head(last_key, 2));
+
+        assert_eq!(
+            group.finish_selection().as_deref(),
+            Some("lpha\n\ncommand output\n\nom")
+        );
+
+        group.retain_items([
+            MessageSelectionKey::Message(99),
+            first_key,
+            command_key,
+            last_key,
+        ]);
+        assert_eq!(
+            group.selected_text().as_deref(),
+            Some("lpha\n\ncommand output\n\nom")
+        );
+
+        group.retain_items([first_key, command_key]);
+        assert_eq!(group.selected_text(), None);
+    }
+
+    #[gpui::test]
+    fn command_drag_focuses_timeline_and_copies_with_shortcut_and_yank(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct TestSelectionView {
+            message: Rc<FormattedMessage>,
+            group: MessageSelectionGroup,
+            other_focus: FocusHandle,
+        }
+
+        impl gpui::Render for TestSelectionView {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .track_focus(&self.other_focus)
+                    .child(MessageSelectionArea::new(
+                        div().w(px(320.)).h(px(100.)).child(
+                            FormattedMessageElement::new(self.message.clone()).selection_group(
+                                self.group.clone(),
+                                MessageSelectionKey::Command(1),
+                            ),
+                        ),
+                        self.group.clone(),
+                    ))
+            }
+        }
+
+        cx.update(crate::fonts::init);
+        cx.update(bind_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let other_focus = cx.focus_handle();
+            let group = MessageSelectionGroup::new(cx.focus_handle());
+            group.retain_items([MessageSelectionKey::Command(1)]);
+            window.focus(&other_focus, cx);
+            TestSelectionView {
+                message: Rc::new(FormattedMessage::plain("command output")),
+                group,
+                other_focus,
+            }
+        });
+        let (start, end) = view.read_with(cx, |view, _| {
+            let state = view.group.0.borrow();
+            let participant = &state.current[0].1;
+            let line = &participant.text.lines[0];
+            let bounds = line.layout.bounds();
+            let physical = &line.layout.line_layouts()[0].unwrapped_layout;
+            (
+                point(
+                    bounds.left() + physical.x_for_index(0),
+                    bounds.center().y,
+                ),
+                point(
+                    bounds.left() + physical.x_for_index("command output".len()),
+                    bounds.center().y,
+                ),
+            )
+        });
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.group.selected_text().as_deref(),
+                Some("command output")
+            );
+        });
+
+        cx.write_to_clipboard(ClipboardItem::new_string("before shortcut".into()));
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("command output")
+        );
+
+        cx.write_to_clipboard(ClipboardItem::new_string("before yank".into()));
+        cx.simulate_keystrokes("y");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("command output")
+        );
     }
 }
