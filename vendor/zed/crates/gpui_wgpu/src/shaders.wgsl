@@ -98,6 +98,7 @@ struct GammaParams {
 
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+const MEDIA_MINIFICATION_THRESHOLD: f32 = 1.5;
 
 struct Bounds {
     origin: vec2<f32>,
@@ -1263,7 +1264,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    sample_expansion: u32,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
@@ -1277,7 +1278,9 @@ struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
+    @location(2) @interpolate(flat) expand_samples: u32,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) quarter_step: vec2<f32>,
 }
 
 @vertex
@@ -1289,19 +1292,73 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position(unit_vertex, sprite.bounds);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
+    out.expand_samples = 0u;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.quarter_step = vec2<f32>(0.0);
+
+    if (sprite.sample_expansion != 0u) {
+        let tile_size = vec2<f32>(max(sprite.tile.bounds.size, vec2<i32>(1)));
+        let destination_size = max(sprite.bounds.size, vec2<f32>(1.0));
+        let source_scale = tile_size / destination_size;
+        if (max(source_scale.x, source_scale.y) > MEDIA_MINIFICATION_THRESHOLD) {
+            let texture_dimensions = vec2<f32>(textureDimensions(t_sprite, 0));
+            out.expand_samples = 1u;
+            out.quarter_step = 0.25 * tile_size / (texture_dimensions * destination_size);
+        }
+    }
+
     return out;
+}
+
+fn sample_poly_sprite(
+    texture_position: vec2<f32>,
+    tile: AtlasTile,
+    sample_expansion_enabled: u32,
+    expand_samples: u32,
+    quarter_step: vec2<f32>,
+) -> vec4<f32> {
+    if (sample_expansion_enabled == 0u) {
+        return textureSampleLevel(t_sprite, s_sprite, texture_position, 0.0);
+    }
+
+    let texture_dimensions = vec2<f32>(textureDimensions(t_sprite, 0));
+    let tile_origin = vec2<f32>(tile.bounds.origin);
+    let tile_size = vec2<f32>(max(tile.bounds.size, vec2<i32>(1)));
+    let minimum_uv = (tile_origin + vec2<f32>(0.5)) / texture_dimensions;
+    let maximum_uv = (tile_origin + tile_size - vec2<f32>(0.5)) / texture_dimensions;
+    if (expand_samples == 0u) {
+        let center = clamp(texture_position, minimum_uv, maximum_uv);
+        return textureSampleLevel(t_sprite, s_sprite, center, 0.0);
+    }
+
+    let quarter_dx = vec2<f32>(quarter_step.x, 0.0);
+    let quarter_dy = vec2<f32>(0.0, quarter_step.y);
+    let top_left = clamp(texture_position - quarter_dx - quarter_dy, minimum_uv, maximum_uv);
+    let top_right = clamp(texture_position + quarter_dx - quarter_dy, minimum_uv, maximum_uv);
+    let bottom_left = clamp(texture_position - quarter_dx + quarter_dy, minimum_uv, maximum_uv);
+    let bottom_right = clamp(texture_position + quarter_dx + quarter_dy, minimum_uv, maximum_uv);
+    return (
+        textureSampleLevel(t_sprite, s_sprite, top_left, 0.0)
+        + textureSampleLevel(t_sprite, s_sprite, top_right, 0.0)
+        + textureSampleLevel(t_sprite, s_sprite, bottom_left, 0.0)
+        + textureSampleLevel(t_sprite, s_sprite, bottom_right, 0.0)
+    ) * 0.25;
 }
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
-    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     let sprite = b_poly_sprites[input.sprite_id];
+    let sample = sample_poly_sprite(
+        input.tile_position,
+        sprite.tile,
+        sprite.sample_expansion,
+        input.expand_samples,
+        input.quarter_step,
+    );
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
@@ -1327,6 +1384,8 @@ struct SurfaceParams {
 struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_position: vec2<f32>,
+    @location(1) @interpolate(flat) expand_samples: u32,
+    @location(2) @interpolate(flat) quarter_step: vec2<f32>,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1338,15 +1397,53 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
     out.position = to_device_position(unit_vertex, surface_locals.bounds);
     out.texture_position = unit_vertex;
     out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    let destination_size = max(surface_locals.bounds.size, vec2<f32>(1.0));
+    let texture_dimensions = vec2<f32>(textureDimensions(t_surface, 0));
+    let source_scale = texture_dimensions / destination_size;
+    out.expand_samples = 0u;
+    out.quarter_step = vec2<f32>(0.0);
+    if (max(source_scale.x, source_scale.y) > MEDIA_MINIFICATION_THRESHOLD) {
+        out.expand_samples = 1u;
+        out.quarter_step = vec2<f32>(0.25) / destination_size;
+    }
     return out;
+}
+
+fn sample_surface(
+    texture_position: vec2<f32>,
+    expand_samples: u32,
+    quarter_step: vec2<f32>,
+) -> vec4<f32> {
+    if (expand_samples == 0u) {
+        return textureSampleLevel(t_surface, s_surface, texture_position, 0.0);
+    }
+
+    let texture_dimensions = vec2<f32>(textureDimensions(t_surface, 0));
+    let minimum_uv = vec2<f32>(0.5) / texture_dimensions;
+    let maximum_uv = (texture_dimensions - vec2<f32>(0.5)) / texture_dimensions;
+    let quarter_dx = vec2<f32>(quarter_step.x, 0.0);
+    let quarter_dy = vec2<f32>(0.0, quarter_step.y);
+    let top_left = clamp(texture_position - quarter_dx - quarter_dy, minimum_uv, maximum_uv);
+    let top_right = clamp(texture_position + quarter_dx - quarter_dy, minimum_uv, maximum_uv);
+    let bottom_left = clamp(texture_position - quarter_dx + quarter_dy, minimum_uv, maximum_uv);
+    let bottom_right = clamp(texture_position + quarter_dx + quarter_dy, minimum_uv, maximum_uv);
+    return (
+        textureSampleLevel(t_surface, s_surface, top_left, 0.0)
+        + textureSampleLevel(t_surface, s_surface, top_right, 0.0)
+        + textureSampleLevel(t_surface, s_surface, bottom_left, 0.0)
+        + textureSampleLevel(t_surface, s_surface, bottom_right, 0.0)
+    ) * 0.25;
 }
 
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
-    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    return textureSampleLevel(t_surface, s_surface, input.texture_position, 0.0);
+    return sample_surface(
+        input.texture_position,
+        input.expand_samples,
+        input.quarter_step,
+    );
 }
