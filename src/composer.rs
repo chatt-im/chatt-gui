@@ -61,8 +61,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", SelectRight, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-a", SelectAll, Some("ComposerInsert")),
         KeyBinding::new("cmd-a", SelectAll, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-v", Paste, Some("ComposerInsert")),
-        KeyBinding::new("cmd-v", Paste, Some("ChattCodeSearch")),
+        KeyBinding::new("secondary-v", Paste, Some("ComposerInsert")),
+        KeyBinding::new("secondary-v", Paste, Some("ChattCodeSearch")),
+        KeyBinding::new("secondary-v", Paste, Some("VimMode")),
         KeyBinding::new("cmd-c", Copy, Some("ComposerInsert")),
         KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-x", Cut, Some("ComposerInsert")),
@@ -291,7 +292,11 @@ impl Composer {
     }
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text(None, &text, false, window, cx);
+            if self.vim_enabled && self.editor.mode() != Mode::Insert {
+                self.paste_in_vim_mode(&text, VimKey::Char('p'), cx);
+            } else {
+                self.replace_text(None, &text, false, window, cx);
+            }
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -419,10 +424,36 @@ impl Composer {
         if self.editor.mode() == Mode::Insert && key != VimKey::Escape {
             return;
         }
+        if matches!(key, VimKey::Char('p' | 'P')) {
+            let text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            self.editor.set_paste_text(&text);
+        }
         let version = self.editor.text_version();
         if !self.editor.send_key(key) {
             return;
         }
+        self.finish_vim_action(version, cx);
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn paste_in_vim_mode(
+        &mut self,
+        text: &str,
+        key: VimKey,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.set_paste_text(text);
+        let version = self.editor.text_version();
+        if self.editor.send_key(key) {
+            self.finish_vim_action(version, cx);
+        }
+    }
+
+    fn finish_vim_action(&mut self, version: u64, cx: &mut Context<Self>) {
         let cursor = self.editor.cursor_offset();
         self.selected = cursor..cursor;
         self.reversed = false;
@@ -433,8 +464,6 @@ impl Composer {
             cx.emit(ComposerChanged);
         }
         cx.emit(ComposerStateChanged);
-        window.prevent_default();
-        cx.stop_propagation();
         cx.notify();
     }
 }
@@ -1055,9 +1084,36 @@ impl Focusable for Composer {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerLine, line_for_offset, logical_lines, normalize_range, range_from_utf16,
-        should_auto_close_code_fence, visible_line_range,
+        Composer, ComposerLine, bind_keys, line_for_offset, logical_lines, normalize_range,
+        range_from_utf16, should_auto_close_code_fence, visible_line_range,
     };
+
+    #[gpui::test]
+    fn platform_paste_shortcut_and_normal_p_read_the_system_clipboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        cx.update(bind_keys);
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let composer = Composer::new(cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("first".to_string()));
+        cx.simulate_keystrokes("secondary-v");
+        assert_eq!(composer.read_with(cx, |composer, _| composer.text()), "first");
+
+        cx.simulate_keystrokes("escape");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            " second".to_string(),
+        ));
+        cx.simulate_keystrokes("p");
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "first second"
+        );
+    }
 
     #[test]
     fn splits_multiline_content_before_single_line_shaping() {

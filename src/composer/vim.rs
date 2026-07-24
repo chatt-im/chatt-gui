@@ -2615,6 +2615,18 @@ impl VimEditor {
         self.fixup_cursor();
     }
 
+    pub fn set_paste_text(&mut self, text: &str) {
+        let text = self.normalize_text_for_mode(text);
+        self.yank = if text.is_empty() {
+            Yank::default()
+        } else {
+            Yank {
+                lines: split_to_lines(&text),
+                kind: YankKind::Charwise,
+            }
+        };
+    }
+
     pub fn set_layout(&mut self, width: u16, viewport_rows: u16) {
         self.width = width.max(1);
         self.last_viewport_h = viewport_rows.max(1);
@@ -3220,6 +3232,16 @@ mod tests {
         assert_eq!(editor.text(), "one two");
         assert!(editor.send_key(VimKey::Control('r')));
         assert_eq!(editor.text(), "changed two");
+    }
+
+    #[test]
+    fn normal_mode_p_uses_loaded_system_clipboard_text() {
+        let mut editor = normal("ab");
+        editor.set_paste_text("α\nβ");
+        keys(&mut editor, "2p");
+
+        assert_eq!(editor.text(), "aα\nβα\nβb");
+        assert_eq!(editor.cursor_offset(), "aα\nβα\n".len());
     }
 
     #[test]
