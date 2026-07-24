@@ -42,7 +42,13 @@ use crate::{
         ImageViewState, PreviewContent, PreviewHistory, PreviewItem, clamp_panel_width,
     },
     scroll_capture::capture_scroll,
+    settings::{SettingsClosed, SettingsView},
+    theme::{AppliedSettings, ThemePalette, ThemeRole},
     timeline::{self, Attachment},
+    ui_controls::{
+        composer_add_button, icon_button, message_action_button, mini_button,
+        preview_action_button, preview_control_button, preview_status, room_button, toolbar_button,
+    },
     video_controls::{
         CONTROLS_ANIMATION_DURATION, CONTROLS_HIDE_DELAY, VideoControlsState, VideoScrub,
         VideoVolumeDrag, horizontal_fraction, vertical_fraction, volume_scroll_delta,
@@ -56,11 +62,11 @@ use crate::{
 use dbus_message::{FileChooserResponse, OpenFileOptions, open_files};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, FontWeight, KeyBinding, ListAlignment, ListState,
-    LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window,
-    actions, canvas, div, img, list, point, prelude::*, px, relative, rgb, rgba,
+    FocusHandle, Focusable, FollowMode, FontWeight, ListAlignment, ListState, LruImageCache,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString,
+    Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions,
+    canvas, div, img, list, point, prelude::*, px, relative,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
@@ -455,6 +461,7 @@ actions!(
     chatt_gui,
     [
         OpenMedia,
+        OpenSettings,
         SendMessage,
         TogglePlayback,
         SeekBack,
@@ -479,63 +486,6 @@ actions!(
         CompletionDismiss
     ]
 );
-
-pub fn bind_keys(cx: &mut App) {
-    const NON_INPUT_CONTEXT: &str = "Chatt && !ChattComposer && !ChattCodeSearch";
-
-    crate::composer::bind_keys(cx);
-    crate::code_viewer::bind_keys(cx);
-    cx.bind_keys([
-        KeyBinding::new("cmd-o", OpenMedia, Some("Chatt")),
-        KeyBinding::new("escape", ClosePreview, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new(
-            "cmd-f",
-            FindInCode,
-            Some("ChattCodeViewer && !ChattCodeSearch"),
-        ),
-        KeyBinding::new("enter", NextCodeMatch, Some("ChattCodeSearch")),
-        KeyBinding::new("shift-enter", PreviousCodeMatch, Some("ChattCodeSearch")),
-        KeyBinding::new("escape", CloseCodeSearch, Some("ChattCodeSearch")),
-        KeyBinding::new(
-            "enter",
-            SendMessage,
-            Some("ChattComposer && ComposerInsert && !CompletionEngaged"),
-        ),
-        KeyBinding::new(
-            "down",
-            CompletionNext,
-            Some("ChattComposer && ComposerInsert && CompletionOpen"),
-        ),
-        KeyBinding::new(
-            "up",
-            CompletionPrevious,
-            Some("ChattComposer && ComposerInsert && CompletionOpen"),
-        ),
-        KeyBinding::new(
-            "tab",
-            CompletionAccept,
-            Some("ChattComposer && ComposerInsert && CompletionOpen"),
-        ),
-        KeyBinding::new(
-            "enter",
-            CompletionAcceptEngaged,
-            Some("ChattComposer && ComposerInsert && CompletionEngaged"),
-        ),
-        KeyBinding::new(
-            "escape",
-            CompletionDismiss,
-            Some("ChattComposer && ComposerInsert && CompletionOpen"),
-        ),
-        KeyBinding::new("space", TogglePlayback, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("left", SeekBack, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("right", SeekForward, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("=", LiveZoomIn, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("-", LiveZoomOut, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("home", LiveReset, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("up", LivePanUp, Some(NON_INPUT_CONTEXT)),
-        KeyBinding::new("down", LivePanDown, Some(NON_INPUT_CONTEXT)),
-    ]);
-}
 
 pub struct ChattView {
     model: ChatModel,
@@ -607,6 +557,9 @@ pub struct ChattView {
     live_pane_resize: Option<LivePaneResize>,
     composer_error: Option<SharedString>,
     status: SharedString,
+    typography_revision: u64,
+    settings: Option<gpui::Entity<SettingsView>>,
+    settings_subscription: Option<Subscription>,
     _code_search_subscription: Subscription,
     _composer_image_paste_subscription: Subscription,
     _composer_state_subscription: Subscription,
@@ -624,7 +577,8 @@ impl ChattView {
             MediaCache::new(512 * 1024 * 1024).expect("failed to create private media cache"),
         ));
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
-        let composer = cx.new(Composer::new);
+        let binding_mode = AppliedSettings::get(cx).binding_mode;
+        let composer = cx.new(|cx| Composer::with_binding_mode(binding_mode, cx));
         let code_search_input = cx.new(Composer::search);
         let code_search_subscription =
             cx.subscribe(&code_search_input, |this, _, _: &ComposerChanged, cx| {
@@ -784,6 +738,9 @@ impl ChattView {
             live_pane_resize: None,
             composer_error: None,
             status: "Discovering Chatt daemon…".into(),
+            typography_revision: AppliedSettings::get(cx).typography_revision,
+            settings: None,
+            settings_subscription: None,
             _code_search_subscription: code_search_subscription,
             _composer_image_paste_subscription: composer_image_paste_subscription,
             _composer_state_subscription: composer_state_subscription,
@@ -799,15 +756,28 @@ impl ChattView {
         RequestId(id)
     }
 
-    fn set_composer_error(
-        &mut self,
-        message: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_composer_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
         log::warn!("composer action failed: {message}");
         self.status = message.clone();
         self.composer_error = Some(message);
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(settings) = self.settings.as_ref() {
+            window.focus(&settings.focus_handle(cx), cx);
+            return;
+        }
+        let settings = cx.new(SettingsView::new);
+        let subscription = cx.subscribe(&settings, |this, _, _: &SettingsClosed, cx| {
+            this.settings = None;
+            this.settings_subscription = None;
+            cx.notify();
+        });
+        window.focus(&settings.focus_handle(cx), cx);
+        self.settings = Some(settings);
+        self.settings_subscription = Some(subscription);
         cx.notify();
     }
 
@@ -970,10 +940,8 @@ impl ChattView {
                 local_id + 1
             };
             let body = line.text;
-            self.formatted_command_messages.insert(
-                local_id,
-                Rc::new(FormattedMessage::plain(body.clone())),
-            );
+            self.formatted_command_messages
+                .insert(local_id, Rc::new(FormattedMessage::plain(body.clone())));
             self.command_rows.push(timeline::LocalCommandRow {
                 local_id,
                 anchor_message_id,
@@ -2258,10 +2226,7 @@ impl ChattView {
 
     fn send_message(&mut self, _: &SendMessage, _: &mut Window, cx: &mut Context<Self>) {
         if !self.model.is_ready() {
-            self.set_composer_error(
-                "Cannot send until the Chatt daemon is connected",
-                cx,
-            );
+            self.set_composer_error("Cannot send until the Chatt daemon is connected", cx);
             return;
         }
         if self.submission_outcome_unknown {
@@ -2572,11 +2537,7 @@ impl ChattView {
         cx.notify();
     }
 
-    fn queue_clipboard_images(
-        &mut self,
-        images: Arc<[PastedImage]>,
-        cx: &mut Context<Self>,
-    ) {
+    fn queue_clipboard_images(&mut self, images: Arc<[PastedImage]>, cx: &mut Context<Self>) {
         if self.editing.is_some() {
             self.set_composer_error("Finish editing before attaching files", cx);
             return;
@@ -2600,9 +2561,7 @@ impl ChattView {
             );
             return;
         }
-        let timestamp = chrono::Utc::now()
-            .format("%Y-%m-%dT%H-%M-%SZ")
-            .to_string();
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
         let result = prepare_images(
             images,
             self.model.limits.upload_bytes,
@@ -2617,11 +2576,7 @@ impl ChattView {
         self.accept_file_inspection(result, cx);
     }
 
-    fn accept_file_inspection(
-        &mut self,
-        result: FileInspection,
-        cx: &mut Context<Self>,
-    ) {
+    fn accept_file_inspection(&mut self, result: FileInspection, cx: &mut Context<Self>) {
         let accepted = result.accepted.len();
         self.queued_files.extend(result.accepted);
         let first_error = result.rejected.first().cloned();
@@ -3524,12 +3479,22 @@ impl ChattView {
         }
     }
 
-    fn render_command_row(&self, command_index: usize, local_id: u64) -> AnyElement {
+    fn render_command_row(&self, command_index: usize, local_id: u64, cx: &App) -> AnyElement {
         let Some(row) = self.command_rows.get(command_index) else {
             return div().into_any_element();
         };
-        let accent = if row.error { 0xc27070 } else { 0x7895bd };
-        let body_color = if row.error { 0xe0a3a3 } else { 0xd2d5da };
+        let settings = AppliedSettings::get(cx);
+        let accent = settings.theme.color(if row.error {
+            ThemeRole::StateDanger
+        } else {
+            ThemeRole::MediaProgressFill
+        });
+        let body_color = settings.theme.color(if row.error {
+            ThemeRole::StateDanger
+        } else {
+            ThemeRole::TextBody
+        });
+        let row_hover = settings.theme.color(ThemeRole::StateRowHover);
         let timestamp = timeline::format_age(row.timestamp_ms, timeline::now_ms());
         let formatted = self
             .formatted_command_messages
@@ -3543,8 +3508,8 @@ impl ChattView {
             .pl(px(64.))
             .pr(px(28.))
             .py(px(9.))
-            .bg(rgb(0x15181c))
-            .hover(|row| row.bg(rgb(0x1b1f25)))
+            .bg(settings.theme.color(ThemeRole::Raised))
+            .hover(move |row| row.bg(row_hover))
             .child(
                 div()
                     .absolute()
@@ -3552,7 +3517,7 @@ impl ChattView {
                     .top_0()
                     .bottom_0()
                     .w(px(3.))
-                    .bg(rgb(accent)),
+                    .bg(accent),
             )
             .child(
                 div()
@@ -3566,7 +3531,7 @@ impl ChattView {
                     .items_center()
                     .justify_end()
                     .text_xs()
-                    .text_color(rgb(0x777d87))
+                    .text_color(settings.theme.color(ThemeRole::TextDim))
                     .child(timestamp),
             )
             .child(
@@ -3584,16 +3549,16 @@ impl ChattView {
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(accent))
+                                    .text_color(accent)
                                     .child("chatt"),
                             )
                             .child(
                                 div()
                                     .px_1()
                                     .border_1()
-                                    .border_color(rgb(0x3a414b))
+                                    .border_color(settings.theme.color(ThemeRole::BorderStrong))
                                     .text_xs()
-                                    .text_color(rgb(0x8f98a6))
+                                    .text_color(settings.theme.color(ThemeRole::TextMuted))
                                     .child(if row.error {
                                         "COMMAND ERROR"
                                     } else {
@@ -3627,7 +3592,7 @@ impl ChattView {
             local_id,
         } = item.source
         {
-            return self.render_command_row(command_index, local_id);
+            return self.render_command_row(command_index, local_id, cx);
         }
         let Some(message_index) = item.message_index() else {
             return div().into_any_element();
@@ -3638,16 +3603,22 @@ impl ChattView {
         let continuation = item.continuation;
         let collapsed_count = item.collapsed_count;
         let collapsed = item.is_collapsed();
-        let accent = sender_color(&message.sender, message.local);
+        let settings = AppliedSettings::get(cx);
+        let accent = sender_color(&message.sender, message.local, &settings);
         let background = if collapsed {
-            0x202329
+            settings.theme.color(ThemeRole::ControlSurface)
         } else if message.notice {
-            0x15181c
+            settings.theme.color(ThemeRole::Raised)
         } else if message.local {
-            0x171a20
+            settings.theme.color(ThemeRole::Panel)
         } else {
-            0x111317
+            settings.theme.color(ThemeRole::Window)
         };
+        let row_hover = settings.theme.color(if collapsed {
+            ThemeRole::ControlButtonHover
+        } else {
+            ThemeRole::StateRowHover
+        });
         let message_id = message.id;
         let room_id = message.room_id;
         let formatted_message =
@@ -3677,8 +3648,8 @@ impl ChattView {
             .pl(px(64.))
             .pr(px(28.))
             .py(px(if continuation { 3. } else { 10. }))
-            .bg(rgb(background))
-            .hover(move |row| row.bg(rgb(if collapsed { 0x292d34 } else { 0x1b1e24 })))
+            .bg(background)
+            .hover(move |row| row.bg(row_hover))
             .child(
                 div()
                     .absolute()
@@ -3686,7 +3657,7 @@ impl ChattView {
                     .top_0()
                     .bottom_0()
                     .w(px(3.))
-                    .bg(rgb(accent)),
+                    .bg(accent),
             )
             .child(
                 div()
@@ -3700,7 +3671,7 @@ impl ChattView {
                     .items_center()
                     .justify_end()
                     .text_xs()
-                    .text_color(rgb(0x777d87))
+                    .text_color(settings.theme.color(ThemeRole::TextDim))
                     .when(continuation, |time| {
                         time.invisible()
                             .group_hover(hover_group.clone(), |time| time.visible())
@@ -3723,14 +3694,16 @@ impl ChattView {
                                     .child(
                                         div()
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(accent))
+                                            .text_color(accent)
                                             .child(sender),
                                     )
                                     .when(!collapsed && edited, |meta| {
                                         meta.child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x777d87))
+                                                .text_color(
+                                                    settings.theme.color(ThemeRole::TextDim),
+                                                )
                                                 .child("edited"),
                                         )
                                     })
@@ -3738,7 +3711,9 @@ impl ChattView {
                                         meta.child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0xc49a74))
+                                                .text_color(
+                                                    settings.theme.color(ThemeRole::StateWarning),
+                                                )
                                                 .child("unverified"),
                                         )
                                     })
@@ -3748,7 +3723,9 @@ impl ChattView {
                                                 .min_w_0()
                                                 .truncate()
                                                 .text_xs()
-                                                .text_color(rgb(0x8b929d))
+                                                .text_color(
+                                                    settings.theme.color(ThemeRole::TextMuted),
+                                                )
                                                 .child(format!(
                                                     "· {count} {} collapsed",
                                                     if count == 1 { "message" } else { "messages" }
@@ -3792,6 +3769,7 @@ impl ChattView {
                                         ("edit", message_id.0 as usize),
                                         IconName::Pencil,
                                         false,
+                                        &settings.theme,
                                     )
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
@@ -3810,6 +3788,7 @@ impl ChattView {
                                     ("delete", message_id.0 as usize),
                                     IconName::Trash,
                                     true,
+                                    &settings.theme,
                                 )
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
@@ -3827,6 +3806,7 @@ impl ChattView {
                                 IconName::ListChevronsDownUp
                             },
                             false,
+                            &settings.theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_message_group(message_id, cx)
@@ -3844,6 +3824,7 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let settings = AppliedSettings::get(cx);
         let descriptor = attachment.descriptor.clone();
         let (cache_path, active_transfer) = {
             let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
@@ -3879,30 +3860,38 @@ impl ChattView {
         if attachment.is_image() {
             let fetch = EagerImageFetch::new(room_id, descriptor.clone());
             if let Some(transfer_id) = active_transfer {
-                let action = mini_button(("cancel-image-read", transfer_id.0 as usize), "Cancel")
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.cancel_bulk_read(transfer_id, cx)),
-                    )
-                    .into_any_element();
+                let action = mini_button(
+                    ("cancel-image-read", transfer_id.0 as usize),
+                    "Cancel",
+                    &settings.theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.cancel_bulk_read(transfer_id, cx)))
+                .into_any_element();
                 return Self::render_image_status(
                     message_id,
                     &descriptor,
                     format!("Fetching {}…", descriptor.file_name),
                     Some(action),
+                    &settings.theme,
                 );
             }
             if let Some(reason) = self.eager_image_fetches.failure(fetch.key) {
                 let retry = fetch.clone();
-                let action = mini_button(("retry-image-read", message_id as usize), "Retry")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.retry_eager_image(retry.clone(), window, cx)
-                    }))
-                    .into_any_element();
+                let action = mini_button(
+                    ("retry-image-read", message_id as usize),
+                    "Retry",
+                    &settings.theme,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.retry_eager_image(retry.clone(), window, cx)
+                }))
+                .into_any_element();
                 return Self::render_image_status(
                     message_id,
                     &descriptor,
                     format!("Could not fetch {} · {reason}", descriptor.file_name),
                     Some(action),
+                    &settings.theme,
                 );
             }
             self.enqueue_eager_image(fetch, window, cx);
@@ -3911,6 +3900,7 @@ impl ChattView {
                 &descriptor,
                 format!("Loading {}…", descriptor.file_name),
                 None,
+                &settings.theme,
             );
         }
         if descriptor.media_kind == MediaKind::File && !attachment.is_video() {
@@ -3936,20 +3926,26 @@ impl ChattView {
                 .flex()
                 .items_center()
                 .gap_3()
-                .bg(rgb(0x171a20))
+                .bg(settings.theme.color(ThemeRole::Panel))
                 .cursor_pointer()
-                .hover(|item| item.bg(rgb(0x20242a)))
+                .hover({
+                    let hover = settings.theme.color(ThemeRole::StateHover);
+                    move |item| item.bg(hover)
+                })
                 .text_sm()
-                .text_color(rgb(0x9aa1ac))
+                .text_color(settings.theme.color(ThemeRole::TextSecondary))
                 .child(div().flex_1().min_w_0().truncate().child(label))
                 .when_some(active_transfer, |card, transfer_id| {
                     card.child(
-                        mini_button(("cancel-read", transfer_id.0 as usize), "Cancel").on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.cancel_bulk_read(transfer_id, cx)
-                            }),
-                        ),
+                        mini_button(
+                            ("cancel-read", transfer_id.0 as usize),
+                            "Cancel",
+                            &settings.theme,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.cancel_bulk_read(transfer_id, cx)
+                        })),
                     )
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -3966,16 +3962,21 @@ impl ChattView {
                 .flex()
                 .items_center()
                 .gap_3()
-                .bg(rgb(0x171a20))
+                .bg(settings.theme.color(ThemeRole::Panel))
                 .child(
                     div()
                         .flex_1()
                         .text_sm()
-                        .text_color(rgb(0x9aa1ac))
+                        .text_color(settings.theme.color(ThemeRole::TextSecondary))
                         .child(format!("Fetching {}…", descriptor.file_name)),
                 )
                 .child(
-                    mini_button(("cancel-read", transfer_id.0 as usize), "Cancel").on_click(
+                    mini_button(
+                        ("cancel-read", transfer_id.0 as usize),
+                        "Cancel",
+                        &settings.theme,
+                    )
+                    .on_click(
                         cx.listener(move |this, _, _, cx| this.cancel_bulk_read(transfer_id, cx)),
                     ),
                 )
@@ -3994,11 +3995,14 @@ impl ChattView {
             .mt_2()
             .px_3()
             .py_2()
-            .bg(rgb(0x171a20))
+            .bg(settings.theme.color(ThemeRole::Panel))
             .cursor_pointer()
-            .hover(|item| item.bg(rgb(0x20242a)))
+            .hover({
+                let hover = settings.theme.color(ThemeRole::StateHover);
+                move |item| item.bg(hover)
+            })
             .text_sm()
-            .text_color(rgb(0x9aa1ac))
+            .text_color(settings.theme.color(ThemeRole::TextSecondary))
             .child(format!(
                 "{} · {} bytes · click to fetch",
                 descriptor.file_name, descriptor.byte_len
@@ -4012,6 +4016,7 @@ impl ChattView {
         descriptor: &AttachmentDescriptor,
         label: String,
         action: Option<AnyElement>,
+        palette: &ThemePalette,
     ) -> AnyElement {
         image_frame(descriptor)
             .id(("image-status", message_id as usize))
@@ -4022,12 +4027,12 @@ impl ChattView {
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(rgb(0x171a20))
+            .bg(palette.color(ThemeRole::Panel))
             .child(
                 div()
                     .min_w_0()
                     .text_sm()
-                    .text_color(rgb(0x9aa1ac))
+                    .text_color(palette.color(ThemeRole::TextSecondary))
                     .child(label),
             )
             .when_some(action, |status, action| status.child(action))
@@ -4217,6 +4222,10 @@ impl ChattView {
         active_key: AttachmentId,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let settings = AppliedSettings::get(cx);
+        let tab_hover = settings.theme.color(ThemeRole::Raised);
+        let tab_hover_text = settings.theme.color(ThemeRole::TextPrimary);
+        let close_hover = settings.theme.color(ThemeRole::StateHover);
         let history = self.preview_history.items().to_vec();
         let mut tabs = div()
             .id("preview-tabs")
@@ -4249,10 +4258,18 @@ impl ChattView {
                     .flex()
                     .items_center()
                     .border_r_1()
-                    .border_color(rgb(0x272a30))
-                    .bg(rgb(if selected { 0x111317 } else { 0x191c21 }))
-                    .text_color(rgb(if selected { 0xaebce0 } else { 0x8b929d }))
-                    .hover(|tab| tab.bg(rgb(0x15181c)).text_color(rgb(0xd9dbe0)))
+                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+                    .bg(settings.theme.color(if selected {
+                        ThemeRole::Window
+                    } else {
+                        ThemeRole::Panel
+                    }))
+                    .text_color(settings.theme.color(if selected {
+                        ThemeRole::MediaProgressKnob
+                    } else {
+                        ThemeRole::TextMuted
+                    }))
+                    .hover(move |tab| tab.bg(tab_hover).text_color(tab_hover_text))
                     .child(
                         div()
                             .id(select_id)
@@ -4291,7 +4308,7 @@ impl ChattView {
                             .justify_center()
                             .cursor_pointer()
                             .text_sm()
-                            .hover(|button| button.bg(rgb(0x20242a)).text_color(rgb(0xe4e6ea)))
+                            .hover(move |button| button.bg(close_hover).text_color(tab_hover_text))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.close_preview_tab(close_key, window, cx)
@@ -4312,6 +4329,8 @@ impl ChattView {
         if matches!(active.content, PreviewContent::Code(_)) {
             return self.render_code_preview_panel(active, width, cx);
         }
+        let settings = AppliedSettings::get(cx);
+        let muted = settings.theme.color(ThemeRole::TextMuted);
         let tabs = self.render_preview_tabs(active.key(), cx);
         let cache_path = self
             .media_cache
@@ -4342,7 +4361,7 @@ impl ChattView {
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(0x08090b))
+            .bg(settings.theme.color(ThemeRole::MediaViewport))
             .cursor(if panning {
                 gpui::CursorStyle::ClosedHand
             } else if can_pan {
@@ -4396,25 +4415,25 @@ impl ChattView {
                         .w(geometry.bounds.size.width)
                         .h(geometry.bounds.size.height)
                         .object_fit(ObjectFit::Contain)
-                        .with_loading(|| {
+                        .with_loading(move || {
                             div()
                                 .size_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .text_sm()
-                                .text_color(rgb(0x8b929d))
+                                .text_color(muted)
                                 .child("loading…")
                                 .into_any_element()
                         })
-                        .with_fallback(|| {
+                        .with_fallback(move || {
                             div()
                                 .size_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .text_sm()
-                                .text_color(rgb(0x8b929d))
+                                .text_color(muted)
                                 .child("failed to load image")
                                 .into_any_element()
                         }),
@@ -4429,7 +4448,7 @@ impl ChattView {
                         .items_center()
                         .justify_center()
                         .text_sm()
-                        .text_color(rgb(0x8b929d))
+                        .text_color(muted)
                         .child("image is no longer cached"),
                 )
             });
@@ -4443,7 +4462,7 @@ impl ChattView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(0x111317))
+            .bg(settings.theme.color(ThemeRole::Window))
             .track_focus(&self.code_viewer_focus)
             .child(
                 div()
@@ -4453,8 +4472,8 @@ impl ChattView {
                     .items_center()
                     .min_w_0()
                     .border_b_1()
-                    .border_color(rgb(0x272a30))
-                    .bg(rgb(0x191c21))
+                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+                    .bg(settings.theme.color(ThemeRole::Panel))
                     .child(tabs)
                     .child(
                         div()
@@ -4464,16 +4483,24 @@ impl ChattView {
                             .items_center()
                             .gap_1()
                             .px_2()
-                            .bg(rgb(0x191c21))
+                            .bg(settings.theme.color(ThemeRole::Panel))
                             .child(
-                                preview_action_button("preview-save", IconName::Download).on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.save_preview_attachment(window, cx)
-                                    }),
-                                ),
+                                preview_action_button(
+                                    "preview-save",
+                                    IconName::Download,
+                                    &settings.theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.save_preview_attachment(window, cx),
+                                )),
                             )
                             .child(
-                                preview_action_button("preview-close", IconName::Close).on_click(
+                                preview_action_button(
+                                    "preview-close",
+                                    IconName::Close,
+                                    &settings.theme,
+                                )
+                                .on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.close_preview(window, cx)
                                     }),
@@ -4490,19 +4517,19 @@ impl ChattView {
                     .gap_1()
                     .px_2()
                     .border_b_1()
-                    .border_color(rgb(0x272a30))
-                    .bg(rgb(0x111317))
+                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+                    .bg(settings.theme.color(ThemeRole::Window))
                     .child(
-                        preview_control_button("preview-fit", "Fit")
+                        preview_control_button("preview-fit", "Fit", &settings.theme)
                             .on_click(cx.listener(|this, _, _, cx| this.fit_preview_image(cx))),
                     )
                     .child(
-                        preview_control_button("preview-actual", "100%").on_click(
+                        preview_control_button("preview-actual", "100%", &settings.theme).on_click(
                             cx.listener(|this, _, _, cx| this.actual_size_preview_image(cx)),
                         ),
                     )
                     .child(
-                        preview_control_button("preview-zoom-out", "−").on_click(
+                        preview_control_button("preview-zoom-out", "−", &settings.theme).on_click(
                             cx.listener(|this, _, _, cx| this.zoom_preview_image(-0.25, cx)),
                         ),
                     )
@@ -4511,11 +4538,11 @@ impl ChattView {
                             .w(px(56.0))
                             .text_center()
                             .text_xs()
-                            .text_color(rgb(0x8b929d))
+                            .text_color(muted)
                             .child(format!("{zoom_percent}%")),
                     )
                     .child(
-                        preview_control_button("preview-zoom-in", "+").on_click(
+                        preview_control_button("preview-zoom-in", "+", &settings.theme).on_click(
                             cx.listener(|this, _, _, cx| this.zoom_preview_image(0.25, cx)),
                         ),
                     ),
@@ -4529,6 +4556,7 @@ impl ChattView {
         width: Pixels,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let settings = AppliedSettings::get(cx);
         let tabs = self.render_preview_tabs(active.key(), cx);
         let preview = active
             .code_preview()
@@ -4586,16 +4614,16 @@ impl ChattView {
             }
         };
         let body = match preview.state {
-            CodePreviewState::Fetching { .. } => preview_status("loading…"),
-            CodePreviewState::Preparing { .. } => preview_status("highlighting…"),
-            CodePreviewState::Error(reason) => preview_status(reason),
+            CodePreviewState::Fetching { .. } => preview_status("loading…", &settings.theme),
+            CodePreviewState::Preparing { .. } => preview_status("highlighting…", &settings.theme),
+            CodePreviewState::Error(reason) => preview_status(reason, &settings.theme),
             CodePreviewState::Ready(document) => div()
                 .id("preview-code-viewport")
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
                 .overflow_hidden()
-                .bg(rgb(0x08090b))
+                .bg(settings.theme.color(ThemeRole::MediaViewport))
                 .child(render_code_document(
                     document,
                     preview.scroll_handle.clone(),
@@ -4603,6 +4631,7 @@ impl ChattView {
                     preview.scrollbar_state.clone(),
                     self.code_selection.clone(),
                     active_match,
+                    Some(settings.clone()),
                 ))
                 .into_any_element(),
         };
@@ -4616,7 +4645,7 @@ impl ChattView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(0x111317))
+            .bg(settings.theme.color(ThemeRole::Window))
             .key_context("ChattCodeViewer")
             .track_focus(&self.code_viewer_focus)
             .child(
@@ -4627,8 +4656,8 @@ impl ChattView {
                     .items_center()
                     .min_w_0()
                     .border_b_1()
-                    .border_color(rgb(0x272a30))
-                    .bg(rgb(0x191c21))
+                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+                    .bg(settings.theme.color(ThemeRole::Panel))
                     .child(tabs)
                     .child(
                         div()
@@ -4638,13 +4667,14 @@ impl ChattView {
                             .items_center()
                             .gap_1()
                             .px_2()
-                            .bg(rgb(0x191c21))
+                            .bg(settings.theme.color(ThemeRole::Panel))
                             .when(ready, |actions| {
                                 actions
                                     .child(
                                         preview_action_button(
                                             "preview-find-code",
                                             IconName::Search,
+                                            &settings.theme,
                                         )
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
@@ -4653,21 +4683,35 @@ impl ChattView {
                                         ),
                                     )
                                     .child(
-                                        preview_action_button("preview-copy-code", IconName::Copy)
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                        preview_action_button(
+                                            "preview-copy-code",
+                                            IconName::Copy,
+                                            &settings.theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
                                                 this.copy_preview_code(cx)
-                                            })),
+                                            }),
+                                        ),
                                     )
                             })
                             .child(
-                                preview_action_button("preview-save", IconName::Download).on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.save_preview_attachment(window, cx)
-                                    }),
-                                ),
+                                preview_action_button(
+                                    "preview-save",
+                                    IconName::Download,
+                                    &settings.theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.save_preview_attachment(window, cx),
+                                )),
                             )
                             .child(
-                                preview_action_button("preview-close", IconName::Close).on_click(
+                                preview_action_button(
+                                    "preview-close",
+                                    IconName::Close,
+                                    &settings.theme,
+                                )
+                                .on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.close_preview(window, cx)
                                     }),
@@ -4685,8 +4729,8 @@ impl ChattView {
                         .gap(if compact_search { px(4.0) } else { px(8.0) })
                         .px(if compact_search { px(4.0) } else { px(8.0) })
                         .border_b_1()
-                        .border_color(rgb(0x272a30))
-                        .bg(rgb(0x111317))
+                        .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+                        .bg(settings.theme.color(ThemeRole::Window))
                         .child(
                             div()
                                 .h(px(30.0))
@@ -4697,8 +4741,8 @@ impl ChattView {
                                 .px_2()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(0x343943))
-                                .bg(rgb(0x0d0f12))
+                                .border_color(settings.theme.color(ThemeRole::BorderStrong))
+                                .bg(settings.theme.color(ThemeRole::Input))
                                 .text_sm()
                                 .child(self.code_search_input.clone()),
                         )
@@ -4714,24 +4758,26 @@ impl ChattView {
                                 .flex_none()
                                 .text_right()
                                 .text_xs()
-                                .text_color(rgb(0x8b929d))
+                                .text_color(settings.theme.color(ThemeRole::TextMuted))
                                 .child(search_status),
                         )
                         .child(
-                            preview_control_button("preview-find-previous", "↑").on_click(
-                                cx.listener(|this, _, _, cx| this.previous_code_match(cx)),
-                            ),
+                            preview_control_button("preview-find-previous", "↑", &settings.theme)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.previous_code_match(cx)),
+                                ),
                         )
                         .child(
-                            preview_control_button("preview-find-next", "↓")
+                            preview_control_button("preview-find-next", "↓", &settings.theme)
                                 .on_click(cx.listener(|this, _, _, cx| this.next_code_match(cx))),
                         )
-                        .child(preview_control_button("preview-find-close", "×").on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.close_code_search(cx);
-                                window.focus(&this.code_viewer_focus, cx);
-                            }),
-                        )),
+                        .child(
+                            preview_control_button("preview-find-close", "×", &settings.theme)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_code_search(cx);
+                                    window.focus(&this.code_viewer_focus, cx);
+                                })),
+                        ),
                 )
             })
             .child(body)
@@ -4814,6 +4860,7 @@ impl ChattView {
             handler,
             self.video_volume_popup_bounds.clone(),
             self.video_volume_button_bounds.clone(),
+            AppliedSettings::get(cx),
         )
     }
 
@@ -5308,6 +5355,7 @@ impl ChattView {
     }
 
     fn render_live_shares(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let settings = AppliedSettings::get(cx);
         let shares = self.model.live_shares.clone();
         let resizable = !self.live_players.is_empty();
         let pane_height = resizable
@@ -5328,8 +5376,8 @@ impl ChattView {
             .overflow_hidden()
             .gap_0()
             .border_b_1()
-            .border_color(rgb(0x272a30))
-            .bg(rgb(0x14161a))
+            .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+            .bg(settings.theme.color(ThemeRole::Raised))
             .when_some(pane_height, |panel, height| panel.h(height))
             .child(
                 canvas(
@@ -5352,7 +5400,10 @@ impl ChattView {
                     .bottom_0()
                     .h(px(LIVE_PANE_DIVIDER_SIZE))
                     .cursor_row_resize()
-                    .hover(|handle| handle.bg(rgba(0x53698766)))
+                    .hover({
+                        let hover = settings.theme.color(ThemeRole::StateSelection);
+                        move |handle| handle.bg(hover)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -5383,6 +5434,7 @@ impl ChattView {
         constrained: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let settings = AppliedSettings::get(cx);
         let stream_id = share.stream_id;
         let active = self.live_players.get(&stream_id).map(|view| {
             let viewport_bounds = view.viewport_bounds.clone();
@@ -5400,7 +5452,7 @@ impl ChattView {
             .id(("live-share", stream_id.0 as usize))
             .flex()
             .flex_col()
-            .bg(rgb(0x08090b))
+            .bg(settings.theme.color(ThemeRole::MediaViewport))
             .when(fullscreen, |card| card.size_full())
             .when(constrained && active_share, |card| card.flex_1().min_h_0())
             .when(constrained && !active_share, |card| card.flex_none());
@@ -5418,42 +5470,64 @@ impl ChattView {
                         .gap_1()
                         .px_3()
                         .py_2()
-                        .bg(rgb(0x111317))
-                        .child(live_share_title(&share))
+                        .bg(settings.theme.color(ThemeRole::Window))
+                        .child(live_share_title(&share, &settings.theme))
                         .child(
-                            icon_button(("live-stop", stream_id.0 as usize), IconName::Stop)
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                            icon_button(
+                                ("live-stop", stream_id.0 as usize),
+                                IconName::Stop,
+                                &settings.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
                                     if this.fullscreen_share == Some(stop_id)
                                         && window.is_fullscreen()
                                     {
                                         window.toggle_fullscreen();
                                     }
                                     this.stop_live_share(stop_id, cx)
-                                })),
+                                },
+                            )),
                         )
                         .child(
-                            icon_button(("live-reset", stream_id.0 as usize), IconName::RotateCcw)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            icon_button(
+                                ("live-reset", stream_id.0 as usize),
+                                IconName::RotateCcw,
+                                &settings.theme,
+                            )
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
                                     this.reset_live_view(reset_id, cx)
-                                })),
+                                }),
+                            ),
                         )
                         .child(
-                            icon_button(("live-zoom-out", stream_id.0 as usize), IconName::ZoomOut)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            icon_button(
+                                ("live-zoom-out", stream_id.0 as usize),
+                                IconName::ZoomOut,
+                                &settings.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.zoom_live_view(zoom_out_id, 1.0 / 1.25, cx)
-                                })),
+                                },
+                            )),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x8b929d))
+                                .text_color(settings.theme.color(ThemeRole::TextMuted))
                                 .child(format!("{:.0}%", zoom * 100.0)),
                         )
                         .child(
-                            icon_button(("live-zoom-in", stream_id.0 as usize), IconName::ZoomIn)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.zoom_live_view(zoom_in_id, 1.25, cx)
-                                })),
+                            icon_button(
+                                ("live-zoom-in", stream_id.0 as usize),
+                                IconName::ZoomIn,
+                                &settings.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.zoom_live_view(zoom_in_id, 1.25, cx),
+                            )),
                         )
                         .child(
                             icon_button(
@@ -5463,6 +5537,7 @@ impl ChattView {
                                 } else {
                                     IconName::Maximize
                                 },
+                                &settings.theme,
                             )
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
@@ -5485,7 +5560,7 @@ impl ChattView {
                             viewport.flex_1().min_h_0()
                         })
                         .when(!fullscreen && !constrained, |viewport| viewport.h(px(320.)))
-                        .bg(rgb(0x08090b))
+                        .bg(settings.theme.color(ThemeRole::MediaViewport))
                         .cursor(if dragging {
                             gpui::CursorStyle::ClosedHand
                         } else {
@@ -5540,10 +5615,15 @@ impl ChattView {
                     .gap_1()
                     .px_3()
                     .py_2()
-                    .bg(rgb(0x111317))
-                    .child(live_share_title(&share))
+                    .bg(settings.theme.color(ThemeRole::Window))
+                    .child(live_share_title(&share, &settings.theme))
                     .child(
-                        icon_button(("live-play", stream_id.0 as usize), IconName::Play).on_click(
+                        icon_button(
+                            ("live-play", stream_id.0 as usize),
+                            IconName::Play,
+                            &settings.theme,
+                        )
+                        .on_click(
                             cx.listener(move |this, _, _, cx| this.start_live_share(stream_id, cx)),
                         ),
                     ),
@@ -5557,6 +5637,7 @@ impl ChattView {
         view: CompletionView,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let settings = AppliedSettings::get(cx);
         let active = self
             .completion_session
             .as_ref()
@@ -5579,6 +5660,7 @@ impl ChattView {
                             command.name.clone(),
                             &option.match_ranges,
                             selected,
+                            &settings.theme,
                         )
                         .w(px(138.))
                         .flex_none(),
@@ -5589,7 +5671,11 @@ impl ChattView {
                             .flex_none()
                             .truncate()
                             .text_xs()
-                            .text_color(rgb(if selected { 0xdce5f2 } else { 0x9aa2ae }))
+                            .text_color(settings.theme.color(if selected {
+                                ThemeRole::TextInverse
+                            } else {
+                                ThemeRole::TextSecondary
+                            }))
                             .child(command.usage.clone()),
                     )
                     .child(
@@ -5598,7 +5684,11 @@ impl ChattView {
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(rgb(if selected { 0xcbd6e5 } else { 0x747c87 }))
+                            .text_color(settings.theme.color(if selected {
+                                ThemeRole::TextInverse
+                            } else {
+                                ThemeRole::TextDim
+                            }))
                             .child(command.description.clone()),
                     ),
                 CompletionValue::Candidate { kind, item } => div()
@@ -5612,7 +5702,11 @@ impl ChattView {
                             .w(px(72.))
                             .flex_none()
                             .text_xs()
-                            .text_color(rgb(if selected { 0xdce5f2 } else { 0x707986 }))
+                            .text_color(settings.theme.color(if selected {
+                                ThemeRole::TextInverse
+                            } else {
+                                ThemeRole::TextSubtle
+                            }))
                             .child(candidate_kind_label(*kind).to_ascii_uppercase()),
                     )
                     .child(
@@ -5620,6 +5714,7 @@ impl ChattView {
                             item.value.clone(),
                             &option.match_ranges,
                             selected,
+                            &settings.theme,
                         )
                         .w(px(220.))
                         .flex_none(),
@@ -5631,7 +5726,11 @@ impl ChattView {
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
-                                .text_color(rgb(if selected { 0xcbd6e5 } else { 0x747c87 }))
+                                .text_color(settings.theme.color(if selected {
+                                    ThemeRole::TextInverse
+                                } else {
+                                    ThemeRole::TextDim
+                                }))
                                 .child(detail),
                         )
                     }),
@@ -5646,9 +5745,24 @@ impl ChattView {
                     .items_center()
                     .px_3()
                     .border_b_1()
-                    .border_color(rgb(if selected { 0x667c9a } else { 0x292d34 }))
-                    .bg(rgb(if selected { 0x536987 } else { 0x14171b }))
-                    .hover(|row| row.bg(rgb(if selected { 0x536987 } else { 0x20252c })))
+                    .border_color(settings.theme.color(if selected {
+                        ThemeRole::BorderFocus
+                    } else {
+                        ThemeRole::BorderStrong
+                    }))
+                    .bg(settings.theme.color(if selected {
+                        ThemeRole::ControlActive
+                    } else {
+                        ThemeRole::Raised
+                    }))
+                    .hover({
+                        let hover = settings.theme.color(if selected {
+                            ThemeRole::ControlActive
+                        } else {
+                            ThemeRole::StateHover
+                        });
+                        move |row| row.bg(hover)
+                    })
                     .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
                         this.hover_completion(hover_key.clone(), cx)
                     }))
@@ -5669,9 +5783,9 @@ impl ChattView {
                     .items_center()
                     .px_3()
                     .border_b_1()
-                    .border_color(rgb(0x292d34))
+                    .border_color(settings.theme.color(ThemeRole::BorderStrong))
                     .text_sm()
-                    .text_color(rgb(0x838b96))
+                    .text_color(settings.theme.color(ThemeRole::TextMuted))
                     .child(hint),
             );
         }
@@ -5684,8 +5798,8 @@ impl ChattView {
             .bottom(relative(1.))
             .mb(px(6.))
             .border_1()
-            .border_color(rgb(0x343a43))
-            .bg(rgb(0x14171b))
+            .border_color(settings.theme.color(ThemeRole::BorderStrong))
+            .bg(settings.theme.color(ThemeRole::Raised))
             .child(rows)
             .child(
                 div()
@@ -5695,9 +5809,9 @@ impl ChattView {
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .bg(rgb(0x101216))
+                    .bg(settings.theme.color(ThemeRole::Sidebar))
                     .text_xs()
-                    .text_color(rgb(0x727a86))
+                    .text_color(settings.theme.color(ThemeRole::TextDim))
                     .child("↑↓ navigate  ·  Tab complete")
                     .child("Enter run  ·  Esc close"),
             )
@@ -5710,6 +5824,7 @@ impl ChattView {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
+        let applied = AppliedSettings::get(cx);
         let mut sidebar = div()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -5717,8 +5832,8 @@ impl ChattView {
             .flex()
             .flex_col()
             .border_r_1()
-            .border_color(rgb(0x272a30))
-            .bg(rgb(0x0d0f12))
+            .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+            .bg(applied.theme.color(ThemeRole::Sidebar))
             .child(
                 div()
                     .h(px(TOP_BAR_HEIGHT))
@@ -5727,7 +5842,7 @@ impl ChattView {
                     .items_center()
                     .px_4()
                     .border_b_1()
-                    .border_color(rgb(0x272a30))
+                    .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                     .font_weight(FontWeight::BOLD)
                     .child("CHATT"),
             )
@@ -5737,7 +5852,7 @@ impl ChattView {
                     .pt_4()
                     .pb_2()
                     .text_xs()
-                    .text_color(rgb(0x676d77))
+                    .text_color(applied.theme.color(ThemeRole::TextSubtle))
                     .child("ROOMS"),
             );
         for room in self.model.rooms.clone() {
@@ -5755,8 +5870,15 @@ impl ChattView {
                 room.name
             };
             sidebar = sidebar.child(
-                room_button(("room", room.id.0 as usize), sigil, label, active, unread)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_room(room_id, cx))),
+                room_button(
+                    ("room", room.id.0 as usize),
+                    sigil,
+                    label,
+                    active,
+                    unread,
+                    &applied.theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.select_room(room_id, cx))),
             );
         }
         if !self.model.transfers.is_empty() {
@@ -5766,7 +5888,7 @@ impl ChattView {
                     .px_3()
                     .pb_2()
                     .text_xs()
-                    .text_color(rgb(0x676d77))
+                    .text_color(applied.theme.color(ThemeRole::TextSubtle))
                     .child("TRANSFERS"),
             );
             for transfer in self.model.transfers.clone() {
@@ -5785,7 +5907,7 @@ impl ChattView {
                         .items_center()
                         .gap_2()
                         .text_xs()
-                        .text_color(rgb(0x969ca6))
+                        .text_color(applied.theme.color(ThemeRole::TextSecondary))
                         .child(
                             div()
                                 .flex_1()
@@ -5793,11 +5915,14 @@ impl ChattView {
                                 .child(format!("{} · {percent}%", transfer.file_name)),
                         )
                         .child(
-                            mini_button(("cancel-transfer", transfer_id.0 as usize), "×").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.cancel_file_transfer(transfer_id, cx)
-                                }),
-                            ),
+                            mini_button(
+                                ("cancel-transfer", transfer_id.0 as usize),
+                                "×",
+                                &applied.theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.cancel_file_transfer(transfer_id, cx),
+                            )),
                         ),
                 );
             }
@@ -5817,23 +5942,35 @@ impl ChattView {
                 .gap_3()
                 .px_3()
                 .border_t_1()
-                .border_color(rgb(0x272a30))
+                .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                 .child(
                     div()
                         .size(px(30.))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(rgb(0x33412f))
-                        .text_color(rgb(0xaacb93))
+                        .bg(applied.theme.color(ThemeRole::ParticipantIdentitySurface))
+                        .text_color(applied.theme.color(ThemeRole::ParticipantIdentityText))
                         .child(identity.chars().next().unwrap_or('?').to_string()),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .child(div().text_sm().child(identity))
-                        .child(div().text_xs().text_color(rgb(0x6f7580)).child(connection)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                .child(connection),
+                        ),
+                )
+                .child(
+                    mini_button("open-settings", "⚙", &applied.theme).on_click(cx.listener(
+                        |this, _, window, cx| this.open_settings(&OpenSettings, window, cx),
+                    )),
                 ),
         )
     }
@@ -5942,6 +6079,7 @@ impl ChattView {
     }
 
     fn render_queued_files(&self, cx: &mut Context<Self>) -> Div {
+        let settings = AppliedSettings::get(cx);
         let mut row = div()
             .w_full()
             .flex()
@@ -5963,8 +6101,8 @@ impl ChattView {
                     .gap_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x343840))
-                    .bg(rgb(0x111317))
+                    .border_color(settings.theme.color(ThemeRole::BorderStrong))
+                    .bg(settings.theme.color(ThemeRole::Window))
                     .text_sm()
                     .child(
                         div()
@@ -5982,9 +6120,17 @@ impl ChattView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .text_color(rgb(0x8b929d))
-                            .hover(|button| button.bg(rgb(0x536987)).text_color(rgb(0xf0f2f5)))
-                            .child(icon(IconName::Close, 13.0, 0x9ba1ab))
+                            .text_color(settings.theme.color(ThemeRole::TextMuted))
+                            .hover({
+                                let hover = settings.theme.color(ThemeRole::ControlActive);
+                                let text = settings.theme.color(ThemeRole::ControlActiveText);
+                                move |button| button.bg(hover).text_color(text)
+                            })
+                            .child(icon(
+                                IconName::Close,
+                                13.0,
+                                settings.theme.color(ThemeRole::TextSecondary),
+                            ))
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.remove_queued_file(id, cx)),
                             ),
@@ -5997,6 +6143,20 @@ impl ChattView {
 
 impl Render for ChattView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let applied = AppliedSettings::get(cx);
+        let show_config_diagnostic = !applied.diagnostics.is_empty()
+            && !matches!(
+                applied.source_status,
+                crate::config::io::SourceStatus::Missing
+            );
+        window.set_rem_size(px(applied.fonts.interface_size));
+        if self.typography_revision != applied.typography_revision {
+            self.typography_revision = applied.typography_revision;
+            self.preview_history.reset_code_measurements();
+        }
+        self.composer.update(cx, |composer, cx| {
+            composer.set_binding_mode(applied.binding_mode, cx)
+        });
         self.advance_video(cx);
         if !self.live_players.is_empty() {
             self.advance_live_video();
@@ -6012,6 +6172,7 @@ impl Render for ChattView {
             return div()
                 .id("chatt-video-theater")
                 .key_context("Chatt")
+                .on_action(cx.listener(Self::open_settings))
                 .on_action(cx.listener(Self::toggle_playback))
                 .on_action(cx.listener(Self::seek_back))
                 .on_action(cx.listener(Self::seek_forward))
@@ -6034,9 +6195,11 @@ impl Render for ChattView {
                     }),
                 )
                 .size_full()
-                .bg(rgb(0x08090b))
-                .text_color(rgb(0xd9dbe0))
-                .child(player);
+                .font_family(applied.fonts.interface_family.clone())
+                .bg(applied.theme.color(ThemeRole::MediaViewport))
+                .text_color(applied.theme.color(ThemeRole::MediaText))
+                .child(player)
+                .when_some(self.settings.clone(), |root, settings| root.child(settings));
         }
         if let Some(stream_id) = self.fullscreen_share
             && let Some(share) = self
@@ -6051,6 +6214,7 @@ impl Render for ChattView {
             return div()
                 .id("chatt-live-fullscreen")
                 .key_context("Chatt")
+                .on_action(cx.listener(Self::open_settings))
                 .on_action(cx.listener(Self::seek_back))
                 .on_action(cx.listener(Self::seek_forward))
                 .on_action(cx.listener(Self::live_zoom_in_action))
@@ -6059,8 +6223,10 @@ impl Render for ChattView {
                 .on_action(cx.listener(Self::live_pan_up_action))
                 .on_action(cx.listener(Self::live_pan_down_action))
                 .size_full()
-                .bg(rgb(0x08090b))
-                .child(card);
+                .font_family(applied.fonts.interface_family.clone())
+                .bg(applied.theme.color(ThemeRole::MediaViewport))
+                .child(card)
+                .when_some(self.settings.clone(), |root, settings| root.child(settings));
         }
         if self.scroll_animation_active {
             self.advance_timeline_scroll(window);
@@ -6140,6 +6306,7 @@ impl Render for ChattView {
             .id("chatt")
             .key_context("Chatt")
             .on_action(cx.listener(Self::open_media))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::send_message))
             .on_action(cx.listener(Self::completion_next))
             .on_action(cx.listener(Self::completion_previous))
@@ -6188,8 +6355,9 @@ impl Render for ChattView {
             )
             .size_full()
             .flex()
-            .bg(rgb(0x111317))
-            .text_color(rgb(0xd9dbe0))
+            .font_family(applied.fonts.interface_family.clone())
+            .bg(applied.theme.color(ThemeRole::Window))
+            .text_color(applied.theme.color(ThemeRole::TextPrimary))
             .when(resizing_live_pane, |root| {
                 root.child(
                     canvas(
@@ -6231,9 +6399,13 @@ impl Render for ChattView {
                             .gap_3()
                             .px_4()
                             .border_b_1()
-                            .border_color(rgb(0x272a30))
-                            .bg(rgb(0x14161a))
-                            .child(div().text_color(rgb(0x777d87)).child("#"))
+                            .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+                            .bg(applied.theme.color(ThemeRole::Toolbar))
+                            .child(
+                                div()
+                                    .text_color(applied.theme.color(ThemeRole::TextDim))
+                                    .child("#"),
+                            )
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -6242,28 +6414,42 @@ impl Render for ChattView {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(0x747a84))
+                                    .text_color(applied.theme.color(ThemeRole::TextDim))
                                     .child(format!("{count} messages")),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(0x747a84))
+                                    .text_color(applied.theme.color(ThemeRole::TextDim))
                                     .child(format!("{online} online")),
                             )
                             .when(!security.is_empty(), |bar| {
-                                bar.child(div().text_xs().text_color(rgb(0x8b929d)).child(security))
+                                bar.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                        .child(security),
+                                )
                             })
                             .child(div().flex_1())
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(if ready { 0x7f9c70 } else { 0xc49a74 }))
+                                    .text_color(if ready {
+                                        applied.theme.color(ThemeRole::StateSuccess)
+                                    } else {
+                                        applied.theme.color(ThemeRole::StateWarning)
+                                    })
                                     .child(self.status.clone()),
                             )
                             .when(!ready, |bar| {
                                 bar.child(
-                                    toolbar_button("retry", Some(IconName::RotateCcw), "Retry")
+                                    toolbar_button(
+                                        "retry",
+                                        Some(IconName::RotateCcw),
+                                        "Retry",
+                                        &applied.theme,
+                                    )
                                         .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                                 )
                             })
@@ -6280,6 +6466,7 @@ impl Render for ChattView {
                                     } else {
                                         "Mute"
                                     },
+                                    &applied.theme,
                                 )
                                 .on_click(cx.listener(
                                     |this, _, window, cx| this.toggle_mute(&ToggleMute, window, cx),
@@ -6298,6 +6485,7 @@ impl Render for ChattView {
                                     } else {
                                         "Deafen"
                                     },
+                                    &applied.theme,
                                 )
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
@@ -6305,16 +6493,26 @@ impl Render for ChattView {
                                     },
                                 )),
                             )
-                            .child(toolbar_button("output-down", None, "Vol −").on_click(
+                            .child(toolbar_button(
+                                "output-down",
+                                None,
+                                "Vol −",
+                                &applied.theme,
+                            ).on_click(
                                 cx.listener(|this, _, _, cx| this.adjust_output_volume(-5., cx)),
                             ))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x8b929d))
+                                    .text_color(applied.theme.color(ThemeRole::TextMuted))
                                     .child(format!("{}", self.model.voice.output_volume.round())),
                             )
-                            .child(toolbar_button("output-up", None, "Vol +").on_click(
+                            .child(toolbar_button(
+                                "output-up",
+                                None,
+                                "Vol +",
+                                &applied.theme,
+                            ).on_click(
                                 cx.listener(|this, _, _, cx| this.adjust_output_volume(5., cx)),
                             ))
                             .child(
@@ -6336,6 +6534,7 @@ impl Render for ChattView {
                                     } else {
                                         "Join voice"
                                     },
+                                    &applied.theme,
                                 )
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
@@ -6344,6 +6543,31 @@ impl Render for ChattView {
                                 )),
                             ),
                     )
+                    .when(show_config_diagnostic, |panel| {
+                        let diagnostic = &applied.diagnostics[0];
+                        panel.child(
+                            div()
+                                .flex_none()
+                                .px_4()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+                                .bg(applied.theme.color(ThemeRole::Panel))
+                                .text_sm()
+                                .text_color(match diagnostic.severity {
+                                    crate::config::validation::DiagnosticSeverity::Warning => {
+                                        applied.theme.color(ThemeRole::StateWarning)
+                                    }
+                                    crate::config::validation::DiagnosticSeverity::Error => {
+                                        applied.theme.color(ThemeRole::StateDanger)
+                                    }
+                                })
+                                .child(format!(
+                                    "{}: {} — open Settings for details",
+                                    diagnostic.path, diagnostic.message
+                                )),
+                        )
+                    })
                     .when_some(live_panel, |panel, live_panel| panel.child(live_panel))
                     .when(
                         !self.model.at_start && self.model.older_cursor.is_some(),
@@ -6356,12 +6580,13 @@ impl Render for ChattView {
                                     .items_center()
                                     .justify_center()
                                     .border_b_1()
-                                    .border_color(rgb(0x272a30))
+                                    .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                                     .child(
                                         toolbar_button(
                                             "load-older",
                                             Some(IconName::Download),
                                             "Load older messages",
+                                            &applied.theme,
                                         )
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.load_older(cx)),
@@ -6377,7 +6602,7 @@ impl Render for ChattView {
                                 .absolute()
                                 .left(px(SIDEBAR_WIDTH + 30.))
                                 .top(px(TOP_BAR_HEIGHT + 40.))
-                                .text_color(rgb(0x747a84))
+                                .text_color(applied.theme.color(ThemeRole::TextDim))
                                 .child(empty_state(&self.model)),
                         )
                     })
@@ -6394,8 +6619,8 @@ impl Render for ChattView {
                             .pr(px(28.))
                             .py_2()
                             .border_t_1()
-                            .border_color(rgb(0x272a30))
-                            .bg(rgb(0x14161a))
+                            .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+                            .bg(applied.theme.color(ThemeRole::Toolbar))
                             .when_some(completion_popup, |bar, popup| bar.child(popup))
                             .when_some(queued_file_row, |bar, files| bar.child(files))
                             .when_some(self.composer_error.clone(), |bar, error| {
@@ -6403,7 +6628,7 @@ impl Render for ChattView {
                                     div()
                                         .mb_1()
                                         .text_sm()
-                                        .text_color(rgb(0xd9a066))
+                                        .text_color(applied.theme.color(ThemeRole::StateWarning))
                                         .child(format!(
                                             "{error}. Your draft and queued files were retained."
                                         )),
@@ -6414,7 +6639,7 @@ impl Render for ChattView {
                                     div()
                                         .mb_1()
                                         .text_sm()
-                                        .text_color(rgb(0x8b929d))
+                                        .text_color(applied.theme.color(ThemeRole::TextMuted))
                                         .child(
                                             "Daemon offline — your draft and queued files are retained; sending is disabled.",
                                         ),
@@ -6433,7 +6658,10 @@ impl Render for ChattView {
                                             .items_center()
                                             .justify_center()
                                             .mr(px(15.))
-                                            .child(composer_add_button(can_attach).on_click(
+                                            .child(composer_add_button(
+                                                can_attach,
+                                                &applied.theme,
+                                            ).on_click(
                                                 cx.listener(|this, _, window, cx| {
                                                     this.open_media(&OpenMedia, window, cx)
                                                 }),
@@ -6461,7 +6689,10 @@ impl Render for ChattView {
                         .flex()
                         .justify_center()
                         .cursor_col_resize()
-                        .hover(|divider| divider.bg(rgba(0x53698733)))
+                        .hover({
+                            let hover = applied.theme.color(ThemeRole::StateSelection);
+                            move |divider| divider.bg(hover)
+                        })
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -6480,18 +6711,21 @@ impl Render for ChattView {
                                 this.finish_preview_pane_resize(cx)
                             }),
                         )
-                        .child(div().w(px(3.0)).h_full().bg(rgb(if resizing_preview_pane {
-                            0x536987
-                        } else {
-                            0x272a30
-                        }))),
+                        .child(div().w(px(3.0)).h_full().bg(applied.theme.color(
+                            if resizing_preview_pane {
+                                ThemeRole::BorderFocus
+                            } else {
+                                ThemeRole::BorderSubtle
+                            },
+                        ))),
                 )
                 .child(preview_panel)
             })
+            .when_some(self.settings.clone(), |root, settings| root.child(settings))
     }
 }
 
-fn live_share_title(share: &local_rpc::model::LiveShare) -> Div {
+fn live_share_title(share: &local_rpc::model::LiveShare, palette: &ThemePalette) -> Div {
     div()
         .min_w_0()
         .flex_1()
@@ -6510,7 +6744,7 @@ fn live_share_title(share: &local_rpc::model::LiveShare) -> Div {
             div()
                 .flex_none()
                 .text_xs()
-                .text_color(rgb(0x747a84))
+                .text_color(palette.color(ThemeRole::TextDim))
                 .child(format!(
                     "{}×{} · {}",
                     share.coded_width, share.coded_height, share.codec
@@ -6615,6 +6849,7 @@ fn highlighted_completion_label(
     label: String,
     ranges: &[std::ops::Range<usize>],
     selected: bool,
+    palette: &ThemePalette,
 ) -> Div {
     let mut element = div()
         .min_w_0()
@@ -6630,13 +6865,17 @@ fn highlighted_completion_label(
         element = element.child(
             div()
                 .flex_none()
-                .text_color(rgb(if matched {
-                    if selected { 0xffffff } else { 0x9fc1ee }
+                .text_color(if matched {
+                    if selected {
+                        palette.color(ThemeRole::TextInverse)
+                    } else {
+                        palette.color(ThemeRole::ParticipantRemoteOne)
+                    }
                 } else if selected {
-                    0xf0f3f8
+                    palette.color(ThemeRole::ControlActiveText)
                 } else {
-                    0xc9cdd4
-                }))
+                    palette.color(ThemeRole::TextSecondary)
+                })
                 .child(character.to_string()),
         );
     }
@@ -6652,188 +6891,21 @@ fn security_label(trust: TrustState) -> &'static str {
     }
 }
 
-fn sender_color(sender: &str, local: bool) -> u32 {
+fn sender_color(
+    sender: &str,
+    local: bool,
+    settings: &crate::theme::ResolvedSettings,
+) -> gpui::Rgba {
     if local {
-        0x9fbd89
+        settings.theme.color(ThemeRole::ParticipantLocal)
     } else {
         match sender.as_bytes().first().copied().unwrap_or_default() % 4 {
-            0 => 0x8ca9d8,
-            1 => 0xc49acb,
-            2 => 0xd1a477,
-            _ => 0x79b9b0,
+            0 => settings.theme.color(ThemeRole::ParticipantRemoteOne),
+            1 => settings.theme.color(ThemeRole::ParticipantRemoteTwo),
+            2 => settings.theme.color(ThemeRole::ParticipantRemoteThree),
+            _ => settings.theme.color(ThemeRole::ParticipantRemoteFour),
         }
     }
-}
-
-fn room_button(
-    id: impl Into<gpui::ElementId>,
-    sigil: &'static str,
-    label: String,
-    active: bool,
-    unread: u32,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .mx_2()
-        .h(px(34.))
-        .px_2()
-        .flex()
-        .items_center()
-        .gap_2()
-        .cursor_pointer()
-        .bg(rgb(if active { 0x252930 } else { 0x0d0f12 }))
-        .hover(|button| button.bg(rgb(0x202329)))
-        .text_color(rgb(if active { 0xe0e2e6 } else { 0x969ca6 }))
-        .child(div().w(px(16.)).text_center().child(sigil))
-        .child(div().flex_1().child(label))
-        .when(unread > 0, |button| {
-            button.child(
-                div()
-                    .text_xs()
-                    .px_2()
-                    .bg(rgb(0x536987))
-                    .child(unread.to_string()),
-            )
-        })
-}
-
-fn toolbar_button(
-    id: &'static str,
-    icon_name: Option<IconName>,
-    label: &'static str,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h(px(30.))
-        .px_2()
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap_1()
-        .cursor_pointer()
-        .bg(rgb(0x1b1e23))
-        .hover(|button| button.bg(rgb(0x292d34)))
-        .text_xs()
-        .when_some(icon_name, |button, icon_name| {
-            button.child(icon(icon_name, 15.0, 0xaeb4bf))
-        })
-        .child(label)
-}
-fn mini_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h(px(28.))
-        .px_2()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .bg(rgb(0x22262c))
-        .hover(|button| button.bg(rgb(0x30353d)))
-        .text_xs()
-        .child(label)
-}
-
-fn icon_button(id: impl Into<gpui::ElementId>, icon_name: IconName) -> Stateful<Div> {
-    div()
-        .id(id)
-        .size(px(28.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .bg(rgb(0x202329))
-        .text_color(rgb(0xb4b9c2))
-        .hover(|button| button.bg(rgb(0x536987)).text_color(rgb(0xf0f2f5)))
-        .child(icon(icon_name, 17.0, 0xd0d4dc))
-}
-
-fn message_action_button(
-    id: impl Into<gpui::ElementId>,
-    icon_name: IconName,
-    destructive: bool,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .size(px(28.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .bg(rgb(0x202329))
-        .text_color(rgb(0x8b929d))
-        .hover(move |button| {
-            button
-                .bg(rgb(0x30353d))
-                .text_color(rgb(if destructive { 0xd99a93 } else { 0xe4e6ea }))
-        })
-        .child(icon(
-            icon_name,
-            16.0,
-            if destructive { 0xb9827d } else { 0xadb3bd },
-        ))
-}
-
-fn composer_add_button(ready: bool) -> Stateful<Div> {
-    div()
-        .id("add-media")
-        .size(px(36.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .text_color(rgb(if ready { 0x8b929d } else { 0x555a63 }))
-        .hover(|button| button.text_color(rgb(0xd9dbe0)))
-        .child(icon(
-            IconName::Plus,
-            24.0,
-            if ready { 0x8b929d } else { 0x555a63 },
-        ))
-}
-
-fn preview_action_button(id: &'static str, icon_name: IconName) -> Stateful<Div> {
-    div()
-        .id(id)
-        .w(px(28.0))
-        .h(px(28.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .text_color(rgb(0x8b929d))
-        .hover(|button| button.bg(rgb(0x111317)).text_color(rgb(0xd9dbe0)))
-        .child(icon(icon_name, 17.0, 0x9ba1ab))
-}
-
-fn preview_status(message: impl Into<SharedString>) -> AnyElement {
-    div()
-        .flex_1()
-        .min_w_0()
-        .min_h_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(0x08090b))
-        .text_sm()
-        .text_color(rgb(0x8b929d))
-        .child(message.into())
-        .into_any_element()
-}
-
-fn preview_control_button(id: &'static str, label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .min_w(px(32.0))
-        .h(px(28.0))
-        .px_2()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .bg(rgb(0x202329))
-        .hover(|button| button.bg(rgb(0x536987)))
-        .text_xs()
-        .child(label)
 }
 
 fn video_key(room_id: RoomId, message_id: u64, descriptor: &AttachmentDescriptor) -> VideoKey {

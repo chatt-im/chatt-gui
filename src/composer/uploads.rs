@@ -266,9 +266,7 @@ mod tests {
 
         assert_eq!(accepted, 1);
         assert_eq!(result.rejected.len(), 3);
-        assert!(
-            matches!(&queue.files()[0].source, QueuedFileSource::Path(path) if path == &valid)
-        );
+        assert!(matches!(&queue.files()[0].source, QueuedFileSource::Path(path) if path == &valid));
     }
 
     #[test]
@@ -327,12 +325,7 @@ mod tests {
         ]
         .into();
 
-        let result = prepare_images(
-            images,
-            1024,
-            MAX_QUEUED_FILES,
-            "2026-07-24T12-34-56Z",
-        );
+        let result = prepare_images(images, 1024, MAX_QUEUED_FILES, "2026-07-24T12-34-56Z");
         let mut queue = FileQueue::default();
         queue.extend(result.accepted);
 

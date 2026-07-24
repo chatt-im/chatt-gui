@@ -69,10 +69,7 @@ struct PreparedUpload {
 
 enum UploadSource {
     File(File),
-    Memory {
-        bytes: Arc<Vec<u8>>,
-        offset: usize,
-    },
+    Memory { bytes: Arc<Vec<u8>>, offset: usize },
 }
 
 impl Read for UploadSource {
@@ -246,8 +243,7 @@ impl DaemonClient {
             file_name,
             byte_len,
         };
-        self
-            .commands
+        self.commands
             .try_send(ConnectorCommand::PreparedUpload(PreparedUpload {
                 begin_request,
                 finish_request,

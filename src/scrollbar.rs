@@ -7,6 +7,8 @@ use gpui::{
     UniformListScrollHandle, Window, point, px, quad, relative, rgba, size,
 };
 
+use crate::theme::{ResolvedSettings, ThemeRole};
+
 const SCROLLBAR_SIZE: Pixels = px(12.0);
 const SCROLLBAR_PADDING: Pixels = px(2.0);
 const SCROLLBAR_MIN_THUMB: Pixels = px(28.0);
@@ -66,6 +68,16 @@ impl Default for OverlayScrollbarColors {
             track: rgba(0x111317dd).into(),
             thumb: rgba(0x5f6670cc).into(),
             thumb_hovered: rgba(0x8b929ddd).into(),
+        }
+    }
+}
+
+impl OverlayScrollbarColors {
+    pub(crate) fn from_settings(settings: &ResolvedSettings) -> Self {
+        Self {
+            track: settings.theme.color(ThemeRole::ScrollbarTrack).into(),
+            thumb: settings.theme.color(ThemeRole::ScrollbarThumb).into(),
+            thumb_hovered: settings.theme.color(ThemeRole::ScrollbarThumbHover).into(),
         }
     }
 }

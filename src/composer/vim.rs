@@ -2615,6 +2615,18 @@ impl VimEditor {
         self.fixup_cursor();
     }
 
+    pub fn set_primary_mode_preserving_history(&mut self, mode: Mode) {
+        debug_assert!(matches!(mode, Mode::Insert | Mode::Normal));
+        self.mode = mode;
+        self.selection = None;
+        self.pending_block_change = None;
+        self.pending = Pending::None;
+        self.pending_count = None;
+        self.fixup_cursor();
+        self.update_desired_display_col();
+        self.dirty = true;
+    }
+
     pub fn set_paste_text(&mut self, text: &str) {
         let text = self.normalize_text_for_mode(text);
         self.yank = if text.is_empty() {

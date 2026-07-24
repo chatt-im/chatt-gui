@@ -15,16 +15,17 @@ use chatt_message_format::highlight::{self, HlClass};
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DecorationRun, DispatchPhase, Edges,
     Element, ElementId, FocusHandle, FontRun, FontStyle, GlobalElementId, Hitbox, HitboxBehavior,
-    Hsla, KeyBinding, KeyContext, LayoutId, LineLayout, ListHorizontalSizingBehavior,
-    ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, Style, TextAlign, UniformListScrollHandle, Window, actions, div, point,
-    prelude::*, px, quad, rgb, rgba, uniform_list,
+    Hsla, KeyContext, LayoutId, LineLayout, ListHorizontalSizingBehavior, ListSizingBehavior,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Style,
+    TextAlign, UniformListScrollHandle, Window, actions, div, point, prelude::*, px, quad, rgb,
+    rgba, uniform_list,
 };
 
 use crate::{
     fonts::CODE_FONT_FAMILY,
     formatted_message::syntax_color,
     scrollbar::{OverlayScrollbarColors, OverlayScrollbarState, OverlayScrollbars},
+    theme::{ResolvedSettings, ThemeRole, syntax_role},
 };
 
 pub const MAX_CODE_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
@@ -42,17 +43,6 @@ const CODE_TAB_WIDTH: usize = 8;
 const CODE_TAB_WIDTH: usize = 4;
 
 actions!(code_viewer, [Copy, SelectAll]);
-
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-c", Copy, Some("ChattCodeViewer && !ChattCodeSearch")),
-        KeyBinding::new(
-            "cmd-a",
-            SelectAll,
-            Some("ChattCodeViewer && !ChattCodeSearch"),
-        ),
-    ]);
-}
 
 #[derive(Clone, Copy, Debug)]
 enum CodeRecord {
@@ -1266,6 +1256,7 @@ pub fn render_code_document(
     scrollbar_state: OverlayScrollbarState,
     selection: CodeSelection,
     active_match: Option<CodeMatchTarget>,
+    settings: Option<Arc<ResolvedSettings>>,
 ) -> impl IntoElement {
     let line_count = document.line_count();
     let widest_line = view_state.widest_line(&document);
@@ -1274,10 +1265,12 @@ pub fn render_code_document(
     let list_document = document.clone();
     let list_view_state = view_state.clone();
     let list_selection = selection.clone();
+    let list_settings = settings.clone();
     let list = uniform_list(
         ("code-viewer-lines", document.cache_key as usize),
         line_count,
         move |range, window, _| {
+            let settings = list_settings.clone();
             let line_height = window.line_height();
             range
                 .map(|line| {
@@ -1290,7 +1283,12 @@ pub fn render_code_document(
                         .whitespace_nowrap()
                         .when(
                             active_match.is_some_and(|target| target.line == line),
-                            |row| row.bg(rgb(0x242832)),
+                            |row| {
+                                row.bg(settings
+                                    .as_ref()
+                                    .map(|settings| settings.theme.color(ThemeRole::Raised))
+                                    .unwrap_or_else(|| rgb(0x242832)))
+                            },
                         )
                         .child(
                             div()
@@ -1298,7 +1296,12 @@ pub fn render_code_document(
                                 .flex_none()
                                 .pr_2()
                                 .text_right()
-                                .text_color(rgb(0x6f7680))
+                                .text_color(
+                                    settings
+                                        .as_ref()
+                                        .map(|settings| settings.theme.color(ThemeRole::TextDim))
+                                        .unwrap_or_else(|| rgb(0x6f7680)),
+                                )
                                 .child(number),
                         )
                         .child(CodeLineElement {
@@ -1307,6 +1310,7 @@ pub fn render_code_document(
                             view_state: list_view_state.clone(),
                             selection: list_selection.clone(),
                             active_match,
+                            settings: settings.clone(),
                         })
                 })
                 .collect::<Vec<_>>()
@@ -1320,17 +1324,34 @@ pub fn render_code_document(
     let contents = div()
         .relative()
         .size_full()
-        .font_family(CODE_FONT_FAMILY)
-        .text_size(px(14.0))
-        .text_color(rgb(syntax_color(
-            chatt_message_format::highlight::PaletteRole::Foreground,
-        )))
+        .font_family(
+            settings
+                .as_ref()
+                .map(|settings| settings.fonts.code_family.clone())
+                .unwrap_or_else(|| CODE_FONT_FAMILY.into()),
+        )
+        .text_size(px(settings
+            .as_ref()
+            .map_or(14.0, |settings| settings.fonts.code_size)))
+        .text_color(
+            settings
+                .as_ref()
+                .map(|settings| settings.theme.color(ThemeRole::SyntaxForeground))
+                .unwrap_or_else(|| {
+                    rgb(syntax_color(
+                        chatt_message_format::highlight::PaletteRole::Foreground,
+                    ))
+                }),
+        )
         .child(list)
         .child(OverlayScrollbars::new(
             "code-viewer-scrollbars",
             scroll_handle.clone(),
             scrollbar_state,
-            OverlayScrollbarColors::default(),
+            settings
+                .as_ref()
+                .map(|settings| OverlayScrollbarColors::from_settings(settings))
+                .unwrap_or_default(),
         ));
     CodeSelectionArea::new(contents, document, selection, scroll_handle, view_state)
 }
@@ -1341,6 +1362,7 @@ struct CodeLineElement {
     view_state: CodeViewState,
     selection: CodeSelection,
     active_match: Option<CodeMatchTarget>,
+    settings: Option<Arc<ResolvedSettings>>,
 }
 
 struct CodeLineLayout {
@@ -1518,7 +1540,10 @@ impl Element for CodeLineElement {
                     ),
                 ),
                 px(2.0),
-                rgba(0xd9a44166),
+                self.settings
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::StateCurrentSearch))
+                    .unwrap_or_else(|| rgba(0xd9a44166)),
                 Edges::default(),
                 Hsla::transparent_black(),
                 BorderStyle::default(),
@@ -1528,7 +1553,12 @@ impl Element for CodeLineElement {
         let document = self.document.clone();
         let decorations = document.line_spans(line).map(|span| DecorationRun {
             len: (span.end - span.start) as u32,
-            color: rgb(syntax_color(span.class.palette_role())).into(),
+            color: self
+                .settings
+                .as_ref()
+                .map(|settings| settings.theme.color(syntax_role(span.class.palette_role())))
+                .unwrap_or_else(|| rgb(syntax_color(span.class.palette_role())))
+                .into(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -1556,16 +1586,25 @@ impl Element for CodeLineElement {
                         gpui::size(marker.width, bounds.size.height),
                     ),
                     px(2.0),
-                    rgba(0xd9a44144),
+                    self.settings
+                        .as_ref()
+                        .map(|settings| settings.theme.color(ThemeRole::StateSearch))
+                        .unwrap_or_else(|| rgba(0xd9a44144)),
                     Edges::default(),
                     Hsla::transparent_black(),
                     BorderStyle::default(),
                 ));
             }
             let marker_color = if active_hidden {
-                rgb(0xd9a441)
+                self.settings
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::StateWarning))
+                    .unwrap_or_else(|| rgb(0xd9a441))
             } else {
-                rgb(0x6f7680)
+                self.settings
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::TextDim))
+                    .unwrap_or_else(|| rgb(0x6f7680))
             };
             marker
                 .paint_with_decorations(
@@ -1599,7 +1638,10 @@ impl Element for CodeLineElement {
                     point(bounds.left() + end_x, bounds.bottom()),
                 ),
                 Pixels::ZERO,
-                rgba(0x5277a866),
+                self.settings
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::StateSelection))
+                    .unwrap_or_else(|| rgba(0x5277a866)),
                 Edges::default(),
                 Hsla::transparent_black(),
                 BorderStyle::default(),
@@ -1674,6 +1716,7 @@ mod tests {
                     self.scrollbar_state.clone(),
                     self.selection.clone(),
                     self.active_match,
+                    None,
                 )))
         }
     }

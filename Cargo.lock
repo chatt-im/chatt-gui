@@ -598,6 +598,7 @@ dependencies = [
  "log",
  "naga",
  "tempfile",
+ "toml-spanner",
  "unicode-segmentation",
  "unicode-width",
  "zmij",
@@ -4013,6 +4014,23 @@ dependencies = [
  "toml_datetime 0.6.11",
  "toml_edit 0.22.27",
 ]
+
+[[package]]
+name = "toml-spanner"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0454309849e01bb15a8591a5032d706694445b393f0b1ac84b5e3b0b07ca8d69"
+dependencies = [
+ "foldhash 0.2.0",
+ "toml-spanner-macros",
+ "zmij",
+]
+
+[[package]]
+name = "toml-spanner-macros"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e31f017b6327c4d14f8a90240489076bdb23ea7d1c514ed1a45f72739c717ec"
 
 [[package]]
 name = "toml_datetime"

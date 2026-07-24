@@ -68,3 +68,27 @@ cargo check --locked
 Local Chatt changes that alter their crates' dependency graphs can require a
 temporary lockfile update. Do not commit that update unless the Chatt Git pins
 are advanced to the same revision.
+
+## GUI configuration
+
+The renderer owns `chatt/gui.toml` in the platform configuration directory.
+This is separate from the daemon-owned `client.toml`; the GUI never reads or
+writes daemon configuration. Set `CHATT_GUI_CONFIG` to use an explicit path
+(including a relative path), or `XDG_CONFIG_HOME` to override the platform
+configuration root.
+
+Open the native Settings surface with the sidebar gear or `secondary-,`.
+Appearance and typography changes preview immediately; composer mode and key
+bindings take effect after a successful save. A missing file is normal and is
+only created on Save. Invalid or externally changed files are not overwritten
+without an explicit Replace or reload confirmation.
+
+Files use schema version 1, kebab-case setting names, hex colors (`#rgb`,
+`#rgba`, `#rrggbb`, or `#rrggbbaa`), and GPUI key syntax. Partial files inherit
+built-in defaults. Binding tables map sequences to commands; assigning
+`"Unbind"` removes an inherited sequence. Tables are separated by dispatch
+context: `application`, `composer`, `completion`, `vim`, `code-search`,
+`code-viewer`, `formatted-message`, and `non-input`. Supported text rendering
+values are `platform-default`, `subpixel`, and `grayscale`. Subpixel rendering
+can fall back when the platform backend, window transparency, or renderer does
+not support it.

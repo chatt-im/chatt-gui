@@ -18,13 +18,16 @@ pub(crate) mod uploads;
 mod vim;
 mod visual;
 
-use crate::{fonts::CODE_FONT_FAMILY, formatted_message::syntax_color};
+use crate::{
+    fonts::CODE_FONT_FAMILY,
+    formatted_message::syntax_color,
+    theme::{AppliedSettings, ResolvedSettings, ThemeRole, syntax_role},
+};
 use chatt_message_format::highlight::PaletteRole;
 use highlight::{ComposerColor, ComposerSyntax, ComposerTextStyle, ComposerTypeface};
 use mode::Mode;
 use vim::{VimEditor, VimKey};
 
-const VIM_MODE: bool = true;
 const MAX_VISIBLE_LINES: usize = 8;
 
 actions!(
@@ -44,35 +47,6 @@ actions!(
         Newline
     ]
 );
-
-pub fn bind_keys(cx: &mut App) {
-    use gpui::KeyBinding;
-    cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, Some("ComposerInsert")),
-        KeyBinding::new("backspace", Backspace, Some("ChattCodeSearch")),
-        KeyBinding::new("delete", Delete, Some("ComposerInsert")),
-        KeyBinding::new("delete", Delete, Some("ChattCodeSearch")),
-        KeyBinding::new("left", Left, Some("ComposerInsert")),
-        KeyBinding::new("left", Left, Some("ChattCodeSearch")),
-        KeyBinding::new("right", Right, Some("ComposerInsert")),
-        KeyBinding::new("right", Right, Some("ChattCodeSearch")),
-        KeyBinding::new("shift-left", SelectLeft, Some("ComposerInsert")),
-        KeyBinding::new("shift-left", SelectLeft, Some("ChattCodeSearch")),
-        KeyBinding::new("shift-right", SelectRight, Some("ComposerInsert")),
-        KeyBinding::new("shift-right", SelectRight, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-a", SelectAll, Some("ComposerInsert")),
-        KeyBinding::new("cmd-a", SelectAll, Some("ChattCodeSearch")),
-        KeyBinding::new("secondary-v", Paste, Some("ComposerInsert")),
-        KeyBinding::new("secondary-v", Paste, Some("ChattCodeSearch")),
-        KeyBinding::new("secondary-v", Paste, Some("VimMode")),
-        KeyBinding::new("cmd-c", Copy, Some("ComposerInsert")),
-        KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
-        KeyBinding::new("cmd-x", Cut, Some("ComposerInsert")),
-        KeyBinding::new("cmd-x", Cut, Some("ChattCodeSearch")),
-        KeyBinding::new("tab", InsertTab, Some("ComposerInsert && !CompletionOpen")),
-        KeyBinding::new("shift-enter", Newline, Some("ComposerInsert")),
-    ]);
-}
 
 pub struct ComposerChanged;
 pub struct ComposerStateChanged;
@@ -116,14 +90,22 @@ pub struct Composer {
 }
 
 impl Composer {
+    #[cfg(test)]
     pub fn new(cx: &mut Context<Self>) -> Self {
+        Self::with_binding_mode(crate::config::schema::BindingMode::Vim, cx)
+    }
+
+    pub(crate) fn with_binding_mode(
+        binding_mode: crate::config::schema::BindingMode,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             focus: cx.focus_handle(),
             editor: VimEditor::new(),
             placeholder: "Message".into(),
             key_context: "ChattComposer",
             multiline: true,
-            vim_enabled: VIM_MODE,
+            vim_enabled: binding_mode == crate::config::schema::BindingMode::Vim,
             accepts_image_paste: true,
             min_height: px(42.),
             selected: 0..0,
@@ -159,6 +141,16 @@ impl Composer {
             last_line_height: None,
             syntax: None,
         }
+    }
+
+    pub(crate) fn settings_input(
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut input = Self::search(cx);
+        input.placeholder = placeholder.into();
+        input.key_context = "ChattSettingsInput";
+        input
     }
 
     pub fn text(&self) -> String {
@@ -218,6 +210,35 @@ impl Composer {
         self.last_layout.clear();
         self.refresh_syntax();
         cx.emit(ComposerChanged);
+        cx.emit(ComposerStateChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
+        self.restore(value.into(), cx);
+    }
+
+    pub(crate) fn set_binding_mode(
+        &mut self,
+        mode: crate::config::schema::BindingMode,
+        cx: &mut Context<Self>,
+    ) {
+        let vim_enabled = mode == crate::config::schema::BindingMode::Vim;
+        if self.key_context != "ChattComposer" || self.vim_enabled == vim_enabled {
+            return;
+        }
+        self.vim_enabled = vim_enabled;
+        self.editor
+            .set_primary_mode_preserving_history(if vim_enabled {
+                Mode::Normal
+            } else {
+                Mode::Insert
+            });
+        let cursor = self.editor.cursor_offset();
+        self.selected = cursor..cursor;
+        self.reversed = false;
+        self.marked = None;
+        self.last_layout.clear();
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -759,6 +780,7 @@ fn composer_text_runs(
     range: Range<usize>,
     base_font: &Font,
     base_color: Hsla,
+    settings: Option<&ResolvedSettings>,
 ) -> Vec<TextRun> {
     let mut runs = Vec::new();
     let mut cursor = range.start;
@@ -770,6 +792,7 @@ fn composer_text_runs(
                     ComposerTextStyle::default(),
                     base_font,
                     base_color,
+                    settings,
                 ));
             }
             runs.push(composer_text_run(
@@ -777,6 +800,7 @@ fn composer_text_runs(
                 styled.style,
                 base_font,
                 base_color,
+                settings,
             ));
             cursor = styled.range.end;
         }
@@ -787,6 +811,7 @@ fn composer_text_runs(
             ComposerTextStyle::default(),
             base_font,
             base_color,
+            settings,
         ));
     }
     if runs.is_empty() {
@@ -795,6 +820,7 @@ fn composer_text_runs(
             ComposerTextStyle::default(),
             base_font,
             base_color,
+            settings,
         ));
     }
     runs
@@ -805,10 +831,13 @@ fn composer_text_run(
     style: ComposerTextStyle,
     base_font: &Font,
     base_color: Hsla,
+    settings: Option<&ResolvedSettings>,
 ) -> TextRun {
     let mut font = base_font.clone();
     if style.typeface == ComposerTypeface::Code {
-        font.family = CODE_FONT_FAMILY.into();
+        font.family = settings
+            .map(|settings| settings.fonts.code_family.clone())
+            .unwrap_or_else(|| CODE_FONT_FAMILY.into());
     }
     if style.bold {
         font.weight = FontWeight::BOLD;
@@ -818,15 +847,25 @@ fn composer_text_run(
     }
     let color = match style.color {
         ComposerColor::Default => base_color,
-        ComposerColor::Dim => rgb(syntax_color(PaletteRole::Comment)).into(),
-        ComposerColor::Link => rgb(0xf0f0f0).into(),
-        ComposerColor::Syntax(role) => rgb(syntax_color(role)).into(),
+        ComposerColor::Dim => settings
+            .map(|settings| settings.theme.color(ThemeRole::SyntaxComment).into())
+            .unwrap_or_else(|| rgb(syntax_color(PaletteRole::Comment)).into()),
+        ComposerColor::Link => settings
+            .map(|settings| settings.theme.color(ThemeRole::TextLink).into())
+            .unwrap_or_else(|| rgb(0xf0f0f0).into()),
+        ComposerColor::Syntax(role) => settings
+            .map(|settings| settings.theme.color(syntax_role(role)).into())
+            .unwrap_or_else(|| rgb(syntax_color(role)).into()),
     };
     TextRun {
         len,
         font,
         color,
-        background_color: style.code_background.then(|| rgba(0xffffff14).into()),
+        background_color: style.code_background.then(|| {
+            settings
+                .map(|settings| settings.theme.color(ThemeRole::StateInlineCode).into())
+                .unwrap_or_else(|| rgba(0xffffff14).into())
+        }),
         underline: style.underline.then(|| UnderlineStyle {
             color: Some(color),
             thickness: px(1.),
@@ -887,9 +926,15 @@ impl Element for ComposerElement {
         cx: &mut App,
     ) -> Prepaint {
         let input = self.input.read(cx);
+        let applied = cx
+            .try_global::<AppliedSettings>()
+            .map(|settings| settings.0.clone());
         let is_placeholder = input.editor.len() == 0;
         let color = if is_placeholder {
-            rgb(0x747a84).into()
+            applied
+                .as_ref()
+                .map(|settings| settings.theme.color(ThemeRole::TextDim).into())
+                .unwrap_or_else(|| rgb(0x747a84).into())
         } else {
             window.text_style().color
         };
@@ -906,7 +951,13 @@ impl Element for ComposerElement {
                     strikethrough: None,
                 }]
             } else {
-                composer_text_runs(input.syntax.as_ref(), range.clone(), &font, color)
+                composer_text_runs(
+                    input.syntax.as_ref(),
+                    range.clone(),
+                    &font,
+                    color,
+                    applied.as_deref(),
+                )
             };
             ComposerLine {
                 range,
@@ -971,7 +1022,12 @@ impl Element for ComposerElement {
                         }
                         Some(fill(
                             Bounds::from_corners(point(left, top), point(right, top + line_height)),
-                            rgba(0x6f8fc044),
+                            applied
+                                .as_ref()
+                                .map(|settings| {
+                                    settings.theme.color(ThemeRole::StateComposerSelection)
+                                })
+                                .unwrap_or_else(|| rgba(0x6f8fc044)),
                         ))
                     })
                     .collect::<Vec<_>>()
@@ -1001,9 +1057,15 @@ impl Element for ComposerElement {
                     size(cursor_width, line_height),
                 ),
                 if input.vim_enabled && input.editor.mode() != Mode::Insert {
-                    rgba(0x8ca9d888)
+                    applied
+                        .as_ref()
+                        .map(|settings| settings.theme.color(ThemeRole::StateCursorNormal))
+                        .unwrap_or_else(|| rgba(0x8ca9d888))
                 } else {
-                    rgba(0x8ca9d8ff)
+                    applied
+                        .as_ref()
+                        .map(|settings| settings.theme.color(ThemeRole::StateCursorInsert))
+                        .unwrap_or_else(|| rgba(0x8ca9d8ff))
                 },
             )
         });
@@ -1066,7 +1128,27 @@ impl Element for ComposerElement {
 
 impl Render for Composer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let key_context = if self.key_context == "ChattCodeSearch" {
+        let fonts = cx
+            .try_global::<AppliedSettings>()
+            .map(|settings| settings.0.fonts.clone());
+        let (family, size) = if self.key_context == "ChattComposer" {
+            (
+                fonts
+                    .as_ref()
+                    .map(|fonts| fonts.message_family.clone())
+                    .unwrap_or_else(|| "IBM Plex Sans".into()),
+                fonts.as_ref().map_or(16.0, |fonts| fonts.message_size),
+            )
+        } else {
+            (
+                fonts
+                    .as_ref()
+                    .map(|fonts| fonts.interface_family.clone())
+                    .unwrap_or_else(|| ".SystemUIFont".into()),
+                fonts.as_ref().map_or(16.0, |fonts| fonts.interface_size),
+            )
+        };
+        let key_context = if self.key_context != "ChattComposer" {
             self.key_context
         } else if !self.vim_enabled || self.editor.mode() == Mode::Insert {
             "ChattComposer ComposerInsert"
@@ -1076,6 +1158,8 @@ impl Render for Composer {
         div()
             .flex()
             .items_center()
+            .font_family(family)
+            .text_size(px(size))
             .key_context(key_context)
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
@@ -1155,7 +1239,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::{
-        Composer, ComposerImagePaste, ComposerLine, bind_keys, line_for_offset, logical_lines,
+        Composer, ComposerImagePaste, ComposerLine, line_for_offset, logical_lines,
         normalize_range, range_from_utf16, should_auto_close_code_fence, visible_line_range,
     };
 
@@ -1164,7 +1248,9 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(crate::fonts::init);
-        cx.update(bind_keys);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
         let (composer, cx) = cx.add_window_view(|window, cx| {
             let composer = Composer::new(cx);
             window.focus(&composer.focus, cx);
@@ -1188,11 +1274,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn image_paste_emits_memory_payload_for_shortcut_and_normal_p(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn image_paste_emits_memory_payload_for_shortcut_and_normal_p(cx: &mut gpui::TestAppContext) {
         cx.update(crate::fonts::init);
-        cx.update(bind_keys);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
         let (composer, cx) = cx.add_window_view(|window, cx| {
             let composer = Composer::new(cx);
             window.focus(&composer.focus, cx);
@@ -1240,7 +1326,9 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(crate::fonts::init);
-        cx.update(bind_keys);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
         let (composer, cx) = cx.add_window_view(|window, cx| {
             let composer = Composer::search(cx);
             window.focus(&composer.focus, cx);

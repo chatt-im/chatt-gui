@@ -29,6 +29,11 @@ local_rpc = { package = "chatt-local-rpc", git = "https://github.com/chatt-im/ch
 unicode-segmentation = "1"
 unicode-width = "0.2"
 tempfile = "3"
+toml-spanner = { version = "1.0.3", features = [
+    "derive",
+    "from-toml",
+    "to-toml",
+] }
 zmij = "1.0.23"
 
 [dev-dependencies]

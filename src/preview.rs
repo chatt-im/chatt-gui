@@ -110,6 +110,14 @@ pub struct PreviewOpenResult {
 }
 
 impl PreviewHistory {
+    pub fn reset_code_measurements(&mut self) {
+        for item in &mut self.items {
+            if let Some(preview) = item.code_preview_mut() {
+                preview.view_state.reset();
+            }
+        }
+    }
+
     pub fn items(&self) -> &[PreviewItem] {
         &self.items
     }

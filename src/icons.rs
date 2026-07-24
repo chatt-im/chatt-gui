@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString, Svg, prelude::*, px, rgb, svg};
+use gpui::{AssetSource, Result, Rgba, SharedString, Svg, prelude::*, px, svg};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IconName {
@@ -61,7 +61,7 @@ impl IconName {
     }
 }
 
-pub(crate) fn icon(name: IconName, size: f32, color: u32) -> Svg {
+pub(crate) fn icon(name: IconName, size: f32, color: Rgba) -> Svg {
     // Unlike text, GPUI SVG elements need their monochrome tint on the SVG's
     // own style at paint time. Relying on the button's inherited text color
     // leaves `Svg::paint` without a color and it skips drawing altogether.
@@ -69,7 +69,7 @@ pub(crate) fn icon(name: IconName, size: f32, color: u32) -> Svg {
         .path(name.path())
         .size(px(size))
         .flex_none()
-        .text_color(rgb(color))
+        .text_color(color)
 }
 
 /// The client previously had no asset source. Keep this deliberately small and

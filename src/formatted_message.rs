@@ -1,11 +1,4 @@
-use std::{
-    cell::RefCell,
-    cmp::Ordering,
-    collections::HashMap,
-    ops::Range,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
 use chatt_message_format::{
     Token, TokenKind,
@@ -14,15 +7,15 @@ use chatt_message_format::{
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges,
     Element, ElementId, FocusHandle, FontStyle, FontWeight, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, KeyBinding, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, StyledText, TextLayout, TextRun,
-    TextStyle, UnderlineStyle, WhiteSpace, Window, actions, div, point, prelude::*, px, quad, rgb,
-    rgba,
+    HitboxBehavior, Hsla, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollHandle, SharedString, StyledText, TextLayout, TextRun, TextStyle,
+    UnderlineStyle, WhiteSpace, Window, actions, div, point, prelude::*, px, quad, rgb, rgba,
 };
 
 use crate::{
     fonts::{CODE_FONT_FAMILY, UI_FONT_FAMILY},
     icons::{IconName, icon},
+    theme::{AppliedSettings, ThemeRole, syntax_role},
 };
 
 const BODY_COLOR: u32 = 0xd8d8d8;
@@ -34,13 +27,6 @@ const CODE_BORDER: u32 = 0x2a2a2a;
 const MAX_VISIBLE_QUOTE_DEPTH: usize = 8;
 
 actions!(formatted_message, [Copy]);
-
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-c", Copy, Some("ChattFormattedText")),
-        KeyBinding::new("y", Copy, Some("ChattFormattedText")),
-    ]);
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InlineKind {
@@ -481,7 +467,7 @@ pub struct RenderedMessage {
 pub struct FormattedMessageElement {
     message: Rc<FormattedMessage>,
     selection: Option<(MessageSelectionGroup, MessageSelectionKey)>,
-    body_color: u32,
+    body_color: Option<gpui::Rgba>,
 }
 
 impl FormattedMessageElement {
@@ -489,7 +475,7 @@ impl FormattedMessageElement {
         Self {
             message,
             selection: None,
-            body_color: BODY_COLOR,
+            body_color: None,
         }
     }
 
@@ -502,14 +488,36 @@ impl FormattedMessageElement {
         self
     }
 
-    pub fn body_color(mut self, color: u32) -> Self {
-        self.body_color = color;
+    pub fn body_color(mut self, color: gpui::Rgba) -> Self {
+        self.body_color = Some(color);
         self
     }
 
-    fn build(&self, window: &mut Window, _cx: &mut App) -> RenderedMessage {
+    fn build(&self, window: &mut Window, cx: &mut App) -> RenderedMessage {
+        let applied = cx
+            .try_global::<AppliedSettings>()
+            .map(|settings| settings.0.clone());
+        let message_size = applied
+            .as_ref()
+            .map_or(16.0, |settings| settings.fonts.message_size);
+        let code_size = applied
+            .as_ref()
+            .map_or(14.0, |settings| settings.fonts.code_size);
+        let body_color = self
+            .body_color
+            .or_else(|| {
+                applied
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::TextBody))
+            })
+            .unwrap_or_else(|| rgb(BODY_COLOR));
         let mut lines = Vec::new();
-        let mut root = div().w_full().min_w_0().flex().flex_col();
+        let mut root = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .text_size(px(message_size));
 
         for (index, block) in self.message.blocks.iter().enumerate() {
             let element = match &block.kind {
@@ -518,22 +526,24 @@ impl FormattedMessageElement {
                     PiecePresentation::Body,
                     block.quote_depth,
                     true,
-                    self.body_color,
+                    body_color,
                     &mut lines,
                     window,
+                    cx,
                 ),
                 BlockKind::Header(piece) => div()
                     .w_full()
                     .min_w_0()
-                    .text_size(px(17.))
+                    .text_size(px(message_size + 1.))
                     .child(render_piece(
                         piece,
                         PiecePresentation::Header,
                         block.quote_depth,
                         true,
-                        self.body_color,
+                        body_color,
                         &mut lines,
                         window,
+                        cx,
                     ))
                     .into_any_element(),
                 BlockKind::ListItem { marker, content } => div()
@@ -546,18 +556,20 @@ impl FormattedMessageElement {
                         PiecePresentation::Body,
                         block.quote_depth,
                         false,
-                        self.body_color,
+                        body_color,
                         &mut lines,
                         window,
+                        cx,
                     ))
                     .child(div().flex_1().w_0().child(render_piece(
                         content,
                         PiecePresentation::Body,
                         block.quote_depth,
                         true,
-                        self.body_color,
+                        body_color,
                         &mut lines,
                         window,
+                        cx,
                     )))
                     .into_any_element(),
                 BlockKind::Code {
@@ -569,9 +581,11 @@ impl FormattedMessageElement {
                     scroll_handle,
                     hover_group,
                     block.quote_depth,
-                    self.body_color,
+                    body_color,
                     &mut lines,
                     window,
+                    cx,
+                    code_size,
                 ),
                 BlockKind::Blank => div().h(px(7.)).into_any_element(),
             };
@@ -585,7 +599,14 @@ impl FormattedMessageElement {
                 )
                 .child(element)
                 .into_any_element();
-            root = root.child(wrap_quote(element, block.quote_depth));
+            root = root.child(wrap_quote(
+                element,
+                block.quote_depth,
+                applied
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::BorderQuote))
+                    .unwrap_or_else(|| rgb(QUOTE_RAIL_COLOR)),
+            ));
         }
 
         let text = RenderedText {
@@ -748,7 +769,9 @@ impl Element for FormattedMessageElement {
                 window.paint_quad(quad(
                     bounds,
                     Pixels::ZERO,
-                    rgba(0x5277a866),
+                    cx.try_global::<AppliedSettings>()
+                        .map(|settings| settings.0.theme.color(ThemeRole::StateSelection))
+                        .unwrap_or_else(|| rgba(0x5277a866)),
                     Edges::default(),
                     Hsla::transparent_black(),
                     BorderStyle::default(),
@@ -771,12 +794,13 @@ fn render_piece(
     presentation: PiecePresentation,
     quote_depth: usize,
     fill_width: bool,
-    body_color: u32,
+    body_color: gpui::Rgba,
     lines: &mut Vec<RenderedLine>,
     window: &Window,
+    cx: &App,
 ) -> AnyElement {
     let text = piece.text.clone();
-    let runs = text_runs(piece, presentation, quote_depth, body_color, window);
+    let runs = text_runs(piece, presentation, quote_depth, body_color, window, cx);
     let styled = StyledText::new(text).with_shared_runs(runs);
     lines.push(RenderedLine {
         layout: styled.layout().clone(),
@@ -794,10 +818,15 @@ fn render_code_block(
     scroll_handle: &ScrollHandle,
     hover_group: &SharedString,
     quote_depth: usize,
-    body_color: u32,
+    body_color: gpui::Rgba,
     lines: &mut Vec<RenderedLine>,
     window: &Window,
+    cx: &App,
+    code_size: f32,
 ) -> AnyElement {
+    let applied = cx
+        .try_global::<AppliedSettings>()
+        .map(|settings| settings.0.clone());
     let code = piece.text.clone();
     let content = if code.is_empty() {
         div().h(px(20.)).into_any_element()
@@ -808,6 +837,7 @@ fn render_code_block(
             quote_depth,
             body_color,
             window,
+            cx,
         );
         let styled = StyledText::new(code.clone()).with_shared_runs(runs);
         lines.push(RenderedLine {
@@ -834,11 +864,24 @@ fn render_code_block(
         .px(px(8.))
         .py(px(8.))
         .pr(px(40.))
-        .bg(rgb(CODE_BACKGROUND))
+        .bg(applied
+            .as_ref()
+            .map(|settings| settings.theme.color(ThemeRole::CodeSurface))
+            .unwrap_or_else(|| rgb(CODE_BACKGROUND)))
         .border_1()
-        .border_color(rgb(CODE_BORDER))
-        .text_size(px(14.))
-        .font_family(CODE_FONT_FAMILY)
+        .border_color(
+            applied
+                .as_ref()
+                .map(|settings| settings.theme.color(ThemeRole::BorderCode))
+                .unwrap_or_else(|| rgb(CODE_BORDER)),
+        )
+        .text_size(px(code_size))
+        .font_family(
+            applied
+                .as_ref()
+                .map(|settings| settings.fonts.code_family.clone())
+                .unwrap_or_else(|| CODE_FONT_FAMILY.into()),
+        )
         .child(content)
         .child(
             div()
@@ -850,8 +893,16 @@ fn render_code_block(
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(0x1d1d1d))
-                .text_color(rgb(DIM_COLOR))
+                .bg(applied
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::ControlButton))
+                    .unwrap_or_else(|| rgb(0x1d1d1d)))
+                .text_color(
+                    applied
+                        .as_ref()
+                        .map(|settings| settings.theme.color(ThemeRole::TextDim))
+                        .unwrap_or_else(|| rgb(DIM_COLOR)),
+                )
                 .cursor_pointer()
                 .invisible()
                 .group_hover(hover_group.clone(), |button| button.visible())
@@ -860,19 +911,26 @@ fn render_code_block(
                     cx.stop_propagation();
                     cx.write_to_clipboard(ClipboardItem::new_string(copy_code.to_string()));
                 })
-                .child(icon(IconName::Copy, 15., DIM_COLOR)),
+                .child(icon(
+                    IconName::Copy,
+                    15.,
+                    applied
+                        .as_ref()
+                        .map(|settings| settings.theme.color(ThemeRole::TextMuted))
+                        .unwrap_or_else(|| rgb(DIM_COLOR)),
+                )),
         )
         .into_any_element()
 }
 
-fn wrap_quote(mut element: AnyElement, depth: usize) -> AnyElement {
+fn wrap_quote(mut element: AnyElement, depth: usize, color: gpui::Rgba) -> AnyElement {
     for _ in 0..depth.min(MAX_VISIBLE_QUOTE_DEPTH) {
         element = div()
             .w_full()
             .min_w_0()
             .pl(px(10.))
             .border_l_4()
-            .border_color(rgb(QUOTE_RAIL_COLOR))
+            .border_color(color)
             .child(element)
             .into_any_element();
     }
@@ -883,10 +941,11 @@ fn text_runs(
     piece: &TextPiece,
     presentation: PiecePresentation,
     quote_depth: usize,
-    body_color: u32,
+    body_color: gpui::Rgba,
     window: &Window,
+    cx: &App,
 ) -> Arc<[TextRun]> {
-    let base_style = base_text_style(presentation, quote_depth, body_color, window);
+    let base_style = base_text_style(presentation, quote_depth, body_color, window, cx);
     if let Some((cached_style, cached_runs)) = piece.cached_runs.borrow().as_ref()
         && cached_style == &base_style
     {
@@ -903,7 +962,7 @@ fn text_runs(
             continue;
         }
         let mut style = base_style.clone();
-        apply_span_style(&mut style, *span);
+        apply_span_style(&mut style, *span, cx);
         runs.push(style.to_run(span.end - span.start));
         cursor = span.end;
     }
@@ -918,19 +977,32 @@ fn text_runs(
 fn base_text_style(
     presentation: PiecePresentation,
     quote_depth: usize,
-    body_color: u32,
+    body_color: gpui::Rgba,
     window: &Window,
+    cx: &App,
 ) -> TextStyle {
     let mut style = window.text_style();
-    style.color = rgb(if quote_depth > 0 {
-        DIM_COLOR
+    let applied = cx
+        .try_global::<AppliedSettings>()
+        .map(|settings| settings.0.clone());
+    style.color = if quote_depth > 0 {
+        applied
+            .as_ref()
+            .map(|settings| settings.theme.color(ThemeRole::TextMuted))
+            .unwrap_or_else(|| rgb(DIM_COLOR))
     } else {
         body_color
-    })
+    }
     .into();
     style.font_family = match presentation {
-        PiecePresentation::Code => CODE_FONT_FAMILY.into(),
-        PiecePresentation::Body | PiecePresentation::Header => UI_FONT_FAMILY.into(),
+        PiecePresentation::Code => applied
+            .as_ref()
+            .map(|settings| settings.fonts.code_family.clone())
+            .unwrap_or_else(|| CODE_FONT_FAMILY.into()),
+        PiecePresentation::Body | PiecePresentation::Header => applied
+            .as_ref()
+            .map(|settings| settings.fonts.message_family.clone())
+            .unwrap_or_else(|| UI_FONT_FAMILY.into()),
     };
     style.font_weight = if matches!(presentation, PiecePresentation::Header) {
         FontWeight::SEMIBOLD
@@ -939,12 +1011,19 @@ fn base_text_style(
     };
     if matches!(presentation, PiecePresentation::Code) {
         style.white_space = WhiteSpace::Nowrap;
-        style.color = rgb(syntax_color(PaletteRole::Foreground)).into();
+        style.color = applied
+            .as_ref()
+            .map(|settings| settings.theme.color(ThemeRole::SyntaxForeground))
+            .unwrap_or_else(|| rgb(syntax_color(PaletteRole::Foreground)))
+            .into();
     }
     style
 }
 
-fn apply_span_style(style: &mut TextStyle, span: FormatSpan) {
+fn apply_span_style(style: &mut TextStyle, span: FormatSpan, cx: &App) {
+    let applied = cx
+        .try_global::<AppliedSettings>()
+        .map(|settings| settings.0.clone());
     if span.bold {
         style.font_weight = FontWeight::BOLD;
     }
@@ -954,26 +1033,50 @@ fn apply_span_style(style: &mut TextStyle, span: FormatSpan) {
     match span.kind {
         InlineKind::Plain => {}
         InlineKind::Url => {
-            style.color = rgb(LINK_COLOR).into();
+            let color = applied
+                .as_ref()
+                .map(|settings| settings.theme.color(ThemeRole::TextLink))
+                .unwrap_or_else(|| rgb(LINK_COLOR));
+            style.color = color.into();
             style.underline = Some(UnderlineStyle {
-                color: Some(rgb(LINK_COLOR).into()),
+                color: Some(color.into()),
                 thickness: px(1.),
                 ..Default::default()
             });
         }
         InlineKind::Reference => {
-            style.color = rgb(DIM_COLOR).into();
-            style.font_family = CODE_FONT_FAMILY.into();
+            style.color = applied
+                .as_ref()
+                .map(|settings| settings.theme.color(ThemeRole::TextMuted))
+                .unwrap_or_else(|| rgb(DIM_COLOR))
+                .into();
+            style.font_family = applied
+                .as_ref()
+                .map(|settings| settings.fonts.code_family.clone())
+                .unwrap_or_else(|| CODE_FONT_FAMILY.into());
         }
         InlineKind::Code => {
-            style.font_family = CODE_FONT_FAMILY.into();
-            style.background_color = Some(rgba(0xffffff14).into());
+            style.font_family = applied
+                .as_ref()
+                .map(|settings| settings.fonts.code_family.clone())
+                .unwrap_or_else(|| CODE_FONT_FAMILY.into());
+            style.background_color = Some(
+                applied
+                    .as_ref()
+                    .map(|settings| settings.theme.color(ThemeRole::StateInlineCode))
+                    .unwrap_or_else(|| rgba(0xffffff14))
+                    .into(),
+            );
         }
         InlineKind::ListMarker => {
             style.font_weight = FontWeight::BOLD;
         }
         InlineKind::Syntax(class) => {
-            style.color = rgb(syntax_color(class.palette_role())).into();
+            style.color = applied
+                .as_ref()
+                .map(|settings| settings.theme.color(syntax_role(class.palette_role())))
+                .unwrap_or_else(|| rgb(syntax_color(class.palette_role())))
+                .into();
             if matches!(class, HlClass::Comment | HlClass::DocComment) {
                 style.font_style = FontStyle::Italic;
             }
@@ -1962,11 +2065,7 @@ mod tests {
             Bounds::default(),
             second.clone(),
         );
-        group.register(
-            MessageSelectionKey::Message(3),
-            Bounds::default(),
-            third,
-        );
+        group.register(MessageSelectionKey::Message(3), Bounds::default(), third);
         group.begin_selection(MessageSelectionKey::Message(1), 2, 1, false, &first);
         assert!(group.update_head(MessageSelectionKey::Message(2), 3));
 
@@ -2030,11 +2129,7 @@ mod tests {
         }
 
         impl gpui::Render for TestSelectionView {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut gpui::Context<Self>,
-            ) -> impl IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
                 div()
                     .size_full()
                     .track_focus(&self.other_focus)
@@ -2051,7 +2146,9 @@ mod tests {
         }
 
         cx.update(crate::fonts::init);
-        cx.update(bind_keys);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
         let (view, cx) = cx.add_window_view(|window, cx| {
             let other_focus = cx.focus_handle();
             let group = MessageSelectionGroup::new(cx.focus_handle());
@@ -2070,10 +2167,7 @@ mod tests {
             let bounds = line.layout.bounds();
             let physical = &line.layout.line_layouts()[0].unwrapped_layout;
             (
-                point(
-                    bounds.left() + physical.x_for_index(0),
-                    bounds.center().y,
-                ),
+                point(bounds.left() + physical.x_for_index(0), bounds.center().y),
                 point(
                     bounds.left() + physical.x_for_index("command output".len()),
                     bounds.center().y,

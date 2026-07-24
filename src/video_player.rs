@@ -1,13 +1,14 @@
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Div, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, Pixels, Stateful, Window, canvas, div, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, rgb, rgba, surface,
+    linear_gradient, point, prelude::*, px, relative, surface,
 };
 
 use crate::{
     icons::{IconName, icon},
+    theme::{ResolvedSettings, ThemeRole},
     video_controls::{
         CONTROLS_ANIMATION_DURATION, ControlsPhase, VOLUME_ANIMATION_DURATION, horizontal_fraction,
     },
@@ -60,6 +61,7 @@ pub(crate) fn render_video_player(
     handler: VideoPlayerHandler,
     volume_popup_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     volume_button_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    settings: Arc<ResolvedSettings>,
 ) -> AnyElement {
     let VideoPlayerConfig {
         key,
@@ -135,7 +137,7 @@ pub(crate) fn render_video_player(
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .bg(rgb(0x08090b))
+        .bg(settings.theme.color(ThemeRole::MediaViewport))
         .when(theater, |viewport| viewport.size_full())
         .when(!theater, |viewport| viewport.aspect_ratio(aspect_ratio))
         .on_hover(move |hovered, window, cx| {
@@ -163,7 +165,7 @@ pub(crate) fn render_video_player(
                 .flex_col()
                 .items_center()
                 .gap_2()
-                .text_color(rgb(0x8d939d))
+                .text_color(settings.theme.color(ThemeRole::MediaMutedText))
                 .child(div().text_sm().child(if video.loading {
                     "Starting video…".to_string()
                 } else if thumbnail.failed {
@@ -185,16 +187,24 @@ pub(crate) fn render_video_player(
                 .items_center()
                 .justify_center()
                 .border_1()
-                .border_color(rgba(0xffffff2b))
-                .bg(rgba(0x08090bcc))
+                .border_color(settings.theme.color(ThemeRole::MediaBorder))
+                .bg(settings.theme.color(ThemeRole::MediaOverlay))
                 .cursor_pointer()
-                .hover(|button| button.bg(rgba(0x171a20ee)).border_color(rgba(0xffffff55)))
+                .hover({
+                    let hover = settings.theme.color(ThemeRole::MediaOverlayStrong);
+                    let border = settings.theme.color(ThemeRole::BorderFocus);
+                    move |button| button.bg(hover).border_color(border)
+                })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
                     play(VideoPlayerEvent::Play, window, cx)
                 })
-                .child(icon(IconName::Play, 22.0, 0xf0f2f5)),
+                .child(icon(
+                    IconName::Play,
+                    22.0,
+                    settings.theme.color(ThemeRole::ControlActiveText),
+                )),
         );
     }
 
@@ -259,11 +269,11 @@ pub(crate) fn render_video_player(
                         .px_2()
                         .py_1()
                         .border_1()
-                        .border_color(rgb(0x30343b))
-                        .bg(rgba(0x08090bf2))
+                        .border_color(settings.theme.color(ThemeRole::MediaBorder))
+                        .bg(settings.theme.color(ThemeRole::MediaOverlayStrong))
                         .text_center()
                         .text_xs()
-                        .text_color(rgb(0xd9dbe0))
+                        .text_color(settings.theme.color(ThemeRole::MediaText))
                         .child(format_time(tooltip_position)),
                 )
             })
@@ -272,13 +282,13 @@ pub(crate) fn render_video_player(
                     .relative()
                     .w_full()
                     .h(px(if scrub_active { 5.0 } else { 3.0 }))
-                    .bg(rgba(0xc4c8d033))
+                    .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
                     .child(
                         div()
                             .relative()
                             .h_full()
                             .w(relative(progress))
-                            .bg(rgb(0x748bbd))
+                            .bg(settings.theme.color(ThemeRole::MediaProgressFill))
                             .when(scrub_active, |progress| {
                                 progress.child(
                                     div()
@@ -286,7 +296,7 @@ pub(crate) fn render_video_player(
                                         .right(px(-4.0))
                                         .top(px(-2.0))
                                         .size(px(9.0))
-                                        .bg(rgb(0xaebce0)),
+                                        .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
                                 )
                             }),
                     ),
@@ -326,6 +336,7 @@ pub(crate) fn render_video_player(
                 video_control_button(
                     ("video-volume-button", key.message_id as usize),
                     volume_icon,
+                    &settings,
                 )
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -349,8 +360,8 @@ pub(crate) fn render_video_player(
                 .px_2()
                 .py_2()
                 .border_1()
-                .border_color(rgb(0x30343b))
-                .bg(rgba(0x111317f5))
+                .border_color(settings.theme.color(ThemeRole::MediaBorder))
+                .bg(settings.theme.color(ThemeRole::MediaOverlayStrong))
                 .shadow_sm()
                 .on_hover(move |hovered, window, cx| {
                     popup_hover(VideoPlayerEvent::VolumePopupHovered(*hovered), window, cx)
@@ -366,7 +377,7 @@ pub(crate) fn render_video_player(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xb4b9c2))
+                        .text_color(settings.theme.color(ThemeRole::TextSecondary))
                         .child(format!("{:.0}", video.volume)),
                 )
                 .child(
@@ -402,7 +413,7 @@ pub(crate) fn render_video_player(
                                 .relative()
                                 .w(px(4.0))
                                 .h_full()
-                                .bg(rgb(0x353941))
+                                .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
                                 .child(
                                     div()
                                         .absolute()
@@ -410,7 +421,7 @@ pub(crate) fn render_video_player(
                                         .bottom_0()
                                         .w_full()
                                         .h(relative(volume_fraction))
-                                        .bg(rgb(0x748bbd)),
+                                        .bg(settings.theme.color(ThemeRole::MediaProgressFill)),
                                 )
                                 .child(
                                     div()
@@ -419,7 +430,7 @@ pub(crate) fn render_video_player(
                                         .bottom(relative(volume_fraction))
                                         .mb(px(-4.0))
                                         .size(px(10.0))
-                                        .bg(rgb(0xaebce0)),
+                                        .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
                                 ),
                         ),
                 )
@@ -446,6 +457,7 @@ pub(crate) fn render_video_player(
                     } else {
                         IconName::Play
                     },
+                    &settings,
                 )
                 .opacity(if video.loading { 0.55 } else { 1.0 })
                 .when(!video.loading, |button| {
@@ -460,7 +472,7 @@ pub(crate) fn render_video_player(
                 div()
                     .ml_1()
                     .text_xs()
-                    .text_color(rgb(0xc5c9d0))
+                    .text_color(settings.theme.color(ThemeRole::MediaText))
                     .child(format!(
                         "{} / {}",
                         format_time(display_position),
@@ -476,6 +488,7 @@ pub(crate) fn render_video_player(
                     } else {
                         IconName::Maximize
                     },
+                    &settings,
                 )
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -495,8 +508,8 @@ pub(crate) fn render_video_player(
             .pb(px(if theater { 12.0 } else { 7.0 }))
             .bg(linear_gradient(
                 180.0,
-                linear_color_stop(rgba(0x08090b00), 0.0),
-                linear_color_stop(rgba(0x08090be8), 1.0),
+                linear_color_stop(settings.theme.color(ThemeRole::MediaGradientStart), 0.0),
+                linear_color_stop(settings.theme.color(ThemeRole::MediaGradientEnd), 1.0),
             ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_hover(move |hovered, window, cx| {
@@ -537,14 +550,18 @@ pub(crate) fn render_video_player(
         ))
         .relative()
         .w_full()
-        .bg(rgb(0x08090b))
+        .bg(settings.theme.color(ThemeRole::MediaViewport))
         .when(theater, |frame| frame.size_full())
         .when(!theater, |frame| frame.mt_2())
         .child(viewport)
         .into_any_element()
 }
 
-fn video_control_button(id: impl Into<gpui::ElementId>, icon_name: IconName) -> Stateful<Div> {
+fn video_control_button(
+    id: impl Into<gpui::ElementId>,
+    icon_name: IconName,
+    settings: &ResolvedSettings,
+) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(36.0))
@@ -553,10 +570,17 @@ fn video_control_button(id: impl Into<gpui::ElementId>, icon_name: IconName) -> 
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .text_color(rgb(0xd9dbe0))
-        .hover(|button| button.bg(rgba(0xffffff12)))
+        .text_color(settings.theme.color(ThemeRole::MediaText))
+        .hover({
+            let hover = settings.theme.color(ThemeRole::StateInlineCode);
+            move |button| button.bg(hover)
+        })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(icon(icon_name, 18.0, 0xd9dbe0))
+        .child(icon(
+            icon_name,
+            18.0,
+            settings.theme.color(ThemeRole::MediaText),
+        ))
 }
 
 pub(crate) fn aspect_ratio(video: &VideoView, fallback: (Option<u32>, Option<u32>)) -> f32 {
