@@ -1,4 +1,5 @@
 mod catalog;
+mod remote;
 
 use std::sync::Arc;
 
@@ -22,6 +23,8 @@ use catalog::{
     RowRef, SETTINGS_SECTIONS, ScalarSetting, SettingsSection, help, label, matches_search, path,
     rows,
 };
+use local_rpc::settings as wire_settings;
+use remote::{RemoteField, RemoteSection, RemoteValues};
 
 #[derive(Clone)]
 pub(crate) struct ConfigurationState(pub(crate) LoadedConfig);
@@ -32,7 +35,10 @@ pub(crate) fn install_loaded(loaded: LoadedConfig, cx: &mut App) {
     cx.set_global(ConfigurationState(loaded));
 }
 
-pub(crate) struct SettingsClosed;
+pub(crate) enum SettingsViewEvent {
+    Closed,
+    Command(wire_settings::SettingsCommand),
+}
 
 struct PendingSave {
     config: GuiConfig,
@@ -43,6 +49,7 @@ struct PendingSave {
 enum SettingsFocus {
     Search,
     Row(RowRef),
+    RemoteRow(RemoteField),
     ResetAll,
     ResetSection,
     Reload,
@@ -54,6 +61,7 @@ enum SettingsFocus {
 enum EditorTarget {
     Search,
     Row(RowRef),
+    RemoteRow(RemoteField),
 }
 
 struct ActiveEditor {
@@ -62,9 +70,25 @@ struct ActiveEditor {
     _subscription: Subscription,
 }
 
+struct ChoicePicker {
+    field: RemoteField,
+    query: String,
+    selected: usize,
+    search: Entity<TextEditor>,
+    _subscription: Subscription,
+    scroll: UniformListScrollHandle,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct InvalidEdit {
     row: RowRef,
+    text: String,
+    error: SharedString,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InvalidRemoteEdit {
+    field: RemoteField,
     text: String,
     error: SharedString,
 }
@@ -80,7 +104,9 @@ pub(crate) struct SettingsView {
     focus: FocusHandle,
     focused: SettingsFocus,
     editor: Option<ActiveEditor>,
+    choice_picker: Option<ChoicePicker>,
     invalid_edits: Vec<InvalidEdit>,
+    invalid_remote_edits: Vec<InvalidRemoteEdit>,
     action_menu: Option<(RowRef, usize)>,
     active_section: usize,
     query: String,
@@ -99,13 +125,31 @@ pub(crate) struct SettingsView {
     pending_save: Option<PendingSave>,
     pending_reload_draft: Option<GuiConfig>,
     pending_reload_invalid_edits: Option<Vec<InvalidEdit>>,
+    remote_session: Option<wire_settings::SettingsSessionId>,
+    remote_revision: u64,
+    remote_sections: Vec<wire_settings::SettingsSection>,
+    remote_actions: Option<wire_settings::SettingsActions>,
+    remote_draft: Option<RemoteValues>,
+    remote_baseline: Option<RemoteValues>,
+    remote_defaults: Option<RemoteValues>,
+    remote_runtime: Option<wire_settings::AudioRuntimeState>,
+    remote_diagnostics: Vec<wire_settings::SettingsDiagnostic>,
+    remote_status: SharedString,
+    remote_open_pending: bool,
+    remote_saving: bool,
+    remote_pending_save: Option<RemoteValues>,
+    remote_confirm_replace: bool,
+    remote_loopback: bool,
+    remote_advanced: bool,
+    remote_meter_rms: f32,
+    remote_meter_peak: f32,
     recording: Option<(BindingScope, BindCommand)>,
     key_interceptor: Option<Subscription>,
     scroll: UniformListScrollHandle,
     _save_task: Option<Task<()>>,
 }
 
-impl EventEmitter<SettingsClosed> for SettingsView {}
+impl EventEmitter<SettingsViewEvent> for SettingsView {}
 
 impl SettingsView {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
@@ -131,7 +175,9 @@ impl SettingsView {
             focus: cx.focus_handle(),
             focused: SettingsFocus::Row(first_row),
             editor: None,
+            choice_picker: None,
             invalid_edits: Vec::new(),
+            invalid_remote_edits: Vec::new(),
             action_menu: None,
             active_section: 0,
             query: String::new(),
@@ -150,6 +196,24 @@ impl SettingsView {
             pending_save: None,
             pending_reload_draft: None,
             pending_reload_invalid_edits: None,
+            remote_session: None,
+            remote_revision: 0,
+            remote_sections: Vec::new(),
+            remote_actions: None,
+            remote_draft: None,
+            remote_baseline: None,
+            remote_defaults: None,
+            remote_runtime: None,
+            remote_diagnostics: Vec::new(),
+            remote_status: "Connecting to Chatt daemon…".into(),
+            remote_open_pending: false,
+            remote_saving: false,
+            remote_pending_save: None,
+            remote_confirm_replace: false,
+            remote_loopback: false,
+            remote_advanced: false,
+            remote_meter_rms: 0.0,
+            remote_meter_peak: 0.0,
             recording: None,
             key_interceptor: None,
             scroll: UniformListScrollHandle::new(),
@@ -160,19 +224,73 @@ impl SettingsView {
     }
 
     fn dirty(&self) -> bool {
+        self.local_dirty() || self.remote_dirty()
+    }
+
+    fn local_dirty(&self) -> bool {
         self.draft != self.baseline || !self.invalid_edits.is_empty()
+    }
+
+    fn remote_dirty(&self) -> bool {
+        self.remote_draft != self.remote_baseline || !self.invalid_remote_edits.is_empty()
+    }
+
+    fn local_working(&self) -> bool {
+        self.pending_save.is_some() || self.pending_reload_draft.is_some()
     }
 
     fn section(&self) -> &'static SettingsSection {
         &SETTINGS_SECTIONS[self.active_section]
     }
 
+    fn remote_section(&self) -> Option<RemoteSection> {
+        self.active_section
+            .checked_sub(SETTINGS_SECTIONS.len())
+            .filter(|index| *index < self.remote_sections.len())
+    }
+
+    fn remote_field(&self, field: RemoteField) -> Option<&wire_settings::SettingsField> {
+        remote::field(&self.remote_sections, field)
+    }
+
+    fn remote_field_is_text(&self, field: RemoteField) -> bool {
+        self.remote_field(field).is_some_and(remote::is_text)
+    }
+
+    fn remote_field_is_searchable_choice(&self, field: RemoteField) -> bool {
+        self.remote_field(field)
+            .is_some_and(|field| field.control.kind == wire_settings::CONTROL_SEARCHABLE_CHOICE)
+    }
+
+    fn remote_section_is_audio(&self) -> bool {
+        self.remote_section()
+            .and_then(|section| self.remote_sections.get(section))
+            .is_some_and(|section| section.fields.iter().any(remote::is_audio))
+    }
+
     fn visible_rows(&self) -> Vec<RowRef> {
+        if self.remote_section().is_some() {
+            return Vec::new();
+        }
         let section = self.section();
         rows(section, self.diagnostics.len())
             .into_iter()
             .filter(|row| matches_search(section, *row, &self.query))
             .collect()
+    }
+
+    fn visible_remote_fields(&self) -> Vec<RemoteField> {
+        let Some(section) = self.remote_section() else {
+            return Vec::new();
+        };
+        remote::fields(
+            &self.remote_sections,
+            section,
+            self.remote_advanced || !self.query.trim().is_empty(),
+        )
+        .into_iter()
+        .filter(|field| remote::matches_search(&self.remote_sections, section, *field, &self.query))
+        .collect()
     }
 
     fn invalid_edit(&self, row: RowRef) -> Option<&InvalidEdit> {
@@ -198,6 +316,35 @@ impl SettingsView {
         }
     }
 
+    fn invalid_remote_edit(&self, field: RemoteField) -> Option<&InvalidRemoteEdit> {
+        self.invalid_remote_edits
+            .iter()
+            .find(|edit| edit.field == field)
+    }
+
+    fn clear_invalid_remote_edit(&mut self, field: RemoteField) {
+        self.invalid_remote_edits.retain(|edit| edit.field != field);
+    }
+
+    fn set_invalid_remote_edit(&mut self, field: RemoteField, text: &str, error: String) {
+        let error: SharedString = error.into();
+        if let Some(edit) = self
+            .invalid_remote_edits
+            .iter_mut()
+            .find(|edit| edit.field == field)
+        {
+            edit.text.clear();
+            edit.text.push_str(text);
+            edit.error = error;
+        } else {
+            self.invalid_remote_edits.push(InvalidRemoteEdit {
+                field,
+                text: text.to_string(),
+                error,
+            });
+        }
+    }
+
     fn row_has_editor(row: RowRef) -> bool {
         matches!(
             row,
@@ -212,6 +359,16 @@ impl SettingsView {
                 .invalid_edit(row)
                 .map(|edit| edit.text.clone())
                 .unwrap_or_else(|| self.edit_text(row)),
+            EditorTarget::RemoteRow(field) => self
+                .invalid_remote_edit(field)
+                .map(|edit| edit.text.clone())
+                .or_else(|| {
+                    self.remote_draft.as_ref().and_then(|draft| {
+                        self.remote_field(field)
+                            .map(|descriptor| remote::editor_value(draft, descriptor))
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -229,6 +386,7 @@ impl SettingsView {
         let placeholder = match target {
             EditorTarget::Search => "Search settings",
             EditorTarget::Row(_) => "Edit value",
+            EditorTarget::RemoteRow(_) => "Edit value",
         };
         let entity = cx.new(|cx| {
             let mut editor = TextEditor::settings_input(placeholder, binding_mode, cx);
@@ -247,6 +405,12 @@ impl SettingsView {
                     this.apply_editor_text(&value, cx);
                 }
                 EditorTarget::Row(_) => {}
+                EditorTarget::RemoteRow(field)
+                    if this.focused == SettingsFocus::RemoteRow(field) =>
+                {
+                    this.apply_remote_editor_text(field, &value, cx);
+                }
+                EditorTarget::RemoteRow(_) => {}
             }
         });
         self.editor = Some(ActiveEditor {
@@ -257,14 +421,23 @@ impl SettingsView {
     }
 
     fn focus_order(&self) -> Vec<SettingsFocus> {
-        let mut order = Vec::with_capacity(self.visible_rows().len() + 7);
+        let mut order =
+            Vec::with_capacity(self.visible_rows().len() + self.visible_remote_fields().len() + 7);
         order.push(SettingsFocus::Search);
-        order.extend(
-            self.visible_rows()
-                .into_iter()
-                .filter(|row| !matches!(row, RowRef::Diagnostic(_)))
-                .map(SettingsFocus::Row),
-        );
+        if self.remote_section().is_some() {
+            order.extend(
+                self.visible_remote_fields()
+                    .into_iter()
+                    .map(SettingsFocus::RemoteRow),
+            );
+        } else {
+            order.extend(
+                self.visible_rows()
+                    .into_iter()
+                    .filter(|row| !matches!(row, RowRef::Diagnostic(_)))
+                    .map(SettingsFocus::Row),
+            );
+        }
         order.extend([
             SettingsFocus::ResetAll,
             SettingsFocus::ResetSection,
@@ -331,6 +504,42 @@ impl SettingsView {
                 }
                 window.focus(&self.focus, cx);
             }
+            SettingsFocus::RemoteRow(field)
+                if self.remote_field(field).is_some_and(remote::is_text)
+                    && self.remote_draft.is_some() =>
+            {
+                self.materialize_editor(EditorTarget::RemoteRow(field), cx);
+                if enter_insert {
+                    if let Some(editor) = &self.editor {
+                        editor
+                            .entity
+                            .update(cx, |editor, cx| editor.enter_insert_mode(cx));
+                    }
+                }
+                if let Some(index) = self
+                    .visible_remote_fields()
+                    .iter()
+                    .position(|candidate| *candidate == field)
+                {
+                    self.scroll
+                        .scroll_to_item(index, gpui::ScrollStrategy::Center);
+                }
+                if let Some(editor) = &self.editor {
+                    window.focus(&editor.entity.focus_handle(cx), cx);
+                }
+            }
+            SettingsFocus::RemoteRow(field) => {
+                self.editor = None;
+                if let Some(index) = self
+                    .visible_remote_fields()
+                    .iter()
+                    .position(|candidate| *candidate == field)
+                {
+                    self.scroll
+                        .scroll_to_item(index, gpui::ScrollStrategy::Center);
+                }
+                window.focus(&self.focus, cx);
+            }
             _ => {
                 self.editor = None;
                 window.focus(&self.focus, cx);
@@ -359,6 +568,19 @@ impl SettingsView {
     }
 
     fn reconcile_focus_after_filter(&mut self, cx: &mut Context<Self>) {
+        if !self.query.trim().is_empty() && !self.active_section_has_matches() {
+            if let Some(index) = (0..SETTINGS_SECTIONS.len() + self.remote_sections.len())
+                .find(|index| self.section_has_matches(*index))
+            {
+                let was_audio = self.remote_section_is_audio();
+                self.active_section = index;
+                let is_audio = self.remote_section_is_audio();
+                if was_audio != is_audio {
+                    self.set_remote_audio_active(is_audio, cx);
+                }
+                self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+            }
+        }
         let order = self.focus_order();
         if order.contains(&self.focused) {
             cx.notify();
@@ -367,7 +589,7 @@ impl SettingsView {
         self.focused = order
             .iter()
             .copied()
-            .find(|target| matches!(target, SettingsFocus::Row(_)))
+            .find(|target| matches!(target, SettingsFocus::Row(_) | SettingsFocus::RemoteRow(_)))
             .unwrap_or(SettingsFocus::Search);
         self.editor = None;
         match self.focused {
@@ -375,16 +597,50 @@ impl SettingsView {
             SettingsFocus::Row(row) if Self::row_has_editor(row) => {
                 self.materialize_editor(EditorTarget::Row(row), cx)
             }
+            SettingsFocus::RemoteRow(field)
+                if self.remote_field(field).is_some_and(remote::is_text) =>
+            {
+                self.materialize_editor(EditorTarget::RemoteRow(field), cx)
+            }
             _ => {}
         }
         cx.notify();
+    }
+
+    fn active_section_has_matches(&self) -> bool {
+        self.section_has_matches(self.active_section)
+    }
+
+    fn section_has_matches(&self, index: usize) -> bool {
+        if let Some(section) = index
+            .checked_sub(SETTINGS_SECTIONS.len())
+            .filter(|index| *index < self.remote_sections.len())
+        {
+            return remote::fields(&self.remote_sections, section, true)
+                .into_iter()
+                .any(|field| {
+                    remote::matches_search(&self.remote_sections, section, field, &self.query)
+                });
+        }
+        let Some(section) = SETTINGS_SECTIONS.get(index) else {
+            return false;
+        };
+        rows(section, self.diagnostics.len())
+            .into_iter()
+            .any(|row| matches_search(section, row, &self.query))
     }
 
     fn select_section(&mut self, index: usize, window: &mut gpui::Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
+        self.choice_picker = None;
+        let was_audio = self.remote_section_is_audio();
         self.active_section = index;
+        let is_audio = self.remote_section_is_audio();
+        if was_audio != is_audio {
+            self.set_remote_audio_active(is_audio, cx);
+        }
         self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
         let target = if matches!(
             self.focused,
@@ -396,6 +652,12 @@ impl SettingsView {
                 | SettingsFocus::Save
         ) {
             self.focused
+        } else if self.remote_section().is_some() {
+            self.visible_remote_fields()
+                .into_iter()
+                .next()
+                .map(SettingsFocus::RemoteRow)
+                .unwrap_or(SettingsFocus::Search)
         } else {
             self.visible_rows()
                 .into_iter()
@@ -404,6 +666,203 @@ impl SettingsView {
                 .unwrap_or(SettingsFocus::Search)
         };
         self.focus_target(target, false, window, cx);
+    }
+
+    fn select_remote_row(
+        &mut self,
+        field: RemoteField,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.saving || self.remote_draft.is_none() {
+            return;
+        }
+        self.focus_target(SettingsFocus::RemoteRow(field), false, window, cx);
+    }
+
+    fn choice_picker_items<'a>(
+        &'a self,
+        field: RemoteField,
+        query: &str,
+    ) -> impl Iterator<Item = &'a wire_settings::SettingsChoice> {
+        let query = query.trim().to_ascii_lowercase();
+        self.remote_field(field)
+            .into_iter()
+            .flat_map(|field| &field.control.choices)
+            .filter(move |choice| {
+                query.is_empty()
+                    || choice.label.to_ascii_lowercase().contains(&query)
+                    || choice.detail.to_ascii_lowercase().contains(&query)
+                    || choice.value.to_ascii_lowercase().contains(&query)
+                    || choice.search.to_ascii_lowercase().contains(&query)
+            })
+    }
+
+    fn current_choice_selection(&self, field: RemoteField) -> Option<&str> {
+        match self.remote_draft.as_ref()?.get(field)? {
+            wire_settings::SettingsValue::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn open_choice_picker(
+        &mut self,
+        field: RemoteField,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(descriptor) = self.remote_field(field) else {
+            return;
+        };
+        if descriptor.control.kind != wire_settings::CONTROL_SEARCHABLE_CHOICE
+            || self.saving
+            || self.remote_draft.is_none()
+        {
+            return;
+        }
+        let placeholder = if descriptor.control.placeholder.is_empty() {
+            "Search choices".to_string()
+        } else {
+            descriptor.control.placeholder.clone()
+        };
+        let current = self.current_choice_selection(field);
+        let selected = self
+            .choice_picker_items(field, "")
+            .position(|choice| Some(choice.value.as_str()) == current)
+            .unwrap_or(0);
+        let binding_mode = self.draft.input.default_binding_mode;
+        let search = cx.new(|cx| {
+            let mut editor = TextEditor::settings_input(placeholder, binding_mode, cx);
+            editor.enter_insert_mode(cx);
+            editor
+        });
+        let subscription = cx.subscribe(&search, move |this, editor, _: &ComposerChanged, cx| {
+            let query = editor.read(cx).text();
+            let current = this.current_choice_selection(field);
+            let selected = this
+                .choice_picker_items(field, &query)
+                .position(|choice| Some(choice.value.as_str()) == current)
+                .unwrap_or(0);
+            let has_items = this.choice_picker_items(field, &query).next().is_some();
+            if let Some(picker) = &mut this.choice_picker
+                && picker.field == field
+            {
+                picker.query = query;
+                picker.selected = selected;
+                if has_items {
+                    picker
+                        .scroll
+                        .scroll_to_item(selected, gpui::ScrollStrategy::Center);
+                }
+                cx.notify();
+            }
+        });
+        let focus = search.focus_handle(cx);
+        self.focused = SettingsFocus::RemoteRow(field);
+        self.editor = None;
+        self.choice_picker = Some(ChoicePicker {
+            field,
+            query: String::new(),
+            selected,
+            search,
+            _subscription: subscription,
+            scroll: UniformListScrollHandle::new(),
+        });
+        self.refresh_remote_choices(field, cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn close_choice_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.choice_picker = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn move_choice_picker_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(picker) = self.choice_picker.as_ref() else {
+            return;
+        };
+        let count = self
+            .choice_picker_items(picker.field, &picker.query)
+            .count();
+        if count == 0 {
+            return;
+        }
+        let selected =
+            (picker.selected.min(count - 1) as isize + delta).rem_euclid(count as isize) as usize;
+        if let Some(picker) = &mut self.choice_picker {
+            picker.selected = selected;
+            picker
+                .scroll
+                .scroll_to_item(selected, gpui::ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    fn choose_selected_choice(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.choice_picker.as_ref() else {
+            return;
+        };
+        let field = picker.field;
+        let Some(choice) = self
+            .choice_picker_items(field, &picker.query)
+            .nth(picker.selected)
+            .cloned()
+        else {
+            return;
+        };
+        self.choose_choice(field, choice, window, cx);
+    }
+
+    fn choose_choice(
+        &mut self,
+        field: RemoteField,
+        choice: wire_settings::SettingsChoice,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !choice.enabled {
+            return;
+        }
+        let Some(draft) = &mut self.remote_draft else {
+            return;
+        };
+        draft.set(field, wire_settings::SettingsValue::Text(choice.value));
+        self.clear_invalid_remote_edit(field);
+        self.choice_picker = None;
+        window.focus(&self.focus, cx);
+        if self.remote_field(field).is_some_and(remote::is_audio) {
+            self.preview_remote_audio(cx);
+        }
+        cx.notify();
+    }
+
+    fn reconcile_choice_picker(&mut self) {
+        let Some(picker) = self.choice_picker.as_ref() else {
+            return;
+        };
+        let field = picker.field;
+        let query = picker.query.clone();
+        let previous = picker.selected;
+        if !self.remote_field_is_searchable_choice(field) {
+            self.choice_picker = None;
+            return;
+        }
+        let current = self.current_choice_selection(field);
+        let selected = self
+            .choice_picker_items(field, &query)
+            .position(|choice| Some(choice.value.as_str()) == current)
+            .unwrap_or_else(|| {
+                previous.min(
+                    self.choice_picker_items(field, &query)
+                        .count()
+                        .saturating_sub(1),
+                )
+            });
+        if let Some(picker) = &mut self.choice_picker {
+            picker.selected = selected;
+        }
     }
 
     fn select_row(&mut self, row: RowRef, window: &mut gpui::Window, cx: &mut Context<Self>) {
@@ -522,6 +981,434 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn apply_remote_editor_text(&mut self, field: RemoteField, text: &str, cx: &mut Context<Self>) {
+        let Some(descriptor) = self.remote_field(field).cloned() else {
+            return;
+        };
+        let Some(mut candidate) = self.remote_draft.clone() else {
+            return;
+        };
+        match remote::apply_text(&mut candidate, &descriptor, text) {
+            Ok(()) => {
+                let changed = self.remote_draft.as_ref() != Some(&candidate);
+                self.remote_draft = Some(candidate);
+                self.clear_invalid_remote_edit(field);
+                if changed && remote::is_audio(&descriptor) {
+                    self.preview_remote_audio(cx);
+                }
+            }
+            Err(error) => self.set_invalid_remote_edit(field, text, error),
+        }
+        cx.notify();
+    }
+
+    fn cycle_remote_field(&mut self, field: RemoteField, delta: isize, cx: &mut Context<Self>) {
+        let Some(descriptor) = self.remote_field(field).cloned() else {
+            return;
+        };
+        let Some(draft) = &mut self.remote_draft else {
+            return;
+        };
+        if !remote::cycle(draft, &descriptor, delta) {
+            return;
+        }
+        self.clear_invalid_remote_edit(field);
+        self.sync_remote_editor(field, cx);
+        if remote::is_audio(&descriptor) {
+            self.preview_remote_audio(cx);
+        }
+        cx.notify();
+    }
+
+    fn change_remote_field(
+        &mut self,
+        field: RemoteField,
+        delta: isize,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_field_is_searchable_choice(field) {
+            self.open_choice_picker(field, window, cx);
+        } else {
+            self.cycle_remote_field(field, delta, cx);
+        }
+    }
+
+    fn sync_remote_editor(&mut self, field: RemoteField, cx: &mut Context<Self>) {
+        let entity = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.target == EditorTarget::RemoteRow(field))
+            .map(|editor| editor.entity.clone());
+        if let Some(entity) = entity {
+            let value = self.editor_value(EditorTarget::RemoteRow(field));
+            entity.update(cx, |editor, cx| editor.set_value(value, cx));
+        }
+    }
+
+    fn reset_remote_field(&mut self, field: RemoteField, cx: &mut Context<Self>) {
+        let is_audio = self.remote_field(field).is_some_and(remote::is_audio);
+        let (Some(draft), Some(defaults)) = (&mut self.remote_draft, self.remote_defaults.as_ref())
+        else {
+            return;
+        };
+        draft.copy_from(defaults, field);
+        self.clear_invalid_remote_edit(field);
+        self.sync_remote_editor(field, cx);
+        if is_audio {
+            self.preview_remote_audio(cx);
+        }
+        cx.notify();
+    }
+
+    fn set_remote_audio_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        let Some(session_id) = self.remote_session else {
+            return;
+        };
+        if active
+            && !self
+                .remote_actions
+                .as_ref()
+                .is_some_and(|actions| actions.audio_preview)
+        {
+            return;
+        }
+        cx.emit(SettingsViewEvent::Command(
+            wire_settings::SettingsCommand::SetAudioPreviewActive { session_id, active },
+        ));
+        if active {
+            self.preview_remote_audio(cx);
+        } else {
+            self.remote_loopback = false;
+            self.remote_meter_rms = 0.0;
+            self.remote_meter_peak = 0.0;
+        }
+    }
+
+    fn preview_remote_audio(&mut self, cx: &mut Context<Self>) {
+        if !self.remote_section_is_audio() {
+            return;
+        }
+        let (Some(session_id), Some(draft), Some(baseline)) = (
+            self.remote_session,
+            self.remote_draft.as_ref(),
+            self.remote_baseline.as_ref(),
+        ) else {
+            return;
+        };
+        let changes = draft.changes(baseline, |field| {
+            self.remote_field(field).is_some_and(remote::is_audio)
+        });
+        let preview_seq = self
+            .remote_runtime
+            .as_ref()
+            .map_or(1, |runtime| runtime.preview_seq.saturating_add(1))
+            .max(1);
+        if let Some(runtime) = &mut self.remote_runtime {
+            runtime.preview_seq = preview_seq;
+        }
+        cx.emit(SettingsViewEvent::Command(
+            wire_settings::SettingsCommand::PreviewAudio {
+                session_id,
+                preview_seq,
+                changes,
+                loopback: self.remote_loopback,
+            },
+        ));
+    }
+
+    fn toggle_remote_loopback(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .remote_actions
+            .as_ref()
+            .is_some_and(|actions| actions.audio_loopback)
+        {
+            self.remote_status = "Microphone loopback is unavailable in this daemon mode.".into();
+            cx.notify();
+            return;
+        }
+        self.remote_loopback = !self.remote_loopback;
+        self.preview_remote_audio(cx);
+        cx.notify();
+    }
+
+    fn refresh_remote_choices(&mut self, field: RemoteField, cx: &mut Context<Self>) {
+        let (Some(session_id), Some(draft), Some(baseline)) = (
+            self.remote_session,
+            self.remote_draft.as_ref(),
+            self.remote_baseline.as_ref(),
+        ) else {
+            return;
+        };
+        let changes = draft.changes(baseline, |_| true);
+        self.remote_status = "Refreshing choices…".into();
+        cx.emit(SettingsViewEvent::Command(
+            wire_settings::SettingsCommand::RefreshChoices {
+                session_id,
+                field,
+                changes,
+            },
+        ));
+        cx.notify();
+    }
+
+    pub(crate) fn begin_remote(&mut self, cx: &mut Context<Self>) {
+        if self.remote_open_pending || self.remote_session.is_some() {
+            return;
+        }
+        self.remote_open_pending = true;
+        self.remote_status = "Loading daemon settings…".into();
+        cx.emit(SettingsViewEvent::Command(
+            wire_settings::SettingsCommand::Open,
+        ));
+        cx.notify();
+    }
+
+    pub(crate) fn remote_disconnected(&mut self, reason: &str, cx: &mut Context<Self>) {
+        self.remote_session = None;
+        self.remote_open_pending = false;
+        self.remote_saving = false;
+        self.choice_picker = None;
+        self.remote_status = format!("Daemon unavailable · {reason}").into();
+        self.remote_runtime = None;
+        self.remote_meter_rms = 0.0;
+        self.remote_meter_peak = 0.0;
+        self.saving = self.local_working();
+        cx.notify();
+    }
+
+    pub(crate) fn remote_command_failed(&mut self, reason: &str, cx: &mut Context<Self>) {
+        self.remote_open_pending = false;
+        self.remote_saving = false;
+        self.remote_pending_save = None;
+        self.remote_status = format!("Could not send daemon setting change · {reason}").into();
+        self.saving = self.local_working();
+        cx.notify();
+    }
+
+    pub(crate) fn remote_reconnected(&mut self, cx: &mut Context<Self>) {
+        if self.remote_session.is_none() {
+            self.begin_remote(cx);
+        }
+    }
+
+    pub(crate) fn apply_remote_result(
+        &mut self,
+        result: wire_settings::SettingsResult,
+        cx: &mut Context<Self>,
+    ) {
+        let operation = result.result.operation;
+        let document = match &result.payload {
+            wire_settings::SettingsResultPayload::Document(document)
+            | wire_settings::SettingsResultPayload::Conflict { latest: document } => Some(document),
+            _ => None,
+        };
+        if let Some(document) = document {
+            let same_session = self.remote_session == Some(document.session_id);
+            if operation != local_rpc::frame::Operation::OpenSettings && !same_session
+                || operation == local_rpc::frame::Operation::OpenSettings
+                    && self.remote_session.is_some()
+                    && !same_session
+                    && !self.remote_open_pending
+                || same_session && document.revision < self.remote_revision
+            {
+                return;
+            }
+        }
+        if matches!(
+            &result.payload,
+            wire_settings::SettingsResultPayload::PreviewApplied { session_id, .. }
+                | wire_settings::SettingsResultPayload::Closed { session_id }
+                if self.remote_session != Some(*session_id)
+        ) {
+            return;
+        }
+        let rejected = match &result.result.outcome {
+            local_rpc::frame::RequestOutcome::Accepted => None,
+            local_rpc::frame::RequestOutcome::Rejected { message, .. } => Some(message.clone()),
+        };
+        if operation == local_rpc::frame::Operation::OpenSettings {
+            self.remote_open_pending = false;
+        }
+        let save_result = operation == local_rpc::frame::Operation::SaveSettings;
+        match result.payload {
+            wire_settings::SettingsResultPayload::Document(document) => match operation {
+                local_rpc::frame::Operation::OpenSettings => {
+                    let source = document.source;
+                    let preserve = self.remote_dirty();
+                    self.install_remote_document(document, preserve);
+                    self.remote_pending_save = None;
+                    self.remote_saving = false;
+                    self.remote_confirm_replace = false;
+                    self.remote_status = match source {
+                        wire_settings::SettingsSourceStatus::Defaults => {
+                            "Daemon settings loaded from embedded defaults.".into()
+                        }
+                        wire_settings::SettingsSourceStatus::File => {
+                            "Daemon settings loaded from chatt.toml.".into()
+                        }
+                    };
+                    if self.remote_section_is_audio() {
+                        self.set_remote_audio_active(true, cx);
+                    }
+                }
+                local_rpc::frame::Operation::SaveSettings => {
+                    let pending = self.remote_pending_save.take();
+                    let newer_edits = pending
+                        .as_ref()
+                        .is_some_and(|pending| self.remote_draft.as_ref() != Some(pending));
+                    self.install_remote_document(document, newer_edits);
+                    self.remote_confirm_replace = false;
+                    self.remote_status = if newer_edits {
+                        "Daemon settings saved; newer edits remain unsaved.".into()
+                    } else {
+                        "Daemon settings saved.".into()
+                    };
+                }
+                local_rpc::frame::Operation::ReloadSettings => {
+                    self.install_remote_document(document, false);
+                    self.remote_pending_save = None;
+                    self.remote_confirm_replace = false;
+                    self.remote_status = "Daemon settings reloaded from disk.".into();
+                }
+                local_rpc::frame::Operation::RefreshSettingsChoices => {
+                    self.install_remote_document(document, true);
+                    self.remote_status = "Choice refresh started.".into();
+                }
+                _ => self.install_remote_document(document, true),
+            },
+            wire_settings::SettingsResultPayload::PreviewApplied { runtime, .. } => {
+                self.remote_diagnostics = runtime.diagnostics.clone();
+                if let Some(diagnostic) = self.remote_diagnostics.first() {
+                    self.remote_status =
+                        format!("{} · {}", diagnostic.field, diagnostic.message).into();
+                }
+                self.remote_loopback = runtime.loopback;
+                self.remote_runtime = Some(runtime);
+            }
+            wire_settings::SettingsResultPayload::Conflict { latest } => {
+                self.install_remote_document(latest, true);
+                self.remote_confirm_replace = true;
+                self.remote_status =
+                    "chatt.toml changed on disk. Reload or Confirm replace.".into();
+            }
+            wire_settings::SettingsResultPayload::Closed { .. } => {
+                self.remote_session = None;
+                self.remote_runtime = None;
+                self.choice_picker = None;
+                self.remote_status = "Daemon settings session closed.".into();
+            }
+            wire_settings::SettingsResultPayload::None => {}
+        }
+        let reload_result = operation == local_rpc::frame::Operation::ReloadSettings;
+        if save_result || reload_result {
+            self.remote_saving = false;
+            self.saving = self.local_working();
+        }
+        if let Some(message) = rejected {
+            if save_result {
+                self.remote_pending_save = None;
+            }
+            if result.diagnostics.is_empty() {
+                self.remote_status = message.into();
+            } else {
+                self.remote_status = format!(
+                    "{message} · {}",
+                    result
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+                .into();
+            }
+            self.remote_diagnostics = result.diagnostics;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn apply_remote_event(
+        &mut self,
+        event: wire_settings::SettingsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            wire_settings::SettingsEvent::AudioMeter {
+                session_id,
+                rms,
+                peak,
+                ..
+            } if Some(session_id) == self.remote_session => {
+                self.remote_meter_rms = self.remote_meter_rms * 0.62 + rms * 0.38;
+                self.remote_meter_peak = (self.remote_meter_peak * 0.9).max(peak);
+            }
+            wire_settings::SettingsEvent::AudioRuntime {
+                session_id,
+                runtime,
+            } if Some(session_id) == self.remote_session => {
+                self.remote_diagnostics = runtime.diagnostics.clone();
+                if let Some(diagnostic) = self.remote_diagnostics.first() {
+                    self.remote_status =
+                        format!("{} · {}", diagnostic.field, diagnostic.message).into();
+                }
+                self.remote_runtime = Some(runtime);
+            }
+            wire_settings::SettingsEvent::Document(document)
+                if Some(document.session_id) == self.remote_session =>
+            {
+                if document.revision < self.remote_revision {
+                    return;
+                }
+                self.install_remote_document(document, true);
+                self.remote_status = "Choices refreshed.".into();
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    fn install_remote_document(
+        &mut self,
+        document: wire_settings::SettingsDocument,
+        preserve_draft: bool,
+    ) {
+        let retained_changes = if preserve_draft {
+            self.remote_draft
+                .as_ref()
+                .zip(self.remote_baseline.as_ref())
+                .map_or_else(Vec::new, |(draft, baseline)| {
+                    draft.changes(baseline, |_| true)
+                })
+        } else {
+            Vec::new()
+        };
+        let retained_invalid = preserve_draft.then(|| self.invalid_remote_edits.clone());
+        let mut current = RemoteValues::current(&document);
+        let known_fields = document
+            .sections
+            .iter()
+            .flat_map(|section| &section.fields)
+            .map(|field| field.id)
+            .collect::<std::collections::HashSet<_>>();
+        for change in retained_changes {
+            if known_fields.contains(&change.field) {
+                current.set(change.field, change.value);
+            }
+        }
+        self.remote_session = Some(document.session_id);
+        self.remote_revision = document.revision;
+        self.remote_baseline = Some(RemoteValues::current(&document));
+        self.remote_defaults = Some(RemoteValues::defaults(&document));
+        self.remote_sections = document.sections;
+        self.remote_actions = Some(document.actions);
+        self.remote_draft = Some(current);
+        self.reconcile_choice_picker();
+        self.remote_runtime = Some(document.audio_runtime);
+        self.remote_diagnostics = document.diagnostics;
+        self.invalid_remote_edits = retained_invalid.unwrap_or_default();
+    }
+
     fn preview(&mut self, cx: &mut Context<Self>) {
         let diagnostics = validate(&self.draft);
         if has_errors(&diagnostics) {
@@ -636,6 +1523,31 @@ impl SettingsView {
         if self.saving {
             return;
         }
+        if let Some(section) = self.remote_section() {
+            let section_fields = remote::fields(&self.remote_sections, section, true);
+            let is_audio = self
+                .remote_sections
+                .get(section)
+                .is_some_and(|section| section.fields.iter().any(remote::is_audio));
+            let (Some(defaults), Some(draft)) =
+                (self.remote_defaults.clone(), self.remote_draft.as_mut())
+            else {
+                return;
+            };
+            for field in &section_fields {
+                draft.copy_from(&defaults, *field);
+            }
+            self.invalid_remote_edits
+                .retain(|edit| !section_fields.contains(&edit.field));
+            if is_audio {
+                self.preview_remote_audio(cx);
+            }
+            if let SettingsFocus::RemoteRow(field) = self.focused {
+                self.sync_remote_editor(field, cx);
+            }
+            cx.notify();
+            return;
+        }
         let section_rows = rows(self.section(), self.diagnostics.len());
         let defaults = GuiConfig::default();
         let mut appearance_changed = false;
@@ -660,6 +1572,11 @@ impl SettingsView {
         }
         self.draft = GuiConfig::default();
         self.invalid_edits.clear();
+        if let Some(defaults) = self.remote_defaults.clone() {
+            self.remote_draft = Some(defaults);
+            self.invalid_remote_edits.clear();
+            self.preview_remote_audio(cx);
+        }
         self.sync_editor_binding_mode(cx);
         if let SettingsFocus::Row(row) = self.focused {
             self.sync_row_editor(row, cx);
@@ -676,7 +1593,7 @@ impl SettingsView {
         cx.set_text_rendering_mode(theme::rendering_mode(self.committed.rendering));
         cx.set_global(AppliedSettings(self.committed.clone()));
         cx.refresh_windows();
-        cx.emit(SettingsClosed);
+        cx.emit(SettingsViewEvent::Closed);
     }
 
     fn start_recording(
@@ -742,7 +1659,7 @@ impl SettingsView {
         if self.saving {
             return;
         }
-        if !self.invalid_edits.is_empty() {
+        if !self.invalid_edits.is_empty() || !self.invalid_remote_edits.is_empty() {
             self.status_message =
                 Some("Fix or discard the invalid editor value before saving.".into());
             cx.notify();
@@ -757,17 +1674,45 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        let Some(path) = self.path.clone() else {
-            self.status_message =
-                Some("No configuration path is available; changes remain session-only.".into());
-            cx.notify();
-            return;
-        };
         let mut diagnostics = validate(&self.draft);
         diagnostics.extend(key_bindings::validate(&self.draft));
         if has_errors(&diagnostics) {
             self.diagnostics = diagnostics;
             self.status_message = Some("Fix validation errors before saving.".into());
+            cx.notify();
+            return;
+        }
+        if self.remote_dirty() {
+            if let (Some(session_id), Some(settings), Some(baseline)) = (
+                self.remote_session,
+                self.remote_draft.clone(),
+                self.remote_baseline.as_ref(),
+            ) {
+                let changes =
+                    settings.changes(baseline, |field| self.remote_field(field).is_some());
+                self.remote_saving = true;
+                self.remote_pending_save = Some(settings.clone());
+                cx.emit(SettingsViewEvent::Command(
+                    wire_settings::SettingsCommand::Save {
+                        session_id,
+                        expected_revision: self.remote_revision,
+                        changes,
+                        force: self.remote_confirm_replace,
+                    },
+                ));
+                self.remote_status = "Saving daemon settings…".into();
+            } else {
+                self.remote_status = "Daemon unavailable; daemon changes remain unsaved.".into();
+            }
+        }
+
+        if !self.local_dirty() {
+            self.saving = self.remote_saving;
+            self.status_message = Some(if self.remote_saving {
+                "Saving daemon settings…".into()
+            } else {
+                "Nothing to save.".into()
+            });
             cx.notify();
             return;
         }
@@ -778,6 +1723,13 @@ impl SettingsView {
                 cx.notify();
                 return;
             }
+        };
+        let Some(path) = self.path.clone() else {
+            self.status_message =
+                Some("GUI config path unavailable; daemon save continues independently.".into());
+            self.saving = self.remote_saving;
+            cx.notify();
+            return;
         };
         let config = self.draft.clone();
         let baseline = self.source.clone();
@@ -799,7 +1751,7 @@ impl SettingsView {
     }
 
     fn finish_save(&mut self, result: Result<Vec<u8>, SaveError>, cx: &mut Context<Self>) {
-        self.saving = false;
+        self.saving = self.remote_saving;
         match result {
             Ok(source) => {
                 let saved = self
@@ -873,8 +1825,17 @@ impl SettingsView {
             return;
         }
         self.confirm_reload = false;
+        if let Some(session_id) = self.remote_session {
+            self.remote_saving = true;
+            self.remote_status = "Reloading daemon settings…".into();
+            cx.emit(SettingsViewEvent::Command(
+                wire_settings::SettingsCommand::Reload { session_id },
+            ));
+        }
         let Some(path) = self.path.clone() else {
-            self.status_message = Some("No configuration path is available.".into());
+            self.saving = self.remote_saving;
+            self.status_message =
+                Some("GUI config path unavailable; daemon reload continues independently.".into());
             cx.notify();
             return;
         };
@@ -891,7 +1852,7 @@ impl SettingsView {
     }
 
     fn finish_reload(&mut self, loaded: LoadedConfig, cx: &mut Context<Self>) {
-        self.saving = false;
+        self.saving = self.remote_saving;
         let draft_at_start = self
             .pending_reload_draft
             .take()
@@ -1036,6 +1997,10 @@ impl SettingsView {
                 self.focus_target(SettingsFocus::Row(row), true, window, cx)
             }
             SettingsFocus::Row(_) => {}
+            SettingsFocus::RemoteRow(field) if self.remote_field_is_text(field) => {
+                self.focus_target(SettingsFocus::RemoteRow(field), true, window, cx)
+            }
+            SettingsFocus::RemoteRow(field) => self.change_remote_field(field, 1, window, cx),
             SettingsFocus::ResetAll => self.reset_all(cx),
             SettingsFocus::ResetSection => self.reset_section(cx),
             SettingsFocus::Reload => self.reload(cx),
@@ -1063,10 +2028,27 @@ impl SettingsView {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
 
+        if let Some(picker) = self.choice_picker.as_ref() {
+            let mode = picker.search.read(cx).mode();
+            match key {
+                "escape" => self.close_choice_picker(window, cx),
+                "down" | "tab" if !modifiers.shift => self.move_choice_picker_selection(1, cx),
+                "up" | "tab" => self.move_choice_picker_selection(-1, cx),
+                "j" if mode == Mode::Normal => self.move_choice_picker_selection(1, cx),
+                "k" if mode == Mode::Normal => self.move_choice_picker_selection(-1, cx),
+                "enter" => self.choose_selected_choice(window, cx),
+                _ => return,
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
         if key == "tab" {
             let delta = if modifiers.shift { -1 } else { 1 };
             let next = (self.active_section as isize + delta)
-                .rem_euclid(SETTINGS_SECTIONS.len() as isize) as usize;
+                .rem_euclid((SETTINGS_SECTIONS.len() + self.remote_sections.len()) as isize)
+                as usize;
             self.select_section(next, window, cx);
             window.prevent_default();
             cx.stop_propagation();
@@ -1121,6 +2103,10 @@ impl SettingsView {
             ),
             (SettingsFocus::Search, Some(EditorTarget::Search))
                 | (SettingsFocus::Row(_), Some(EditorTarget::Row(_)))
+                | (
+                    SettingsFocus::RemoteRow(_),
+                    Some(EditorTarget::RemoteRow(_))
+                )
         );
 
         if editor_focused && binding_mode == BindingMode::Vim {
@@ -1157,6 +2143,10 @@ impl SettingsView {
                 "h" if binding_mode == BindingMode::Vim => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, -1, cx);
+                    } else if let SettingsFocus::RemoteRow(field) = self.focused
+                        && !self.remote_field_is_text(field)
+                    {
+                        self.change_remote_field(field, -1, window, cx);
                     } else {
                         return;
                     }
@@ -1164,6 +2154,10 @@ impl SettingsView {
                 "left" => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, -1, cx);
+                    } else if let SettingsFocus::RemoteRow(field) = self.focused
+                        && !self.remote_field_is_text(field)
+                    {
+                        self.change_remote_field(field, -1, window, cx);
                     } else {
                         return;
                     }
@@ -1171,6 +2165,10 @@ impl SettingsView {
                 "l" if binding_mode == BindingMode::Vim => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, 1, cx);
+                    } else if let SettingsFocus::RemoteRow(field) = self.focused
+                        && !self.remote_field_is_text(field)
+                    {
+                        self.change_remote_field(field, 1, window, cx);
                     } else {
                         return;
                     }
@@ -1178,6 +2176,10 @@ impl SettingsView {
                 "right" => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, 1, cx);
+                    } else if let SettingsFocus::RemoteRow(field) = self.focused
+                        && !self.remote_field_is_text(field)
+                    {
+                        self.change_remote_field(field, 1, window, cx);
                     } else {
                         return;
                     }
@@ -1238,8 +2240,20 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let palette = ThemePalette::from_config(&self.draft.theme);
-        let section = self.section();
+        let remote_section = self.remote_section();
+        let (section_title, section_help) = match remote_section {
+            Some(section) => self
+                .remote_sections
+                .get(section)
+                .map(|section| (section.title.clone(), section.help.clone()))
+                .unwrap_or_default(),
+            None => {
+                let section = self.section();
+                (section.title.to_string(), section.help.to_string())
+            }
+        };
         let visible_rows = self.visible_rows();
+        let visible_remote_fields = self.visible_remote_fields();
         let focused = self.focused;
         let draft = self.draft.clone();
         let diagnostics = self.diagnostics.clone();
@@ -1256,37 +2270,76 @@ impl Render for SettingsView {
             .map(ToOwned::to_owned);
         let row_view = view.clone();
         let row_palette = palette.clone();
-        let list_rows = visible_rows.clone();
-        let list = uniform_list(
-            ("settings-rows", self.active_section),
-            list_rows.len(),
-            move |range, _, _| {
-                range
-                    .map(|index| {
-                        let row = list_rows[index];
-                        let editor = row_editor.as_ref().and_then(|(target, entity)| {
-                            (*target == EditorTarget::Row(row)).then(|| entity.clone())
-                        });
-                        let invalid = invalid_edits.iter().find(|edit| edit.row == row);
-                        render_row(
-                            row,
-                            &draft,
-                            &diagnostics,
-                            focused == SettingsFocus::Row(row),
-                            editor,
-                            invalid.map(|edit| edit.text.clone()),
-                            invalid.map(|edit| edit.error.clone()),
-                            row_view.clone(),
-                            &row_palette,
-                            diagnostic_source.as_deref(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-        )
-        .track_scroll(&self.scroll)
-        .w_full()
-        .flex_1();
+        let list: AnyElement = if remote_section.is_some() {
+            let fields = visible_remote_fields.clone();
+            let remote_sections = self.remote_sections.clone();
+            let remote_draft = self.remote_draft.clone();
+            let invalid = self.invalid_remote_edits.clone();
+            let remote_editor = row_editor.clone();
+            uniform_list(
+                ("settings-remote-rows", self.active_section),
+                fields.len(),
+                move |range, _, _| {
+                    range
+                        .map(|index| {
+                            let field = fields[index];
+                            let editor = remote_editor.as_ref().and_then(|(target, entity)| {
+                                (*target == EditorTarget::RemoteRow(field)).then(|| entity.clone())
+                            });
+                            let invalid = invalid.iter().find(|edit| edit.field == field);
+                            let descriptor = remote::field(&remote_sections, field)
+                                .expect("visible remote field has a descriptor");
+                            render_remote_row(
+                                descriptor,
+                                remote_draft.as_ref(),
+                                focused == SettingsFocus::RemoteRow(field),
+                                editor,
+                                invalid.map(|edit| edit.error.clone()),
+                                row_view.clone(),
+                                &row_palette,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .track_scroll(&self.scroll)
+            .w_full()
+            .flex_1()
+            .into_any_element()
+        } else {
+            let list_rows = visible_rows.clone();
+            uniform_list(
+                ("settings-rows", self.active_section),
+                list_rows.len(),
+                move |range, _, _| {
+                    range
+                        .map(|index| {
+                            let row = list_rows[index];
+                            let editor = row_editor.as_ref().and_then(|(target, entity)| {
+                                (*target == EditorTarget::Row(row)).then(|| entity.clone())
+                            });
+                            let invalid = invalid_edits.iter().find(|edit| edit.row == row);
+                            render_row(
+                                row,
+                                &draft,
+                                &diagnostics,
+                                focused == SettingsFocus::Row(row),
+                                editor,
+                                invalid.map(|edit| edit.text.clone()),
+                                invalid.map(|edit| edit.error.clone()),
+                                row_view.clone(),
+                                &row_palette,
+                                diagnostic_source.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .track_scroll(&self.scroll)
+            .w_full()
+            .flex_1()
+            .into_any_element()
+        };
 
         let mut navigation = div()
             .w(px(190.))
@@ -1297,6 +2350,15 @@ impl Render for SettingsView {
             .p_3()
             .border_r_1()
             .border_color(palette.color(ThemeRole::BorderSubtle));
+        navigation = navigation.child(
+            div()
+                .px_2()
+                .pb_1()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(palette.color(ThemeRole::TextDim))
+                .child("RENDERER"),
+        );
         for (index, candidate) in SETTINGS_SECTIONS.iter().enumerate() {
             let selected = index == self.active_section;
             let section_view = view.clone();
@@ -1307,6 +2369,34 @@ impl Render for SettingsView {
                         let _ = section_view
                             .update(cx, |this, cx| this.select_section(index, window, cx));
                     }),
+            );
+        }
+        navigation = navigation.child(
+            div()
+                .px_2()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(palette.color(ThemeRole::TextDim))
+                .child("CHATT DAEMON"),
+        );
+        for (remote_index, candidate) in self.remote_sections.iter().enumerate() {
+            let index = SETTINGS_SECTIONS.len() + remote_index;
+            let selected = index == self.active_section;
+            let section_view = view.clone();
+            navigation = navigation.child(
+                setting_button(
+                    candidate.id.clone(),
+                    candidate.title.clone(),
+                    selected,
+                    &palette,
+                )
+                .w_full()
+                .on_click(move |_, window, cx| {
+                    let _ =
+                        section_view.update(cx, |this, cx| this.select_section(index, window, cx));
+                }),
             );
         }
         let reset_all_view = view.clone();
@@ -1385,14 +2475,136 @@ impl Render for SettingsView {
             );
         let save_label = if self.saving {
             "Working…"
-        } else if self.confirm_replace {
+        } else if self.confirm_replace || self.remote_confirm_replace {
             "Confirm replace"
         } else if replace {
             "Replace invalid file"
         } else {
             "Save"
         };
-
+        let footer_status = if remote_section.is_some() {
+            Some(self.remote_status.clone())
+        } else {
+            self.status_message.clone()
+        };
+        let audio_toolbar = self.remote_section_is_audio().then(|| {
+            let loopback_view = view.clone();
+            let advanced_view = view.clone();
+            let meter_width = 220.0 * (self.remote_meter_rms * 7.0).clamp(0.0, 1.0);
+            let peak_width = 220.0 * (self.remote_meter_peak * 5.0).clamp(0.0, 1.0);
+            div()
+                .h(px(54.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_5()
+                .border_b_1()
+                .border_color(palette.color(ThemeRole::BorderSubtle))
+                .child(
+                    div()
+                        .w(px(220.))
+                        .h(px(10.))
+                        .relative()
+                        .overflow_hidden()
+                        .rounded_md()
+                        .bg(palette.color(ThemeRole::ControlSurface))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left_0()
+                                .w(px(peak_width))
+                                .bg(palette.color(ThemeRole::StateWarning)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left_0()
+                                .w(px(meter_width))
+                                .bg(palette.color(ThemeRole::StateSuccess)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.color(ThemeRole::TextDim))
+                        .child(
+                            if self
+                                .remote_runtime
+                                .as_ref()
+                                .is_some_and(|runtime| runtime.applying)
+                            {
+                                "Applying audio…"
+                            } else {
+                                "Microphone level"
+                            },
+                        ),
+                )
+                .child(div().flex_1())
+                .child(
+                    setting_button(
+                        "audio-loopback",
+                        if !self
+                            .remote_actions
+                            .as_ref()
+                            .is_some_and(|actions| actions.audio_loopback)
+                        {
+                            "Loopback unavailable"
+                        } else if self.remote_loopback {
+                            "Loopback on"
+                        } else {
+                            "Test loopback"
+                        },
+                        self.remote_loopback,
+                        &palette,
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ =
+                            loopback_view.update(cx, |this, cx| this.toggle_remote_loopback(cx));
+                    }),
+                )
+                .child(
+                    setting_button(
+                        "audio-advanced",
+                        if self.remote_advanced {
+                            "Hide advanced"
+                        } else {
+                            "Advanced"
+                        },
+                        self.remote_advanced,
+                        &palette,
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = advanced_view.update(cx, |this, cx| {
+                            this.remote_advanced = !this.remote_advanced;
+                            this.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                            cx.notify();
+                        });
+                    }),
+                )
+                .into_any_element()
+        });
+        let choice_picker = self.choice_picker.as_ref().and_then(|picker| {
+            let descriptor = self.remote_field(picker.field)?;
+            Some(render_choice_picker(
+                picker.field,
+                descriptor.label.clone(),
+                self.choice_picker_items(picker.field, &picker.query)
+                    .cloned()
+                    .collect(),
+                self.current_choice_selection(picker.field)
+                    .map(str::to_owned),
+                picker.selected,
+                picker.search.clone(),
+                picker.scroll.clone(),
+                view.clone(),
+                &palette,
+            ))
+        });
         window.set_rem_size(px(AppliedSettings::get(cx).fonts.interface_size));
         div()
             .id("settings")
@@ -1459,15 +2671,16 @@ impl Render for SettingsView {
                                         .child(
                                             div()
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .child(section.title),
+                                                .child(section_title),
                                         )
                                         .child(
                                             div()
                                                 .text_sm()
                                                 .text_color(palette.color(ThemeRole::TextMuted))
-                                                .child(section.help),
+                                                .child(section_help),
                                         ),
                                 )
+                                .when_some(audio_toolbar, |content, toolbar| content.child(toolbar))
                                 .when_some(self.action_menu, |content, (row, selected)| {
                                     content.child(self.render_action_menu(
                                         row,
@@ -1488,7 +2701,7 @@ impl Render for SettingsView {
                             .px_4()
                             .border_t_1()
                             .border_color(palette.color(ThemeRole::BorderSubtle))
-                            .when_some(self.status_message.clone(), |footer, message| {
+                            .when_some(footer_status.clone(), |footer, message| {
                                 footer.child(
                                     div()
                                         .flex_1()
@@ -1497,7 +2710,7 @@ impl Render for SettingsView {
                                         .child(message),
                                 )
                             })
-                            .when(self.status_message.is_none(), |footer| {
+                            .when(footer_status.is_none(), |footer| {
                                 footer.child(div().flex_1())
                             })
                             .child(
@@ -1567,14 +2780,20 @@ impl Render for SettingsView {
                             ),
                     ),
             )
+            .when_some(choice_picker, |root, picker| root.child(picker))
     }
 }
 
 impl Focusable for SettingsView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.editor
+        self.choice_picker
             .as_ref()
-            .map(|editor| editor.entity.focus_handle(cx))
+            .map(|picker| picker.search.focus_handle(cx))
+            .or_else(|| {
+                self.editor
+                    .as_ref()
+                    .map(|editor| editor.entity.focus_handle(cx))
+            })
             .unwrap_or_else(|| self.focus.clone())
     }
 }
@@ -1777,6 +2996,455 @@ fn render_row(
         .into_any_element()
 }
 
+fn render_remote_row(
+    descriptor: &wire_settings::SettingsField,
+    draft: Option<&RemoteValues>,
+    focused: bool,
+    editor: Option<Entity<TextEditor>>,
+    editor_error: Option<SharedString>,
+    view: WeakEntity<SettingsView>,
+    palette: &ThemePalette,
+) -> AnyElement {
+    let field = descriptor.id;
+    let enabled = draft.is_some();
+    let display = draft
+        .map(|draft| remote::value(draft, descriptor))
+        .unwrap_or_else(|| "Unavailable".into());
+    let select_view = view.clone();
+    let choice_view = view.clone();
+    let reset_view = view.clone();
+    let value = if remote::is_text(descriptor) {
+        if let Some(editor) = editor {
+            div()
+                .id(("settings-remote-editor", remote_field_id(field)))
+                .max_w(px(330.))
+                .min_h(px(38.))
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(if focused {
+                    palette.color(ThemeRole::BorderFocus)
+                } else {
+                    palette.color(ThemeRole::BorderStrong)
+                })
+                .bg(palette.color(ThemeRole::Input))
+                .child(editor)
+                .into_any_element()
+        } else {
+            div()
+                .id(("settings-remote-text", remote_field_id(field)))
+                .max_w(px(330.))
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .cursor_text()
+                .bg(palette.color(ThemeRole::Input))
+                .text_sm()
+                .text_color(palette.color(ThemeRole::TextSecondary))
+                .child(if display.is_empty() {
+                    "Use platform default".to_string()
+                } else {
+                    display
+                })
+                .on_click(move |_, window, cx| {
+                    let _ = choice_view.update(cx, |this, cx| {
+                        this.focus_target(SettingsFocus::RemoteRow(field), true, window, cx);
+                    });
+                })
+                .into_any_element()
+        }
+    } else if descriptor.control.kind == wire_settings::CONTROL_SEARCHABLE_CHOICE {
+        div()
+            .id(("settings-remote-picker", remote_field_id(field)))
+            .max_w(px(330.))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(palette.color(ThemeRole::ControlSurface))
+            .text_sm()
+            .text_color(if enabled {
+                palette.color(ThemeRole::TextSecondary)
+            } else {
+                palette.color(ThemeRole::TextDim)
+            })
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().min_w_0().truncate().child(display))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(palette.color(ThemeRole::TextDim))
+                    .child("⌄"),
+            )
+            .on_click(move |_, window, cx| {
+                let _ = choice_view.update(cx, |this, cx| {
+                    this.open_choice_picker(field, window, cx);
+                });
+                cx.stop_propagation();
+            })
+            .into_any_element()
+    } else {
+        div()
+            .id(("settings-remote-choice", remote_field_id(field)))
+            .max_w(px(330.))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(palette.color(ThemeRole::ControlSurface))
+            .text_sm()
+            .text_color(if enabled {
+                palette.color(ThemeRole::TextSecondary)
+            } else {
+                palette.color(ThemeRole::TextDim)
+            })
+            .child(format!("‹  {display}  ›"))
+            .on_click(move |_, window, cx| {
+                let _ = choice_view.update(cx, |this, cx| {
+                    this.focus_target(SettingsFocus::RemoteRow(field), false, window, cx);
+                    this.change_remote_field(field, 1, window, cx);
+                });
+            })
+            .into_any_element()
+    };
+    div()
+        .id(("settings-remote-row", remote_field_id(field)))
+        .h(px(84.))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_5()
+        .border_b_1()
+        .border_color(palette.color(ThemeRole::BorderSubtle))
+        .bg(if focused {
+            palette.color(ThemeRole::Panel)
+        } else {
+            palette.color(ThemeRole::Raised)
+        })
+        .hover({
+            let hover = palette.color(ThemeRole::StateRowHover);
+            move |row| row.bg(hover)
+        })
+        .on_click(move |_, window, cx| {
+            let _ = select_view.update(cx, |this, cx| this.select_remote_row(field, window, cx));
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(descriptor.label.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.color(ThemeRole::TextDim))
+                        .child(descriptor.key.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .text_color(palette.color(ThemeRole::TextSubtle))
+                        .child(descriptor.help.clone()),
+                ),
+        )
+        .child(
+            div()
+                .w(px(330.))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(value)
+                .when_some(editor_error, |column, error| {
+                    column.child(
+                        div()
+                            .mt_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(palette.color(ThemeRole::StateDanger))
+                            .child(error),
+                    )
+                }),
+        )
+        .child(
+            setting_button(
+                ("reset-remote-row", remote_field_id(field)),
+                "Reset",
+                false,
+                palette,
+            )
+            .on_click(move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, cx| this.reset_remote_field(field, cx));
+            }),
+        )
+        .into_any_element()
+}
+
+fn render_choice_picker(
+    field: RemoteField,
+    title: String,
+    items: Vec<wire_settings::SettingsChoice>,
+    current: Option<String>,
+    selected: usize,
+    search: Entity<TextEditor>,
+    scroll: UniformListScrollHandle,
+    view: WeakEntity<SettingsView>,
+    palette: &ThemePalette,
+) -> AnyElement {
+    let selectable_count = items.iter().filter(|choice| choice.enabled).count();
+    let item_count = items.len();
+    let list: AnyElement = if items.is_empty() {
+        div()
+            .h(px(330.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_color(palette.color(ThemeRole::TextMuted))
+            .child("No choices match this search.")
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(palette.color(ThemeRole::TextDim))
+                    .child("Try another name, identifier, or alias."),
+            )
+            .into_any_element()
+    } else {
+        let items = Arc::new(items);
+        let list_items = items.clone();
+        let list_view = view.clone();
+        let list_palette = palette.clone();
+        uniform_list(
+            ("settings-choice-picker-options", usize::from(field.0)),
+            item_count,
+            move |range, _, _| {
+                range
+                    .map(|index| {
+                        let choice = list_items[index].clone();
+                        let is_selected = index == selected.min(item_count - 1);
+                        let is_current = Some(&choice.value) == current.as_ref();
+                        let choice_view = list_view.clone();
+                        let enabled = choice.enabled;
+                        let detail = if choice.detail.is_empty() {
+                            choice.value.clone()
+                        } else {
+                            choice.detail.clone()
+                        };
+                        div()
+                            .id((
+                                "settings-choice-picker-option",
+                                usize::from(field.0) * 10_000 + index,
+                            ))
+                            .h(px(78.))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_4()
+                            .border_b_1()
+                            .border_color(list_palette.color(ThemeRole::BorderSubtle))
+                            .bg(if is_selected {
+                                list_palette.color(ThemeRole::ControlActive)
+                            } else {
+                                list_palette.color(ThemeRole::Raised)
+                            })
+                            .hover({
+                                let hover = list_palette.color(ThemeRole::ControlSurfaceHover);
+                                move |row| row.bg(hover)
+                            })
+                            .when(enabled, |row| {
+                                let choice = choice.clone();
+                                row.cursor_pointer().on_click(move |_, window, cx| {
+                                    let _ = choice_view.update(cx, |this, cx| {
+                                        this.choose_choice(field, choice.clone(), window, cx);
+                                    });
+                                    cx.stop_propagation();
+                                })
+                            })
+                            .when(!enabled, |row| row.cursor_default())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(if enabled {
+                                                list_palette.color(ThemeRole::TextPrimary)
+                                            } else {
+                                                list_palette.color(ThemeRole::TextMuted)
+                                            })
+                                            .child(choice.label.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(list_palette.color(ThemeRole::TextDim))
+                                            .child(detail),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .flex_col()
+                                    .items_end()
+                                    .gap_1()
+                                    .when(is_current, |status| {
+                                        status.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(
+                                                    list_palette.color(ThemeRole::StateSuccess),
+                                                )
+                                                .child("Current"),
+                                        )
+                                    })
+                                    .when(!enabled, |status| {
+                                        status.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(
+                                                    list_palette.color(ThemeRole::StateWarning),
+                                                )
+                                                .child("Unavailable"),
+                                        )
+                                    }),
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .track_scroll(&scroll)
+        .h(px(330.))
+        .w_full()
+        .into_any_element()
+    };
+
+    let dismiss_view = view.clone();
+    let close_view = view.clone();
+    let refresh_view = view.clone();
+    div()
+        .id("settings-choice-picker-scrim")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000070))
+        .on_click(move |_, window, cx| {
+            let _ = dismiss_view.update(cx, |this, cx| {
+                this.close_choice_picker(window, cx);
+            });
+        })
+        .child(
+            div()
+                .id("settings-choice-picker")
+                .w(px(600.))
+                .max_h(px(540.))
+                .overflow_hidden()
+                .rounded_lg()
+                .border_1()
+                .border_color(palette.color(ThemeRole::BorderStrong))
+                .bg(palette.color(ThemeRole::Raised))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_5()
+                        .py_4()
+                        .border_b_1()
+                        .border_color(palette.color(ThemeRole::BorderSubtle))
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(div().text_lg().font_weight(FontWeight::BOLD).child(title))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(palette.color(ThemeRole::TextDim))
+                                        .child("Choices refresh automatically when opened."),
+                                ),
+                        )
+                        .child(
+                            setting_button("close-choice-picker", "Esc", false, palette).on_click(
+                                move |_, window, cx| {
+                                    let _ = close_view.update(cx, |this, cx| {
+                                        this.close_choice_picker(window, cx);
+                                    });
+                                    cx.stop_propagation();
+                                },
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_5()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(palette.color(ThemeRole::BorderSubtle))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(40.))
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(palette.color(ThemeRole::BorderFocus))
+                                .bg(palette.color(ThemeRole::Input))
+                                .child(search),
+                        )
+                        .child(
+                            setting_button("refresh-choice-picker", "Refresh", false, palette)
+                                .on_click(move |_, _, cx| {
+                                    let _ = refresh_view.update(cx, |this, cx| {
+                                        this.refresh_remote_choices(field, cx);
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                        ),
+                )
+                .child(list)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .px_5()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(palette.color(ThemeRole::BorderSubtle))
+                        .text_xs()
+                        .text_color(palette.color(ThemeRole::TextDim))
+                        .child(format!(
+                            "{selectable_count} selectable · ↑/↓ choose · Enter apply · Esc close"
+                        )),
+                ),
+        )
+        .into_any_element()
+}
+
 fn render_diagnostic_row(
     index: usize,
     diagnostics: &[ConfigDiagnostic],
@@ -1888,6 +3556,10 @@ fn row_id(row: RowRef) -> usize {
     }
 }
 
+fn remote_field_id(field: RemoteField) -> usize {
+    2_000 + usize::from(field.0)
+}
+
 fn setting_button(
     id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
@@ -1919,6 +3591,8 @@ fn setting_button(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::*;
 
     fn create_settings(cx: &gpui::TestAppContext) -> Entity<SettingsView> {
@@ -1939,6 +3613,180 @@ mod tests {
             );
             cx.new(SettingsView::new)
         })
+    }
+
+    const OUTPUT_VOLUME: RemoteField = wire_settings::SettingsFieldId(1);
+    const MICROPHONE: RemoteField = wire_settings::SettingsFieldId(2);
+
+    fn remote_document(value: f32, revision: u64) -> wire_settings::SettingsDocument {
+        wire_settings::SettingsDocument {
+            session_id: wire_settings::SettingsSessionId(9),
+            revision,
+            source: wire_settings::SettingsSourceStatus::File,
+            sections: vec![wire_settings::SettingsSection {
+                id: "audio".into(),
+                title: "Audio".into(),
+                help: String::new(),
+                fields: vec![wire_settings::SettingsField {
+                    id: OUTPUT_VOLUME,
+                    key: "audio.output-volume".into(),
+                    label: "Output volume".into(),
+                    help: String::new(),
+                    flags: wire_settings::FIELD_AUDIO,
+                    value: wire_settings::SettingsValue::Float(value),
+                    default: wire_settings::SettingsValue::Float(100.0),
+                    control: wire_settings::SettingsControl {
+                        kind: wire_settings::CONTROL_NUMBER,
+                        choices: Vec::new(),
+                        min: Some(0.0),
+                        max: Some(130.0),
+                        step: Some(1.0),
+                        unit: "%".into(),
+                        placeholder: String::new(),
+                    },
+                }],
+            }],
+            actions: wire_settings::SettingsActions {
+                audio_preview: true,
+                audio_loopback: true,
+            },
+            audio_runtime: wire_settings::AudioRuntimeState {
+                preview_active: false,
+                loopback: false,
+                applying: false,
+                preview_seq: 0,
+                diagnostics: Vec::new(),
+            },
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn searchable_choice_document() -> wire_settings::SettingsDocument {
+        let mut document = remote_document(100.0, 4);
+        document.sections[0].fields = vec![wire_settings::SettingsField {
+            id: MICROPHONE,
+            key: "audio.input-device-id".into(),
+            label: "Microphone".into(),
+            help: "Select an input device.".into(),
+            flags: wire_settings::FIELD_AUDIO,
+            value: wire_settings::SettingsValue::Text("alsa:usb-studio".into()),
+            default: wire_settings::SettingsValue::Text(String::new()),
+            control: wire_settings::SettingsControl {
+                kind: wire_settings::CONTROL_SEARCHABLE_CHOICE,
+                choices: vec![
+                    wire_settings::SettingsChoice {
+                        value: String::new(),
+                        label: "System default".into(),
+                        detail: "OS default input".into(),
+                        search: "system default input".into(),
+                        enabled: true,
+                    },
+                    wire_settings::SettingsChoice {
+                        value: "alsa:usb-studio".into(),
+                        label: "Studio microphone".into(),
+                        detail: "48 kHz · stereo · USB Audio".into(),
+                        search: "hw:Studio legacy-usb".into(),
+                        enabled: true,
+                    },
+                    wire_settings::SettingsChoice {
+                        value: "alsa:offline".into(),
+                        label: "Disconnected microphone".into(),
+                        detail: "Device is unavailable".into(),
+                        search: "offline".into(),
+                        enabled: false,
+                    },
+                ],
+                min: None,
+                max: None,
+                step: None,
+                unit: String::new(),
+                placeholder: "Search microphones".into(),
+            },
+        }];
+        document
+    }
+
+    #[gpui::test]
+    fn searchable_choice_opens_with_metadata_search_and_refreshes_automatically(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            let config = GuiConfig::default();
+            let available_families = cx.text_system().all_font_names();
+            theme::apply_appearance(&config, SourceStatus::Missing, &[], &available_families, cx);
+            install_loaded(
+                LoadedConfig {
+                    path: None,
+                    config,
+                    source: None,
+                    status: SourceStatus::Missing,
+                    diagnostics: Vec::new(),
+                },
+                cx,
+            );
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsView::new(cx);
+            settings.install_remote_document(searchable_choice_document(), false);
+            window.focus(&settings.focus, cx);
+            settings
+        });
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update({
+            let settings = settings.clone();
+            let commands = commands.clone();
+            move |_, cx| {
+                cx.subscribe(&settings, move |_, event: &SettingsViewEvent, _| {
+                    if let SettingsViewEvent::Command(command) = event {
+                        commands.borrow_mut().push(command.clone());
+                    }
+                })
+            }
+        });
+
+        settings.update_in(cx, |settings, window, cx| {
+            settings.open_choice_picker(MICROPHONE, window, cx);
+        });
+
+        settings.read_with(cx, |settings, _| {
+            let picker = settings
+                .choice_picker
+                .as_ref()
+                .expect("searchable choice opens a picker");
+            assert_eq!(picker.selected, 1);
+            assert_eq!(
+                settings
+                    .choice_picker_items(MICROPHONE, "48 khz")
+                    .next()
+                    .unwrap()
+                    .label,
+                "Studio microphone"
+            );
+            assert_eq!(
+                settings
+                    .choice_picker_items(MICROPHONE, "legacy-usb")
+                    .next()
+                    .unwrap()
+                    .label,
+                "Studio microphone"
+            );
+            assert!(
+                !settings
+                    .choice_picker_items(MICROPHONE, "offline")
+                    .next()
+                    .unwrap()
+                    .enabled
+            );
+        });
+        assert!(matches!(
+            commands.borrow().as_slice(),
+            [wire_settings::SettingsCommand::RefreshChoices {
+                field: MICROPHONE,
+                changes,
+                ..
+            }] if changes.is_empty()
+        ));
     }
 
     #[gpui::test]
@@ -2214,6 +4062,115 @@ mod tests {
                         SettingsFocus::Row(row) => row,
                         _ => panic!("settings remains focused on its row"),
                     })
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn daemon_save_commits_sent_snapshot_and_keeps_newer_edits_dirty(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings(cx);
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                settings.install_remote_document(remote_document(80.0, 4), false);
+                let sent = settings.remote_draft.clone().unwrap();
+                settings.remote_pending_save = Some(sent.clone());
+                settings.remote_saving = true;
+                settings
+                    .remote_draft
+                    .as_mut()
+                    .unwrap()
+                    .set(OUTPUT_VOLUME, wire_settings::SettingsValue::Float(60.0));
+
+                settings.apply_remote_result(
+                    wire_settings::SettingsResult::accepted(
+                        local_rpc::model::RequestId(3),
+                        local_rpc::frame::Operation::SaveSettings,
+                        wire_settings::SettingsResultPayload::Document(remote_document(80.0, 5)),
+                    ),
+                    cx,
+                );
+
+                assert_eq!(
+                    settings
+                        .remote_baseline
+                        .as_ref()
+                        .unwrap()
+                        .get(OUTPUT_VOLUME),
+                    Some(&wire_settings::SettingsValue::Float(80.0))
+                );
+                assert_eq!(
+                    settings.remote_draft.as_ref().unwrap().get(OUTPUT_VOLUME),
+                    Some(&wire_settings::SettingsValue::Float(60.0))
+                );
+                assert!(settings.remote_dirty());
+                assert!(!settings.remote_saving);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn audio_events_from_an_old_settings_session_are_ignored(cx: &mut gpui::TestAppContext) {
+        let settings = create_settings(cx);
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                settings.install_remote_document(remote_document(100.0, 4), false);
+                settings.apply_remote_event(
+                    wire_settings::SettingsEvent::AudioMeter {
+                        session_id: wire_settings::SettingsSessionId(8),
+                        rms: 1.0,
+                        peak: 1.0,
+                        voice_active: true,
+                    },
+                    cx,
+                );
+                assert_eq!(settings.remote_meter_rms, 0.0);
+                assert_eq!(settings.remote_meter_peak, 0.0);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn stale_documents_and_old_session_results_do_not_replace_the_active_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings(cx);
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                settings.install_remote_document(remote_document(80.0, 5), false);
+                settings.apply_remote_result(
+                    wire_settings::SettingsResult::accepted(
+                        local_rpc::model::RequestId(7),
+                        local_rpc::frame::Operation::RefreshSettingsChoices,
+                        wire_settings::SettingsResultPayload::Document(remote_document(100.0, 4)),
+                    ),
+                    cx,
+                );
+                settings.apply_remote_result(
+                    wire_settings::SettingsResult::accepted(
+                        local_rpc::model::RequestId(8),
+                        local_rpc::frame::Operation::CloseSettings,
+                        wire_settings::SettingsResultPayload::Closed {
+                            session_id: wire_settings::SettingsSessionId(8),
+                        },
+                    ),
+                    cx,
+                );
+
+                assert_eq!(
+                    settings.remote_session,
+                    Some(wire_settings::SettingsSessionId(9))
+                );
+                assert_eq!(settings.remote_revision, 5);
+                assert_eq!(
+                    settings
+                        .remote_baseline
+                        .as_ref()
+                        .unwrap()
+                        .get(OUTPUT_VOLUME),
+                    Some(&wire_settings::SettingsValue::Float(80.0))
                 );
             });
         });

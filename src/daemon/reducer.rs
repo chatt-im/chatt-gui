@@ -91,7 +91,9 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::BulkChunk(_)
         | DaemonFrame::BulkFinished(_)
-        | DaemonFrame::BulkCanceled { .. } => {}
+        | DaemonFrame::BulkCanceled { .. }
+        | DaemonFrame::SettingsResult(_)
+        | DaemonFrame::SettingsEvent(_) => {}
     }
     effect
 }

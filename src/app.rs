@@ -42,7 +42,7 @@ use crate::{
         ImageViewState, PreviewContent, PreviewHistory, PreviewItem, clamp_panel_width,
     },
     scroll_capture::capture_scroll,
-    settings::{SettingsClosed, SettingsView},
+    settings::{SettingsView, SettingsViewEvent},
     theme::{AppliedSettings, ThemePalette, ThemeRole},
     timeline::{self, Attachment},
     ui_controls::{
@@ -560,6 +560,8 @@ pub struct ChattView {
     typography_revision: u64,
     settings: Option<gpui::Entity<SettingsView>>,
     settings_subscription: Option<Subscription>,
+    settings_remote_session: Option<local_rpc::settings::SettingsSessionId>,
+    settings_close_when_opened: bool,
     _code_search_subscription: Subscription,
     _composer_image_paste_subscription: Subscription,
     _composer_state_subscription: Subscription,
@@ -741,6 +743,8 @@ impl ChattView {
             typography_revision: AppliedSettings::get(cx).typography_revision,
             settings: None,
             settings_subscription: None,
+            settings_remote_session: None,
+            settings_close_when_opened: false,
             _code_search_subscription: code_search_subscription,
             _composer_image_paste_subscription: composer_image_paste_subscription,
             _composer_state_subscription: composer_state_subscription,
@@ -769,16 +773,52 @@ impl ChattView {
             window.focus(&settings.focus_handle(cx), cx);
             return;
         }
+        self.settings_close_when_opened = false;
         let settings = cx.new(SettingsView::new);
-        let subscription = cx.subscribe(&settings, |this, _, _: &SettingsClosed, cx| {
-            this.settings = None;
-            this.settings_subscription = None;
-            cx.notify();
-        });
+        let subscription =
+            cx.subscribe(
+                &settings,
+                |this, _, event: &SettingsViewEvent, cx| match event {
+                    SettingsViewEvent::Closed => {
+                        this.settings = None;
+                        this.settings_subscription = None;
+                        if let Some(session_id) = this.settings_remote_session {
+                            this.send_settings_command(
+                                local_rpc::settings::SettingsCommand::Close { session_id },
+                                cx,
+                            );
+                        } else {
+                            this.settings_close_when_opened = true;
+                        }
+                        cx.notify();
+                    }
+                    SettingsViewEvent::Command(command) => {
+                        this.send_settings_command(command.clone(), cx);
+                    }
+                },
+            );
         window.focus(&settings.focus_handle(cx), cx);
-        self.settings = Some(settings);
+        self.settings = Some(settings.clone());
         self.settings_subscription = Some(subscription);
+        settings.update(cx, |settings, cx| settings.begin_remote(cx));
         cx.notify();
+    }
+
+    fn send_settings_command(
+        &mut self,
+        command: local_rpc::settings::SettingsCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = self.request_id();
+        if let Err(error) = self.daemon.send(ClientFrame::Settings {
+            request_id,
+            command,
+        }) && let Some(settings) = &self.settings
+        {
+            settings.update(cx, |settings, cx| {
+                settings.remote_command_failed(&error, cx)
+            });
+        }
     }
 
     fn completion_view(&self, cx: &Context<Self>) -> Option<CompletionView> {
@@ -1806,6 +1846,11 @@ impl ChattView {
                     format!("Offline · {reason}").into()
                 };
                 self.release_live_players(window);
+                if let Some(settings) = &self.settings {
+                    settings.update(cx, |settings, cx| settings.remote_disconnected(&reason, cx));
+                }
+                self.settings_remote_session = None;
+                self.settings_close_when_opened = false;
             }
             DaemonEvent::Incompatible(details) => {
                 log::error!("daemon connection is incompatible: {details}");
@@ -1822,6 +1867,13 @@ impl ChattView {
                 } else {
                     format!("Cannot connect · {details}").into()
                 };
+                if let Some(settings) = &self.settings {
+                    settings.update(cx, |settings, cx| {
+                        settings.remote_disconnected(&details, cx)
+                    });
+                }
+                self.settings_remote_session = None;
+                self.settings_close_when_opened = false;
             }
             DaemonEvent::UploadFailed {
                 begin_request,
@@ -2009,6 +2061,54 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match frame {
+            DaemonFrame::SettingsResult(result) => {
+                let opened = match &result.payload {
+                    local_rpc::settings::SettingsResultPayload::Document(document)
+                        if result.result.operation == local_rpc::frame::Operation::OpenSettings =>
+                    {
+                        Some(document.session_id)
+                    }
+                    _ => None,
+                };
+                if let Some(session_id) = opened {
+                    self.settings_remote_session = Some(session_id);
+                }
+                if let local_rpc::settings::SettingsResultPayload::Closed { session_id } =
+                    &result.payload
+                    && self.settings_remote_session == Some(*session_id)
+                {
+                    self.settings_remote_session = None;
+                }
+                if let Some(settings) = &self.settings {
+                    if opened.is_some() {
+                        self.settings_close_when_opened = false;
+                    }
+                    settings.update(cx, |settings, cx| settings.apply_remote_result(result, cx));
+                } else if let Some(session_id) = opened
+                    && self.settings_close_when_opened
+                {
+                    self.settings_close_when_opened = false;
+                    self.send_settings_command(
+                        local_rpc::settings::SettingsCommand::Close { session_id },
+                        cx,
+                    );
+                }
+                return;
+            }
+            DaemonFrame::SettingsEvent(event) => {
+                if let Some(settings) = &self.settings {
+                    settings.update(cx, |settings, cx| settings.apply_remote_event(event, cx));
+                }
+                return;
+            }
+            DaemonFrame::Welcome(_) => {
+                if let Some(settings) = &self.settings {
+                    settings.update(cx, |settings, cx| settings.remote_reconnected(cx));
+                }
+            }
+            _ => {}
+        }
         let pending = match &frame {
             DaemonFrame::RequestResult(result) => {
                 self.model.pending.get(&result.request_id).cloned()
