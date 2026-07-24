@@ -9,6 +9,7 @@ use gpui::{
 };
 
 mod buffer;
+pub(crate) mod completion;
 mod cursor;
 mod highlight;
 mod history;
@@ -66,12 +67,25 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-x", Cut, Some("ComposerInsert")),
         KeyBinding::new("cmd-x", Cut, Some("ChattCodeSearch")),
-        KeyBinding::new("tab", InsertTab, Some("ComposerInsert")),
+        KeyBinding::new(
+            "tab",
+            InsertTab,
+            Some("ComposerInsert && !CompletionOpen"),
+        ),
         KeyBinding::new("shift-enter", Newline, Some("ComposerInsert")),
     ]);
 }
 
 pub struct ComposerChanged;
+pub struct ComposerStateChanged;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerSnapshot {
+    pub text: String,
+    pub selection: Range<usize>,
+    pub accepts_completion: bool,
+    pub composing: bool,
+}
 
 pub struct Composer {
     focus: FocusHandle,
@@ -84,6 +98,7 @@ pub struct Composer {
     selected: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
+    completion_open: bool,
     last_layout: Vec<ComposerLine>,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Option<Pixels>,
@@ -103,6 +118,7 @@ impl Composer {
             selected: 0..0,
             reversed: false,
             marked: None,
+            completion_open: false,
             last_layout: Vec::new(),
             last_bounds: None,
             last_line_height: None,
@@ -125,6 +141,7 @@ impl Composer {
             selected: 0..0,
             reversed: false,
             marked: None,
+            completion_open: false,
             last_layout: Vec::new(),
             last_bounds: None,
             last_line_height: None,
@@ -135,8 +152,33 @@ impl Composer {
     pub fn text(&self) -> String {
         self.editor.text()
     }
+    pub fn snapshot(&self) -> ComposerSnapshot {
+        ComposerSnapshot {
+            text: self.editor.text(),
+            selection: self.selected.clone(),
+            accepts_completion: !self.vim_enabled || self.editor.mode() == Mode::Insert,
+            composing: self.marked.is_some(),
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.editor.is_blank()
+    }
+    pub fn set_completion_open(&mut self, open: bool) {
+        self.completion_open = open;
+    }
+    pub fn replace_completion(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.normalize_range(range);
+        self.selected = range.clone();
+        self.reversed = false;
+        self.editor.set_cursor_offset(range.end);
+        self.marked = None;
+        self.replace_text(None, text, false, window, cx);
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.editor.set_text("", Mode::Insert, true);
@@ -146,6 +188,7 @@ impl Composer {
         self.last_layout.clear();
         self.refresh_syntax();
         cx.emit(ComposerChanged);
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
     pub fn restore(&mut self, text: String, cx: &mut Context<Self>) {
@@ -163,6 +206,7 @@ impl Composer {
         self.last_layout.clear();
         self.refresh_syntax();
         cx.emit(ComposerChanged);
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
 
@@ -181,6 +225,7 @@ impl Composer {
         let offset = self.editor.cursor_offset();
         self.selected = offset..offset;
         self.reversed = false;
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -193,6 +238,7 @@ impl Composer {
             self.reversed = !self.reversed;
             self.selected = self.selected.end..self.selected.start;
         }
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
     fn previous(&self, offset: usize) -> usize {
@@ -225,6 +271,7 @@ impl Composer {
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected = 0..self.editor.len();
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -331,6 +378,7 @@ impl Composer {
         self.last_layout.clear();
         self.refresh_syntax();
         cx.emit(ComposerChanged);
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
 
@@ -365,6 +413,9 @@ impl Composer {
         let Some(key) = vim_key(event) else {
             return;
         };
+        if self.completion_open && key == VimKey::Escape {
+            return;
+        }
         if self.editor.mode() == Mode::Insert && key != VimKey::Escape {
             return;
         }
@@ -381,6 +432,7 @@ impl Composer {
             self.refresh_syntax();
             cx.emit(ComposerChanged);
         }
+        cx.emit(ComposerStateChanged);
         window.prevent_default();
         cx.stop_propagation();
         cx.notify();
@@ -483,8 +535,9 @@ impl EntityInputHandler for Composer {
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         self.marked.as_ref().map(|range| self.range_to_utf16(range))
     }
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.marked = None;
+        cx.emit(ComposerStateChanged);
     }
     fn replace_text_in_range(
         &mut self,
@@ -573,6 +626,7 @@ impl EntityInputHandler for Composer {
         self.selected = range.clone();
         self.reversed = false;
         self.editor.set_cursor_offset(range.end);
+        cx.emit(ComposerStateChanged);
         cx.notify();
     }
 
@@ -586,6 +640,7 @@ impl EntityInputHandler for Composer {
 }
 
 impl EventEmitter<ComposerChanged> for Composer {}
+impl EventEmitter<ComposerStateChanged> for Composer {}
 
 #[derive(Clone)]
 struct ComposerLine {

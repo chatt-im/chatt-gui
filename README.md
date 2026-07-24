@@ -1,9 +1,9 @@
 # Chatt GUI
 
 Chatt GUI is a Rust 2024 GPUI desktop client for a separately running Chatt
-daemon. The renderer protocol crates come from a pinned Chatt submodule, and
-the media stack is built from pinned source rather than whichever FFmpeg or mpv
-features happen to be installed on the build host.
+daemon. The renderer protocol crates come from a pinned Chatt Git revision,
+and the media stack is built from pinned source rather than whichever FFmpeg
+or mpv features happen to be installed on the build host.
 
 ## Build prerequisites
 
@@ -20,12 +20,6 @@ when their system libraries and drivers are available; they are not required to
 start the application.
 
 ## Reproducible checkout and build
-
-Clone with submodules, or initialize them in an existing checkout:
-
-```sh
-git submodule update --init --recursive
-```
 
 Download and verify the pinned FFmpeg source release and apply the tracked
 build patch:
@@ -54,8 +48,8 @@ checkout.
 
 ## Developing against a local Chatt checkout
 
-The normal build uses the revision pinned by `vendor/chatt`. To use an active
-checkout without editing tracked manifests:
+The normal build uses the exact Chatt Git revision pinned in `Cargo.toml`. To
+use an active checkout without editing tracked manifests:
 
 ```sh
 ./scripts/use-local-chatt.sh /code/chatt
@@ -63,14 +57,14 @@ cargo check
 ```
 
 The helper writes ignored Cargo patches to `.cargo/local.toml`. The checkout
-argument defaults to `/code/chatt`. Restore the reproducible submodule build
-with:
+argument defaults to `/code/chatt`. Restore the reproducible pinned Git
+dependencies with:
 
 ```sh
-./scripts/use-local-chatt.sh --submodule
+./scripts/use-local-chatt.sh --pinned
 cargo check --locked
 ```
 
 Local Chatt changes that alter their crates' dependency graphs can require a
-temporary lockfile update. Do not commit that update unless the pinned
-submodule is advanced to the same Chatt revision.
+temporary lockfile update. Do not commit that update unless the Chatt Git pins
+are advanced to the same revision.

@@ -13,7 +13,13 @@ use crate::{
         CodeDocument, CodeSearchResults, CodeSelection, CodeViewState, MAX_CODE_PREVIEW_BYTES,
         render_code_document,
     },
-    composer::{Composer, ComposerChanged},
+    composer::{
+        Composer, ComposerChanged, ComposerStateChanged,
+        completion::{
+            self, ArgumentKind, AssistSession, CompletionContext, CompletionOption,
+            CompletionValue, OptionKey,
+        },
+    },
     daemon::{
         client::{DaemonClient, DaemonEvent},
         reducer,
@@ -45,19 +51,20 @@ use crate::{
 };
 use dbus_message::{FileChooserResponse, OpenFileOptions, open_files};
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths, FocusHandle, Focusable,
-    FollowMode, FontWeight, KeyBinding, ListAlignment, ListState, LruImageCache, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
-    Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions, canvas, div,
-    img, list, point, prelude::*, px, rgb, rgba,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths,
+    FocusHandle, Focusable, FollowMode, FontWeight, KeyBinding, ListAlignment, ListState,
+    LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy,
+    ScrollWheelEvent, SharedString, Stateful, Subscription, Task, UniformListScrollHandle,
+    WeakFocusHandle, Window, actions, canvas, div, img, list, point, prelude::*, px, rgb, rgba,
+    relative,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
     ids::{RoomId, StreamId},
     model::{
-        AttachmentDescriptor, AttachmentId, BulkTransferId, MediaKind, RequestId, RoomKind,
-        TrustState,
+        AttachmentDescriptor, AttachmentId, BulkTransferId, CommandCandidate,
+        CommandCandidateKind, CommandOutputLine, MediaKind, RequestId, RoomKind, TrustState,
     },
 };
 
@@ -160,6 +167,20 @@ struct LivePaneResize {
 struct PreviewPaneResize {
     start_x: Pixels,
     start_width: Pixels,
+}
+
+#[derive(Clone)]
+struct CompletionView {
+    context: CompletionContext,
+    context_key: String,
+    options: Vec<CompletionOption>,
+    hint: Option<SharedString>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCommand {
+    request_id: RequestId,
+    draft: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -378,7 +399,12 @@ actions!(
         FindInCode,
         NextCodeMatch,
         PreviousCodeMatch,
-        CloseCodeSearch
+        CloseCodeSearch,
+        CompletionNext,
+        CompletionPrevious,
+        CompletionAccept,
+        CompletionAcceptEngaged,
+        CompletionDismiss
     ]
 );
 
@@ -401,7 +427,32 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "enter",
             SendMessage,
-            Some("ChattComposer && ComposerInsert"),
+            Some("ChattComposer && ComposerInsert && !CompletionEngaged"),
+        ),
+        KeyBinding::new(
+            "down",
+            CompletionNext,
+            Some("ChattComposer && ComposerInsert && CompletionOpen"),
+        ),
+        KeyBinding::new(
+            "up",
+            CompletionPrevious,
+            Some("ChattComposer && ComposerInsert && CompletionOpen"),
+        ),
+        KeyBinding::new(
+            "tab",
+            CompletionAccept,
+            Some("ChattComposer && ComposerInsert && CompletionOpen"),
+        ),
+        KeyBinding::new(
+            "enter",
+            CompletionAcceptEngaged,
+            Some("ChattComposer && ComposerInsert && CompletionEngaged"),
+        ),
+        KeyBinding::new(
+            "escape",
+            CompletionDismiss,
+            Some("ChattComposer && ComposerInsert && CompletionOpen"),
         ),
         KeyBinding::new("space", TogglePlayback, Some(NON_INPUT_CONTEXT)),
         KeyBinding::new("left", SeekBack, Some(NON_INPUT_CONTEXT)),
@@ -421,6 +472,11 @@ pub struct ChattView {
     next_transfer_id: u64,
     editing: Option<(RoomId, local_rpc::ids::MessageId, String)>,
     composer: gpui::Entity<Composer>,
+    completion_session: Option<AssistSession>,
+    command_candidates: HashMap<CommandCandidateKind, Vec<CommandCandidate>>,
+    candidate_requests: HashMap<CommandCandidateKind, RequestId>,
+    pending_command: Option<PendingCommand>,
+    suppress_completion_refresh: bool,
     code_search_input: gpui::Entity<Composer>,
     code_viewer_focus: FocusHandle,
     code_selection: CodeSelection,
@@ -446,6 +502,8 @@ pub struct ChattView {
     preview_pane_resize: Option<PreviewPaneResize>,
     list_state: ListState,
     collapsed_sections: timeline::CollapsedSections,
+    command_rows: Vec<timeline::LocalCommandRow>,
+    next_command_row_id: u64,
     message_list: Vec<timeline::MessageListItem>,
     pending_scroll: gpui::Pixels,
     scroll_animation_active: bool,
@@ -472,6 +530,8 @@ pub struct ChattView {
     live_pane_resize: Option<LivePaneResize>,
     status: SharedString,
     _code_search_subscription: Subscription,
+    _composer_state_subscription: Subscription,
+    _composer_blur_subscription: Subscription,
     _daemon_task: Task<()>,
     _video_task: Task<()>,
 }
@@ -490,6 +550,21 @@ impl ChattView {
         let code_search_subscription =
             cx.subscribe(&code_search_input, |this, _, _: &ComposerChanged, cx| {
                 this.update_code_search(cx);
+            });
+        let composer_state_subscription =
+            cx.subscribe(&composer, |this, _, _: &ComposerStateChanged, cx| {
+                if !this.suppress_completion_refresh {
+                    this.refresh_completion(cx);
+                }
+            });
+        let composer_focus = composer.focus_handle(cx);
+        let composer_blur_subscription =
+            cx.on_blur(&composer_focus, window, |this, _, cx| {
+                if this.completion_session.take().is_some() {
+                    this.composer
+                        .update(cx, |composer, _| composer.set_completion_open(false));
+                    cx.notify();
+                }
             });
         let code_viewer_focus = cx.focus_handle();
         let code_selection = CodeSelection::new(code_viewer_focus.clone());
@@ -564,6 +639,11 @@ impl ChattView {
             next_transfer_id: 1,
             editing: None,
             composer,
+            completion_session: None,
+            command_candidates: HashMap::new(),
+            candidate_requests: HashMap::new(),
+            pending_command: None,
+            suppress_completion_refresh: false,
             code_search_input,
             code_viewer_focus,
             code_selection,
@@ -589,6 +669,8 @@ impl ChattView {
             preview_pane_resize: None,
             list_state,
             collapsed_sections: timeline::CollapsedSections::new(),
+            command_rows: Vec::new(),
+            next_command_row_id: 1,
             message_list: Vec::new(),
             pending_scroll: px(0.),
             scroll_animation_active: false,
@@ -615,6 +697,8 @@ impl ChattView {
             live_pane_resize: None,
             status: "Discovering Chatt daemon…".into(),
             _code_search_subscription: code_search_subscription,
+            _composer_state_subscription: composer_state_subscription,
+            _composer_blur_subscription: composer_blur_subscription,
             _daemon_task: daemon_task,
             _video_task: video_task,
         }
@@ -624,6 +708,320 @@ impl ChattView {
         let id = self.next_request_id.clamp(1, (1u64 << 63) - 1);
         self.next_request_id = if id == (1u64 << 63) - 1 { 1 } else { id + 1 };
         RequestId(id)
+    }
+
+    fn completion_view(&self, cx: &Context<Self>) -> Option<CompletionView> {
+        if !self.model.is_ready() || self.editing.is_some() || self.pending_command.is_some() {
+            return None;
+        }
+        let snapshot = self.composer.read(cx).snapshot();
+        let context = completion::completion_context(
+            &snapshot.text,
+            snapshot.selection,
+            snapshot.accepts_completion,
+            snapshot.composing,
+            &self.model.commands,
+        )?;
+        let context_key = completion::context_key(&context);
+        let (options, hint) = match &context {
+            CompletionContext::Command { query, .. } => {
+                let options = completion::command_options(&self.model.commands, query);
+                let hint = options
+                    .is_empty()
+                    .then(|| "No matching commands · Enter runs as typed".into());
+                (options, hint)
+            }
+            CompletionContext::Argument {
+                command,
+                kind: ArgumentKind::Free,
+                query,
+                ..
+            } => {
+                let hint = query
+                    .is_empty()
+                    .then(|| {
+                        command
+                            .placeholder
+                            .clone()
+                            .unwrap_or_else(|| command.usage.clone())
+                    })
+                    .map(SharedString::from);
+                (Vec::new(), hint)
+            }
+            CompletionContext::Argument {
+                kind: ArgumentKind::Candidates(kind),
+                query,
+                ..
+            } => {
+                let cached = self.command_candidates.get(kind);
+                let options = cached
+                    .map(|items| completion::candidate_options(*kind, items, query))
+                    .unwrap_or_default();
+                let hint = if cached.is_none() && self.candidate_requests.contains_key(kind) {
+                    Some(format!("Loading {}…", candidate_kind_label(*kind)).into())
+                } else if options.is_empty() {
+                    Some(format!("No matching {}", candidate_kind_label(*kind)).into())
+                } else {
+                    None
+                };
+                (options, hint)
+            }
+        };
+        Some(CompletionView {
+            context,
+            context_key,
+            options,
+            hint,
+        })
+    }
+
+    fn refresh_completion(&mut self, cx: &mut Context<Self>) {
+        let view = self.completion_view(cx);
+        let previous_key = self
+            .completion_session
+            .as_ref()
+            .map(|session| session.context_key.clone());
+        let request_kind = view.as_ref().and_then(|view| match &view.context {
+            CompletionContext::Argument {
+                kind: ArgumentKind::Candidates(kind),
+                ..
+            } if previous_key.as_deref() != Some(view.context_key.as_str()) => Some(*kind),
+            _ => None,
+        });
+
+        match &view {
+            None => self.completion_session = None,
+            Some(view) if previous_key.as_deref() != Some(view.context_key.as_str()) => {
+                self.completion_session = Some(completion::open_session(&view.context));
+            }
+            Some(view) => completion::reconcile_session(
+                &mut self.completion_session,
+                Some(&view.context),
+                &view.options,
+            ),
+        }
+        if let Some(kind) = request_kind {
+            self.request_command_candidates(kind);
+        }
+        let completion_open = view.as_ref().is_some_and(|view| {
+            self.completion_session
+                .as_ref()
+                .is_some_and(|session| session.context_key == view.context_key)
+                && (!view.options.is_empty() || view.hint.is_some())
+        });
+        self.composer.update(cx, |composer, _| {
+            composer.set_completion_open(completion_open)
+        });
+        cx.notify();
+    }
+
+    fn request_command_candidates(&mut self, kind: CommandCandidateKind) {
+        if self.command_candidates.contains_key(&kind)
+            || self.candidate_requests.contains_key(&kind)
+        {
+            return;
+        }
+        let request_id = self.request_id();
+        self.candidate_requests.insert(kind, request_id);
+        if let Err(error) = self
+            .daemon
+            .send(ClientFrame::RequestCommandCandidates { request_id, kind })
+        {
+            self.candidate_requests.remove(&kind);
+            self.status = error.into();
+        }
+    }
+
+    fn clear_completion(&mut self, cx: &mut Context<Self>) {
+        self.completion_session = None;
+        self.command_candidates.clear();
+        self.candidate_requests.clear();
+        self.composer
+            .update(cx, |composer, _| composer.set_completion_open(false));
+    }
+
+    fn clear_command_surface(&mut self, cx: &mut Context<Self>) {
+        self.pending_command = None;
+        self.clear_completion(cx);
+        if !self.command_rows.is_empty() {
+            self.command_rows.clear();
+            self.rebuild_message_list();
+        }
+    }
+
+    fn append_command_output(&mut self, lines: Vec<CommandOutputLine>) {
+        if lines.is_empty() {
+            return;
+        }
+        let anchor_message_id = self.model.messages.last().map(|message| message.id);
+        let timestamp_ms = timeline::now_ms();
+        for line in lines {
+            let local_id = self.next_command_row_id.max(1);
+            self.next_command_row_id = if local_id == u64::MAX {
+                1
+            } else {
+                local_id + 1
+            };
+            self.command_rows.push(timeline::LocalCommandRow {
+                local_id,
+                anchor_message_id,
+                body: line.text,
+                error: line.error,
+                timestamp_ms,
+            });
+        }
+        self.rebuild_message_list();
+        self.list_state.scroll_to_end();
+    }
+
+    fn move_completion(
+        &mut self,
+        delta: isize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.completion_view(cx) else {
+            self.completion_session = None;
+            self.composer
+                .update(cx, |composer, _| composer.set_completion_open(false));
+            return;
+        };
+        let Some(session) = &mut self.completion_session else {
+            return;
+        };
+        if completion::move_selection(session, &view.options, delta) {
+            cx.notify();
+        }
+    }
+
+    fn completion_next(
+        &mut self,
+        _: &CompletionNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_completion(1, window, cx);
+    }
+
+    fn completion_previous(
+        &mut self,
+        _: &CompletionPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_completion(-1, window, cx);
+    }
+
+    fn completion_accept(
+        &mut self,
+        _: &CompletionAccept,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.completion_view(cx) else {
+            return;
+        };
+        let Some(session) = &self.completion_session else {
+            return;
+        };
+        let Some(option) = completion::tab_option(session, &view.options).cloned() else {
+            return;
+        };
+        self.accept_completion_option(&view.context, option, window, cx);
+    }
+
+    fn completion_accept_engaged(
+        &mut self,
+        _: &CompletionAcceptEngaged,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.completion_view(cx) else {
+            return;
+        };
+        let Some(session) = &self.completion_session else {
+            return;
+        };
+        let Some(option) = completion::enter_option(session, &view.options).cloned() else {
+            return;
+        };
+        self.accept_completion_option(&view.context, option, window, cx);
+    }
+
+    fn completion_dismiss(
+        &mut self,
+        _: &CompletionDismiss,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completion_session.take().is_some() {
+            self.composer
+                .update(cx, |composer, _| composer.set_completion_open(false));
+            cx.notify();
+        }
+    }
+
+    fn hover_completion(&mut self, key: OptionKey, cx: &mut Context<Self>) {
+        let Some(view) = self.completion_view(cx) else {
+            return;
+        };
+        if !view.options.iter().any(|option| option.key == key) {
+            return;
+        }
+        let Some(session) = &mut self.completion_session else {
+            return;
+        };
+        session.active = Some(key);
+        session.engaged = true;
+        cx.notify();
+    }
+
+    fn accept_completion_key(
+        &mut self,
+        key: OptionKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.completion_view(cx) else {
+            return;
+        };
+        let Some(option) = view
+            .options
+            .iter()
+            .find(|option| option.key == key)
+            .cloned()
+        else {
+            return;
+        };
+        self.accept_completion_option(&view.context, option, window, cx);
+    }
+
+    fn accept_completion_option(
+        &mut self,
+        context: &CompletionContext,
+        option: CompletionOption,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reopen = matches!(
+            &option.value,
+            CompletionValue::Command(command)
+                if command.arg != local_rpc::model::CommandArgKind::None
+        );
+        let replacement = completion::replacement(context, &option);
+        self.suppress_completion_refresh = true;
+        self.composer.update(cx, |composer, cx| {
+            composer.replace_completion(replacement.span, &replacement.text, window, cx)
+        });
+        self.suppress_completion_refresh = false;
+        self.completion_session = None;
+        if reopen {
+            self.refresh_completion(cx);
+        } else {
+            self.composer
+                .update(cx, |composer, _| composer.set_completion_open(false));
+            cx.notify();
+        }
     }
 
     fn transfer_id(&mut self) -> BulkTransferId {
@@ -670,7 +1068,8 @@ impl ChattView {
             .unwrap_or_default()
             .iter()
             .filter(|item| !item.is_collapsed())
-            .filter_map(|item| self.model.messages.get(item.message_index))
+            .filter_map(|item| item.message_index())
+            .filter_map(|index| self.model.messages.get(index))
             .filter_map(message_video_key)
             .collect::<HashSet<_>>();
         if let Some(theater) = self.theater_video.as_ref() {
@@ -1019,11 +1418,18 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            DaemonEvent::Discovering => self.model.phase = ConnectionPhase::Discovering,
+            DaemonEvent::Discovering => {
+                self.clear_command_surface(cx);
+                self.model.phase = ConnectionPhase::Discovering;
+            }
             DaemonEvent::Connecting => self.model.phase = ConnectionPhase::Connecting,
-            DaemonEvent::TransportConnected => self.model.phase = ConnectionPhase::Syncing,
+            DaemonEvent::TransportConnected => {
+                self.clear_completion(cx);
+                self.model.phase = ConnectionPhase::Syncing;
+            }
             DaemonEvent::Disconnected(reason) => {
                 log::error!("daemon disconnected: {reason}");
+                self.clear_command_surface(cx);
                 self.media_cache
                     .lock()
                     .expect("media cache lock poisoned")
@@ -1044,6 +1450,7 @@ impl ChattView {
             }
             DaemonEvent::Incompatible(details) => {
                 log::error!("daemon connection is incompatible: {details}");
+                self.clear_command_surface(cx);
                 self.model.phase = ConnectionPhase::Incompatible {
                     details: details.clone(),
                 };
@@ -1173,7 +1580,11 @@ impl ChattView {
     }
 
     fn rebuild_message_list(&mut self) {
-        let next = timeline::build_message_list(&self.model.messages, &self.collapsed_sections);
+        let next = timeline::build_timeline_list(
+            &self.model.messages,
+            &self.command_rows,
+            &self.collapsed_sections,
+        );
         let common_prefix = self
             .message_list
             .iter()
@@ -1225,6 +1636,9 @@ impl ChattView {
             DaemonFrame::RequestResult(result) => {
                 self.model.pending.get(&result.request_id).cloned()
             }
+            DaemonFrame::CommandResult { result, .. } => {
+                self.model.pending.get(&result.request_id).cloned()
+            }
             _ => None,
         };
         let old_selected_room = self.model.selected_room;
@@ -1236,6 +1650,13 @@ impl ChattView {
         }
         let media_namespace_changed = self.model.daemon_instance != old_daemon_instance
             || self.model.active_server != old_active_server;
+        if self.model.selected_room != old_selected_room
+            || effect.replace_messages
+            || media_namespace_changed
+            || !self.model.is_ready()
+        {
+            self.clear_command_surface(cx);
+        }
         if media_namespace_changed {
             let preview_was_open = self.preview_history.active().is_some();
             self.media_cache
@@ -1325,6 +1746,7 @@ impl ChattView {
             self.enqueue_new_image_fetches(window, cx);
         }
         if effect.request_resync {
+            self.clear_command_surface(cx);
             let request_id = self.request_id();
             if let Err(error) = self
                 .daemon
@@ -1332,6 +1754,41 @@ impl ChattView {
             {
                 self.model.resync_requested = false;
                 self.status = format!("Could not request daemon resync · {error}").into();
+            }
+        }
+        if let Some((request_id, kind, items)) = effect.command_candidates
+            && self.candidate_requests.get(&kind) == Some(&request_id)
+        {
+            self.candidate_requests.remove(&kind);
+            self.command_candidates.insert(kind, items);
+            self.refresh_completion(cx);
+        }
+        let mut command_result_applied = false;
+        if let Some((result, lines)) = effect.command_result {
+            command_result_applied = true;
+            let matching = self
+                .pending_command
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == result.request_id);
+            if matching {
+                let submitted = self.pending_command.take().expect("matching command pending");
+                match result.outcome {
+                    RequestOutcome::Accepted => {
+                        if self.composer.read(cx).text() == submitted.draft {
+                            self.composer.update(cx, |composer, cx| composer.clear(cx));
+                        }
+                        self.append_command_output(lines);
+                        self.status = "Command completed".into();
+                    }
+                    RequestOutcome::Rejected { code, message } => {
+                        log::error!(
+                            "daemon command rejected request_id={} code={code}: {message}",
+                            result.request_id.0,
+                        );
+                        self.append_command_output(lines);
+                        self.status = message.into();
+                    }
+                }
             }
         }
         if let Some(result) = effect.request_result {
@@ -1381,7 +1838,10 @@ impl ChattView {
                     };
                 }
             }
-        } else if self.model.is_ready() && self.model.last_error.is_none() {
+        } else if !command_result_applied
+            && self.model.is_ready()
+            && self.model.last_error.is_none()
+        {
             self.status = connection_label(&self.model).into();
         }
     }
@@ -1392,15 +1852,56 @@ impl ChattView {
             cx.notify();
             return;
         }
+        if self.composer.read(cx).is_empty() {
+            return;
+        }
+        let draft = self.composer.read(cx).text();
+        if self.editing.is_none() && draft.starts_with('/') {
+            if self.pending_command.is_some() {
+                self.status = "Wait for the current command to finish".into();
+                cx.notify();
+                return;
+            }
+            if draft.contains(['\r', '\n']) {
+                self.status = "Slash commands must fit on one line".into();
+                cx.notify();
+                return;
+            }
+            let request_id = self.request_id();
+            self.model.pending.insert(
+                request_id,
+                PendingRequest {
+                    operation: Operation::RunCommand,
+                    room_id: self.model.selected_room,
+                    draft: Some(draft.clone()),
+                    transfer_id: None,
+                },
+            );
+            self.pending_command = Some(PendingCommand {
+                request_id,
+                draft: draft.clone(),
+            });
+            self.completion_session = None;
+            self.composer
+                .update(cx, |composer, _| composer.set_completion_open(false));
+            if let Err(error) = self.daemon.send(ClientFrame::RunCommand {
+                request_id,
+                body: draft,
+            }) {
+                self.model.pending.remove(&request_id);
+                self.pending_command = None;
+                self.status = error.into();
+            } else {
+                self.status = "Running command…".into();
+            }
+            cx.notify();
+            return;
+        }
         let Some(selected_room) = self.model.selected_room else {
             self.status = "Select a room before sending".into();
             cx.notify();
             return;
         };
-        if self.composer.read(cx).is_empty() {
-            return;
-        }
-        let draft = self.composer.read(cx).text();
         let request_id = self.request_id();
         let (operation, room_id, frame) = if let Some((room_id, target, _)) = self.editing {
             (
@@ -2494,6 +2995,84 @@ impl ChattView {
         }
     }
 
+    fn render_command_row(&self, command_index: usize, local_id: u64) -> AnyElement {
+        let Some(row) = self.command_rows.get(command_index) else {
+            return div().into_any_element();
+        };
+        let accent = if row.error { 0xc27070 } else { 0x7895bd };
+        let timestamp = timeline::format_age(row.timestamp_ms, timeline::now_ms());
+        let body = row.body.clone();
+        div()
+            .id(("command-output", local_id as usize))
+            .relative()
+            .w_full()
+            .pl(px(64.))
+            .pr(px(28.))
+            .py(px(9.))
+            .bg(rgb(0x15181c))
+            .hover(|row| row.bg(rgb(0x1b1f25)))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(64.))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(rgb(accent)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(9.))
+                    .h(px(24.))
+                    .w(px(64.))
+                    .pr(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .text_xs()
+                    .text_color(rgb(0x777d87))
+                    .child(timestamp),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(860.))
+                    .min_w_0()
+                    .pl(px(15.))
+                    .child(
+                        div()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(accent))
+                                    .child("chatt"),
+                            )
+                            .child(
+                                div()
+                                    .px_1()
+                                    .border_1()
+                                    .border_color(rgb(0x3a414b))
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child(if row.error { "COMMAND ERROR" } else { "COMMAND" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_color(rgb(if row.error { 0xe0a3a3 } else { 0xd2d5da }))
+                            .child(body),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_message(
         &mut self,
         index: usize,
@@ -2503,7 +3082,17 @@ impl ChattView {
         let Some(item) = self.message_list.get(index).copied() else {
             return div().into_any_element();
         };
-        let Some(message) = self.model.messages.get(item.message_index) else {
+        if let timeline::MessageListSource::Command {
+            command_index,
+            local_id,
+        } = item.source
+        {
+            return self.render_command_row(command_index, local_id);
+        }
+        let Some(message_index) = item.message_index() else {
+            return div().into_any_element();
+        };
+        let Some(message) = self.model.messages.get(message_index) else {
             return div().into_any_element();
         };
         let continuation = item.continuation;
@@ -4423,6 +5012,166 @@ impl ChattView {
         card
     }
 
+    fn render_completion_popup(
+        &mut self,
+        view: CompletionView,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self
+            .completion_session
+            .as_ref()
+            .and_then(|session| session.active.clone());
+        let mut rows = div().w_full().flex().flex_col();
+
+        for (index, option) in view.options.into_iter().enumerate() {
+            let selected = active.as_ref() == Some(&option.key);
+            let hover_key = option.key.clone();
+            let accept_key = option.key.clone();
+            let content = match &option.value {
+                CompletionValue::Command(command) => div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        highlighted_completion_label(
+                            command.name.clone(),
+                            &option.match_ranges,
+                            selected,
+                        )
+                        .w(px(138.))
+                        .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .w(px(190.))
+                            .flex_none()
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(if selected { 0xdce5f2 } else { 0x9aa2ae }))
+                            .child(command.usage.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(if selected { 0xcbd6e5 } else { 0x747c87 }))
+                            .child(command.description.clone()),
+                    ),
+                CompletionValue::Candidate { kind, item } => div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(if selected { 0xdce5f2 } else { 0x707986 }))
+                            .child(candidate_kind_label(*kind).to_ascii_uppercase()),
+                    )
+                    .child(
+                        highlighted_completion_label(
+                            item.value.clone(),
+                            &option.match_ranges,
+                            selected,
+                        )
+                        .w(px(220.))
+                        .flex_none(),
+                    )
+                    .when_some(item.detail.clone(), |row, detail| {
+                        row.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(if selected { 0xcbd6e5 } else { 0x747c87 }))
+                                .child(detail),
+                        )
+                    }),
+            };
+            rows = rows.child(
+                div()
+                    .id(("completion-option", index))
+                    .h(px(40.))
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(if selected { 0x667c9a } else { 0x292d34 }))
+                    .bg(rgb(if selected { 0x536987 } else { 0x14171b }))
+                    .hover(|row| {
+                        row.bg(rgb(if selected { 0x536987 } else { 0x20252c }))
+                    })
+                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                        this.hover_completion(hover_key.clone(), cx)
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.accept_completion_key(accept_key.clone(), window, cx)
+                    }))
+                    .child(content),
+            );
+        }
+
+        if let Some(hint) = view.hint {
+            rows = rows.child(
+                div()
+                    .h(px(40.))
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(0x292d34))
+                    .text_sm()
+                    .text_color(rgb(0x838b96))
+                    .child(hint),
+            );
+        }
+
+        div()
+            .id("command-completion")
+            .absolute()
+            .left(px(79.))
+            .right(px(28.))
+            .bottom(relative(1.))
+            .mb(px(6.))
+            .border_1()
+            .border_color(rgb(0x343a43))
+            .bg(rgb(0x14171b))
+            .child(rows)
+            .child(
+                div()
+                    .h(px(28.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .bg(rgb(0x101216))
+                    .text_xs()
+                    .text_color(rgb(0x727a86))
+                    .child("↑↓ navigate  ·  Tab complete")
+                    .child("Enter run  ·  Esc close"),
+            )
+            .with_animation(
+                ("command-completion-in", 0usize),
+                Animation::new(Duration::from_millis(90))
+                    .with_easing(gpui::ease_out_quint()),
+                |popup, delta| popup.opacity(delta).mb(px(2. + 4. * delta)),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
         let mut sidebar = div()
             .w(px(SIDEBAR_WIDTH))
@@ -4774,11 +5523,36 @@ impl Render for ChattView {
             self.render_preview_panel(active, self.preview_panel_width, window, cx)
         });
         let resizing_preview_pane = self.preview_pane_resize.is_some();
+        let completion_view = self.completion_view(cx).filter(|view| {
+            self.completion_session
+                .as_ref()
+                .is_some_and(|session| session.context_key == view.context_key)
+                && (!view.options.is_empty() || view.hint.is_some())
+        });
+        let completion_engaged = completion_view.is_some()
+            && self
+                .completion_session
+                .as_ref()
+                .is_some_and(|session| session.engaged);
+        let completion_key_context = if completion_engaged {
+            "CompletionOpen CompletionEngaged"
+        } else if completion_view.is_some() {
+            "CompletionOpen"
+        } else {
+            ""
+        };
+        let completion_popup =
+            completion_view.map(|view| self.render_completion_popup(view, cx));
         div()
             .id("chatt")
             .key_context("Chatt")
             .on_action(cx.listener(Self::open_media))
             .on_action(cx.listener(Self::send_message))
+            .on_action(cx.listener(Self::completion_next))
+            .on_action(cx.listener(Self::completion_previous))
+            .on_action(cx.listener(Self::completion_accept))
+            .on_action(cx.listener(Self::completion_accept_engaged))
+            .on_action(cx.listener(Self::completion_dismiss))
             .on_action(cx.listener(Self::toggle_playback))
             .on_action(cx.listener(Self::seek_back))
             .on_action(cx.listener(Self::seek_forward))
@@ -5004,7 +5778,7 @@ impl Render for ChattView {
                         },
                     )
                     .child(timeline)
-                    .when(count == 0, |panel| {
+                    .when(count == 0 && self.command_rows.is_empty(), |panel| {
                         panel.child(
                             div()
                                 .absolute()
@@ -5016,6 +5790,8 @@ impl Render for ChattView {
                     })
                     .child(
                         div()
+                            .relative()
+                            .key_context(completion_key_context)
                             .min_h(px(MIN_COMPOSER_HEIGHT))
                             .flex_none()
                             .flex()
@@ -5026,6 +5802,7 @@ impl Render for ChattView {
                             .border_t_1()
                             .border_color(rgb(0x272a30))
                             .bg(rgb(0x14161a))
+                            .when_some(completion_popup, |bar, popup| bar.child(popup))
                             .child(
                                 div()
                                     .w(px(36.))
@@ -5175,6 +5952,7 @@ fn operation_label(operation: &Operation) -> &'static str {
     match operation {
         Operation::SelectRoom => "Room selection",
         Operation::SendMessage => "Message",
+        Operation::RunCommand => "Command",
         Operation::EditMessage => "Edit",
         Operation::DeleteMessage => "Delete",
         Operation::SetMuted => "Mute change",
@@ -5189,6 +5967,46 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::CancelFileTransfer => "File transfer cancellation",
         _ => "Request",
     }
+}
+
+fn candidate_kind_label(kind: CommandCandidateKind) -> &'static str {
+    match kind {
+        CommandCandidateKind::User => "users",
+        CommandCandidateKind::Room => "rooms",
+        CommandCandidateKind::Sound => "sounds",
+    }
+}
+
+fn highlighted_completion_label(
+    label: String,
+    ranges: &[std::ops::Range<usize>],
+    selected: bool,
+) -> Div {
+    let mut element = div()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD);
+    for (byte_index, character) in label.char_indices() {
+        let matched = ranges
+            .iter()
+            .any(|range| range.start <= byte_index && byte_index < range.end);
+        element = element.child(
+            div()
+                .flex_none()
+                .text_color(rgb(if matched {
+                    if selected { 0xffffff } else { 0x9fc1ee }
+                } else if selected {
+                    0xf0f3f8
+                } else {
+                    0xc9cdd4
+                }))
+                .child(character.to_string()),
+        );
+    }
+    element
 }
 
 fn security_label(trust: TrustState) -> &'static str {

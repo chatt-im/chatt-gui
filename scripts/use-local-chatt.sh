@@ -8,11 +8,11 @@ config="$repository/.cargo/local.toml"
 usage() {
     cat <<'EOF'
 Usage: scripts/use-local-chatt.sh [CHATT_CHECKOUT]
-       scripts/use-local-chatt.sh --submodule
+       scripts/use-local-chatt.sh --pinned
 
 Use a local Chatt checkout for this repository's Chatt crate dependencies.
-CHATT_CHECKOUT defaults to /code/chatt. Pass --submodule to restore the pinned
-submodule dependencies.
+CHATT_CHECKOUT defaults to /code/chatt. Pass --pinned to restore the pinned Git
+dependencies from Cargo.toml.
 EOF
 }
 
@@ -21,9 +21,9 @@ case "${1:-}" in
         usage
         exit 0
         ;;
-    --submodule)
+    --pinned)
         rm -f -- "$config"
-        echo "Using the pinned Chatt submodule."
+        echo "Using the pinned Chatt Git revision."
         exit 0
         ;;
 esac

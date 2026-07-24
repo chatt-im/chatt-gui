@@ -27,12 +27,32 @@ pub struct Attachment {
     pub descriptor: AttachmentDescriptor,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalCommandRow {
+    pub local_id: u64,
+    pub anchor_message_id: Option<u64>,
+    pub body: String,
+    pub error: bool,
+    pub timestamp_ms: u64,
+}
+
 pub type CollapsedSections = HashMap<u64, Option<u64>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageListSource {
+    Message {
+        message_index: usize,
+        message_id: u64,
+    },
+    Command {
+        command_index: usize,
+        local_id: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MessageListItem {
-    pub message_index: usize,
-    pub message_id: u64,
+    pub source: MessageListSource,
     pub continuation: bool,
     pub collapsed_count: Option<usize>,
 }
@@ -43,9 +63,23 @@ impl MessageListItem {
     }
 
     pub fn has_same_visible_state(self, other: Self) -> bool {
-        self.message_id == other.message_id
+        self.source == other.source
             && self.continuation == other.continuation
             && self.collapsed_count == other.collapsed_count
+    }
+
+    pub fn message_index(self) -> Option<usize> {
+        match self.source {
+            MessageListSource::Message { message_index, .. } => Some(message_index),
+            MessageListSource::Command { .. } => None,
+        }
+    }
+
+    pub fn message_id(self) -> Option<u64> {
+        match self.source {
+            MessageListSource::Message { message_id, .. } => Some(message_id),
+            MessageListSource::Command { .. } => None,
+        }
     }
 }
 
@@ -162,19 +196,68 @@ pub fn build_message_list(
                     continue;
                 }
                 visible.push(MessageListItem {
-                    message_index: index,
-                    message_id: messages[index].id,
+                    source: MessageListSource::Message {
+                        message_index: index,
+                        message_id: messages[index].id,
+                    },
                     continuation: false,
                     collapsed_count: Some(section_end - section_start),
                 });
             } else {
                 visible.push(MessageListItem {
-                    message_index: index,
-                    message_id: messages[index].id,
+                    source: MessageListSource::Message {
+                        message_index: index,
+                        message_id: messages[index].id,
+                    },
                     continuation: index > group_start,
                     collapsed_count: None,
                 });
             }
+        }
+    }
+
+    visible
+}
+
+/// Merges ephemeral command output into the projected message feed. Command
+/// rows stay after the remote tail that existed when the command completed.
+pub fn build_timeline_list(
+    messages: &[Message],
+    command_rows: &[LocalCommandRow],
+    collapsed_sections: &CollapsedSections,
+) -> Vec<MessageListItem> {
+    let remote = build_message_list(messages, collapsed_sections);
+    let mut visible = Vec::with_capacity(remote.len() + command_rows.len());
+    let mut inserted = vec![false; command_rows.len()];
+
+    for item in remote {
+        let message_id = item.message_id();
+        visible.push(item);
+        for (command_index, row) in command_rows.iter().enumerate() {
+            if !inserted[command_index] && row.anchor_message_id == message_id {
+                visible.push(MessageListItem {
+                    source: MessageListSource::Command {
+                        command_index,
+                        local_id: row.local_id,
+                    },
+                    continuation: false,
+                    collapsed_count: None,
+                });
+                inserted[command_index] = true;
+            }
+        }
+    }
+
+    for (command_index, row) in command_rows.iter().enumerate() {
+        if !inserted[command_index] {
+            visible.push(MessageListItem {
+                source: MessageListSource::Command {
+                    command_index,
+                    local_id: row.local_id,
+                },
+                continuation: false,
+                collapsed_count: None,
+            });
         }
     }
 
@@ -294,7 +377,11 @@ mod tests {
         assert_eq!(
             visible
                 .iter()
-                .map(|item| (item.message_id, item.continuation, item.collapsed_count))
+                .map(|item| (
+                    item.message_id().unwrap(),
+                    item.continuation,
+                    item.collapsed_count
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 (1_000, false, None),
@@ -320,7 +407,7 @@ mod tests {
         assert_eq!(
             visible
                 .iter()
-                .map(|item| (item.message_id, item.collapsed_count))
+                .map(|item| (item.message_id().unwrap(), item.collapsed_count))
                 .collect::<Vec<_>>(),
             vec![(1_000, Some(2)), (3_000, Some(2))]
         );
@@ -330,7 +417,11 @@ mod tests {
         assert_eq!(
             visible
                 .iter()
-                .map(|item| (item.message_id, item.continuation, item.collapsed_count))
+                .map(|item| (
+                    item.message_id().unwrap(),
+                    item.continuation,
+                    item.collapsed_count
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 (1_000, false, None),
@@ -354,9 +445,76 @@ mod tests {
         assert_eq!(
             visible
                 .iter()
-                .map(|item| (item.message_id, item.collapsed_count))
+                .map(|item| (item.message_id().unwrap(), item.collapsed_count))
                 .collect::<Vec<_>>(),
             vec![(1_000, Some(2)), (3_000, None)]
+        );
+    }
+
+    #[test]
+    fn command_rows_remain_between_their_anchor_and_new_messages() {
+        let messages = vec![message("Mara", 1_000), message("Ivo", 3_000)];
+        let rows = vec![
+            LocalCommandRow {
+                local_id: 1,
+                anchor_message_id: Some(1_000),
+                body: "first".into(),
+                error: false,
+                timestamp_ms: 2_000,
+            },
+            LocalCommandRow {
+                local_id: 2,
+                anchor_message_id: Some(1_000),
+                body: "second".into(),
+                error: true,
+                timestamp_ms: 2_001,
+            },
+        ];
+
+        let visible = build_timeline_list(&messages, &rows, &CollapsedSections::new());
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.source)
+                .collect::<Vec<_>>(),
+            vec![
+                MessageListSource::Message {
+                    message_index: 0,
+                    message_id: 1_000,
+                },
+                MessageListSource::Command {
+                    command_index: 0,
+                    local_id: 1,
+                },
+                MessageListSource::Command {
+                    command_index: 1,
+                    local_id: 2,
+                },
+                MessageListSource::Message {
+                    message_index: 1,
+                    message_id: 3_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn command_rows_without_an_anchor_render_in_an_empty_feed() {
+        let rows = vec![LocalCommandRow {
+            local_id: 7,
+            anchor_message_id: None,
+            body: "ready".into(),
+            error: false,
+            timestamp_ms: 1,
+        }];
+
+        let visible = build_timeline_list(&[], &rows, &CollapsedSections::new());
+        assert_eq!(
+            visible[0].source,
+            MessageListSource::Command {
+                command_index: 0,
+                local_id: 7,
+            }
         );
     }
 

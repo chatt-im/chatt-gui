@@ -15,7 +15,7 @@ async-channel = "2.5"
 gpui = { path = "vendor/zed/crates/gpui", default-features = false }
 gpui_platform = { path = "vendor/zed/crates/gpui_platform", default-features = false }
 gpui_wgpu = { path = "vendor/zed/crates/gpui_wgpu", default-features = false }
-chatt_message_format = { package = "chatt-message-format", git = "https://github.com/chatt-im/chatt.git", rev = "48dce93ab20db84f3bfdce933dd6704e0dfc9eaa" }
+chatt_message_format = { package = "chatt-message-format", git = "https://github.com/chatt-im/chatt.git", rev = "c9c91e1c765155e1dd43b9406a8e054dbf270841" }
 dbus-message = { path = "crates/dbus-message" }
 fast-float = "0.2"
 image = { version = "0.25", default-features = false }
@@ -24,7 +24,7 @@ libc = "0.2"
 libmpv2 = { path = "vendor/libmpv2-rs", default-features = false, features = ["render", "vendored"] }
 log = "0.4"
 naga = { path = "vendor/wgpu/naga", features = ["glsl-in", "spv-out"] }
-local_rpc = { package = "chatt-local-rpc", git = "https://github.com/chatt-im/chatt.git", rev = "48dce93ab20db84f3bfdce933dd6704e0dfc9eaa" }
+local_rpc = { package = "chatt-local-rpc", git = "https://github.com/chatt-im/chatt.git", rev = "c9c91e1c765155e1dd43b9406a8e054dbf270841" }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 tempfile = "3"
@@ -43,10 +43,6 @@ debug = 0
 
 [profile.release]
 debug = 1
-
-[patch."https://github.com/chatt-im/chatt.git"]
-chatt-local-rpc = { path = "vendor/chatt/crates/local-rpc" }
-chatt-message-format = { path = "vendor/chatt/crates/message-format" }
 
 [patch.crates-io]
 naga = { path = "vendor/wgpu/naga" }

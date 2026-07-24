@@ -15,6 +15,15 @@ pub struct ReduceEffect {
     pub splices: Vec<(usize, usize, usize)>,
     pub request_resync: bool,
     pub request_result: Option<local_rpc::frame::RequestResult>,
+    pub command_result: Option<(
+        local_rpc::frame::RequestResult,
+        Vec<local_rpc::model::CommandOutputLine>,
+    )>,
+    pub command_candidates: Option<(
+        local_rpc::model::RequestId,
+        local_rpc::model::CommandCandidateKind,
+        Vec<local_rpc::model::CommandCandidate>,
+    )>,
 }
 
 pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
@@ -25,6 +34,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
             model.expected_seq = Some(welcome.first_event_seq);
             model.resync_requested = false;
             model.limits = welcome.limits;
+            model.commands = welcome.commands;
             model.active_server = welcome.active_server;
             model.server_connection = welcome.connection;
             model.phase = ConnectionPhase::Syncing;
@@ -65,6 +75,17 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         DaemonFrame::RequestResult(result) => {
             model.record_result(&result);
             effect.request_result = Some(result);
+        }
+        DaemonFrame::CommandResult { result, lines } => {
+            model.record_result(&result);
+            effect.command_result = Some((result, lines));
+        }
+        DaemonFrame::CommandCandidates {
+            request_id,
+            kind,
+            items,
+        } => {
+            effect.command_candidates = Some((request_id, kind, items));
         }
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
@@ -366,8 +387,14 @@ mod tests {
     use super::*;
     use local_rpc::ids::{RoomId, UserId};
     use local_rpc::{
-        frame::{NegotiatedLimits, StateEvent, Welcome},
-        model::{ConnectionState, DaemonInstanceId, Participant, VoiceState},
+        frame::{
+            NegotiatedLimits, Operation, RequestOutcome, RequestResult, StateEvent, Welcome,
+        },
+        model::{
+            CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo,
+            CommandOutputLine, ConnectionState, DaemonInstanceId, Participant, RequestId,
+            VoiceState,
+        },
     };
 
     fn welcome(instance: DaemonInstanceId) -> DaemonFrame {
@@ -379,6 +406,7 @@ mod tests {
             active_server: Some("local".into()),
             first_event_seq: 4,
             limits: NegotiatedLimits::default(),
+            commands: Vec::new(),
         })
     }
 
@@ -474,6 +502,79 @@ mod tests {
         assert!(effect.messages_changed);
         assert_eq!(model.phase, ConnectionPhase::Ready);
         assert_eq!(model.expected_seq, Some(5));
+    }
+
+    #[test]
+    fn welcome_installs_the_daemon_command_catalog() {
+        let instance = DaemonInstanceId([4; 16]);
+        let mut model = ChatModel::default();
+        let DaemonFrame::Welcome(mut frame) = welcome(instance) else {
+            unreachable!();
+        };
+        frame.commands.push(CommandInfo {
+            name: "/whoami".into(),
+            usage: "/whoami".into(),
+            description: "show identity".into(),
+            arg: CommandArgKind::None,
+            placeholder: None,
+        });
+
+        apply(&mut model, DaemonFrame::Welcome(frame));
+
+        assert_eq!(model.commands.len(), 1);
+        assert_eq!(model.commands[0].name, "/whoami");
+    }
+
+    #[test]
+    fn command_terminal_frames_are_returned_as_typed_effects() {
+        let request_id = RequestId(8);
+        let mut model = ChatModel::default();
+        model.pending.insert(
+            request_id,
+            crate::model::PendingRequest {
+                operation: Operation::RunCommand,
+                room_id: None,
+                draft: Some("/whoami".into()),
+                transfer_id: None,
+            },
+        );
+        let result = RequestResult {
+            request_id,
+            operation: Operation::RunCommand,
+            outcome: RequestOutcome::Accepted,
+        };
+        let lines = vec![CommandOutputLine {
+            error: false,
+            text: "alice".into(),
+        }];
+
+        let effect = apply(
+            &mut model,
+            DaemonFrame::CommandResult {
+                result: result.clone(),
+                lines: lines.clone(),
+            },
+        );
+
+        assert_eq!(effect.command_result, Some((result, lines)));
+        assert!(!model.pending.contains_key(&request_id));
+
+        let items = vec![CommandCandidate {
+            value: "alice".into(),
+            detail: None,
+        }];
+        let effect = apply(
+            &mut model,
+            DaemonFrame::CommandCandidates {
+                request_id,
+                kind: CommandCandidateKind::User,
+                items: items.clone(),
+            },
+        );
+        assert_eq!(
+            effect.command_candidates,
+            Some((request_id, CommandCandidateKind::User, items))
+        );
     }
 
     #[test]
