@@ -19,6 +19,7 @@ use crate::{
             self, ArgumentKind, AssistSession, CompletionContext, CompletionOption,
             CompletionValue, OptionKey,
         },
+        uploads::{FileQueue, MAX_QUEUED_FILES, QueuedFile, inspect_files},
     },
     daemon::{
         client::{DaemonClient, DaemonEvent},
@@ -180,6 +181,64 @@ struct CompletionView {
 struct PendingCommand {
     request_id: RequestId,
     draft: String,
+}
+
+#[derive(Clone, Debug)]
+struct EditingMessage {
+    room_id: RoomId,
+    target: local_rpc::ids::MessageId,
+}
+
+#[derive(Clone, Debug)]
+struct SubmittedUpload {
+    file: QueuedFile,
+    begin_request: RequestId,
+    finish_request: RequestId,
+}
+
+#[derive(Clone, Debug)]
+enum SubmissionPhase {
+    AwaitingMessage { request_id: RequestId },
+    ReadyForUpload,
+    Uploading(SubmittedUpload),
+}
+
+#[derive(Clone, Debug)]
+struct PendingSubmission {
+    room_id: RoomId,
+    draft: Option<String>,
+    files: VecDeque<QueuedFile>,
+    total_files: usize,
+    completed_files: usize,
+    phase: SubmissionPhase,
+}
+
+impl PendingSubmission {
+    fn request_ids(&self) -> (Option<RequestId>, Option<RequestId>) {
+        match &self.phase {
+            SubmissionPhase::AwaitingMessage { request_id } => (Some(*request_id), None),
+            SubmissionPhase::ReadyForUpload => (None, None),
+            SubmissionPhase::Uploading(upload) => {
+                (Some(upload.begin_request), Some(upload.finish_request))
+            }
+        }
+    }
+
+    fn into_failed_files(mut self) -> Vec<QueuedFile> {
+        let mut files = Vec::with_capacity(self.files.len() + 1);
+        if let SubmissionPhase::Uploading(upload) = self.phase {
+            files.push(upload.file);
+        }
+        files.extend(self.files.drain(..));
+        files
+    }
+
+    fn outcome_is_ambiguous(&self) -> bool {
+        matches!(
+            &self.phase,
+            SubmissionPhase::AwaitingMessage { .. } | SubmissionPhase::Uploading(_)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -469,8 +528,12 @@ pub struct ChattView {
     daemon: DaemonClient,
     next_request_id: u64,
     next_transfer_id: u64,
-    editing: Option<(RoomId, local_rpc::ids::MessageId, String)>,
+    editing: Option<EditingMessage>,
     composer: gpui::Entity<Composer>,
+    queued_files: FileQueue,
+    file_inspection_pending: bool,
+    pending_submission: Option<PendingSubmission>,
+    submission_outcome_unknown: bool,
     completion_session: Option<AssistSession>,
     command_candidates: HashMap<CommandCandidateKind, Vec<CommandCandidate>>,
     candidate_requests: HashMap<CommandCandidateKind, RequestId>,
@@ -637,6 +700,10 @@ impl ChattView {
             next_transfer_id: 1,
             editing: None,
             composer,
+            queued_files: FileQueue::default(),
+            file_inspection_pending: false,
+            pending_submission: None,
+            submission_outcome_unknown: false,
             completion_session: None,
             command_candidates: HashMap::new(),
             candidate_requests: HashMap::new(),
@@ -709,7 +776,12 @@ impl ChattView {
     }
 
     fn completion_view(&self, cx: &Context<Self>) -> Option<CompletionView> {
-        if !self.model.is_ready() || self.editing.is_some() || self.pending_command.is_some() {
+        if !self.model.is_ready()
+            || self.editing.is_some()
+            || self.pending_command.is_some()
+            || self.file_inspection_pending
+            || self.pending_submission.is_some()
+        {
             return None;
         }
         let snapshot = self.composer.read(cx).snapshot();
@@ -1016,6 +1088,271 @@ impl ChattView {
         let id = self.next_transfer_id.clamp(1, (1u64 << 63) - 1);
         self.next_transfer_id = if id == (1u64 << 63) - 1 { 1 } else { id + 1 };
         BulkTransferId(id)
+    }
+
+    fn begin_submission(&mut self, room_id: RoomId, draft: Option<String>, cx: &mut Context<Self>) {
+        let files = VecDeque::from(self.queued_files.take_all());
+        let total_files = files.len();
+        let phase = if draft.is_some() {
+            let request_id = self.request_id();
+            SubmissionPhase::AwaitingMessage { request_id }
+        } else {
+            SubmissionPhase::ReadyForUpload
+        };
+        self.pending_submission = Some(PendingSubmission {
+            room_id,
+            draft: draft.clone(),
+            files,
+            total_files,
+            completed_files: 0,
+            phase,
+        });
+
+        let Some(draft) = draft else {
+            self.start_next_submission_upload(cx);
+            return;
+        };
+        let SubmissionPhase::AwaitingMessage { request_id } = self
+            .pending_submission
+            .as_ref()
+            .expect("submission was just installed")
+            .phase
+            .clone()
+        else {
+            unreachable!("message submission starts by waiting for its request")
+        };
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::SendMessage,
+                room_id: Some(room_id),
+                draft: Some(draft.clone()),
+                transfer_id: None,
+            },
+        );
+        if let Err(error) = self.daemon.send(ClientFrame::SendMessage {
+            request_id,
+            room_id,
+            body: draft,
+        }) {
+            self.model.pending.remove(&request_id);
+            self.fail_pending_submission(error, cx);
+        } else {
+            self.status = if total_files == 0 {
+                "Sending message…".into()
+            } else {
+                format!("Sending message before {total_files} queued files…").into()
+            };
+            cx.notify();
+        }
+    }
+
+    fn start_next_submission_upload(&mut self, cx: &mut Context<Self>) {
+        let Some(mut submission) = self.pending_submission.take() else {
+            return;
+        };
+        let Some(file) = submission.files.pop_front() else {
+            self.status = if submission.total_files == 0 {
+                "Message accepted".into()
+            } else {
+                format!(
+                    "{} {} submitted",
+                    submission.total_files,
+                    if submission.total_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+                .into()
+            };
+            cx.notify();
+            return;
+        };
+
+        let begin_request = self.request_id();
+        let finish_request = self.request_id();
+        let transfer_id = self.transfer_id();
+        let room_id = submission.room_id;
+        let file_name = file.file_name.clone();
+        let path = file.path.clone();
+        submission.phase = SubmissionPhase::Uploading(SubmittedUpload {
+            file,
+            begin_request,
+            finish_request,
+        });
+        let position = submission.completed_files + 1;
+        let total = submission.total_files;
+        self.pending_submission = Some(submission);
+        self.model.pending.insert(
+            begin_request,
+            PendingRequest {
+                operation: Operation::BeginUpload,
+                room_id: Some(room_id),
+                draft: None,
+                transfer_id: Some(transfer_id),
+            },
+        );
+        self.model.pending.insert(
+            finish_request,
+            PendingRequest {
+                operation: Operation::FinishUpload,
+                room_id: Some(room_id),
+                draft: None,
+                transfer_id: Some(transfer_id),
+            },
+        );
+        self.daemon.upload_file(
+            path,
+            room_id,
+            transfer_id,
+            begin_request,
+            finish_request,
+            self.model.limits.upload_bytes,
+        );
+        self.status = format!("Sending file {position} of {total} · {file_name}").into();
+        cx.notify();
+    }
+
+    fn handle_submission_result(
+        &mut self,
+        result: &local_rpc::frame::RequestResult,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let phase = self
+            .pending_submission
+            .as_ref()
+            .map(|submission| submission.phase.clone());
+        match phase {
+            Some(SubmissionPhase::AwaitingMessage { request_id })
+                if request_id == result.request_id =>
+            {
+                match &result.outcome {
+                    RequestOutcome::Accepted => {
+                        let draft = self
+                            .pending_submission
+                            .as_mut()
+                            .and_then(|submission| submission.draft.take());
+                        if let Some(draft) = draft
+                            && self.composer.read(cx).text() == draft
+                        {
+                            self.composer.update(cx, |composer, cx| composer.clear(cx));
+                        }
+                        if let Some(submission) = self.pending_submission.as_mut() {
+                            submission.phase = SubmissionPhase::ReadyForUpload;
+                        }
+                        self.start_next_submission_upload(cx);
+                    }
+                    RequestOutcome::Rejected { message, .. } => {
+                        self.fail_pending_submission(message.clone(), cx);
+                    }
+                }
+                true
+            }
+            Some(SubmissionPhase::Uploading(upload))
+                if upload.begin_request == result.request_id =>
+            {
+                match &result.outcome {
+                    RequestOutcome::Accepted => {
+                        if let Some(submission) = self.pending_submission.as_ref() {
+                            self.status = format!(
+                                "Sending file {} of {} · {}",
+                                submission.completed_files + 1,
+                                submission.total_files,
+                                upload.file.file_name
+                            )
+                            .into();
+                        }
+                    }
+                    RequestOutcome::Rejected { message, .. } => {
+                        self.fail_pending_submission(message.clone(), cx);
+                    }
+                }
+                true
+            }
+            Some(SubmissionPhase::Uploading(upload))
+                if upload.finish_request == result.request_id =>
+            {
+                match &result.outcome {
+                    RequestOutcome::Accepted => {
+                        if let Some(submission) = self.pending_submission.as_mut() {
+                            submission.completed_files += 1;
+                            submission.phase = SubmissionPhase::ReadyForUpload;
+                        }
+                        self.start_next_submission_upload(cx);
+                    }
+                    RequestOutcome::Rejected { message, .. } => {
+                        self.fail_pending_submission(message.clone(), cx);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn pending_submission_matches_upload(
+        &self,
+        begin_request: RequestId,
+        finish_request: RequestId,
+    ) -> bool {
+        matches!(
+            self.pending_submission
+                .as_ref()
+                .map(|submission| &submission.phase),
+            Some(SubmissionPhase::Uploading(upload))
+                if upload.begin_request == begin_request
+                    && upload.finish_request == finish_request
+        )
+    }
+
+    fn fail_pending_submission(&mut self, reason: String, cx: &mut Context<Self>) {
+        let Some(submission) = self.pending_submission.take() else {
+            self.status = format!("Upload failed · {reason}").into();
+            cx.notify();
+            return;
+        };
+        if let Some(draft) = submission.draft.as_ref()
+            && self.composer.read(cx).text().is_empty()
+        {
+            self.composer
+                .update(cx, |composer, cx| composer.restore(draft.clone(), cx));
+        }
+        let files = self.recover_failed_submission_files(submission);
+        self.queued_files.restore(files);
+        self.status = format!("Could not submit · {reason}").into();
+        cx.notify();
+    }
+
+    fn abandon_disconnected_submission(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(submission) = self.pending_submission.take() else {
+            return self.submission_outcome_unknown;
+        };
+        let ambiguous = submission.outcome_is_ambiguous();
+        if let Some(draft) = submission.draft.as_ref()
+            && self.composer.read(cx).text().is_empty()
+        {
+            self.composer
+                .update(cx, |composer, cx| composer.restore(draft.clone(), cx));
+        }
+        let files = self.recover_failed_submission_files(submission);
+        self.queued_files.restore(files);
+        self.submission_outcome_unknown |= ambiguous;
+        self.submission_outcome_unknown
+    }
+
+    fn recover_failed_submission_files(
+        &mut self,
+        submission: PendingSubmission,
+    ) -> Vec<QueuedFile> {
+        let (first_request, second_request) = submission.request_ids();
+        if let Some(request_id) = first_request {
+            self.model.pending.remove(&request_id);
+        }
+        if let Some(request_id) = second_request {
+            self.model.pending.remove(&request_id);
+        }
+        submission.into_failed_files()
     }
 
     fn advance_video(&mut self, cx: &mut Context<Self>) {
@@ -1418,6 +1755,7 @@ impl ChattView {
             DaemonEvent::Disconnected(reason) => {
                 log::error!("daemon disconnected: {reason}");
                 self.clear_command_surface(cx);
+                let submission_outcome_unknown = self.abandon_disconnected_submission(cx);
                 self.media_cache
                     .lock()
                     .expect("media cache lock poisoned")
@@ -1433,30 +1771,49 @@ impl ChattView {
                     self.model.last_error =
                         Some("Connection changed; pending operations were not replayed".into());
                 }
-                self.status = format!("Offline · {reason}").into();
+                self.status = if submission_outcome_unknown {
+                    format!(
+                        "Offline · Submission outcome unknown; verify the timeline after reconnecting · {reason}"
+                    )
+                    .into()
+                } else {
+                    format!("Offline · {reason}").into()
+                };
                 self.release_live_players(window);
             }
             DaemonEvent::Incompatible(details) => {
                 log::error!("daemon connection is incompatible: {details}");
                 self.clear_command_surface(cx);
+                let submission_outcome_unknown = self.abandon_disconnected_submission(cx);
                 self.model.phase = ConnectionPhase::Incompatible {
                     details: details.clone(),
                 };
-                self.status = format!("Cannot connect · {details}").into();
+                self.status = if submission_outcome_unknown {
+                    format!(
+                        "Cannot connect · Submission outcome unknown; verify before retrying · {details}"
+                    )
+                    .into()
+                } else {
+                    format!("Cannot connect · {details}").into()
+                };
             }
-            DaemonEvent::UploadPreparationFailed {
+            DaemonEvent::UploadFailed {
                 begin_request,
                 finish_request,
                 reason,
             } => {
                 log::error!(
-                    "upload preparation failed begin_request={} finish_request={}: {reason}",
+                    "upload failed begin_request={} finish_request={}: {reason}",
                     begin_request.0,
                     finish_request.0,
                 );
                 self.model.pending.remove(&begin_request);
                 self.model.pending.remove(&finish_request);
-                self.status = format!("Could not prepare upload · {reason}").into();
+                if self.pending_submission_matches_upload(begin_request, finish_request) {
+                    self.fail_pending_submission(reason, cx);
+                } else {
+                    self.status = format!("Upload failed · {reason}").into();
+                }
             }
             DaemonEvent::MediaCached(descriptor) => {
                 log::info!(
@@ -1783,50 +2140,55 @@ impl ChattView {
             }
         }
         if let Some(result) = effect.request_result {
-            match result.outcome {
-                RequestOutcome::Accepted => {
-                    log::info!(
-                        "daemon result applied request_id={} operation={:?} outcome=accepted",
-                        result.request_id.0,
-                        result.operation,
-                    );
-                    self.status = format!("{} accepted", operation_label(&result.operation)).into();
-                    if let Some(pending) = pending.as_ref()
-                        && pending.operation == Operation::EditMessage
-                        && pending.draft.as_deref() == Some(self.composer.read(cx).text().as_str())
-                    {
-                        self.composer.update(cx, |composer, cx| composer.clear(cx));
-                        self.editing = None;
+            let submission_result = self.handle_submission_result(&result, cx);
+            if !submission_result {
+                match result.outcome {
+                    RequestOutcome::Accepted => {
+                        log::info!(
+                            "daemon result applied request_id={} operation={:?} outcome=accepted",
+                            result.request_id.0,
+                            result.operation,
+                        );
+                        self.status =
+                            format!("{} accepted", operation_label(&result.operation)).into();
+                        if let Some(pending) = pending.as_ref()
+                            && pending.operation == Operation::EditMessage
+                            && pending.draft.as_deref()
+                                == Some(self.composer.read(cx).text().as_str())
+                        {
+                            self.composer.update(cx, |composer, cx| composer.clear(cx));
+                            self.editing = None;
+                        }
                     }
-                }
-                RequestOutcome::Rejected { code, message } => {
-                    log::error!(
-                        "daemon result applied request_id={} operation={:?} outcome=rejected code={code}: {message}",
-                        result.request_id.0,
-                        result.operation,
-                    );
-                    if let Some(transfer_id) = pending.as_ref().and_then(|pending| {
-                        (pending.operation == Operation::BeginAttachmentRead)
-                            .then_some(pending.transfer_id)
-                            .flatten()
-                    }) {
-                        self.media_cache
-                            .lock()
-                            .expect("media cache lock poisoned")
-                            .cancel(transfer_id);
-                        self.eager_image_fetches
-                            .failed(transfer_id, message.clone());
-                        self.preview_history
-                            .fail_code_transfer(transfer_id, &message);
-                        self.pump_eager_image_fetches(cx);
+                    RequestOutcome::Rejected { code, message } => {
+                        log::error!(
+                            "daemon result applied request_id={} operation={:?} outcome=rejected code={code}: {message}",
+                            result.request_id.0,
+                            result.operation,
+                        );
+                        if let Some(transfer_id) = pending.as_ref().and_then(|pending| {
+                            (pending.operation == Operation::BeginAttachmentRead)
+                                .then_some(pending.transfer_id)
+                                .flatten()
+                        }) {
+                            self.media_cache
+                                .lock()
+                                .expect("media cache lock poisoned")
+                                .cancel(transfer_id);
+                            self.eager_image_fetches
+                                .failed(transfer_id, message.clone());
+                            self.preview_history
+                                .fail_code_transfer(transfer_id, &message);
+                            self.pump_eager_image_fetches(cx);
+                        }
+                        self.status = if pending.as_ref().is_some_and(|pending| {
+                            pending.room_id.is_some() && pending.room_id != self.model.selected_room
+                        }) {
+                            format!("Request for another room failed · {message}").into()
+                        } else {
+                            message.into()
+                        };
                     }
-                    self.status = if pending.as_ref().is_some_and(|pending| {
-                        pending.room_id.is_some() && pending.room_id != self.model.selected_room
-                    }) {
-                        format!("Request for another room failed · {message}").into()
-                    } else {
-                        message.into()
-                    };
                 }
             }
         } else if !command_result_applied
@@ -1843,7 +2205,26 @@ impl ChattView {
             cx.notify();
             return;
         }
-        if self.composer.read(cx).is_empty() {
+        if self.submission_outcome_unknown {
+            self.submission_outcome_unknown = false;
+            self.status =
+                "Previous submission outcome is unknown · Verify the timeline, then press Enter again to resend"
+                    .into();
+            cx.notify();
+            return;
+        }
+        if self.file_inspection_pending {
+            self.status = "Wait for attached files to finish checking".into();
+            cx.notify();
+            return;
+        }
+        if self.pending_submission.is_some() {
+            self.status = "Wait for the current submission to finish".into();
+            cx.notify();
+            return;
+        }
+        let composer_empty = self.composer.read(cx).is_empty();
+        if composer_empty && (self.editing.is_some() || self.queued_files.is_empty()) {
             return;
         }
         let draft = self.composer.read(cx).text();
@@ -1893,49 +2274,37 @@ impl ChattView {
             cx.notify();
             return;
         };
-        let request_id = self.request_id();
-        let (operation, room_id, frame) = if let Some((room_id, target, _)) = self.editing {
-            (
-                Operation::EditMessage,
+        if let Some((room_id, target)) = self
+            .editing
+            .as_ref()
+            .map(|editing| (editing.room_id, editing.target))
+        {
+            let request_id = self.request_id();
+            self.model.pending.insert(
+                request_id,
+                PendingRequest {
+                    operation: Operation::EditMessage,
+                    room_id: Some(room_id),
+                    draft: Some(draft.clone()),
+                    transfer_id: None,
+                },
+            );
+            if let Err(error) = self.daemon.send(ClientFrame::EditMessage {
+                request_id,
                 room_id,
-                ClientFrame::EditMessage {
-                    request_id,
-                    room_id,
-                    target,
-                    body: draft.clone(),
-                },
-            )
-        } else {
-            (
-                Operation::SendMessage,
-                selected_room,
-                ClientFrame::SendMessage {
-                    request_id,
-                    room_id: selected_room,
-                    body: draft.clone(),
-                },
-            )
-        };
-        let clears_composer_on_enqueue = operation == Operation::SendMessage;
-        self.model.pending.insert(
-            request_id,
-            PendingRequest {
-                operation,
-                room_id: Some(room_id),
-                draft: Some(draft),
-                transfer_id: None,
-            },
-        );
-        if let Err(error) = self.daemon.send(frame) {
-            self.model.pending.remove(&request_id);
-            self.status = error.into();
-        } else {
-            if clears_composer_on_enqueue {
-                self.composer.update(cx, |composer, cx| composer.clear(cx));
+                target,
+                body: draft,
+            }) {
+                self.model.pending.remove(&request_id);
+                self.status = error.into();
+            } else {
+                self.status = "Saving edit…".into();
             }
-            self.status = "Sending…".into();
+            cx.notify();
+            return;
         }
-        cx.notify();
+
+        self.begin_submission(selected_room, (!composer_empty).then_some(draft), cx);
     }
 
     fn begin_edit(
@@ -1948,7 +2317,20 @@ impl ChattView {
         if !self.model.is_ready() {
             return;
         }
-        self.editing = Some((room_id, message_id, body.clone()));
+        if self.pending_submission.is_some() {
+            self.status = "Wait for the current submission to finish".into();
+            cx.notify();
+            return;
+        }
+        if self.file_inspection_pending {
+            self.status = "Wait for attached files to finish checking".into();
+            cx.notify();
+            return;
+        }
+        self.editing = Some(EditingMessage {
+            room_id,
+            target: message_id,
+        });
         self.composer
             .update(cx, |composer, cx| composer.restore(body, cx));
         self.status = "Editing message · Enter saves".into();
@@ -2053,15 +2435,30 @@ impl ChattView {
 
     fn open_media(&mut self, _: &OpenMedia, window: &mut Window, cx: &mut Context<Self>) {
         if !self.model.is_ready() || self.model.selected_room.is_none() {
-            self.status = "Uploads are disabled until a room is synced".into();
+            self.status = "Attachments are disabled until a room is synced".into();
+            cx.notify();
+            return;
+        }
+        if self.editing.is_some() {
+            self.status = "Finish editing before attaching files".into();
+            cx.notify();
+            return;
+        }
+        if self.pending_submission.is_some() {
+            self.status = "Wait for the current submission to finish".into();
+            cx.notify();
+            return;
+        }
+        if self.file_inspection_pending {
+            self.status = "Wait for attached files to finish checking".into();
             cx.notify();
             return;
         }
 
         let chooser = cx.background_executor().spawn(async {
             open_files(OpenFileOptions {
-                title: "Upload files through Chatt".into(),
-                accept_label: Some("Upload".into()),
+                title: "Attach files to a Chatt message".into(),
+                accept_label: Some("Attach".into()),
                 multiple: true,
                 directory: false,
                 current_folder: None,
@@ -2071,7 +2468,7 @@ impl ChattView {
         cx.spawn_in(window, async move |this, cx| {
             let response = chooser.await;
             let _ = this.update_in(cx, |this, _, cx| match response {
-                Ok(FileChooserResponse::Selected(paths)) => this.queue_uploads(paths, cx),
+                Ok(FileChooserResponse::Selected(paths)) => this.queue_files(paths, cx),
                 Ok(FileChooserResponse::Cancelled) => {}
                 Ok(FileChooserResponse::Other) => {
                     this.status = "File chooser closed without a selection".into();
@@ -2086,42 +2483,89 @@ impl ChattView {
         .detach();
     }
 
-    fn queue_uploads(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let Some(room_id) = self.model.selected_room else {
+    fn queue_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if !self.model.is_ready() || self.model.selected_room.is_none() {
+            self.status = "Attachments are disabled until a room is synced".into();
+            cx.notify();
             return;
-        };
-        for path in paths {
-            let begin_request = self.request_id();
-            let finish_request = self.request_id();
-            let transfer_id = self.transfer_id();
-            self.model.pending.insert(
-                begin_request,
-                PendingRequest {
-                    operation: Operation::BeginUpload,
-                    room_id: Some(room_id),
-                    draft: None,
-                    transfer_id: Some(transfer_id),
-                },
-            );
-            self.model.pending.insert(
-                finish_request,
-                PendingRequest {
-                    operation: Operation::FinishUpload,
-                    room_id: Some(room_id),
-                    draft: None,
-                    transfer_id: Some(transfer_id),
-                },
-            );
-            self.daemon.upload_file(
-                path,
-                room_id,
-                transfer_id,
-                begin_request,
-                finish_request,
-                self.model.limits.upload_bytes,
-            );
         }
-        self.status = "Preparing daemon upload…".into();
+        if self.editing.is_some() {
+            self.status = "Finish editing before attaching files".into();
+            cx.notify();
+            return;
+        }
+        if self.pending_submission.is_some() {
+            self.status = "Wait for the current submission to finish".into();
+            cx.notify();
+            return;
+        }
+        if self.file_inspection_pending {
+            self.status = "Wait for attached files to finish checking".into();
+            cx.notify();
+            return;
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let available_slots = MAX_QUEUED_FILES.saturating_sub(self.queued_files.len());
+        if available_slots == 0 {
+            self.status = format!("At most {MAX_QUEUED_FILES} files can be queued").into();
+            cx.notify();
+            return;
+        }
+        let max_upload_bytes = self.model.limits.upload_bytes;
+        let executor = cx.background_executor().clone();
+        self.file_inspection_pending = true;
+        self.status = "Checking attached files…".into();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move { inspect_files(paths, max_upload_bytes, available_slots) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.file_inspection_pending = false;
+                let accepted = result.accepted.len();
+                this.queued_files.extend(result.accepted);
+                let first_error = result.rejected.first().cloned();
+                for error in result.rejected {
+                    log::error!("file was not queued: {error}");
+                }
+                if !this.model.is_ready() {
+                    cx.notify();
+                    return;
+                }
+                this.status = match (accepted, first_error) {
+                    (0, Some(error)) => error.into(),
+                    (accepted, Some(error)) => format!("{accepted} queued · {error}").into(),
+                    (_, None) => {
+                        let count = this.queued_files.len();
+                        format!(
+                            "{count} {} queued · Enter to send",
+                            if count == 1 { "file" } else { "files" }
+                        )
+                        .into()
+                    }
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn remove_queued_file(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.pending_submission.is_some() || !self.queued_files.remove(id) {
+            return;
+        }
+        self.status = if self.queued_files.is_empty() {
+            connection_label(&self.model).into()
+        } else {
+            let count = self.queued_files.len();
+            format!(
+                "{count} {} queued · Enter to send",
+                if count == 1 { "file" } else { "files" }
+            )
+            .into()
+        };
         cx.notify();
     }
 
@@ -5395,6 +5839,59 @@ impl ChattView {
             window.request_animation_frame();
         }
     }
+
+    fn render_queued_files(&self, cx: &mut Context<Self>) -> Div {
+        let mut row = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .pl(px(51.))
+            .pr_2()
+            .pb_2();
+        for file in self.queued_files.files() {
+            let id = file.id;
+            row = row.child(
+                div()
+                    .id(("queued-file", id as usize))
+                    .max_w(px(260.))
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x343840))
+                    .bg(rgb(0x111317))
+                    .text_sm()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(file.file_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(("remove-queued-file", id as usize))
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_color(rgb(0x8b929d))
+                            .hover(|button| button.bg(rgb(0x536987)).text_color(rgb(0xf0f2f5)))
+                            .child(icon(IconName::Close, 13.0, 0x9ba1ab))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.remove_queued_file(id, cx)),
+                            ),
+                    ),
+            );
+        }
+        row
+    }
 }
 
 impl Render for ChattView {
@@ -5485,6 +5982,10 @@ impl Render for ChattView {
             .map(|room| security_label(room.trust))
             .unwrap_or("");
         let ready = self.model.is_ready();
+        let can_attach = ready
+            && self.editing.is_none()
+            && !self.file_inspection_pending
+            && self.pending_submission.is_none();
         let timeline_view = cx.entity().downgrade();
         let selection_view = cx.entity().downgrade();
         let timeline = MessageSelectionArea::new(
@@ -5534,6 +6035,7 @@ impl Render for ChattView {
             ""
         };
         let completion_popup = completion_view.map(|view| self.render_completion_popup(view, cx));
+        let queued_file_row = (!self.queued_files.is_empty()).then(|| self.render_queued_files(cx));
         div()
             .id("chatt")
             .key_context("Chatt")
@@ -5561,7 +6063,7 @@ impl Render for ChattView {
             .on_action(cx.listener(Self::previous_code_match_action))
             .on_action(cx.listener(Self::close_code_search_action))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.queue_uploads(paths.0.to_vec(), cx)
+                this.queue_files(paths.0.to_vec(), cx)
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if !this.drag_video_volume(event, cx) && !this.drag_video_scrub(event, cx) {
@@ -5786,7 +6288,8 @@ impl Render for ChattView {
                             .min_h(px(MIN_COMPOSER_HEIGHT))
                             .flex_none()
                             .flex()
-                            .items_center()
+                            .flex_col()
+                            .items_stretch()
                             .pl(px(28.))
                             .pr(px(28.))
                             .py_2()
@@ -5794,29 +6297,35 @@ impl Render for ChattView {
                             .border_color(rgb(0x272a30))
                             .bg(rgb(0x14161a))
                             .when_some(completion_popup, |bar, popup| bar.child(popup))
+                            .when_some(queued_file_row, |bar, files| bar.child(files))
                             .child(
                                 div()
-                                    .w(px(36.))
-                                    .h(px(40.))
-                                    .flex_none()
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .mr(px(15.))
-                                    .child(composer_add_button(ready).on_click(cx.listener(
-                                        |this, _, window, cx| {
-                                            this.open_media(&OpenMedia, window, cx)
-                                        },
-                                    ))),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .min_h(px(40.))
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .child(self.composer.clone()),
+                                    .child(
+                                        div()
+                                            .w(px(36.))
+                                            .h(px(40.))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .mr(px(15.))
+                                            .child(composer_add_button(can_attach).on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.open_media(&OpenMedia, window, cx)
+                                                }),
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .min_h(px(40.))
+                                            .flex_1()
+                                            .flex()
+                                            .items_center()
+                                            .child(self.composer.clone()),
+                                    ),
                             ),
                     ),
             )
@@ -6213,6 +6722,14 @@ mod tests {
     use super::*;
     use local_rpc::model::MediaKind;
 
+    fn queued_file(id: u64) -> QueuedFile {
+        QueuedFile {
+            id,
+            path: PathBuf::from(format!("/tmp/file-{id}.bin")),
+            file_name: format!("file-{id}.bin"),
+        }
+    }
+
     fn image_fetch(room_id: RoomId, marker: u8) -> EagerImageFetch {
         EagerImageFetch::new(
             room_id,
@@ -6237,6 +6754,82 @@ mod tests {
         assert_eq!(
             code_preview_size_error(MAX_CODE_PREVIEW_BYTES + 1),
             Some("file too large to preview")
+        );
+    }
+
+    #[test]
+    fn rejected_message_submission_recovers_the_complete_file_batch() {
+        let submission = PendingSubmission {
+            room_id: RoomId(7),
+            draft: Some("message".into()),
+            files: VecDeque::from([queued_file(1), queued_file(2)]),
+            total_files: 2,
+            completed_files: 0,
+            phase: SubmissionPhase::AwaitingMessage {
+                request_id: RequestId(11),
+            },
+        };
+
+        assert_eq!(
+            submission
+                .into_failed_files()
+                .into_iter()
+                .map(|file| file.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn failed_upload_recovers_current_and_unstarted_files_but_not_completed_files() {
+        let current = SubmittedUpload {
+            file: queued_file(2),
+            begin_request: RequestId(21),
+            finish_request: RequestId(22),
+        };
+        let submission = PendingSubmission {
+            room_id: RoomId(7),
+            draft: None,
+            files: VecDeque::from([queued_file(3), queued_file(4)]),
+            total_files: 4,
+            completed_files: 1,
+            phase: SubmissionPhase::Uploading(current),
+        };
+
+        assert_eq!(
+            submission
+                .into_failed_files()
+                .into_iter()
+                .map(|file| file.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn disconnect_marks_the_current_upload_ambiguous_and_preserves_the_retry_batch() {
+        let current = SubmittedUpload {
+            file: queued_file(2),
+            begin_request: RequestId(21),
+            finish_request: RequestId(22),
+        };
+        let submission = PendingSubmission {
+            room_id: RoomId(7),
+            draft: None,
+            files: VecDeque::from([queued_file(3), queued_file(4)]),
+            total_files: 4,
+            completed_files: 1,
+            phase: SubmissionPhase::Uploading(current),
+        };
+
+        assert!(submission.outcome_is_ambiguous());
+        assert_eq!(
+            submission
+                .into_failed_files()
+                .into_iter()
+                .map(|file| file.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
         );
     }
 

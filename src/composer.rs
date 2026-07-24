@@ -14,6 +14,7 @@ mod cursor;
 mod highlight;
 mod history;
 mod mode;
+pub(crate) mod uploads;
 mod vim;
 mod visual;
 

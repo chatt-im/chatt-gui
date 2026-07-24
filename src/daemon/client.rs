@@ -29,7 +29,7 @@ pub enum DaemonEvent {
     },
     Disconnected(String),
     Incompatible(String),
-    UploadPreparationFailed {
+    UploadFailed {
         begin_request: RequestId,
         finish_request: RequestId,
         reason: String,
@@ -133,7 +133,7 @@ impl DaemonClient {
                 let file = match File::open(&path) {
                     Ok(file) => file,
                     Err(error) => {
-                        let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
+                        let _ = events.send_blocking(DaemonEvent::UploadFailed {
                             begin_request,
                             finish_request,
                             reason: error.to_string(),
@@ -144,7 +144,7 @@ impl DaemonClient {
                 let metadata = match file.metadata() {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
+                        let _ = events.send_blocking(DaemonEvent::UploadFailed {
                             begin_request,
                             finish_request,
                             reason: error.to_string(),
@@ -153,7 +153,7 @@ impl DaemonClient {
                     }
                 };
                 if metadata.len() > max_upload_bytes {
-                    let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
+                    let _ = events.send_blocking(DaemonEvent::UploadFailed {
                         begin_request,
                         finish_request,
                         reason: format!(
@@ -182,7 +182,7 @@ impl DaemonClient {
                     }))
                     .is_err()
                 {
-                    let _ = events.send_blocking(DaemonEvent::UploadPreparationFailed {
+                    let _ = events.send_blocking(DaemonEvent::UploadFailed {
                         begin_request,
                         finish_request,
                         reason: "daemon connector stopped".into(),
@@ -190,7 +190,7 @@ impl DaemonClient {
                 }
             })
         {
-            let _ = spawn_errors.send(DaemonEvent::UploadPreparationFailed {
+            let _ = spawn_errors.send(DaemonEvent::UploadFailed {
                 begin_request,
                 finish_request,
                 reason: error.to_string(),
@@ -305,14 +305,6 @@ fn connection_loop(
                                     break 'connected "daemon writer stopped".into();
                                 }
                             }
-                            if let DaemonFrame::RequestResult(result) = &frame
-                                && result.operation == Operation::BeginUpload
-                                && command_tx
-                                    .send(ConnectorCommand::BeginUploadResult(result.clone()))
-                                    .is_err()
-                            {
-                                break 'connected "daemon writer stopped".into();
-                            }
                             if let DaemonFrame::RequestResult(result) = &frame {
                                 match &result.outcome {
                                     RequestOutcome::Accepted => log::info!(
@@ -326,6 +318,17 @@ fn connection_loop(
                                         result.operation,
                                     ),
                                 }
+                            }
+                            if let DaemonFrame::RequestResult(result) = &frame
+                                && result.operation == Operation::BeginUpload
+                            {
+                                if command_tx
+                                    .send(ConnectorCommand::BeginUploadResult(result.clone()))
+                                    .is_err()
+                                {
+                                    break 'connected "daemon writer stopped".into();
+                                }
+                                continue;
                             }
                             if matches!(
                                 &frame,
@@ -564,16 +567,19 @@ fn writer_loop(
                     prepared.insert(upload.begin_request, upload);
                 }
                 ConnectorCommand::BeginUploadResult(result) => {
+                    if events
+                        .send_blocking(DaemonEvent::Frame(DaemonFrame::RequestResult(
+                            result.clone(),
+                        )))
+                        .is_err()
+                    {
+                        let _ = writer.shutdown();
+                        break;
+                    }
                     let Some(upload) = prepared.remove(&result.request_id) else {
                         continue;
                     };
-                    if let RequestOutcome::Rejected { message, .. } = result.outcome {
-                        report_upload_error(
-                            &events,
-                            upload.begin_request,
-                            upload.finish_request,
-                            message,
-                        );
+                    if matches!(result.outcome, RequestOutcome::Rejected { .. }) {
                         continue;
                     }
                     active.push_back(ActiveUpload {
@@ -617,14 +623,16 @@ fn writer_loop(
                     upload.prepared.finish_request,
                     error,
                 );
+                let cancel_request = RequestId(internal_request_id);
+                internal_request_id = internal_request_id.wrapping_add(1).max(1 << 63);
                 let cancel = ClientFrame::CancelUpload {
-                    request_id: upload.prepared.finish_request,
+                    request_id: cancel_request,
                     transfer_id: upload.prepared.upload.transfer_id,
                 };
                 if let Err(error) = writer.send_client(&cancel) {
                     log::error!(
                         "could not write failed-upload cancellation request_id={} transfer_id={}: {error}",
-                        upload.prepared.finish_request.0,
+                        cancel_request.0,
                         upload.prepared.upload.transfer_id.0,
                     );
                     let _ = writer.shutdown();
@@ -704,7 +712,7 @@ fn report_upload_error(
         finish_request.0,
     );
     if events
-        .send_blocking(DaemonEvent::UploadPreparationFailed {
+        .send_blocking(DaemonEvent::UploadFailed {
             begin_request,
             finish_request,
             reason,
