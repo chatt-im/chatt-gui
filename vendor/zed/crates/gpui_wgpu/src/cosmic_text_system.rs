@@ -17,8 +17,10 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
+    tag_from_bytes,
     zeno::{Format, Vector},
 };
+use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
@@ -50,6 +52,8 @@ struct CosmicTextSystemState {
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
+    emoji_fallback: Option<(FontId, SharedString)>,
+    emoji_fallback_scanned: bool,
 }
 
 struct LoadedFont {
@@ -72,6 +76,8 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            emoji_fallback: None,
+            emoji_fallback_scanned: false,
         }))
     }
 
@@ -88,6 +94,8 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            emoji_fallback: None,
+            emoji_fallback_scanned: false,
         }))
     }
 }
@@ -221,6 +229,8 @@ impl CosmicTextSystemState {
                 }
             }
         }
+        self.emoji_fallback = None;
+        self.emoji_fallback_scanned = false;
         Ok(())
     }
 
@@ -300,10 +310,12 @@ impl CosmicTextSystemState {
 
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
+            let is_known_emoji_font =
+                check_is_known_emoji_font(&postscript_name, font.as_swash());
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: cosmic_features.clone(),
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                is_known_emoji_font,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
         }
@@ -441,10 +453,12 @@ impl CosmicTextSystemState {
                 .context("fallback font face not found in cosmic-text database")?;
 
             let font_id = FontId(self.loaded_fonts.len());
+            let is_known_emoji_font =
+                check_is_known_emoji_font(&face.post_script_name, font.as_swash());
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: CosmicFontFeatures::new(),
-                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                is_known_emoji_font,
                 user_fallback_chain: Arc::from(Vec::new()),
             });
 
@@ -452,9 +466,48 @@ impl CosmicTextSystemState {
         }
     }
 
+    fn emoji_fallback(&mut self) -> Option<(FontId, SharedString)> {
+        if self.emoji_fallback_scanned {
+            return self.emoji_fallback.clone();
+        }
+        self.emoji_fallback_scanned = true;
+
+        let mut candidates = self
+            .font_system
+            .db()
+            .faces()
+            .filter_map(|face| {
+                emoji_font_preference(face).map(|preference| (preference, face.id))
+            })
+            .collect::<SmallVec<[_; 8]>>();
+        candidates.sort_unstable_by_key(|(preference, _)| *preference);
+
+        for (_, database_id) in candidates {
+            let Some(family) = self
+                .font_system
+                .db()
+                .face(database_id)
+                .and_then(|face| face.families.first())
+                .map(|family| SharedString::from(family.0.clone()))
+            else {
+                continue;
+            };
+            let std::result::Result::Ok(font_id) =
+                self.font_id_for_cosmic_id(database_id)
+            else {
+                continue;
+            };
+            self.emoji_fallback = Some((font_id, family));
+            break;
+        }
+
+        self.emoji_fallback.clone()
+    }
+
     #[profiling::function]
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut attrs_list = AttrsList::new(&Attrs::new());
+        let emoji_fallback = self.emoji_fallback();
         let mut offs = 0;
         for run in font_runs {
             let run_end = offs + run.len;
@@ -482,7 +535,21 @@ impl CosmicTextSystemState {
             let primary_style = face.style;
             let primary_weight = face.weight;
             let primary_features = loaded_font.features.clone();
-            let fallback_chain = Arc::clone(&loaded_font.user_fallback_chain);
+            let user_fallback_chain = Arc::clone(&loaded_font.user_fallback_chain);
+            let mut fallback_chain =
+                SmallVec::<[(FontId, SharedString); 4]>::from_iter(user_fallback_chain.iter().cloned());
+            let mut automatic_emoji_slot = None;
+            let emoji_slot = emoji_fallback.as_ref().map(|(emoji_id, emoji_family)| {
+                fallback_chain
+                    .iter()
+                    .position(|(font_id, _)| font_id == emoji_id)
+                    .unwrap_or_else(|| {
+                        let slot = fallback_chain.len();
+                        fallback_chain.push((*emoji_id, emoji_family.clone()));
+                        automatic_emoji_slot = Some(slot);
+                        slot
+                    })
+            });
 
             // build one `Attrs` per slot up front. each clone of span attrs
             // would otherwise re-allocate the `font_features` Vec.
@@ -518,7 +585,16 @@ impl CosmicTextSystemState {
             } else {
                 let loaded_fonts = &self.loaded_fonts;
                 let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
-                compute_run_spans(text, offs, run.len, run.font_id, &fallback_chain, &covers)
+                compute_run_spans(
+                    text,
+                    offs,
+                    run.len,
+                    run.font_id,
+                    &fallback_chain,
+                    emoji_slot,
+                    automatic_emoji_slot,
+                    &covers,
+                )
             };
 
             for span in spans {
@@ -711,6 +787,8 @@ fn compute_run_spans(
     run_len: usize,
     primary: FontId,
     fallback_chain: &[(FontId, SharedString)],
+    emoji_slot: Option<usize>,
+    automatic_emoji_slot: Option<usize>,
     covers: &impl Fn(FontId, char) -> bool,
 ) -> SmallVec<[RunSpan; 4]> {
     let mut spans = SmallVec::new();
@@ -733,8 +811,15 @@ fn compute_run_spans(
     let mut span_font_id = primary;
     for (grapheme_idx, grapheme) in run_text.grapheme_indices(true) {
         let abs = run_offset + grapheme_idx;
-        let ch = grapheme.chars().next().unwrap_or('\0');
-        let next_slot = pick_covering_slot(ch, span_slot, primary, fallback_chain, covers);
+        let next_slot = pick_covering_slot(
+            grapheme,
+            span_slot,
+            primary,
+            fallback_chain,
+            emoji_slot,
+            automatic_emoji_slot,
+            covers,
+        );
         if next_slot == span_slot {
             continue;
         }
@@ -773,12 +858,21 @@ fn slot_font_id(
 }
 
 fn pick_covering_slot(
-    ch: char,
+    grapheme: &str,
     current: Option<usize>,
     primary: FontId,
     fallback_chain: &[(FontId, SharedString)],
+    emoji_slot: Option<usize>,
+    automatic_emoji_slot: Option<usize>,
     covers: &impl Fn(FontId, char) -> bool,
 ) -> Option<usize> {
+    let ch = grapheme.chars().next().unwrap_or('\0');
+    if grapheme_prefers_emoji(grapheme)
+        && let Some(slot) = emoji_slot
+        && covers(fallback_chain[slot].0, ch)
+    {
+        return Some(slot);
+    }
     if (ch as u32) <= 0x7F {
         return None;
     }
@@ -786,15 +880,38 @@ fn pick_covering_slot(
         return None;
     }
     let current_id = slot_font_id(current, primary, fallback_chain);
-    if covers(current_id, ch) {
+    if current != automatic_emoji_slot && covers(current_id, ch) {
         return current;
     }
     for (ix, (fb_id, _)) in fallback_chain.iter().enumerate() {
+        if Some(ix) == automatic_emoji_slot {
+            continue;
+        }
         if covers(*fb_id, ch) {
             return Some(ix);
         }
     }
     None
+}
+
+fn grapheme_prefers_emoji(grapheme: &str) -> bool {
+    if grapheme.contains('\u{FE0E}') {
+        return false;
+    }
+    if grapheme.contains('\u{FE0F}') {
+        return true;
+    }
+    matches!(
+        grapheme
+            .chars()
+            .next()
+            .map(char::emoji_status)
+            .unwrap_or(EmojiStatus::NonEmoji),
+        EmojiStatus::EmojiPresentation
+            | EmojiStatus::EmojiPresentationAndModifierBase
+            | EmojiStatus::EmojiPresentationAndEmojiComponent
+            | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+    )
 }
 
 fn charmap_covers(loaded_fonts: &[LoadedFont], id: FontId, ch: char) -> bool {
@@ -857,9 +974,52 @@ fn face_info_into_properties(
     }
 }
 
-fn check_is_known_emoji_font(postscript_name: &str) -> bool {
-    // TODO: Include other common emoji fonts
-    postscript_name == "NotoColorEmoji"
+const EMOJI_FONT_NAMES: &[(&str, &str)] = &[
+    ("Twemoji", "Twemoji"),
+    ("Twitter Color Emoji", "TwitterColorEmoji"),
+    ("Noto Color Emoji", "NotoColorEmoji"),
+    ("Noto Emoji", "NotoEmoji"),
+    ("Noto Sans Emoji", "NotoSansEmoji"),
+    ("Apple Color Emoji", "AppleColorEmoji"),
+    (".AppleColorEmojiUI", ".AppleColorEmojiUI"),
+    ("Segoe UI Emoji", "SegoeUIEmoji"),
+    ("Emoji One", "EmojiOne"),
+    ("JoyPixels", "JoyPixels"),
+];
+
+fn emoji_font_preference(face: &cosmic_text::fontdb::FaceInfo) -> Option<usize> {
+    EMOJI_FONT_NAMES
+        .iter()
+        .position(|(family_name, postscript_name)| {
+            face.post_script_name == *postscript_name
+                || face
+                    .families
+                    .iter()
+                    .any(|(family, _)| family == family_name)
+        })
+        .or_else(|| {
+            let has_emoji_name = face.post_script_name.contains("Emoji")
+                || face.post_script_name.contains("emoji")
+                || face
+                    .families
+                    .iter()
+                    .any(|(family, _)| family.contains("Emoji") || family.contains("emoji"));
+            has_emoji_name.then_some(EMOJI_FONT_NAMES.len())
+        })
+}
+
+fn check_is_known_emoji_font(postscript_name: &str, font: swash::FontRef<'_>) -> bool {
+    is_known_emoji_font_name(postscript_name)
+        || [b"CBDT", b"sbix", b"COLR"]
+            .into_iter()
+            .any(|tag| font.table(tag_from_bytes(tag)).is_some())
+}
+
+fn is_known_emoji_font_name(postscript_name: &str) -> bool {
+    matches!(
+        postscript_name,
+        "NotoColorEmoji" | "Twemoji" | "TwitterColorEmoji"
+    )
 }
 
 #[cfg(test)]
@@ -874,6 +1034,89 @@ mod tests {
         ids.iter()
             .map(|&i| (fid(i), SharedString::from(format!("fb{i}"))))
             .collect()
+    }
+
+    fn pick_covering_slot(
+        ch: char,
+        current: Option<usize>,
+        primary: FontId,
+        fallback_chain: &[(FontId, SharedString)],
+        covers: &impl Fn(FontId, char) -> bool,
+    ) -> Option<usize> {
+        let mut encoded = [0; 4];
+        super::pick_covering_slot(
+            ch.encode_utf8(&mut encoded),
+            current,
+            primary,
+            fallback_chain,
+            None,
+            None,
+            covers,
+        )
+    }
+
+    fn compute_run_spans(
+        text: &str,
+        run_offset: usize,
+        run_len: usize,
+        primary: FontId,
+        fallback_chain: &[(FontId, SharedString)],
+        covers: &impl Fn(FontId, char) -> bool,
+    ) -> SmallVec<[RunSpan; 4]> {
+        super::compute_run_spans(
+            text,
+            run_offset,
+            run_len,
+            primary,
+            fallback_chain,
+            None,
+            None,
+            covers,
+        )
+    }
+
+    #[test]
+    fn recognizes_supported_color_emoji_fonts() {
+        assert!(is_known_emoji_font_name("NotoColorEmoji"));
+        assert!(is_known_emoji_font_name("Twemoji"));
+        assert!(is_known_emoji_font_name("TwitterColorEmoji"));
+        assert!(!is_known_emoji_font_name("IBMPlexSans"));
+    }
+
+    #[test]
+    fn recognizes_unicode_emoji_presentation() {
+        assert!(!grapheme_prefers_emoji("☺"));
+        assert!(grapheme_prefers_emoji("☺️"));
+        assert!(grapheme_prefers_emoji("😀"));
+        assert!(!grapheme_prefers_emoji("😀︎"));
+        assert!(grapheme_prefers_emoji("1️⃣"));
+        assert!(grapheme_prefers_emoji("🇺🇸"));
+    }
+
+    #[test]
+    fn emoji_presentation_overrides_a_primary_font_that_covers_the_symbol() {
+        let primary = fid(0);
+        let emoji = fid(1);
+        let fallback_chain = chain(&[1]);
+        let covers = |_: FontId, _: char| true;
+        let text = "text ☺ emoji ☺️ default 😀";
+        let spans = super::compute_run_spans(
+            text,
+            0,
+            text.len(),
+            primary,
+            &fallback_chain,
+            Some(0),
+            Some(0),
+            &covers,
+        );
+
+        let emoji_ranges = spans
+            .iter()
+            .filter(|span| span.font_id == emoji)
+            .map(|span| &text[span.start..span.end])
+            .collect_vec();
+        assert_eq!(emoji_ranges, ["☺️", "😀"]);
     }
 
     fn span(start: usize, end: usize, slot: Option<usize>, font_id: FontId) -> RunSpan {

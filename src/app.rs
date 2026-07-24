@@ -54,17 +54,16 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths,
     FocusHandle, Focusable, FollowMode, FontWeight, KeyBinding, ListAlignment, ListState,
     LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, Stateful, Subscription, Task, UniformListScrollHandle,
-    WeakFocusHandle, Window, actions, canvas, div, img, list, point, prelude::*, px, rgb, rgba,
-    relative,
+    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    SharedString, Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window,
+    actions, canvas, div, img, list, point, prelude::*, px, relative, rgb, rgba,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
     ids::{RoomId, StreamId},
     model::{
-        AttachmentDescriptor, AttachmentId, BulkTransferId, CommandCandidate,
-        CommandCandidateKind, CommandOutputLine, MediaKind, RequestId, RoomKind, TrustState,
+        AttachmentDescriptor, AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind,
+        CommandOutputLine, MediaKind, RequestId, RoomKind, TrustState,
     },
 };
 
@@ -558,14 +557,13 @@ impl ChattView {
                 }
             });
         let composer_focus = composer.focus_handle(cx);
-        let composer_blur_subscription =
-            cx.on_blur(&composer_focus, window, |this, _, cx| {
-                if this.completion_session.take().is_some() {
-                    this.composer
-                        .update(cx, |composer, _| composer.set_completion_open(false));
-                    cx.notify();
-                }
-            });
+        let composer_blur_subscription = cx.on_blur(&composer_focus, window, |this, _, cx| {
+            if this.completion_session.take().is_some() {
+                this.composer
+                    .update(cx, |composer, _| composer.set_completion_open(false));
+                cx.notify();
+            }
+        });
         let code_viewer_focus = cx.focus_handle();
         let code_selection = CodeSelection::new(code_viewer_focus.clone());
         let timeline_selection = MessageSelectionGroup::new(cx.focus_handle());
@@ -874,12 +872,7 @@ impl ChattView {
         self.list_state.scroll_to_end();
     }
 
-    fn move_completion(
-        &mut self,
-        delta: isize,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn move_completion(&mut self, delta: isize, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.completion_view(cx) else {
             self.completion_session = None;
             self.composer
@@ -894,12 +887,7 @@ impl ChattView {
         }
     }
 
-    fn completion_next(
-        &mut self,
-        _: &CompletionNext,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn completion_next(&mut self, _: &CompletionNext, window: &mut Window, cx: &mut Context<Self>) {
         self.move_completion(1, window, cx);
     }
 
@@ -1771,7 +1759,10 @@ impl ChattView {
                 .as_ref()
                 .is_some_and(|pending| pending.request_id == result.request_id);
             if matching {
-                let submitted = self.pending_command.take().expect("matching command pending");
+                let submitted = self
+                    .pending_command
+                    .take()
+                    .expect("matching command pending");
                 match result.outcome {
                     RequestOutcome::Accepted => {
                         if self.composer.read(cx).text() == submitted.draft {
@@ -3060,7 +3051,11 @@ impl ChattView {
                                     .border_color(rgb(0x3a414b))
                                     .text_xs()
                                     .text_color(rgb(0x8f98a6))
-                                    .child(if row.error { "COMMAND ERROR" } else { "COMMAND" }),
+                                    .child(if row.error {
+                                        "COMMAND ERROR"
+                                    } else {
+                                        "COMMAND"
+                                    }),
                             ),
                     )
                     .child(
@@ -5108,9 +5103,7 @@ impl ChattView {
                     .border_b_1()
                     .border_color(rgb(if selected { 0x667c9a } else { 0x292d34 }))
                     .bg(rgb(if selected { 0x536987 } else { 0x14171b }))
-                    .hover(|row| {
-                        row.bg(rgb(if selected { 0x536987 } else { 0x20252c }))
-                    })
+                    .hover(|row| row.bg(rgb(if selected { 0x536987 } else { 0x20252c })))
                     .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
                         this.hover_completion(hover_key.clone(), cx)
                     }))
@@ -5165,8 +5158,7 @@ impl ChattView {
             )
             .with_animation(
                 ("command-completion-in", 0usize),
-                Animation::new(Duration::from_millis(90))
-                    .with_easing(gpui::ease_out_quint()),
+                Animation::new(Duration::from_millis(90)).with_easing(gpui::ease_out_quint()),
                 |popup, delta| popup.opacity(delta).mb(px(2. + 4. * delta)),
             )
             .into_any_element()
@@ -5541,8 +5533,7 @@ impl Render for ChattView {
         } else {
             ""
         };
-        let completion_popup =
-            completion_view.map(|view| self.render_completion_popup(view, cx));
+        let completion_popup = completion_view.map(|view| self.render_completion_popup(view, cx));
         div()
             .id("chatt")
             .key_context("Chatt")

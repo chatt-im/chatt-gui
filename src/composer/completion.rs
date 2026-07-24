@@ -1,8 +1,6 @@
 use std::ops::Range;
 
-use local_rpc::model::{
-    CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo,
-};
+use local_rpc::model::{CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo};
 
 pub const MAX_VISIBLE_OPTIONS: usize = 8;
 
@@ -212,8 +210,9 @@ pub fn replacement(context: &CompletionContext, option: &CompletionOption) -> Re
         CompletionValue::Candidate { item, .. } => item.value.clone(),
     };
     let span = match context {
-        CompletionContext::Command { span, .. }
-        | CompletionContext::Argument { span, .. } => span.clone(),
+        CompletionContext::Command { span, .. } | CompletionContext::Argument { span, .. } => {
+            span.clone()
+        }
     };
     Replacement { span, text }
 }
@@ -430,11 +429,13 @@ mod tests {
         assert_eq!(option_label(&rows[0]), "/room");
         let unicode = command_options(&commands, "/rø");
         assert_eq!(option_label(&unicode[0]), "/røøm");
-        assert!(unicode[0]
-            .match_ranges
-            .iter()
-            .all(|range| "/røøm".is_char_boundary(range.start)
-                && "/røøm".is_char_boundary(range.end)));
+        assert!(
+            unicode[0]
+                .match_ranges
+                .iter()
+                .all(|range| "/røøm".is_char_boundary(range.start)
+                    && "/røøm".is_char_boundary(range.end))
+        );
     }
 
     #[test]
@@ -447,11 +448,20 @@ mod tests {
         let options = command_options(&commands, "/");
         let mut session = open_session(&context);
         assert!(enter_option(&session, &options).is_none());
-        assert_eq!(option_label(tab_option(&session, &options).unwrap()), "/mute");
+        assert_eq!(
+            option_label(tab_option(&session, &options).unwrap()),
+            "/mute"
+        );
         assert!(move_selection(&mut session, &options, -1));
-        assert_eq!(option_label(enter_option(&session, &options).unwrap()), "/room");
+        assert_eq!(
+            option_label(enter_option(&session, &options).unwrap()),
+            "/room"
+        );
         assert!(move_selection(&mut session, &options, 1));
-        assert_eq!(option_label(enter_option(&session, &options).unwrap()), "/mute");
+        assert_eq!(
+            option_label(enter_option(&session, &options).unwrap()),
+            "/mute"
+        );
     }
 
     #[test]

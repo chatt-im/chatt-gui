@@ -1807,6 +1807,7 @@ dependencies = [
  "raw-window-handle",
  "smallvec",
  "swash",
+ "unicode-properties",
  "unicode-segmentation",
  "wgpu",
 ]

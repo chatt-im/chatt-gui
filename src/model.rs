@@ -4,8 +4,8 @@ use local_rpc::{
     frame::{NegotiatedLimits, Operation, RequestOutcome},
     ids::RoomId,
     model::{
-        ConnectionState, DaemonInstanceId, LiveShare, Participant, RequestId, RoomSummary,
-        TransferSummary, VoiceState, CommandInfo,
+        CommandInfo, ConnectionState, DaemonInstanceId, LiveShare, Participant, RequestId,
+        RoomSummary, TransferSummary, VoiceState,
     },
 };
 

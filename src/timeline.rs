@@ -473,10 +473,7 @@ mod tests {
 
         let visible = build_timeline_list(&messages, &rows, &CollapsedSections::new());
         assert_eq!(
-            visible
-                .iter()
-                .map(|item| item.source)
-                .collect::<Vec<_>>(),
+            visible.iter().map(|item| item.source).collect::<Vec<_>>(),
             vec![
                 MessageListSource::Message {
                     message_index: 0,

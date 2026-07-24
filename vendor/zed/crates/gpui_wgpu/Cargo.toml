@@ -30,6 +30,7 @@ raw-window-handle.workspace = true
 smallvec.workspace = true
 swash = "0.2.6"
 unicode-segmentation.workspace = true
+unicode-properties = "0.1"
 gpui_util.workspace = true
 wgpu.workspace = true
 

@@ -387,13 +387,10 @@ mod tests {
     use super::*;
     use local_rpc::ids::{RoomId, UserId};
     use local_rpc::{
-        frame::{
-            NegotiatedLimits, Operation, RequestOutcome, RequestResult, StateEvent, Welcome,
-        },
+        frame::{NegotiatedLimits, Operation, RequestOutcome, RequestResult, StateEvent, Welcome},
         model::{
-            CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo,
-            CommandOutputLine, ConnectionState, DaemonInstanceId, Participant, RequestId,
-            VoiceState,
+            CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
+            ConnectionState, DaemonInstanceId, Participant, RequestId, VoiceState,
         },
     };
 

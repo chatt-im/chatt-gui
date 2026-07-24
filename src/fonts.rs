@@ -42,7 +42,8 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{
-        FontRun, FontStyle, FontWeight, LineFragment, PlatformTextSystem, TextSystem, font, px,
+        FontRun, FontStyle, FontWeight, LineFragment, PlatformTextSystem, RenderGlyphParams,
+        TextSystem, font, point, px,
     };
     use gpui_wgpu::CosmicTextSystem;
 
@@ -106,15 +107,29 @@ mod tests {
         );
         assert!(layout.runs.iter().any(|run| run.font_id != primary));
         let emoji_index = sample.find('☺').unwrap();
-        assert!(
-            layout
-                .runs
-                .iter()
-                .filter(|run| run.font_id != primary)
-                .flat_map(|run| &run.glyphs)
-                .any(|glyph| glyph.index == emoji_index && glyph.id.0 != 0),
-            "emoji did not select a non-primary fallback font"
-        );
+        let (emoji_run, emoji_glyph) = layout
+            .runs
+            .iter()
+            .filter(|run| run.font_id != primary)
+            .find_map(|run| {
+                run.glyphs
+                    .iter()
+                    .find(|glyph| glyph.index == emoji_index && glyph.id.0 != 0)
+                    .map(|glyph| (run, glyph))
+            })
+            .expect("emoji did not select a non-primary fallback font");
+        platform
+            .glyph_raster_bounds(&RenderGlyphParams {
+                font_id: emoji_run.font_id,
+                glyph_id: emoji_glyph.id,
+                font_size: px(16.),
+                subpixel_variant: point(0, 0),
+                scale_factor: 1.,
+                is_emoji: emoji_glyph.is_emoji,
+                subpixel_rendering: !emoji_glyph.is_emoji,
+                dilation: 0,
+            })
+            .expect("emoji fallback glyph should rasterize");
 
         let text_system = Arc::new(TextSystem::new(platform));
         let mut wrapper = text_system.line_wrapper(font("IBM Plex Sans"), px(16.));
@@ -142,5 +157,60 @@ mod tests {
                 .flat_map(|run| &run.glyphs)
                 .any(|glyph| glyph.index == missing_index && glyph.id.0 == 0)
         );
+    }
+
+    #[test]
+    fn emoji_presentation_prefers_installed_twemoji() {
+        let platform = CosmicTextSystem::new("IBM Plex Sans");
+        platform.add_fonts(embedded_fonts()).unwrap();
+        if !platform
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Twemoji")
+        {
+            return;
+        }
+
+        let primary = platform.font_id(&font("IBM Plex Sans")).unwrap();
+        let shape = |sample: &str| {
+            platform.layout_line(
+                sample,
+                px(16.),
+                &[FontRun {
+                    len: sample.len(),
+                    font_id: primary,
+                }],
+            )
+        };
+        let plain = shape("☺");
+        let explicit_emoji = shape("☺️");
+        let default_emoji = shape("😀");
+
+        let first_glyph_is_emoji = |layout: &gpui::LineLayout| {
+            layout
+                .runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .next()
+                .is_some_and(|glyph| glyph.is_emoji)
+        };
+        assert!(!first_glyph_is_emoji(&plain));
+        assert!(first_glyph_is_emoji(&explicit_emoji));
+        assert!(first_glyph_is_emoji(&default_emoji));
+
+        let emoji_run = explicit_emoji.runs.first().unwrap();
+        let emoji_glyph = emoji_run.glyphs.first().unwrap();
+        platform
+            .glyph_raster_bounds(&RenderGlyphParams {
+                font_id: emoji_run.font_id,
+                glyph_id: emoji_glyph.id,
+                font_size: px(16.),
+                subpixel_variant: point(0, 0),
+                scale_factor: 1.,
+                is_emoji: true,
+                subpixel_rendering: false,
+                dilation: 0,
+            })
+            .expect("Twemoji presentation glyph should rasterize");
     }
 }

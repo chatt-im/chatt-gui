@@ -68,11 +68,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, Some("ChattCodeSearch")),
         KeyBinding::new("cmd-x", Cut, Some("ComposerInsert")),
         KeyBinding::new("cmd-x", Cut, Some("ChattCodeSearch")),
-        KeyBinding::new(
-            "tab",
-            InsertTab,
-            Some("ComposerInsert && !CompletionOpen"),
-        ),
+        KeyBinding::new("tab", InsertTab, Some("ComposerInsert && !CompletionOpen")),
         KeyBinding::new("shift-enter", Newline, Some("ComposerInsert")),
     ]);
 }
@@ -440,12 +436,7 @@ impl Composer {
         cx.stop_propagation();
     }
 
-    fn paste_in_vim_mode(
-        &mut self,
-        text: &str,
-        key: VimKey,
-        cx: &mut Context<Self>,
-    ) {
+    fn paste_in_vim_mode(&mut self, text: &str, key: VimKey, cx: &mut Context<Self>) {
         self.editor.set_paste_text(text);
         let version = self.editor.text_version();
         if self.editor.send_key(key) {
@@ -966,16 +957,16 @@ impl Element for ComposerElement {
         let line_height = window.line_height();
         let mut origin = bounds.origin;
         for line in &state.lines {
-            line.layout
-                .paint(
-                    origin,
-                    window.line_height(),
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                )
-                .unwrap();
+            if let Err(error) = line.layout.paint(
+                origin,
+                window.line_height(),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            ) {
+                log::error!("failed to paint composer text: {error:#}");
+            }
             origin.y += line_height;
         }
         if focus.is_focused(window)
@@ -1102,12 +1093,13 @@ mod tests {
 
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("first".to_string()));
         cx.simulate_keystrokes("secondary-v");
-        assert_eq!(composer.read_with(cx, |composer, _| composer.text()), "first");
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "first"
+        );
 
         cx.simulate_keystrokes("escape");
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-            " second".to_string(),
-        ));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(" second".to_string()));
         cx.simulate_keystrokes("p");
         assert_eq!(
             composer.read_with(cx, |composer, _| composer.text()),
