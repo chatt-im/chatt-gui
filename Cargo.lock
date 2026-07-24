@@ -585,6 +585,7 @@ dependencies = [
  "async-channel",
  "chatt-local-rpc",
  "chatt-message-format",
+ "chrono",
  "dbus-message",
  "fast-float",
  "gpui",

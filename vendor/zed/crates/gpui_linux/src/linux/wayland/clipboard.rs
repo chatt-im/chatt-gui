@@ -206,9 +206,12 @@ impl Clipboard {
             return self.contents.clone();
         }
 
+        // Images are more specific than their optional plain-text fallback.
+        // Clipboard producers such as browsers and screenshot tools may expose
+        // both, including an empty text target.
         let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .read_image(&self.connection)
+            .or_else(|| offer.read_text(&self.connection))?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -225,8 +228,8 @@ impl Clipboard {
         }
 
         let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .read_image(&self.connection)
+            .or_else(|| offer.read_text(&self.connection))?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)

@@ -1,27 +1,48 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+use super::PastedImage;
 
 pub(crate) const MAX_QUEUED_FILES: usize = 128;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct QueuedFile {
-    pub id: u64,
-    pub path: PathBuf,
-    pub file_name: String,
+#[derive(Clone)]
+pub(crate) enum QueuedFileSource {
+    Path(PathBuf),
+    Memory(Arc<Vec<u8>>),
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+impl std::fmt::Debug for QueuedFileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            Self::Memory(bytes) => f
+                .debug_struct("Memory")
+                .field("byte_len", &bytes.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedFile {
+    pub id: u64,
+    pub file_name: String,
+    pub source: QueuedFileSource,
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct FileInspection {
     pub accepted: Vec<InspectedFile>,
     pub rejected: Vec<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct InspectedFile {
-    path: PathBuf,
     file_name: String,
+    source: QueuedFileSource,
 }
 
 #[derive(Debug)]
@@ -58,8 +79,8 @@ impl FileQueue {
             self.next_id = id.wrapping_add(1).max(1);
             self.files.push(QueuedFile {
                 id,
-                path: file.path,
                 file_name: file.file_name,
+                source: file.source,
             });
         }
     }
@@ -95,9 +116,66 @@ pub(crate) fn inspect_files(
             continue;
         }
         match inspect_file(&path, max_upload_bytes) {
-            Ok(file_name) => result.accepted.push(InspectedFile { path, file_name }),
+            Ok(file_name) => result.accepted.push(InspectedFile {
+                file_name,
+                source: QueuedFileSource::Path(path),
+            }),
             Err(error) => result.rejected.push(error),
         }
+    }
+    if omitted != 0 {
+        result.rejected.push(format!(
+            "{omitted} {} not queued; at most {MAX_QUEUED_FILES} files can be queued",
+            if omitted == 1 {
+                "file was"
+            } else {
+                "files were"
+            }
+        ));
+    }
+    result
+}
+
+pub(crate) fn prepare_images(
+    images: Arc<[PastedImage]>,
+    max_upload_bytes: u64,
+    available_slots: usize,
+    timestamp: &str,
+) -> FileInspection {
+    let mut result = FileInspection::default();
+    let available_slots = available_slots.min(MAX_QUEUED_FILES);
+    let mut omitted = images.len().saturating_sub(MAX_QUEUED_FILES);
+    for (index, image) in images.iter().take(MAX_QUEUED_FILES).enumerate() {
+        if result.accepted.len() == available_slots {
+            omitted += 1;
+            continue;
+        }
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!("-{}", index + 1)
+        };
+        let file_name = format!(
+            "pasted-image-{timestamp}{suffix}.{}",
+            image.format.extension()
+        );
+        let byte_len = image.bytes.len() as u64;
+        if image.bytes.is_empty() {
+            result
+                .rejected
+                .push(format!("{file_name} contains no image data"));
+            continue;
+        }
+        if byte_len > max_upload_bytes {
+            result.rejected.push(format!(
+                "{file_name} is {byte_len} bytes; the upload limit is {max_upload_bytes} bytes"
+            ));
+            continue;
+        }
+        result.accepted.push(InspectedFile {
+            file_name,
+            source: QueuedFileSource::Memory(image.bytes.clone()),
+        });
     }
     if omitted != 0 {
         result.rejected.push(format!(
@@ -188,7 +266,9 @@ mod tests {
 
         assert_eq!(accepted, 1);
         assert_eq!(result.rejected.len(), 3);
-        assert_eq!(queue.files()[0].path, valid);
+        assert!(
+            matches!(&queue.files()[0].source, QueuedFileSource::Path(path) if path == &valid)
+        );
     }
 
     #[test]
@@ -229,5 +309,81 @@ mod tests {
         assert_eq!(result.accepted.len(), 1);
         assert_eq!(result.rejected.len(), 1);
         assert!(result.rejected[0].contains("at most 128 files"));
+    }
+
+    #[test]
+    fn prepares_clipboard_images_in_memory_with_web_style_names() {
+        let first_bytes = Arc::new(vec![1, 2, 3]);
+        let second_bytes = Arc::new(vec![4, 5]);
+        let images: Arc<[PastedImage]> = vec![
+            PastedImage {
+                format: gpui::ImageFormat::Png,
+                bytes: first_bytes.clone(),
+            },
+            PastedImage {
+                format: gpui::ImageFormat::Jpeg,
+                bytes: second_bytes.clone(),
+            },
+        ]
+        .into();
+
+        let result = prepare_images(
+            images,
+            1024,
+            MAX_QUEUED_FILES,
+            "2026-07-24T12-34-56Z",
+        );
+        let mut queue = FileQueue::default();
+        queue.extend(result.accepted);
+
+        assert!(result.rejected.is_empty());
+        assert_eq!(
+            queue
+                .files()
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "pasted-image-2026-07-24T12-34-56Z.png",
+                "pasted-image-2026-07-24T12-34-56Z-2.jpg"
+            ]
+        );
+        assert!(
+            matches!(&queue.files()[0].source, QueuedFileSource::Memory(bytes) if Arc::ptr_eq(bytes, &first_bytes))
+        );
+        assert!(
+            matches!(&queue.files()[1].source, QueuedFileSource::Memory(bytes) if Arc::ptr_eq(bytes, &second_bytes))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_oversized_and_over_capacity_clipboard_images() {
+        let images: Arc<[PastedImage]> = vec![
+            PastedImage {
+                format: gpui::ImageFormat::Png,
+                bytes: Arc::new(Vec::new()),
+            },
+            PastedImage {
+                format: gpui::ImageFormat::Png,
+                bytes: Arc::new(vec![0; 3]),
+            },
+            PastedImage {
+                format: gpui::ImageFormat::Png,
+                bytes: Arc::new(vec![0; 1]),
+            },
+            PastedImage {
+                format: gpui::ImageFormat::Png,
+                bytes: Arc::new(vec![0; 1]),
+            },
+        ]
+        .into();
+
+        let result = prepare_images(images, 2, 1, "timestamp");
+
+        assert_eq!(result.accepted.len(), 1);
+        assert_eq!(result.rejected.len(), 3);
+        assert!(result.rejected[0].contains("contains no image data"));
+        assert!(result.rejected[1].contains("upload limit is 2 bytes"));
+        assert!(result.rejected[2].contains("at most 128 files"));
     }
 }

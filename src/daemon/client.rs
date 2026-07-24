@@ -3,7 +3,10 @@ use std::{
     fs::File,
     io::Read,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    },
     thread,
     time::Duration,
 };
@@ -61,7 +64,30 @@ struct PreparedUpload {
     begin_request: RequestId,
     finish_request: RequestId,
     upload: BeginUpload,
-    file: File,
+    source: UploadSource,
+}
+
+enum UploadSource {
+    File(File),
+    Memory {
+        bytes: Arc<Vec<u8>>,
+        offset: usize,
+    },
+}
+
+impl Read for UploadSource {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buffer),
+            Self::Memory { bytes, offset } => {
+                let remaining = &bytes[*offset..];
+                let read = remaining.len().min(buffer.len());
+                buffer[..read].copy_from_slice(&remaining[..read]);
+                *offset += read;
+                Ok(read)
+            }
+        }
+    }
 }
 
 struct ActiveUpload {
@@ -178,7 +204,7 @@ impl DaemonClient {
                         begin_request,
                         finish_request,
                         upload,
-                        file,
+                        source: UploadSource::File(file),
                     }))
                     .is_err()
                 {
@@ -196,6 +222,42 @@ impl DaemonClient {
                 reason: error.to_string(),
             });
         }
+    }
+
+    pub fn upload_bytes(
+        &self,
+        bytes: Arc<Vec<u8>>,
+        file_name: String,
+        room_id: local_rpc::ids::RoomId,
+        transfer_id: BulkTransferId,
+        begin_request: RequestId,
+        finish_request: RequestId,
+        max_upload_bytes: u64,
+    ) -> Result<(), String> {
+        let byte_len = bytes.len() as u64;
+        if byte_len > max_upload_bytes {
+            return Err(format!(
+                "upload is {byte_len} bytes; daemon limit is {max_upload_bytes} bytes"
+            ));
+        }
+        let upload = BeginUpload {
+            transfer_id,
+            room_id,
+            file_name,
+            byte_len,
+        };
+        self
+            .commands
+            .try_send(ConnectorCommand::PreparedUpload(PreparedUpload {
+                begin_request,
+                finish_request,
+                upload,
+                source: UploadSource::Memory { bytes, offset: 0 },
+            }))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "daemon command queue is full".into(),
+                TrySendError::Disconnected(_) => "daemon connector stopped".into(),
+            })
     }
 
     pub fn retry(&self) {
@@ -664,7 +726,7 @@ fn stream_upload_chunk(
         upload.buffer.resize(chunk_bytes, 0);
     }
     let read = loop {
-        match upload.prepared.file.read(&mut upload.buffer) {
+        match upload.prepared.source.read(&mut upload.buffer) {
             Ok(read) => break read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error.to_string()),
@@ -754,7 +816,7 @@ mod tests {
                     file_name: "upload.bin".into(),
                     byte_len: source_bytes.len() as u64,
                 },
-                file: source.reopen().unwrap(),
+                source: UploadSource::File(source.reopen().unwrap()),
             },
             buffer: vec![0; 4],
             sent: 0,
@@ -784,6 +846,64 @@ mod tests {
         }
 
         assert!(!stream_upload_chunk(&mut writer, &mut upload, 4).unwrap());
+        assert_eq!(
+            reader.recv_client().unwrap(),
+            ClientFrame::FinishUpload {
+                request_id: finish_request,
+                finished: BulkFinished { transfer_id },
+            }
+        );
+    }
+
+    #[test]
+    fn memory_upload_streams_directly_as_bulk_chunks() {
+        let source_bytes = Arc::new(b"clipboard-image".to_vec());
+        let transfer_id = BulkTransferId(27);
+        let finish_request = RequestId(29);
+        let mut upload = ActiveUpload {
+            prepared: PreparedUpload {
+                begin_request: RequestId(28),
+                finish_request,
+                upload: BeginUpload {
+                    transfer_id,
+                    room_id: local_rpc::ids::RoomId(4),
+                    file_name: "pasted-image.png".into(),
+                    byte_len: source_bytes.len() as u64,
+                },
+                source: UploadSource::Memory {
+                    bytes: source_bytes,
+                    offset: 0,
+                },
+            },
+            buffer: vec![0; 5],
+            sent: 0,
+        };
+        let (writer_stream, reader_stream) = UnixStream::pair().unwrap();
+        let mut writer = FrameWriter::new(writer_stream);
+        let mut reader = FrameReader::new(reader_stream);
+
+        for expected in [
+            b"clipb".as_slice(),
+            b"oard-".as_slice(),
+            b"image".as_slice(),
+        ] {
+            assert!(stream_upload_chunk(&mut writer, &mut upload, 5).unwrap());
+            let mut handled = false;
+            assert!(
+                reader
+                    .recv_client_with_bulk(|received_id, bytes| {
+                        assert_eq!(received_id, transfer_id);
+                        assert_eq!(bytes, expected);
+                        handled = true;
+                        Ok(())
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(handled);
+        }
+
+        assert!(!stream_upload_chunk(&mut writer, &mut upload, 5).unwrap());
         assert_eq!(
             reader.recv_client().unwrap(),
             ClientFrame::FinishUpload {

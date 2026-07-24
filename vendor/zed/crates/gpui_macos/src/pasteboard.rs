@@ -71,18 +71,18 @@ impl Pasteboard {
                 }
             }
 
-            // Next, check for a plain string.
-            if let Some(string_entry) = self.read_string_from_pasteboard() {
-                return Some(ClipboardItem {
-                    entries: vec![string_entry],
-                });
-            }
-
-            // Finally, try the various supported image types.
+            // Next, prefer image data over an optional plain-text fallback.
             for format in ImageFormat::iter() {
                 if let Some(item) = self.read_image(format) {
                     return Some(item);
                 }
+            }
+
+            // Finally, check for a plain string.
+            if let Some(string_entry) = self.read_string_from_pasteboard() {
+                return Some(ClipboardItem {
+                    entries: vec![string_entry],
+                });
             }
         }
 

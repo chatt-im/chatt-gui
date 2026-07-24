@@ -1,11 +1,11 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
-    GlobalElementId, Hsla, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, rgb, rgba, size,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
+    FontStyle, FontWeight, GlobalElementId, Hsla, KeyDownEvent, LayoutId, MouseButton,
+    MouseDownEvent, PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 mod buffer;
@@ -78,6 +78,17 @@ pub struct ComposerChanged;
 pub struct ComposerStateChanged;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PastedImage {
+    pub format: gpui::ImageFormat,
+    pub bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerImagePaste {
+    pub images: Arc<[PastedImage]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComposerSnapshot {
     pub text: String,
     pub selection: Range<usize>,
@@ -92,6 +103,7 @@ pub struct Composer {
     key_context: &'static str,
     multiline: bool,
     vim_enabled: bool,
+    accepts_image_paste: bool,
     min_height: Pixels,
     selected: Range<usize>,
     reversed: bool,
@@ -112,6 +124,7 @@ impl Composer {
             key_context: "ChattComposer",
             multiline: true,
             vim_enabled: VIM_MODE,
+            accepts_image_paste: true,
             min_height: px(42.),
             selected: 0..0,
             reversed: false,
@@ -135,6 +148,7 @@ impl Composer {
             key_context: "ChattCodeSearch",
             multiline: false,
             vim_enabled: false,
+            accepts_image_paste: false,
             min_height: px(28.),
             selected: 0..0,
             reversed: false,
@@ -288,12 +302,22 @@ impl Composer {
         self.replace_text_in_range(None, "\n", window, cx);
     }
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            if self.vim_enabled && self.editor.mode() != Mode::Insert {
-                self.paste_in_vim_mode(&text, VimKey::Char('p'), cx);
-            } else {
-                self.replace_text(None, &text, false, window, cx);
-            }
+        let Some(item) = cx.read_from_clipboard() else {
+            log::info!("clipboard paste returned no clipboard item");
+            return;
+        };
+        let item = match self.emit_clipboard_images(item, cx) {
+            Ok(()) => return,
+            Err(item) => item,
+        };
+        let Some(text) = item.text() else {
+            log::info!("clipboard paste contained no usable text or image data");
+            return;
+        };
+        if self.vim_enabled && self.editor.mode() != Mode::Insert {
+            self.paste_in_vim_mode(&text, VimKey::Char('p'), cx);
+        } else {
+            self.replace_text(None, &text, false, window, cx);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -422,10 +446,28 @@ impl Composer {
             return;
         }
         if matches!(key, VimKey::Char('p' | 'P')) {
-            let text = cx
-                .read_from_clipboard()
-                .and_then(|item| item.text())
-                .unwrap_or_default();
+            let item = cx.read_from_clipboard();
+            if item.is_none() {
+                log::info!("Vim clipboard paste returned no clipboard item");
+            }
+            let item = if let Some(item) = item {
+                match self.emit_clipboard_images(item, cx) {
+                    Ok(()) => {
+                        self.editor.set_paste_text("");
+                        let version = self.editor.text_version();
+                        if self.editor.send_key(key) {
+                            self.finish_vim_action(version, cx);
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    Err(item) => Some(item),
+                }
+            } else {
+                None
+            };
+            let text = item.and_then(|item| item.text()).unwrap_or_default();
             self.editor.set_paste_text(&text);
         }
         let version = self.editor.text_version();
@@ -435,6 +477,40 @@ impl Composer {
         self.finish_vim_action(version, cx);
         window.prevent_default();
         cx.stop_propagation();
+    }
+
+    fn emit_clipboard_images(
+        &self,
+        item: ClipboardItem,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ClipboardItem> {
+        if !self.accepts_image_paste
+            || !item
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+        {
+            return Err(item);
+        }
+        let images = item
+            .into_entries()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(PastedImage {
+                    format: image.format,
+                    bytes: Arc::new(image.bytes),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let byte_len = images.iter().map(|image| image.bytes.len()).sum::<usize>();
+        log::info!(
+            "clipboard image paste detected images={} bytes={byte_len}",
+            images.len(),
+        );
+        cx.emit(ComposerImagePaste {
+            images: images.into(),
+        });
+        Ok(())
     }
 
     fn paste_in_vim_mode(&mut self, text: &str, key: VimKey, cx: &mut Context<Self>) {
@@ -662,6 +738,7 @@ impl EntityInputHandler for Composer {
 
 impl EventEmitter<ComposerChanged> for Composer {}
 impl EventEmitter<ComposerStateChanged> for Composer {}
+impl EventEmitter<ComposerImagePaste> for Composer {}
 
 #[derive(Clone)]
 struct ComposerLine {
@@ -1075,9 +1152,11 @@ impl Focusable for Composer {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::{
-        Composer, ComposerLine, bind_keys, line_for_offset, logical_lines, normalize_range,
-        range_from_utf16, should_auto_close_code_fence, visible_line_range,
+        Composer, ComposerImagePaste, ComposerLine, bind_keys, line_for_offset, logical_lines,
+        normalize_range, range_from_utf16, should_auto_close_code_fence, visible_line_range,
     };
 
     #[gpui::test]
@@ -1105,6 +1184,84 @@ mod tests {
         assert_eq!(
             composer.read_with(cx, |composer, _| composer.text()),
             "first second"
+        );
+    }
+
+    #[gpui::test]
+    fn image_paste_emits_memory_payload_for_shortcut_and_normal_p(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        cx.update(bind_keys);
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let composer = Composer::new(cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+        let clipboard_item = || gpui::ClipboardItem {
+            entries: vec![
+                gpui::ClipboardEntry::from("text fallback".to_string()),
+                gpui::ClipboardEntry::Image(gpui::Image {
+                    format: gpui::ImageFormat::Png,
+                    bytes: vec![1, 2, 3],
+                    id: 7,
+                }),
+            ],
+        };
+        let events = Rc::new(RefCell::new(Vec::<ComposerImagePaste>::new()));
+        let _subscription = cx.update({
+            let composer = composer.clone();
+            let events = events.clone();
+            move |_, cx| {
+                cx.subscribe(&composer, move |_, event: &ComposerImagePaste, _| {
+                    events.borrow_mut().push(event.clone())
+                })
+            }
+        });
+
+        cx.write_to_clipboard(clipboard_item());
+        cx.simulate_keystrokes("secondary-v");
+        let shortcut_event = events.borrow()[0].clone();
+        assert_eq!(shortcut_event.images.len(), 1);
+        assert_eq!(shortcut_event.images[0].format, gpui::ImageFormat::Png);
+        assert_eq!(shortcut_event.images[0].bytes.as_slice(), &[1, 2, 3]);
+        assert_eq!(composer.read_with(cx, |composer, _| composer.text()), "");
+
+        cx.simulate_keystrokes("escape");
+        cx.write_to_clipboard(clipboard_item());
+        cx.simulate_keystrokes("p");
+        let normal_event = events.borrow()[1].clone();
+        assert_eq!(normal_event.images[0].bytes.as_slice(), &[1, 2, 3]);
+        assert_eq!(composer.read_with(cx, |composer, _| composer.text()), "");
+    }
+
+    #[gpui::test]
+    fn text_only_composer_uses_text_fallback_from_mixed_clipboard_item(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        cx.update(bind_keys);
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let composer = Composer::search(cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![
+                gpui::ClipboardEntry::from("fallback".to_string()),
+                gpui::ClipboardEntry::Image(gpui::Image {
+                    format: gpui::ImageFormat::Png,
+                    bytes: vec![1, 2, 3],
+                    id: 8,
+                }),
+            ],
+        });
+
+        cx.simulate_keystrokes("secondary-v");
+
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "fallback"
         );
     }
 

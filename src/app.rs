@@ -14,12 +14,15 @@ use crate::{
         render_code_document,
     },
     composer::{
-        Composer, ComposerChanged, ComposerStateChanged,
+        Composer, ComposerChanged, ComposerImagePaste, ComposerStateChanged, PastedImage,
         completion::{
             self, ArgumentKind, AssistSession, CompletionContext, CompletionOption,
             CompletionValue, OptionKey,
         },
-        uploads::{FileQueue, MAX_QUEUED_FILES, QueuedFile, inspect_files},
+        uploads::{
+            FileInspection, FileQueue, MAX_QUEUED_FILES, QueuedFile, QueuedFileSource,
+            inspect_files, prepare_images,
+        },
     },
     daemon::{
         client::{DaemonClient, DaemonEvent},
@@ -590,8 +593,10 @@ pub struct ChattView {
     live_pane_height: Option<Pixels>,
     live_pane_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     live_pane_resize: Option<LivePaneResize>,
+    composer_error: Option<SharedString>,
     status: SharedString,
     _code_search_subscription: Subscription,
+    _composer_image_paste_subscription: Subscription,
     _composer_state_subscription: Subscription,
     _composer_blur_subscription: Subscription,
     _daemon_task: Task<()>,
@@ -612,6 +617,10 @@ impl ChattView {
         let code_search_subscription =
             cx.subscribe(&code_search_input, |this, _, _: &ComposerChanged, cx| {
                 this.update_code_search(cx);
+            });
+        let composer_image_paste_subscription =
+            cx.subscribe(&composer, |this, _, event: &ComposerImagePaste, cx| {
+                this.queue_clipboard_images(event.images.clone(), cx);
             });
         let composer_state_subscription =
             cx.subscribe(&composer, |this, _, _: &ComposerStateChanged, cx| {
@@ -760,8 +769,10 @@ impl ChattView {
             live_pane_height: None,
             live_pane_bounds: Rc::new(Cell::new(None)),
             live_pane_resize: None,
+            composer_error: None,
             status: "Discovering Chatt daemon…".into(),
             _code_search_subscription: code_search_subscription,
+            _composer_image_paste_subscription: composer_image_paste_subscription,
             _composer_state_subscription: composer_state_subscription,
             _composer_blur_subscription: composer_blur_subscription,
             _daemon_task: daemon_task,
@@ -773,6 +784,18 @@ impl ChattView {
         let id = self.next_request_id.clamp(1, (1u64 << 63) - 1);
         self.next_request_id = if id == (1u64 << 63) - 1 { 1 } else { id + 1 };
         RequestId(id)
+    }
+
+    fn set_composer_error(
+        &mut self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = message.into();
+        log::warn!("composer action failed: {message}");
+        self.status = message.clone();
+        self.composer_error = Some(message);
+        cx.notify();
     }
 
     fn completion_view(&self, cx: &Context<Self>) -> Option<CompletionView> {
@@ -1175,7 +1198,7 @@ impl ChattView {
         let transfer_id = self.transfer_id();
         let room_id = submission.room_id;
         let file_name = file.file_name.clone();
-        let path = file.path.clone();
+        let source = file.source.clone();
         submission.phase = SubmissionPhase::Uploading(SubmittedUpload {
             file,
             begin_request,
@@ -1202,14 +1225,32 @@ impl ChattView {
                 transfer_id: Some(transfer_id),
             },
         );
-        self.daemon.upload_file(
-            path,
-            room_id,
-            transfer_id,
-            begin_request,
-            finish_request,
-            self.model.limits.upload_bytes,
-        );
+        let upload_queued = match source {
+            QueuedFileSource::Path(path) => {
+                self.daemon.upload_file(
+                    path,
+                    room_id,
+                    transfer_id,
+                    begin_request,
+                    finish_request,
+                    self.model.limits.upload_bytes,
+                );
+                Ok(())
+            }
+            QueuedFileSource::Memory(bytes) => self.daemon.upload_bytes(
+                bytes,
+                file_name.clone(),
+                room_id,
+                transfer_id,
+                begin_request,
+                finish_request,
+                self.model.limits.upload_bytes,
+            ),
+        };
+        if let Err(error) = upload_queued {
+            self.fail_pending_submission(error, cx);
+            return;
+        }
         self.status = format!("Sending file {position} of {total} · {file_name}").into();
         cx.notify();
     }
@@ -1308,8 +1349,7 @@ impl ChattView {
 
     fn fail_pending_submission(&mut self, reason: String, cx: &mut Context<Self>) {
         let Some(submission) = self.pending_submission.take() else {
-            self.status = format!("Upload failed · {reason}").into();
-            cx.notify();
+            self.set_composer_error(format!("Upload failed · {reason}"), cx);
             return;
         };
         if let Some(draft) = submission.draft.as_ref()
@@ -1320,8 +1360,7 @@ impl ChattView {
         }
         let files = self.recover_failed_submission_files(submission);
         self.queued_files.restore(files);
-        self.status = format!("Could not submit · {reason}").into();
-        cx.notify();
+        self.set_composer_error(format!("Could not submit · {reason}"), cx);
     }
 
     fn abandon_disconnected_submission(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2201,26 +2240,26 @@ impl ChattView {
 
     fn send_message(&mut self, _: &SendMessage, _: &mut Window, cx: &mut Context<Self>) {
         if !self.model.is_ready() {
-            self.status = "Messages are disabled until daemon state is synced".into();
-            cx.notify();
+            self.set_composer_error(
+                "Cannot send until the Chatt daemon is connected",
+                cx,
+            );
             return;
         }
         if self.submission_outcome_unknown {
             self.submission_outcome_unknown = false;
-            self.status =
-                "Previous submission outcome is unknown · Verify the timeline, then press Enter again to resend"
-                    .into();
-            cx.notify();
+            self.set_composer_error(
+                "Previous submission outcome is unknown · Verify the timeline, then press Enter again to resend",
+                cx,
+            );
             return;
         }
         if self.file_inspection_pending {
-            self.status = "Wait for attached files to finish checking".into();
-            cx.notify();
+            self.set_composer_error("Wait for attached files to finish checking", cx);
             return;
         }
         if self.pending_submission.is_some() {
-            self.status = "Wait for the current submission to finish".into();
-            cx.notify();
+            self.set_composer_error("Wait for the current submission to finish", cx);
             return;
         }
         let composer_empty = self.composer.read(cx).is_empty();
@@ -2230,15 +2269,14 @@ impl ChattView {
         let draft = self.composer.read(cx).text();
         if self.editing.is_none() && draft.starts_with('/') {
             if self.pending_command.is_some() {
-                self.status = "Wait for the current command to finish".into();
-                cx.notify();
+                self.set_composer_error("Wait for the current command to finish", cx);
                 return;
             }
             if draft.contains(['\r', '\n']) {
-                self.status = "Slash commands must fit on one line".into();
-                cx.notify();
+                self.set_composer_error("Slash commands must fit on one line", cx);
                 return;
             }
+            self.composer_error = None;
             let request_id = self.request_id();
             self.model.pending.insert(
                 request_id,
@@ -2270,8 +2308,7 @@ impl ChattView {
             return;
         }
         let Some(selected_room) = self.model.selected_room else {
-            self.status = "Select a room before sending".into();
-            cx.notify();
+            self.set_composer_error("Select a room before sending", cx);
             return;
         };
         if let Some((room_id, target)) = self
@@ -2304,6 +2341,7 @@ impl ChattView {
             return;
         }
 
+        self.composer_error = None;
         self.begin_submission(selected_room, (!composer_empty).then_some(draft), cx);
     }
 
@@ -2434,24 +2472,16 @@ impl ChattView {
     }
 
     fn open_media(&mut self, _: &OpenMedia, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.is_ready() || self.model.selected_room.is_none() {
-            self.status = "Attachments are disabled until a room is synced".into();
-            cx.notify();
-            return;
-        }
         if self.editing.is_some() {
-            self.status = "Finish editing before attaching files".into();
-            cx.notify();
+            self.set_composer_error("Finish editing before attaching files", cx);
             return;
         }
         if self.pending_submission.is_some() {
-            self.status = "Wait for the current submission to finish".into();
-            cx.notify();
+            self.set_composer_error("Wait for the current submission to finish", cx);
             return;
         }
         if self.file_inspection_pending {
-            self.status = "Wait for attached files to finish checking".into();
-            cx.notify();
+            self.set_composer_error("Wait for attached files to finish checking", cx);
             return;
         }
 
@@ -2484,24 +2514,16 @@ impl ChattView {
     }
 
     fn queue_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if !self.model.is_ready() || self.model.selected_room.is_none() {
-            self.status = "Attachments are disabled until a room is synced".into();
-            cx.notify();
-            return;
-        }
         if self.editing.is_some() {
-            self.status = "Finish editing before attaching files".into();
-            cx.notify();
+            self.set_composer_error("Finish editing before attaching files", cx);
             return;
         }
         if self.pending_submission.is_some() {
-            self.status = "Wait for the current submission to finish".into();
-            cx.notify();
+            self.set_composer_error("Wait for the current submission to finish", cx);
             return;
         }
         if self.file_inspection_pending {
-            self.status = "Wait for attached files to finish checking".into();
-            cx.notify();
+            self.set_composer_error("Wait for attached files to finish checking", cx);
             return;
         }
         if paths.is_empty() {
@@ -2509,8 +2531,10 @@ impl ChattView {
         }
         let available_slots = MAX_QUEUED_FILES.saturating_sub(self.queued_files.len());
         if available_slots == 0 {
-            self.status = format!("At most {MAX_QUEUED_FILES} files can be queued").into();
-            cx.notify();
+            self.set_composer_error(
+                format!("At most {MAX_QUEUED_FILES} files can be queued"),
+                cx,
+            );
             return;
         }
         let max_upload_bytes = self.model.limits.upload_bytes;
@@ -2523,32 +2547,83 @@ impl ChattView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.file_inspection_pending = false;
-                let accepted = result.accepted.len();
-                this.queued_files.extend(result.accepted);
-                let first_error = result.rejected.first().cloned();
-                for error in result.rejected {
-                    log::error!("file was not queued: {error}");
-                }
-                if !this.model.is_ready() {
-                    cx.notify();
-                    return;
-                }
-                this.status = match (accepted, first_error) {
-                    (0, Some(error)) => error.into(),
-                    (accepted, Some(error)) => format!("{accepted} queued · {error}").into(),
-                    (_, None) => {
-                        let count = this.queued_files.len();
-                        format!(
-                            "{count} {} queued · Enter to send",
-                            if count == 1 { "file" } else { "files" }
-                        )
-                        .into()
-                    }
-                };
-                cx.notify();
+                this.accept_file_inspection(result, cx);
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    fn queue_clipboard_images(
+        &mut self,
+        images: Arc<[PastedImage]>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_some() {
+            self.set_composer_error("Finish editing before attaching files", cx);
+            return;
+        }
+        if self.pending_submission.is_some() {
+            self.set_composer_error("Wait for the current submission to finish", cx);
+            return;
+        }
+        if self.file_inspection_pending {
+            self.set_composer_error("Wait for attached files to finish checking", cx);
+            return;
+        }
+        if images.is_empty() {
+            return;
+        }
+        let available_slots = MAX_QUEUED_FILES.saturating_sub(self.queued_files.len());
+        if available_slots == 0 {
+            self.set_composer_error(
+                format!("At most {MAX_QUEUED_FILES} files can be queued"),
+                cx,
+            );
+            return;
+        }
+        let timestamp = chrono::Utc::now()
+            .format("%Y-%m-%dT%H-%M-%SZ")
+            .to_string();
+        let result = prepare_images(
+            images,
+            self.model.limits.upload_bytes,
+            available_slots,
+            &timestamp,
+        );
+        log::info!(
+            "clipboard image paste prepared accepted={} rejected={}",
+            result.accepted.len(),
+            result.rejected.len(),
+        );
+        self.accept_file_inspection(result, cx);
+    }
+
+    fn accept_file_inspection(
+        &mut self,
+        result: FileInspection,
+        cx: &mut Context<Self>,
+    ) {
+        let accepted = result.accepted.len();
+        self.queued_files.extend(result.accepted);
+        let first_error = result.rejected.first().cloned();
+        for error in result.rejected {
+            log::error!("file was not queued: {error}");
+        }
+        self.composer_error = first_error.clone().map(Into::into);
+        self.status = match (accepted, first_error) {
+            (0, Some(error)) => error.into(),
+            (accepted, Some(error)) => format!("{accepted} queued · {error}").into(),
+            (_, None) => {
+                let count = self.queued_files.len();
+                queued_files_status(
+                    count,
+                    self.model.is_ready(),
+                    self.model.selected_room.is_some(),
+                )
+                .into()
+            }
+        };
         cx.notify();
     }
 
@@ -2560,9 +2635,10 @@ impl ChattView {
             connection_label(&self.model).into()
         } else {
             let count = self.queued_files.len();
-            format!(
-                "{count} {} queued · Enter to send",
-                if count == 1 { "file" } else { "files" }
+            queued_files_status(
+                count,
+                self.model.is_ready(),
+                self.model.selected_room.is_some(),
             )
             .into()
         };
@@ -5982,8 +6058,7 @@ impl Render for ChattView {
             .map(|room| security_label(room.trust))
             .unwrap_or("");
         let ready = self.model.is_ready();
-        let can_attach = ready
-            && self.editing.is_none()
+        let can_attach = self.editing.is_none()
             && !self.file_inspection_pending
             && self.pending_submission.is_none();
         let timeline_view = cx.entity().downgrade();
@@ -6298,6 +6373,28 @@ impl Render for ChattView {
                             .bg(rgb(0x14161a))
                             .when_some(completion_popup, |bar, popup| bar.child(popup))
                             .when_some(queued_file_row, |bar, files| bar.child(files))
+                            .when_some(self.composer_error.clone(), |bar, error| {
+                                bar.child(
+                                    div()
+                                        .mb_1()
+                                        .text_sm()
+                                        .text_color(rgb(0xd9a066))
+                                        .child(format!(
+                                            "{error}. Your draft and queued files were retained."
+                                        )),
+                                )
+                            })
+                            .when(!ready, |bar| {
+                                bar.child(
+                                    div()
+                                        .mb_1()
+                                        .text_sm()
+                                        .text_color(rgb(0x8b929d))
+                                        .child(
+                                            "Daemon offline — your draft and queued files are retained; sending is disabled.",
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -6430,6 +6527,18 @@ fn connection_label(model: &ChatModel) -> String {
         ConnectionPhase::Disconnected { .. } => "Daemon offline".into(),
         ConnectionPhase::Incompatible { .. } => "Daemon incompatible".into(),
     }
+}
+
+fn queued_files_status(count: usize, daemon_ready: bool, room_selected: bool) -> String {
+    let noun = if count == 1 { "file" } else { "files" };
+    let next_step = if !daemon_ready {
+        "Waiting for daemon"
+    } else if !room_selected {
+        "Select a room to send"
+    } else {
+        "Enter to send"
+    };
+    format!("{count} {noun} queued · {next_step}")
 }
 
 fn empty_state(model: &ChatModel) -> String {
@@ -6725,8 +6834,8 @@ mod tests {
     fn queued_file(id: u64) -> QueuedFile {
         QueuedFile {
             id,
-            path: PathBuf::from(format!("/tmp/file-{id}.bin")),
             file_name: format!("file-{id}.bin"),
+            source: QueuedFileSource::Path(PathBuf::from(format!("/tmp/file-{id}.bin"))),
         }
     }
 
@@ -6746,6 +6855,22 @@ mod tests {
                 height: Some(300),
             },
         )
+    }
+
+    #[test]
+    fn queued_file_status_does_not_invite_sending_before_daemon_sync() {
+        assert_eq!(
+            queued_files_status(1, false, false),
+            "1 file queued · Waiting for daemon",
+        );
+        assert_eq!(
+            queued_files_status(2, true, false),
+            "2 files queued · Select a room to send",
+        );
+        assert_eq!(
+            queued_files_status(2, true, true),
+            "2 files queued · Enter to send",
+        );
     }
 
     #[test]
