@@ -147,19 +147,6 @@ impl MpvPlayer {
         Ok(player)
     }
 
-    pub(crate) fn new_video_smoke_test(
-        gpui_wakeup: AsyncSender<()>,
-        path: &std::path::Path,
-    ) -> Result<Self> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| anyhow!("video smoke-test path is not valid UTF-8"))?;
-        let (mut player, _) =
-            Self::new_internal(gpui_wakeup, true, None, None, Some("h264"), None)?;
-        player.load(path)?;
-        Ok(player)
-    }
-
     fn new_internal(
         gpui_wakeup: AsyncSender<()>,
         live: bool,
@@ -883,6 +870,9 @@ fn create_vulkan_context(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeekMode {
     Exact,
+    // Retained for approximate scrubbing, where avoiding exact frame decoding
+    // is more important than landing on the precise requested timestamp.
+    #[allow(dead_code)]
     Keyframes,
 }
 
@@ -1746,7 +1736,6 @@ fn render_worker(
                     diagnostics.rendered += 1;
                     has_frame = true;
                     redraw_pending = false;
-                    playback.note_render();
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                     if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
@@ -1887,7 +1876,6 @@ fn render_worker(
                     diagnostics.rendered += 1;
                     has_frame = true;
                     redraw_pending = false;
-                    playback.note_render();
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                     if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
@@ -1953,7 +1941,6 @@ pub struct PlaybackState {
     pub finished: bool,
     pub frame_ready: bool,
     pub display_size: Option<(u32, u32)>,
-    pub rendered_frames: u64,
 }
 
 #[derive(Default)]
@@ -1964,7 +1951,6 @@ struct SharedPlaybackState {
     finished: AtomicBool,
     frame_ready: AtomicBool,
     display_size: AtomicU64,
-    rendered_frames: AtomicU64,
 }
 
 impl SharedPlaybackState {
@@ -1992,12 +1978,7 @@ impl SharedPlaybackState {
             frame_ready: self.frame_ready.load(Ordering::Acquire),
             display_size: (packed_size != 0)
                 .then_some(((packed_size >> 32) as u32, packed_size as u32)),
-            rendered_frames: self.rendered_frames.load(Ordering::Acquire),
         }
-    }
-
-    fn note_render(&self) {
-        self.rendered_frames.fetch_add(1, Ordering::Release);
     }
 
     fn seek_to(&self, position: f64) {
@@ -2008,7 +1989,6 @@ impl SharedPlaybackState {
     fn reset(&self) {
         self.publish(PlaybackState::default());
         self.frame_ready.store(false, Ordering::Release);
-        self.rendered_frames.store(0, Ordering::Release);
     }
 }
 

@@ -40,7 +40,7 @@ use crate::{
     },
     icons::{IconName, icon},
     image_cache::{PreviewImageLoader, TimelineImageLoader},
-    media_cache::MediaCache,
+    media_cache::{CachedAttachment, MediaCache},
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode},
     preview::{
@@ -69,12 +69,13 @@ use crate::{
 use chatt_message_format::reference::{MessageRef, REF_PREFIX};
 use dbus_message::{FileChooserResponse, OpenFileOptions, open_files};
 use gpui::{
-    Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, Div,
-    ExternalPaths, FocusHandle, Focusable, FollowMode, FontWeight, ListAlignment, ListState,
-    LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window,
-    actions, anchored, canvas, deferred, div, img, list, point, prelude::*, px, relative,
+    Anchor, Animation, AnimationExt, AnyElement, App, Asset, Bounds, ClipboardItem, Context, Div,
+    ExternalPaths, FocusHandle, Focusable, FollowMode, FontWeight, ImageCacheError, ImageSource,
+    ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful, Subscription, Task,
+    UniformListScrollHandle, WeakFocusHandle, Window, actions, anchored, canvas, deferred, div,
+    img, list, point, prelude::*, px, relative,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
@@ -103,6 +104,54 @@ const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 const PREVIEW_TAB_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
+
+fn cached_attachment_image_source<A>(
+    attachment: CachedAttachment,
+    image_cache: gpui::Entity<LruImageCache<A>>,
+) -> ImageSource
+where
+    A: Asset<Source = CachedAttachment, Output = Result<Arc<RenderImage>, ImageCacheError>>,
+{
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        image_cache.update(cx, |image_cache, cx| {
+            image_cache.load_source(&attachment, window, cx)
+        })
+    }))
+}
+
+fn image_dimensions_from_bytes(bytes: &[u8]) -> image::ImageResult<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()
+}
+
+fn write_cached_attachment_to_user_selected_path(
+    attachment: &CachedAttachment,
+    destination: Option<PathBuf>,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(destination) = destination else {
+        return Ok(None);
+    };
+    fs::write(&destination, attachment.bytes())?;
+    Ok(Some(destination))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachmentRenderRoute {
+    Image,
+    Video,
+    Other,
+}
+
+fn attachment_render_route(attachment: &Attachment) -> AttachmentRenderRoute {
+    if attachment.is_image() {
+        AttachmentRenderRoute::Image
+    } else if attachment.is_video() {
+        AttachmentRenderRoute::Video
+    } else {
+        AttachmentRenderRoute::Other
+    }
+}
 
 fn code_preview_size_error(byte_len: u64) -> Option<&'static str> {
     (byte_len > MAX_CODE_PREVIEW_BYTES).then_some("file too large to preview")
@@ -683,9 +732,7 @@ impl ChattView {
         let model = ChatModel::default();
         let list_state = ListState::new(0, ListAlignment::Bottom, px(1_600.0));
         list_state.set_follow_mode(FollowMode::Tail);
-        let media_cache = Arc::new(Mutex::new(
-            MediaCache::new(512 * 1024 * 1024).expect("failed to create private media cache"),
-        ));
+        let media_cache = Arc::new(Mutex::new(MediaCache::new(512 * 1024 * 1024)));
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let binding_mode = AppliedSettings::get(cx).binding_mode;
         let composer = cx.new(|cx| Composer::with_binding_mode(binding_mode, cx));
@@ -3810,8 +3857,7 @@ impl ChattView {
                 .media_cache
                 .lock()
                 .expect("media cache lock poisoned")
-                .path_for(&descriptor)
-                .is_some();
+                .contains(descriptor.id);
             if cached {
                 self.pending_reference_media_preview = None;
                 self.open_image_preview(descriptor, window, cx);
@@ -4419,11 +4465,11 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self
+        let Some(attachment) = self
             .media_cache
             .lock()
             .expect("media cache lock poisoned")
-            .path_for(&descriptor)
+            .get(descriptor.id)
         else {
             self.status = format!("{} is not cached yet", descriptor.file_name).into();
             cx.notify();
@@ -4431,7 +4477,7 @@ impl ChattView {
         };
         let natural_size = match (descriptor.width, descriptor.height) {
             (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
-            _ => image::image_dimensions(&path).unwrap_or((640, 480)),
+            _ => image_dimensions_from_bytes(attachment.bytes()).unwrap_or((640, 480)),
         };
         self.begin_preview_session(window, cx);
         let item = PreviewItem::image(descriptor, natural_size);
@@ -4463,12 +4509,9 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (cache_path, active_transfer) = {
+        let (cached_attachment, active_transfer) = {
             let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
-            (
-                cache.path_for(&descriptor),
-                cache.active_transfer(&descriptor),
-            )
+            (cache.get(descriptor.id), cache.active_transfer(&descriptor))
         };
         self.begin_preview_session(window, cx);
         let opened = self
@@ -4512,8 +4555,8 @@ impl ChattView {
             return;
         }
 
-        if let Some(path) = cache_path {
-            self.start_code_preview_load(descriptor.id, path, cx);
+        if let Some(attachment) = cached_attachment {
+            self.start_code_preview_load(descriptor.id, attachment, cx);
         } else if let Some(transfer_id) = active_transfer {
             if let Some(preview) = self
                 .preview_history
@@ -4538,13 +4581,13 @@ impl ChattView {
                     }
                 }
                 Ok(None) => {
-                    let path = self
+                    let attachment = self
                         .media_cache
                         .lock()
                         .expect("media cache lock poisoned")
-                        .path_for(&descriptor);
-                    if let Some(path) = path {
-                        self.start_code_preview_load(descriptor.id, path, cx);
+                        .get(descriptor.id);
+                    if let Some(attachment) = attachment {
+                        self.start_code_preview_load(descriptor.id, attachment, cx);
                     } else if let Some(preview) = self
                         .preview_history
                         .item_mut(descriptor.id)
@@ -4571,7 +4614,7 @@ impl ChattView {
     fn start_code_preview_load(
         &mut self,
         key: AttachmentId,
-        path: PathBuf,
+        attachment: CachedAttachment,
         cx: &mut Context<Self>,
     ) {
         let Some(item) = self.preview_history.item(key) else {
@@ -4598,7 +4641,7 @@ impl ChattView {
         let executor = cx.background_executor().clone();
         let task = cx.spawn(async move |this, cx| {
             let result = executor
-                .spawn(async move { CodeDocument::load(&path, &file_name, load_id) })
+                .spawn(async move { CodeDocument::load(attachment.bytes(), &file_name, load_id) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if !this
@@ -4652,13 +4695,13 @@ impl ChattView {
         if !should_load {
             return;
         }
-        let path = self
+        let attachment = self
             .media_cache
             .lock()
             .expect("media cache lock poisoned")
-            .path_for(descriptor);
-        if let Some(path) = path {
-            self.start_code_preview_load(descriptor.id, path, cx);
+            .get(descriptor.id);
+        if let Some(attachment) = attachment {
+            self.start_code_preview_load(descriptor.id, attachment, cx);
         }
     }
 
@@ -4891,11 +4934,11 @@ impl ChattView {
         let Some(item) = self.preview_history.active().cloned() else {
             return;
         };
-        let Some(source) = self
+        let Some(attachment) = self
             .media_cache
             .lock()
             .expect("media cache lock poisoned")
-            .path_for(&item.descriptor)
+            .get(item.descriptor.id)
         else {
             self.status = format!("{} is no longer cached", item.descriptor.file_name).into();
             cx.notify();
@@ -4905,19 +4948,27 @@ impl ChattView {
         let receiver = cx.prompt_for_new_path(&directory, Some(&item.descriptor.file_name));
         let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(destination))) = receiver.await else {
+            let Ok(Ok(destination)) = receiver.await else {
                 return;
             };
             let result = executor
-                .spawn(async move { fs::copy(source, &destination).map(|_| destination) })
+                .spawn(async move {
+                    write_cached_attachment_to_user_selected_path(&attachment, destination)
+                })
                 .await;
-            let _ = this.update_in(cx, |this, _, cx| {
-                match result {
-                    Ok(destination) => {
-                        this.status = format!("Saved to {}", destination.display()).into()
-                    }
-                    Err(error) => this.status = format!("Could not save file · {error}").into(),
+            let destination = match result {
+                Ok(Some(destination)) => destination,
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        this.status = format!("Could not save file · {error}").into();
+                        cx.notify();
+                    });
+                    return;
                 }
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.status = format!("Saved to {}", destination.display()).into();
                 cx.notify();
             });
         })
@@ -5527,39 +5578,37 @@ impl ChattView {
     ) -> AnyElement {
         let settings = AppliedSettings::get(cx);
         let descriptor = attachment.descriptor.clone();
-        let (cache_path, active_transfer) = {
-            let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
-            (
-                cache.path_for(&descriptor),
-                cache.active_transfer(&descriptor),
-            )
-        };
-        if attachment.is_image()
-            && let Some(path) = cache_path.clone()
-        {
-            let preview = descriptor.clone();
-            let hover_border = settings.theme.color(ThemeRole::BorderFocus);
-            return image_frame(&descriptor, &settings.theme)
-                .id(("image-frame", message_id as usize))
-                .mt_2()
-                .overflow_hidden()
-                .cursor_pointer()
-                .hover(move |image| image.border_color(hover_border))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_image_preview(preview.clone(), window, cx)
-                }))
-                .child(
-                    img(path)
-                        .image_cache(&self.image_cache)
+        let render_route = attachment_render_route(&attachment);
+        if render_route == AttachmentRenderRoute::Image {
+            let (cached_attachment, active_transfer) = {
+                let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
+                (cache.get(descriptor.id), cache.active_transfer(&descriptor))
+            };
+            if let Some(attachment) = cached_attachment {
+                let preview = descriptor.clone();
+                let hover_border = settings.theme.color(ThemeRole::BorderFocus);
+                return image_frame(&descriptor, &settings.theme)
+                    .id(("image-frame", message_id as usize))
+                    .mt_2()
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .hover(move |image| image.border_color(hover_border))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_image_preview(preview.clone(), window, cx)
+                    }))
+                    .child(
+                        img(cached_attachment_image_source(
+                            attachment,
+                            self.image_cache.clone(),
+                        ))
                         .id(("image", message_id as usize))
                         .absolute()
                         .inset_0()
                         .size_full()
                         .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element();
-        }
-        if attachment.is_image() {
+                    )
+                    .into_any_element();
+            }
             let fetch = EagerImageFetch::new(room_id, descriptor.clone());
             if let Some(transfer_id) = active_transfer {
                 let action = mini_button(
@@ -5605,7 +5654,7 @@ impl ChattView {
                 &settings.theme,
             );
         }
-        if attachment.is_video() {
+        if render_route == AttachmentRenderRoute::Video {
             let key = video_key(room_id, message_id, &descriptor);
             let source_key = self.source_key(room_id, descriptor.id);
             let has_cached_poster = self
@@ -5674,9 +5723,16 @@ impl ChattView {
                 }
             };
         }
-        if descriptor.media_kind == MediaKind::File && !attachment.is_video() {
+        let (cached, active_transfer) = {
+            let cache = self.media_cache.lock().expect("media cache lock poisoned");
+            (
+                cache.contains(descriptor.id),
+                cache.active_transfer(&descriptor),
+            )
+        };
+        if descriptor.media_kind == MediaKind::File {
             let open = descriptor.clone();
-            let label = if cache_path.is_some() {
+            let label = if cached {
                 format!(
                     "{} · {} bytes · click to preview",
                     descriptor.file_name, descriptor.byte_len
@@ -5857,9 +5913,8 @@ impl ChattView {
             .collect::<Vec<_>>();
         for (room_id, descriptor) in descriptors {
             let cached_or_active = {
-                let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
-                cache.path_for(&descriptor).is_some()
-                    || cache.active_transfer(&descriptor).is_some()
+                let cache = self.media_cache.lock().expect("media cache lock poisoned");
+                cache.contains(descriptor.id) || cache.active_transfer(&descriptor).is_some()
             };
             if !cached_or_active {
                 self.eager_image_fetches
@@ -5957,8 +6012,7 @@ impl ChattView {
         let transfer_id = self.transfer_id();
         {
             let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
-            if cache.path_for(&descriptor).is_some() || cache.active_transfer(&descriptor).is_some()
-            {
+            if cache.contains(descriptor.id) || cache.active_transfer(&descriptor).is_some() {
                 return Ok(None);
             }
             cache.reserve(transfer_id, &descriptor)?;
@@ -6124,12 +6178,12 @@ impl ChattView {
         let settings = AppliedSettings::get(cx);
         let muted = settings.theme.color(ThemeRole::TextMuted);
         let tabs = self.render_preview_tabs(active.key(), cx);
-        let cache_path = self
+        let cached_attachment = self
             .media_cache
             .lock()
             .expect("media cache lock poisoned")
-            .path_for(&active.descriptor);
-        let cache_missing = cache_path.is_none();
+            .get(active.descriptor.id);
+        let cache_missing = cached_attachment.is_none();
         let viewport = preview_image_viewport_bounds(window.viewport_size(), width);
         self.preview_image_viewport.set(Some(viewport));
         let geometry = self.preview_image.geometry(viewport);
@@ -6175,38 +6229,40 @@ impl ChattView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_preview_image_pan(cx)),
             )
-            .when_some(cache_path, |viewport_element, path| {
+            .when_some(cached_attachment, |viewport_element, attachment| {
                 viewport_element.child(
-                    img(path)
-                        .image_cache(&self.preview_image_cache)
-                        .absolute()
-                        .left(geometry.bounds.origin.x - viewport.origin.x)
-                        .top(geometry.bounds.origin.y - viewport.origin.y)
-                        .w(geometry.bounds.size.width)
-                        .h(geometry.bounds.size.height)
-                        .object_fit(ObjectFit::Contain)
-                        .with_loading(move || {
-                            div()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .text_color(muted)
-                                .child("loading…")
-                                .into_any_element()
-                        })
-                        .with_fallback(move || {
-                            div()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .text_color(muted)
-                                .child("failed to load image")
-                                .into_any_element()
-                        }),
+                    img(cached_attachment_image_source(
+                        attachment,
+                        self.preview_image_cache.clone(),
+                    ))
+                    .absolute()
+                    .left(geometry.bounds.origin.x - viewport.origin.x)
+                    .top(geometry.bounds.origin.y - viewport.origin.y)
+                    .w(geometry.bounds.size.width)
+                    .h(geometry.bounds.size.height)
+                    .object_fit(ObjectFit::Contain)
+                    .with_loading(move || {
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("loading…")
+                            .into_any_element()
+                    })
+                    .with_fallback(move || {
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("failed to load image")
+                            .into_any_element()
+                    }),
                 )
             })
             .when(cache_missing, |viewport_element| {
@@ -8488,14 +8544,11 @@ impl ChattView {
         let descriptor = attachment.descriptor;
         let settings = AppliedSettings::get(cx);
         if is_image {
-            let (cache_path, active_transfer) = {
+            let (cached_attachment, active_transfer) = {
                 let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
-                (
-                    cache.path_for(&descriptor),
-                    cache.active_transfer(&descriptor),
-                )
+                (cache.get(descriptor.id), cache.active_transfer(&descriptor))
             };
-            if let Some(path) = cache_path {
+            if let Some(attachment) = cached_attachment {
                 let source_width = descriptor.width.unwrap_or(4).max(1) as f32;
                 let source_height = descriptor.height.unwrap_or(3).max(1) as f32;
                 let aspect_ratio = source_width / source_height;
@@ -8510,12 +8563,14 @@ impl ChattView {
                     .overflow_hidden()
                     .bg(settings.theme.color(ThemeRole::Panel))
                     .child(
-                        img(path)
-                            .image_cache(&self.image_cache)
-                            .absolute()
-                            .inset_0()
-                            .size_full()
-                            .object_fit(ObjectFit::Contain),
+                        img(cached_attachment_image_source(
+                            attachment,
+                            self.image_cache.clone(),
+                        ))
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
                     )
                     .into_any_element();
             }
@@ -9494,6 +9549,7 @@ fn message_video_key(message: &timeline::Message) -> Option<VideoKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use local_rpc::bulk::BulkFinished;
     use local_rpc::model::MediaKind;
 
     fn queued_file(id: u64) -> QueuedFile {
@@ -9520,6 +9576,17 @@ mod tests {
                 height: Some(300),
             },
         )
+    }
+
+    fn complete_cached_attachment(
+        cache: &mut MediaCache,
+        descriptor: &AttachmentDescriptor,
+        transfer_id: BulkTransferId,
+        bytes: &[u8],
+    ) {
+        cache.reserve(transfer_id, descriptor).unwrap();
+        cache.chunk(transfer_id, bytes).unwrap();
+        cache.finish(BulkFinished { transfer_id }).unwrap();
     }
 
     fn jump_message(id: u64) -> timeline::Message {
@@ -9776,6 +9843,100 @@ mod tests {
 
         assert!(images.active.is_empty());
         assert!(images.failure(fetch.key).is_none());
+    }
+
+    #[test]
+    fn completed_image_is_cached_via_contains_and_consumed_via_get() {
+        let mut descriptor = image_fetch(RoomId(1), 11).descriptor;
+        let bytes = b"immutable image bytes";
+        descriptor.byte_len = bytes.len() as u64;
+        let mut cache = MediaCache::new(1024);
+        complete_cached_attachment(&mut cache, &descriptor, BulkTransferId(11), bytes);
+
+        assert!(cache.contains(descriptor.id));
+        let attachment = cache.get(descriptor.id).expect("cached attachment bytes");
+        assert_eq!(attachment.id(), descriptor.id);
+        assert_eq!(attachment.bytes(), bytes);
+    }
+
+    #[test]
+    fn duplicate_attachment_reads_are_not_started() {
+        let descriptor = image_fetch(RoomId(1), 12).descriptor;
+        let mut cache = MediaCache::new(1024);
+        cache.reserve(BulkTransferId(12), &descriptor).unwrap();
+
+        assert!(cache.reserve(BulkTransferId(13), &descriptor).is_err());
+        assert_eq!(cache.active_transfer(&descriptor), Some(BulkTransferId(12)));
+        assert_eq!(
+            cache.available_transfer_slots(),
+            local_rpc::MAX_CONCURRENT_TRANSFERS - 1
+        );
+    }
+
+    #[test]
+    fn explicit_save_writes_exactly_the_selected_attachment_bytes() {
+        let mut descriptor = image_fetch(RoomId(1), 13).descriptor;
+        let bytes = b"bytes selected by the user";
+        descriptor.byte_len = bytes.len() as u64;
+        let mut cache = MediaCache::new(1024);
+        complete_cached_attachment(&mut cache, &descriptor, BulkTransferId(13), bytes);
+        let attachment = cache.get(descriptor.id).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("saved.bin");
+
+        let saved =
+            write_cached_attachment_to_user_selected_path(&attachment, Some(destination.clone()))
+                .unwrap();
+
+        assert_eq!(saved, Some(destination.clone()));
+        assert_eq!(fs::read(destination).unwrap(), bytes);
+    }
+
+    #[test]
+    fn canceling_the_save_picker_performs_no_write() {
+        let mut descriptor = image_fetch(RoomId(1), 14).descriptor;
+        let bytes = b"do not save";
+        descriptor.byte_len = bytes.len() as u64;
+        let mut cache = MediaCache::new(1024);
+        complete_cached_attachment(&mut cache, &descriptor, BulkTransferId(14), bytes);
+        let attachment = cache.get(descriptor.id).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            write_cached_attachment_to_user_selected_path(&attachment, None).unwrap(),
+            None
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn video_rendering_route_does_not_consult_or_populate_media_cache() {
+        let descriptor = AttachmentDescriptor {
+            id: AttachmentId {
+                timestamp_ms: 15,
+                transfer_id: local_rpc::ids::FileTransferId(15),
+            },
+            file_name: "video.mp4".into(),
+            media_kind: MediaKind::Video,
+            content_type: "video/mp4".into(),
+            byte_len: 10,
+            width: Some(1920),
+            height: Some(1080),
+        };
+        let attachment = Attachment {
+            descriptor: descriptor.clone(),
+        };
+        let cache = MediaCache::new(1024);
+
+        assert_eq!(
+            attachment_render_route(&attachment),
+            AttachmentRenderRoute::Video
+        );
+        assert!(!cache.contains(descriptor.id));
+        assert_eq!(
+            cache.available_transfer_slots(),
+            local_rpc::MAX_CONCURRENT_TRANSFERS
+        );
     }
 
     #[test]

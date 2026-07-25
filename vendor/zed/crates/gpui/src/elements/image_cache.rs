@@ -358,7 +358,7 @@ impl<A> fmt::Debug for LruImageCache<A> {
 
 impl<A> LruImageCache<A>
 where
-    A: Asset<Source = Resource, Output = Result<Arc<RenderImage>, ImageCacheError>>,
+    A: Asset<Output = Result<Arc<RenderImage>, ImageCacheError>>,
 {
     /// Create an image cache with the given decoded-pixel byte budget.
     pub fn new(budget_bytes: usize, cx: &mut App) -> Entity<Self> {
@@ -381,11 +381,11 @@ where
         cache
     }
 
-    /// Load an image, updating its recency and evicting older decoded images
-    /// when the byte budget is exceeded.
-    pub fn load(
+    /// Load an image from an application-defined source, updating its recency
+    /// and evicting older decoded images when the byte budget is exceeded.
+    pub fn load_source(
         &mut self,
-        source: &Resource,
+        source: &A::Source,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
@@ -421,7 +421,7 @@ where
 
         let entity = window.current_view();
         log::info!(
-            "image cache load started source={source:?} hash={source_hash} owner={entity:?}"
+            "image cache load started hash={source_hash} owner={entity:?}"
         );
         window
             .spawn(cx, async move |cx| {
@@ -454,8 +454,8 @@ where
         self.total_bytes = 0;
     }
 
-    /// Remove one resource from the cache and from every window's image atlas.
-    pub fn remove(&mut self, source: &Resource, window: &mut Window, cx: &mut App) {
+    /// Remove one source from the cache and from every window's image atlas.
+    pub fn remove_source(&mut self, source: &A::Source, window: &mut Window, cx: &mut App) {
         let source_hash = hash(source);
         if let Some(mut entry) = self.entries.remove(&source_hash) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.decoded_bytes);
@@ -503,6 +503,26 @@ where
     }
 }
 
+impl<A> LruImageCache<A>
+where
+    A: Asset<Source = Resource, Output = Result<Arc<RenderImage>, ImageCacheError>>,
+{
+    /// Load a standard GPUI resource through the source-generic cache.
+    pub fn load(
+        &mut self,
+        source: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        self.load_source(source, window, cx)
+    }
+
+    /// Remove a standard GPUI resource from the cache.
+    pub fn remove(&mut self, source: &Resource, window: &mut Window, cx: &mut App) {
+        self.remove_source(source, window, cx);
+    }
+}
+
 impl<A> ImageCache for LruImageCache<A>
 where
     A: Asset<Source = Resource, Output = Result<Arc<RenderImage>, ImageCacheError>>,
@@ -513,7 +533,7 @@ where
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
-        LruImageCache::load(self, resource, window, cx)
+        self.load_source(resource, window, cx)
     }
 }
 
@@ -550,5 +570,109 @@ impl ImageCacheProvider for RetainAllImageCacheProvider {
                 )
             })
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TestAppContext;
+    use image::{Frame, Rgba, RgbaImage};
+
+    #[derive(Clone, Hash)]
+    struct TestImageSource(u64);
+
+    enum TestImageLoader {}
+
+    impl Asset for TestImageLoader {
+        type Source = TestImageSource;
+        type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+        fn load(
+            source: Self::Source,
+            _cx: &mut App,
+        ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+            async move {
+                let color = source.0 as u8;
+                Ok(Arc::new(RenderImage::new(vec![Frame::new(
+                    RgbaImage::from_pixel(1, 1, Rgba([color, 0, 0, 255])),
+                )])))
+            }
+        }
+    }
+
+    fn load(
+        cx: &mut crate::VisualTestContext,
+        cache: &Entity<LruImageCache<TestImageLoader>>,
+        source: &TestImageSource,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        cx.update(|window, cx| {
+            cache.update(cx, |cache, cx| cache.load_source(source, window, cx))
+        })
+    }
+
+    fn cache_len(
+        cx: &mut crate::VisualTestContext,
+        cache: &Entity<LruImageCache<TestImageLoader>>,
+    ) -> usize {
+        cx.update(|_, cx| cache.read(cx).len())
+    }
+
+    #[gpui::test]
+    fn non_resource_source_can_load(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let cache = cx.update(|_, cx| LruImageCache::<TestImageLoader>::new(4, cx));
+        let source = TestImageSource(1);
+
+        assert!(load(cx, &cache, &source).is_none());
+        cx.run_until_parked();
+        assert!(load(cx, &cache, &source).unwrap().is_ok());
+    }
+
+    #[gpui::test]
+    fn equal_immutable_source_identities_share_an_entry(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let cache = cx.update(|_, cx| LruImageCache::<TestImageLoader>::new(8, cx));
+        let source = TestImageSource(2);
+
+        assert!(load(cx, &cache, &source).is_none());
+        cx.run_until_parked();
+        assert!(load(cx, &cache, &source.clone()).unwrap().is_ok());
+        assert_eq!(cache_len(cx, &cache), 1);
+    }
+
+    #[gpui::test]
+    fn source_generic_lru_accounts_and_evicts_decoded_bytes(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let cache = cx.update(|_, cx| LruImageCache::<TestImageLoader>::new(4, cx));
+        let first = TestImageSource(3);
+        let second = TestImageSource(4);
+
+        assert!(load(cx, &cache, &first).is_none());
+        cx.run_until_parked();
+        assert!(load(cx, &cache, &first).unwrap().is_ok());
+        assert!(load(cx, &cache, &second).is_none());
+        cx.run_until_parked();
+        assert!(load(cx, &cache, &second).unwrap().is_ok());
+
+        assert_eq!(cache_len(cx, &cache), 1);
+        assert_eq!(cx.update(|_, cx| cache.read(cx).total_bytes()), 4);
+    }
+
+    #[gpui::test]
+    fn source_generic_clear_drops_decoded_images(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let cache = cx.update(|_, cx| LruImageCache::<TestImageLoader>::new(4, cx));
+        let source = TestImageSource(5);
+        assert!(load(cx, &cache, &source).is_none());
+        cx.run_until_parked();
+        assert!(load(cx, &cache, &source).unwrap().is_ok());
+
+        cx.update(|window, cx| {
+            cache.update(cx, |cache, cx| cache.clear(window, cx));
+        });
+
+        assert_eq!(cache_len(cx, &cache), 0);
+        assert_eq!(cx.update(|_, cx| cache.read(cx).total_bytes()), 0);
     }
 }

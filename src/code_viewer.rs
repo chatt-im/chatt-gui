@@ -1,11 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
-    fs::File,
     hash::{DefaultHasher, Hash, Hasher},
-    io::Read,
     ops::Range,
-    path::Path,
     rc::Rc,
     sync::Arc,
 };
@@ -171,23 +168,12 @@ impl CodeSearchResults {
 }
 
 impl CodeDocument {
-    pub fn load(path: &Path, file_name: &str, cache_key: u64) -> Result<Arc<Self>, String> {
-        let file = File::open(path).map_err(|error| format!("failed to load · {error}"))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("failed to load · {error}"))?;
-        if metadata.len() > MAX_CODE_PREVIEW_BYTES {
-            return Err("file too large to preview".into());
-        }
-
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_CODE_PREVIEW_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("failed to load · {error}"))?;
+    pub fn load(bytes: &[u8], file_name: &str, cache_key: u64) -> Result<Arc<Self>, String> {
         if bytes.len() as u64 > MAX_CODE_PREVIEW_BYTES {
             return Err("file too large to preview".into());
         }
-        let source = String::from_utf8(bytes).map_err(|_| "not a text file".to_string())?;
+        let source =
+            String::from_utf8(bytes.to_vec()).map_err(|_| "not a text file".to_string())?;
         validate_source_geometry(&source)?;
         Ok(Arc::new(Self::prepare(source, file_name, cache_key)))
     }
@@ -1690,8 +1676,6 @@ fn line_number(value: usize) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
     struct TestCodeView {
@@ -2197,32 +2181,23 @@ mod tests {
 
     #[test]
     fn bounded_load_rejects_oversized_and_non_utf8_files() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let oversized = directory.path().join("oversized.rs");
-        let file = File::create(&oversized).expect("create oversized file");
-        file.set_len(MAX_CODE_PREVIEW_BYTES + 1)
-            .expect("grow oversized file");
+        let oversized = vec![b'x'; MAX_CODE_PREVIEW_BYTES as usize + 1];
         assert_eq!(
             CodeDocument::load(&oversized, "oversized.rs", 1).unwrap_err(),
             "file too large to preview"
         );
 
-        let binary = directory.path().join("binary.rs");
-        fs::write(&binary, [0xff, 0xfe, 0xfd]).expect("write binary file");
         assert_eq!(
-            CodeDocument::load(&binary, "binary.rs", 2).unwrap_err(),
+            CodeDocument::load(&[0xff, 0xfe, 0xfd], "binary.rs", 2).unwrap_err(),
             "not a text file"
         );
     }
 
     #[test]
     fn bounded_load_accepts_a_file_at_the_limit() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("limit.txt");
         let contents = vec![b'x'; MAX_CODE_PREVIEW_BYTES as usize];
-        fs::write(&path, contents).expect("write limit-sized file");
 
-        let document = CodeDocument::load(&path, "limit.txt", 1).expect("load text at limit");
+        let document = CodeDocument::load(&contents, "limit.txt", 1).expect("load text at limit");
         assert_eq!(document.source().len(), MAX_CODE_PREVIEW_BYTES as usize);
         assert_eq!(document.line_count(), 1);
         assert!(document.line_is_truncated(0));
@@ -2231,18 +2206,14 @@ mod tests {
 
     #[test]
     fn bounded_load_truncates_pathological_lines_and_rejects_excessive_line_counts() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let long_line = directory.path().join("long-line.txt");
         let long_line_source = vec![b'x'; MAX_CODE_RENDERED_LINE_BYTES * 2];
-        fs::write(&long_line, &long_line_source).expect("write long line");
         let document =
-            CodeDocument::load(&long_line, "long-line.txt", 1).expect("load truncated line");
+            CodeDocument::load(&long_line_source, "long-line.txt", 1).expect("load truncated line");
         assert_eq!(document.source().as_bytes(), long_line_source);
         assert_eq!(document.line_text(0).len(), MAX_CODE_RENDERED_LINE_BYTES);
         assert!(document.line_is_truncated(0));
 
-        let many_lines = directory.path().join("many-lines.txt");
-        fs::write(&many_lines, vec![b'\n'; MAX_CODE_PREVIEW_LINES + 1]).expect("write many lines");
+        let many_lines = vec![b'\n'; MAX_CODE_PREVIEW_LINES + 1];
         assert_eq!(
             CodeDocument::load(&many_lines, "many-lines.txt", 2).unwrap_err(),
             "too many lines to preview"

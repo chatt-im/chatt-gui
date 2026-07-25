@@ -1,8 +1,10 @@
-use std::{fs, future::Future, sync::Arc};
+use std::{future::Future, sync::Arc};
 
 use anyhow::anyhow;
-use gpui::{App, Asset, ImageCacheError, RenderImage, Resource};
+use gpui::{App, Asset, ImageCacheError, RenderImage, SvgRenderer};
 use image::{DynamicImage, Frame, RgbaImage};
+
+use crate::media_cache::CachedAttachment;
 
 const MAX_THUMBNAIL_WIDTH: u32 = 1_360;
 const MAX_THUMBNAIL_HEIGHT: u32 = 840;
@@ -16,7 +18,7 @@ pub enum TimelineImageLoader {}
 pub enum PreviewImageLoader {}
 
 impl Asset for TimelineImageLoader {
-    type Source = Resource;
+    type Source = CachedAttachment;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
     fn load(
@@ -25,22 +27,18 @@ impl Asset for TimelineImageLoader {
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         let svg_renderer = cx.svg_renderer();
         async move {
-            let Resource::Path(path) = source else {
-                return Err(anyhow!("timeline images must be local files").into());
-            };
-            log::info!("timeline image decode started path={path:?}");
-            let bytes = fs::read(path.as_ref())?;
-            let image = if image::guess_format(&bytes).is_ok() {
-                let image = image::load_from_memory(&bytes)?;
-                thumbnail_from_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)
-            } else {
-                let image = svg_renderer.render_single_frame(&bytes, 1.0)?;
-                downsample_render_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)?
-            };
+            log::info!(
+                "timeline image decode started attachment={:?} source_bytes={} empty={}",
+                source.id(),
+                source.len(),
+                source.is_empty(),
+            );
+            let image = decode_timeline_attachment(&source, &svg_renderer)?;
 
             log::info!(
-                "timeline image decode finished path={path:?} source_bytes={} render_image_id={} size={:?}",
-                bytes.len(),
+                "timeline image decode finished attachment={:?} source_bytes={} render_image_id={} size={:?}",
+                source.id(),
+                source.len(),
                 image.id.0,
                 image.size(0),
             );
@@ -50,7 +48,7 @@ impl Asset for TimelineImageLoader {
 }
 
 impl Asset for PreviewImageLoader {
-    type Source = Resource;
+    type Source = CachedAttachment;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
     fn load(
@@ -59,23 +57,46 @@ impl Asset for PreviewImageLoader {
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         let svg_renderer = cx.svg_renderer();
         async move {
-            let Resource::Path(path) = source else {
-                return Err(anyhow!("preview images must be local files").into());
-            };
-            let bytes = fs::read(path.as_ref())?;
-            let image = if image::guess_format(&bytes).is_ok() {
-                render_image_from_dynamic(image::load_from_memory(&bytes)?)
-            } else {
-                svg_renderer.render_single_frame(&bytes, 1.0)?
-            };
+            let image = decode_preview_attachment(&source, &svg_renderer)?;
             log::info!(
-                "preview image decode finished path={path:?} source_bytes={} render_image_id={} size={:?}",
-                bytes.len(),
+                "preview image decode finished attachment={:?} source_bytes={} render_image_id={} size={:?}",
+                source.id(),
+                source.len(),
                 image.id.0,
                 image.size(0),
             );
             Ok(image)
         }
+    }
+}
+
+fn decode_timeline_attachment(
+    source: &CachedAttachment,
+    svg_renderer: &SvgRenderer,
+) -> Result<Arc<RenderImage>, ImageCacheError> {
+    let bytes = source.bytes();
+    if image::guess_format(bytes).is_ok() {
+        let image = image::load_from_memory(bytes)?;
+        Ok(thumbnail_from_image(
+            image,
+            MAX_THUMBNAIL_WIDTH,
+            MAX_THUMBNAIL_HEIGHT,
+        ))
+    } else {
+        let image = svg_renderer.render_single_frame(bytes, 1.0)?;
+        downsample_render_image(image, MAX_THUMBNAIL_WIDTH, MAX_THUMBNAIL_HEIGHT)
+    }
+}
+
+fn decode_preview_attachment(
+    source: &CachedAttachment,
+    svg_renderer: &SvgRenderer,
+) -> Result<Arc<RenderImage>, ImageCacheError> {
+    let bytes = source.bytes();
+    if image::guess_format(bytes).is_ok() {
+        Ok(render_image_from_dynamic(image::load_from_memory(bytes)?))
+    } else {
+        Ok(svg_renderer.render_single_frame(bytes, 1.0)?)
     }
 }
 
@@ -128,17 +149,130 @@ fn rgba_to_bgra(buffer: &mut RgbaImage) {
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgba, RgbaImage};
+    use std::{
+        hash::{DefaultHasher, Hash, Hasher},
+        io::Cursor,
+    };
+
+    use gpui::SvgRenderer;
+    use image::{ImageFormat, Rgba, RgbaImage};
+    use local_rpc::{
+        bulk::BulkFinished,
+        ids::FileTransferId,
+        model::{AttachmentDescriptor, AttachmentId, BulkTransferId, MediaKind},
+    };
 
     use super::*;
+    use crate::media_cache::MediaCache;
+
+    fn cached_attachment(bytes: &[u8]) -> CachedAttachment {
+        let descriptor = AttachmentDescriptor {
+            id: AttachmentId {
+                timestamp_ms: 1,
+                transfer_id: FileTransferId(1),
+            },
+            file_name: "image.png".into(),
+            media_kind: MediaKind::Image,
+            content_type: "image/png".into(),
+            byte_len: bytes.len() as u64,
+            width: None,
+            height: None,
+        };
+        let mut cache = MediaCache::new(bytes.len() as u64);
+        cache.reserve(BulkTransferId(1), &descriptor).unwrap();
+        cache.chunk(BulkTransferId(1), bytes).unwrap();
+        cache
+            .finish(BulkFinished {
+                transfer_id: BulkTransferId(1),
+            })
+            .unwrap();
+        cache.get(descriptor.id).unwrap()
+    }
+
+    fn png(width: u32, height: u32, color: Rgba<u8>) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(width, height, color));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
 
     #[test]
-    fn thumbnail_is_bounded_and_converted_to_bgra() {
-        let input = RgbaImage::from_pixel(40, 20, Rgba([255, 0, 0, 255]));
-        let thumbnail = thumbnail_from_image(DynamicImage::ImageRgba8(input), 10, 10);
+    fn raster_decodes_from_cached_bytes_with_timeline_downsampling_and_bgra_conversion() {
+        let source = cached_attachment(&png(1_600, 1_000, Rgba([255, 0, 0, 255])));
+        let thumbnail =
+            decode_timeline_attachment(&source, &SvgRenderer::new(Arc::new(()))).unwrap();
 
-        assert_eq!(thumbnail.size(0).width.0, 10);
-        assert_eq!(thumbnail.size(0).height.0, 5);
+        assert_eq!(thumbnail.size(0).width.0, 1_344);
+        assert_eq!(thumbnail.size(0).height.0, 840);
         assert_eq!(&thumbnail.as_bytes(0).unwrap()[..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn svg_decodes_from_cached_bytes() {
+        let source = cached_attachment(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="red"/></svg>"#,
+        );
+        let image = decode_timeline_attachment(&source, &SvgRenderer::new(Arc::new(()))).unwrap();
+        assert_eq!(image.size(0).width.0, 40);
+        assert_eq!(image.size(0).height.0, 20);
+    }
+
+    #[test]
+    fn preview_decodes_raster_at_natural_resolution() {
+        let source = cached_attachment(&png(37, 19, Rgba([1, 2, 3, 255])));
+        let image = decode_preview_attachment(&source, &SvgRenderer::new(Arc::new(()))).unwrap();
+        assert_eq!(image.size(0).width.0, 37);
+        assert_eq!(image.size(0).height.0, 19);
+        assert_eq!(&image.as_bytes(0).unwrap()[..4], &[3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn malformed_cached_bytes_return_an_image_cache_error() {
+        let source = cached_attachment(b"not an image");
+        assert!(decode_preview_attachment(&source, &SvgRenderer::new(Arc::new(()))).is_err());
+    }
+
+    #[test]
+    fn source_identity_distinguishes_revisions_of_one_attachment_id() {
+        let descriptor = AttachmentDescriptor {
+            id: AttachmentId {
+                timestamp_ms: 1,
+                transfer_id: FileTransferId(1),
+            },
+            file_name: "image.png".into(),
+            media_kind: MediaKind::Image,
+            content_type: "image/png".into(),
+            byte_len: 3,
+            width: None,
+            height: None,
+        };
+        let mut cache = MediaCache::new(3);
+        cache.reserve(BulkTransferId(1), &descriptor).unwrap();
+        cache.chunk(BulkTransferId(1), b"one").unwrap();
+        cache
+            .finish(BulkFinished {
+                transfer_id: BulkTransferId(1),
+            })
+            .unwrap();
+        let first = cache.get(descriptor.id).unwrap();
+        cache.clear();
+        cache.reserve(BulkTransferId(2), &descriptor).unwrap();
+        cache.chunk(BulkTransferId(2), b"two").unwrap();
+        cache
+            .finish(BulkFinished {
+                transfer_id: BulkTransferId(2),
+            })
+            .unwrap();
+        let second = cache.get(descriptor.id).unwrap();
+
+        let hash = |source: &CachedAttachment| {
+            let mut hasher = DefaultHasher::new();
+            source.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(hash(&first), hash(&second));
+        assert_eq!(hash(&first), hash(&first.clone()));
     }
 }

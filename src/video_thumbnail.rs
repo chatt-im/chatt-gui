@@ -596,16 +596,6 @@ fn retry_delay(failures: u32) -> Duration {
     RETRY_BASE_DELAY * (1 << failures.saturating_sub(1).min(MAX_RETRY_SHIFT))
 }
 
-fn bounded_size(width: u32, height: u32) -> (u32, u32) {
-    let scale = (MAX_WIDTH as f64 / width.max(1) as f64)
-        .min(MAX_HEIGHT as f64 / height.max(1) as f64)
-        .min(1.0);
-    (
-        (width as f64 * scale).round().max(1.0) as u32,
-        (height as f64 * scale).round().max(1.0) as u32,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,13 +627,6 @@ mod tests {
             file,
             byte_len,
         ))
-    }
-
-    #[test]
-    fn thumbnail_dimensions_preserve_aspect_ratio_within_bounds() {
-        assert_eq!(bounded_size(640, 360), (640, 360));
-        assert_eq!(bounded_size(3_840, 2_160), (1_360, 765));
-        assert_eq!(bounded_size(1_000, 2_000), (420, 840));
     }
 
     #[test]
