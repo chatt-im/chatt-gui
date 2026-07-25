@@ -5,7 +5,7 @@ use local_rpc::{
     ids::RoomId,
     model::{
         CommandInfo, ConnectionState, DaemonInstanceId, LiveShare, Participant, RequestId,
-        RoomSummary, TransferSummary, VoiceState,
+        RoomSummary, ServerSelectionState, TransferSummary, VoiceState,
     },
 };
 
@@ -37,6 +37,7 @@ pub struct ChatModel {
     pub limits: NegotiatedLimits,
     pub active_server: Option<String>,
     pub server_connection: ConnectionState,
+    pub server_selection: ServerSelectionState,
     pub local_identity: Option<String>,
     pub rooms: Vec<RoomSummary>,
     pub selected_room: Option<RoomId>,
@@ -62,6 +63,7 @@ impl Default for ChatModel {
             limits: NegotiatedLimits::default(),
             active_server: None,
             server_connection: ConnectionState::Offline,
+            server_selection: ServerSelectionState::default(),
             local_identity: None,
             rooms: Vec::new(),
             selected_room: None,

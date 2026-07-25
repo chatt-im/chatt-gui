@@ -159,6 +159,13 @@ impl TextEditor {
         }
     }
 
+    pub fn server_search(cx: &mut Context<Self>) -> Self {
+        let mut input = Self::search(cx);
+        input.placeholder = "Search servers".into();
+        input.key_context = "ChattServerSearch";
+        input
+    }
+
     pub(crate) fn settings_input(
         placeholder: impl Into<SharedString>,
         binding_mode: crate::config::schema::BindingMode,

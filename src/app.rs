@@ -73,7 +73,8 @@ use local_rpc::{
     ids::{RoomId, StreamId},
     model::{
         AttachmentDescriptor, AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind,
-        CommandOutputLine, MediaKind, RequestId, RoomKind, TrustState,
+        CommandOutputLine, MediaKind, RequestId, RoomKind, ServerAvailability,
+        ServerSelectionPrompt, ServerSummary, TrustState,
     },
 };
 
@@ -483,7 +484,11 @@ actions!(
         CompletionPrevious,
         CompletionAccept,
         CompletionAcceptEngaged,
-        CompletionDismiss
+        CompletionDismiss,
+        ServerNext,
+        ServerPrevious,
+        ServerActivate,
+        CloseServerSelector
     ]
 );
 
@@ -503,6 +508,13 @@ pub struct ChattView {
     candidate_requests: HashMap<CommandCandidateKind, RequestId>,
     pending_command: Option<PendingCommand>,
     suppress_completion_refresh: bool,
+    server_search_input: gpui::Entity<Composer>,
+    server_selector_open: bool,
+    selected_server_label: Option<String>,
+    server_list_scroll: ScrollHandle,
+    pending_server_selection: Option<RequestId>,
+    server_selection_target: Option<String>,
+    pending_server_prompt: Option<(RequestId, bool)>,
     code_search_input: gpui::Entity<Composer>,
     code_viewer_focus: FocusHandle,
     code_selection: CodeSelection,
@@ -566,6 +578,7 @@ pub struct ChattView {
     _composer_image_paste_subscription: Subscription,
     _composer_state_subscription: Subscription,
     _composer_blur_subscription: Subscription,
+    _server_search_subscription: Subscription,
     _daemon_task: Task<()>,
     _video_task: Task<()>,
 }
@@ -581,6 +594,14 @@ impl ChattView {
         let (daemon, daemon_events) = DaemonClient::spawn(media_cache.clone());
         let binding_mode = AppliedSettings::get(cx).binding_mode;
         let composer = cx.new(|cx| Composer::with_binding_mode(binding_mode, cx));
+        let server_search_input = cx.new(Composer::server_search);
+        let server_search_subscription =
+            cx.subscribe(&server_search_input, |this, _, _: &ComposerChanged, cx| {
+                if let Some(index) = this.reconcile_server_selection(cx) {
+                    this.server_list_scroll.scroll_to_item(index);
+                }
+                cx.notify();
+            });
         let code_search_input = cx.new(Composer::search);
         let code_search_subscription =
             cx.subscribe(&code_search_input, |this, _, _: &ComposerChanged, cx| {
@@ -686,6 +707,13 @@ impl ChattView {
             candidate_requests: HashMap::new(),
             pending_command: None,
             suppress_completion_refresh: false,
+            server_search_input,
+            server_selector_open: false,
+            selected_server_label: None,
+            server_list_scroll: ScrollHandle::new(),
+            pending_server_selection: None,
+            server_selection_target: None,
+            pending_server_prompt: None,
             code_search_input,
             code_viewer_focus,
             code_selection,
@@ -749,6 +777,7 @@ impl ChattView {
             _composer_image_paste_subscription: composer_image_paste_subscription,
             _composer_state_subscription: composer_state_subscription,
             _composer_blur_subscription: composer_blur_subscription,
+            _server_search_subscription: server_search_subscription,
             _daemon_task: daemon_task,
             _video_task: video_task,
         }
@@ -1854,6 +1883,9 @@ impl ChattView {
                     self.model.last_error =
                         Some("Connection changed; pending operations were not replayed".into());
                 }
+                self.pending_server_selection = None;
+                self.pending_server_prompt = None;
+                self.server_selection_target = None;
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Offline · Submission outcome unknown; verify the timeline after reconnecting · {reason}"
@@ -1876,6 +1908,9 @@ impl ChattView {
                 self.model.phase = ConnectionPhase::Incompatible {
                     details: details.clone(),
                 };
+                self.pending_server_selection = None;
+                self.pending_server_prompt = None;
+                self.server_selection_target = None;
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Cannot connect · Submission outcome unknown; verify before retrying · {details}"
@@ -2138,7 +2173,56 @@ impl ChattView {
         let old_selected_room = self.model.selected_room;
         let old_daemon_instance = self.model.daemon_instance;
         let old_active_server = self.model.active_server.clone();
+        let old_server_selector_visible = self.server_selector_visible();
+        let old_server_error = self.model.server_selection.error.clone();
+        let old_server_prompt = self.model.server_selection.prompt.clone();
         let effect = reducer::apply(&mut self.model, frame);
+        if let Some(result) = effect.request_result.as_ref() {
+            if self.pending_server_selection == Some(result.request_id) {
+                self.pending_server_selection = None;
+                if matches!(result.outcome, RequestOutcome::Rejected { .. }) {
+                    self.server_selection_target = None;
+                }
+            }
+            if self
+                .pending_server_prompt
+                .is_some_and(|(request_id, _)| request_id == result.request_id)
+            {
+                let accepted_prompt = self
+                    .pending_server_prompt
+                    .take()
+                    .is_some_and(|(_, accept)| accept);
+                if matches!(result.outcome, RequestOutcome::Rejected { .. }) && accepted_prompt {
+                    self.server_selection_target = None;
+                }
+            }
+        }
+        if self.model.server_selection.error != old_server_error {
+            if let Some(error) = &self.model.server_selection.error {
+                self.server_selection_target = None;
+                self.status = error.message.clone().into();
+            }
+        }
+        if self.model.server_selection.prompt != old_server_prompt
+            && self.model.server_selection.prompt.is_some()
+        {
+            self.server_selector_open = true;
+        }
+        if self
+            .server_selection_target
+            .as_ref()
+            .is_some_and(|target| self.model.active_server.as_ref() == Some(target))
+            && self.model.server_selection.prompt.is_none()
+        {
+            self.server_selection_target = None;
+            self.server_selector_open = false;
+            self.server_search_input
+                .update(cx, |input, cx| input.clear(cx));
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+        if !old_server_selector_visible && self.server_selector_visible() {
+            window.focus(&self.server_search_input.focus_handle(cx), cx);
+        }
         if self.model.selected_room != old_selected_room {
             self.collapsed_sections.clear();
         }
@@ -2336,6 +2420,7 @@ impl ChattView {
         } else if !command_result_applied
             && self.model.is_ready()
             && self.model.last_error.is_none()
+            && self.model.server_selection.error.is_none()
         {
             self.status = connection_label(&self.model).into();
         }
@@ -2529,6 +2614,242 @@ impl ChattView {
             self.status = error.into();
         } else {
             self.status = "Switching room…".into();
+        }
+        cx.notify();
+    }
+
+    fn server_selector_visible(&self) -> bool {
+        self.model.is_ready()
+            && (self.model.active_server.is_none()
+                || self.server_selector_open
+                || self.model.server_selection.error.is_some()
+                || self.model.server_selection.prompt.is_some())
+    }
+
+    fn filtered_servers(&self, cx: &App) -> Vec<ServerSummary> {
+        let query = self.server_search_input.read(cx).text();
+        self.model
+            .server_selection
+            .servers
+            .iter()
+            .filter(|server| server_matches_query(server, &query))
+            .cloned()
+            .collect()
+    }
+
+    fn reconcile_server_selection(&mut self, cx: &App) -> Option<usize> {
+        let servers = self.filtered_servers(cx);
+        if servers.is_empty() {
+            self.selected_server_label = None;
+            return None;
+        }
+        if let Some(index) = server_index_for_label(&servers, self.selected_server_label.as_deref())
+        {
+            return Some(index);
+        }
+        self.selected_server_label = Some(servers[0].label.clone());
+        Some(0)
+    }
+
+    fn selected_server_index(&self, servers: &[ServerSummary]) -> Option<usize> {
+        server_index_for_label(servers, self.selected_server_label.as_deref())
+    }
+
+    fn server_switch_block_reason(&self) -> Option<&'static str> {
+        let pending_activity = self.pending_submission.is_some()
+            || self.pending_command.is_some()
+            || self.model.pending.values().any(|pending| {
+                matches!(
+                    pending.operation,
+                    Operation::SendMessage
+                        | Operation::EditMessage
+                        | Operation::DeleteMessage
+                        | Operation::BeginUpload
+                        | Operation::FinishUpload
+                )
+            });
+        server_switch_guard_reason(pending_activity, !self.model.transfers.is_empty())
+    }
+
+    fn open_server_selector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.is_ready() {
+            return;
+        }
+        if let Some(reason) = self.server_switch_block_reason() {
+            self.status = reason.into();
+            cx.notify();
+            return;
+        }
+        self.server_selector_open = true;
+        self.selected_server_label = self.model.active_server.clone();
+        self.server_search_input
+            .update(cx, |input, cx| input.clear(cx));
+        if let Some(index) = self.reconcile_server_selection(cx) {
+            self.server_list_scroll.scroll_to_item(index);
+        }
+        window.focus(&self.server_search_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn close_server_selector(
+        &mut self,
+        _: &CloseServerSelector,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.model.active_server.is_none()
+            || self.model.server_selection.error.is_some()
+            || self.model.server_selection.prompt.is_some()
+            || self.pending_server_selection.is_some()
+            || self.pending_server_prompt.is_some()
+        {
+            return;
+        }
+        self.server_selector_open = false;
+        self.server_search_input
+            .update(cx, |input, cx| input.clear(cx));
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn server_next(&mut self, _: &ServerNext, _: &mut Window, cx: &mut Context<Self>) {
+        let servers = self.filtered_servers(cx);
+        let count = servers.len();
+        if count == 0 {
+            return;
+        }
+        let selected = self
+            .selected_server_index(&servers)
+            .map_or(0, |index| (index + 1) % count);
+        self.selected_server_label = Some(servers[selected].label.clone());
+        self.server_list_scroll.scroll_to_item(selected);
+        cx.notify();
+    }
+
+    fn server_previous(&mut self, _: &ServerPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        let servers = self.filtered_servers(cx);
+        let count = servers.len();
+        if count == 0 {
+            return;
+        }
+        let selected = self
+            .selected_server_index(&servers)
+            .and_then(|index| index.checked_sub(1))
+            .unwrap_or(count - 1);
+        self.selected_server_label = Some(servers[selected].label.clone());
+        self.server_list_scroll.scroll_to_item(selected);
+        cx.notify();
+    }
+
+    fn server_activate(&mut self, _: &ServerActivate, window: &mut Window, cx: &mut Context<Self>) {
+        let servers = self.filtered_servers(cx);
+        let selected = self.selected_server_index(&servers).unwrap_or(0);
+        if let Some(server) = servers.get(selected).cloned() {
+            self.select_server(server, window, cx);
+        }
+    }
+
+    fn select_server(
+        &mut self,
+        server: ServerSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.model.is_ready()
+            || self.pending_server_selection.is_some()
+            || self.pending_server_prompt.is_some()
+        {
+            return;
+        }
+        if server.availability == ServerAvailability::PairingIncomplete {
+            self.status =
+                "Server pairing is incomplete; finish pairing in the terminal client".into();
+            cx.notify();
+            return;
+        }
+        if self.model.active_server.as_deref() == Some(server.label.as_str())
+            && self.model.server_selection.error.is_none()
+        {
+            self.server_selector_open = false;
+            self.server_search_input
+                .update(cx, |input, cx| input.clear(cx));
+            window.focus(&self.composer.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
+        if self.model.active_server.is_some()
+            && let Some(reason) = self.server_switch_block_reason()
+        {
+            self.status = reason.into();
+            cx.notify();
+            return;
+        }
+
+        let request_id = self.request_id();
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::SelectServer,
+                room_id: None,
+                draft: Some(server.label.clone()),
+                transfer_id: None,
+            },
+        );
+        self.pending_server_selection = Some(request_id);
+        self.server_selection_target = Some(server.label.clone());
+        if let Err(error) = self.daemon.send(ClientFrame::SelectServer {
+            request_id,
+            label: server.label.clone(),
+        }) {
+            self.model.pending.remove(&request_id);
+            self.pending_server_selection = None;
+            self.server_selection_target = None;
+            self.status = error.into();
+        } else {
+            self.status = format!("Connecting to {}…", server.label).into();
+        }
+        cx.notify();
+    }
+
+    fn resolve_server_prompt(&mut self, accept: bool, cx: &mut Context<Self>) {
+        if self.pending_server_prompt.is_some() {
+            return;
+        }
+        let Some(ServerSelectionPrompt::AllowExternalSecureLink { label, attempt_id }) =
+            self.model.server_selection.prompt.clone()
+        else {
+            return;
+        };
+        let request_id = self.request_id();
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::ResolveServerPrompt,
+                room_id: None,
+                draft: Some(label.clone()),
+                transfer_id: None,
+            },
+        );
+        self.pending_server_prompt = Some((request_id, accept));
+        if accept {
+            self.server_selection_target = Some(label);
+        } else {
+            self.server_selection_target = None;
+        }
+        if let Err(error) = self.daemon.send(ClientFrame::ResolveServerPrompt {
+            request_id,
+            attempt_id,
+            accept,
+        }) {
+            self.model.pending.remove(&request_id);
+            self.pending_server_prompt = None;
+            self.status = error.into();
+        } else {
+            self.status = if accept {
+                "Saving security preference and reconnecting…".into()
+            } else {
+                "Canceling connection…".into()
+            };
         }
         cx.notify();
     }
@@ -5984,6 +6305,435 @@ impl ChattView {
             .into_any_element()
     }
 
+    fn render_server_selector(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let applied = AppliedSettings::get(cx);
+        let servers = self.filtered_servers(cx);
+        if self.selected_server_index(&servers).is_none() {
+            self.selected_server_label = servers.first().map(|server| server.label.clone());
+        }
+        let configured_empty = self.model.server_selection.servers.is_empty();
+        let query_empty = self.server_search_input.read(cx).text().trim().is_empty();
+        let active_server = self.model.active_server.clone();
+        let pending_target = self.server_selection_target.clone();
+        let prompt = self.model.server_selection.prompt.clone();
+        let mut list = div()
+            .id("server-list")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .overflow_y_scroll()
+            .track_scroll(&self.server_list_scroll);
+
+        if configured_empty {
+            list = list.child(
+                div()
+                    .flex_1()
+                    .min_h(px(220.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .text_center()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("No servers are configured yet"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(520.))
+                            .text_sm()
+                            .text_color(applied.theme.color(ThemeRole::TextMuted))
+                            .child(
+                                "Pair with a server using `chatt pair JOIN_STRING` in a terminal. \
+                                 Saved servers appear here through the running daemon.",
+                            ),
+                    ),
+            );
+        } else if servers.is_empty() && !query_empty {
+            list = list.child(
+                div()
+                    .flex_1()
+                    .min_h(px(180.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(applied.theme.color(ThemeRole::TextMuted))
+                    .child("No saved servers match this search."),
+            );
+        } else {
+            for (index, server) in servers.into_iter().enumerate() {
+                let selected = self.selected_server_label.as_deref() == Some(server.label.as_str());
+                let current = self.model.server_selection.error.is_none()
+                    && active_server.as_deref() == Some(server.label.as_str());
+                let pending = pending_target.as_deref() == Some(server.label.as_str());
+                let connectable = server.availability == ServerAvailability::Ready;
+                let row_server = server.clone();
+                let background = applied.theme.color(if selected {
+                    ThemeRole::StateSelected
+                } else {
+                    ThemeRole::ControlSurface
+                });
+                let hover = applied.theme.color(ThemeRole::ControlSurfaceHover);
+                let mut row = div()
+                    .id(("server-row", index))
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(applied.theme.color(if current {
+                        ThemeRole::StateSuccess
+                    } else {
+                        ThemeRole::BorderSubtle
+                    }))
+                    .bg(background)
+                    .when(connectable, |row| {
+                        row.cursor_pointer()
+                            .hover(move |row| row.bg(hover))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.selected_server_label = Some(row_server.label.clone());
+                                this.select_server(row_server.clone(), window, cx)
+                            }))
+                    })
+                    .child(
+                        div()
+                            .w(px(28.))
+                            .flex_none()
+                            .text_center()
+                            .text_color(applied.theme.color(if selected {
+                                ThemeRole::TextPrimary
+                            } else {
+                                ThemeRole::TextMuted
+                            }))
+                            .child(if selected { "›" } else { " " }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(server.label.clone()),
+                                    )
+                                    .when(current, |line| {
+                                        line.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(
+                                                    applied.theme.color(ThemeRole::StateSuccess),
+                                                )
+                                                .child("Current"),
+                                        )
+                                    })
+                                    .when(pending, |line| {
+                                        line.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(
+                                                    applied.theme.color(ThemeRole::StateWarning),
+                                                )
+                                                .child("Connecting…"),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(applied.theme.color(ThemeRole::TextSecondary))
+                                    .child(server.username.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                    .child(server.tcp_addr.clone()),
+                            ),
+                    );
+                row = if !connectable {
+                    row.child(
+                        div()
+                            .max_w(px(190.))
+                            .text_right()
+                            .text_xs()
+                            .text_color(applied.theme.color(ThemeRole::StateWarning))
+                            .child("Finish pairing in the terminal client"),
+                    )
+                } else if !server.require_native_encryption {
+                    row.child(
+                        div()
+                            .max_w(px(190.))
+                            .text_right()
+                            .text_xs()
+                            .text_color(applied.theme.color(ThemeRole::StateWarning))
+                            .child("Native encryption not required"),
+                    )
+                } else {
+                    row
+                };
+                list = list.child(row);
+            }
+        }
+
+        let can_cancel = active_server.is_some()
+            && self.model.server_selection.error.is_none()
+            && prompt.is_none()
+            && self.pending_server_selection.is_none()
+            && self.pending_server_prompt.is_none();
+        let mut root = div()
+            .id("chatt-server-selector")
+            .key_context("Chatt ChattServerSelector")
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::server_next))
+            .on_action(cx.listener(Self::server_previous))
+            .on_action(cx.listener(Self::server_activate))
+            .on_action(cx.listener(Self::close_server_selector))
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family(applied.fonts.interface_family.clone())
+            .bg(applied.theme.color(ThemeRole::Window))
+            .text_color(applied.theme.color(ThemeRole::TextPrimary))
+            .child(
+                div()
+                    .h(px(TOP_BAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+                    .bg(applied.theme.color(ThemeRole::Toolbar))
+                    .child(div().font_weight(FontWeight::BOLD).child("CHATT · SERVERS"))
+                    .child(div().flex_1())
+                    .child(
+                        toolbar_button(
+                            "server-selector-settings",
+                            None,
+                            "Settings",
+                            &applied.theme,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings(&OpenSettings, window, cx)
+                        })),
+                    )
+                    .when(can_cancel, |bar| {
+                        bar.child(
+                            toolbar_button(
+                                "server-selector-cancel",
+                                Some(IconName::Close),
+                                "Back to chat",
+                                &applied.theme,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.close_server_selector(&CloseServerSelector, window, cx)
+                                },
+                            )),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .p_6()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(760.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .child(div().text_2xl().font_weight(FontWeight::BOLD).child(
+                                        if active_server.is_some()
+                                            && self.model.server_selection.error.is_none()
+                                        {
+                                            "Switch server"
+                                        } else {
+                                            "Choose a server"
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .text_sm()
+                                            .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                            .child(
+                                                "Select a server saved in Chatt. The daemon owns \
+                                                 the connection and shares it across clients.",
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(36.))
+                                    .w_full()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_3()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(applied.theme.color(ThemeRole::BorderStrong))
+                                    .bg(applied.theme.color(ThemeRole::Input))
+                                    .child(icon(
+                                        IconName::Search,
+                                        15.0,
+                                        applied.theme.color(ThemeRole::TextMuted),
+                                    ))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_sm()
+                                            .child(self.server_search_input.clone()),
+                                    ),
+                            )
+                            .when_some(self.model.server_selection.error.clone(), |panel, error| {
+                                panel.child(
+                                    div()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(applied.theme.color(ThemeRole::ControlSurface))
+                                        .text_sm()
+                                        .text_color(applied.theme.color(ThemeRole::StateDanger))
+                                        .child(error.message),
+                                )
+                            })
+                            .child(list)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .text_xs()
+                                    .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                    .child("↑/↓ select · Enter connect · type to search")
+                                    .child(self.status.clone()),
+                            ),
+                    ),
+            );
+
+        if let Some(ServerSelectionPrompt::AllowExternalSecureLink { label, .. }) = prompt {
+            let resolving = self.pending_server_prompt.is_some();
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(applied.theme.color(ThemeRole::MediaViewport))
+                    .child(
+                        div()
+                            .w(px(620.))
+                            .max_w_full()
+                            .mx_4()
+                            .p_5()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(applied.theme.color(ThemeRole::StateDanger))
+                            .bg(applied.theme.color(ThemeRole::Window))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(
+                                        applied.theme.color(ThemeRole::StateDanger),
+                                    )
+                                    .child("No native encryption to server"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(
+                                        "The server selected plaintext ExternalSecureLink \
+                                         transport. Connect only when another secure link already \
+                                         protects it, such as WireGuard, an SSH tunnel, or a \
+                                         private trusted network.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(
+                                        applied.theme.color(ThemeRole::TextMuted),
+                                    )
+                                    .child(format!(
+                                        "Accepting saves require-native-encryption = false for {label}."
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        toolbar_button(
+                                            "server-prompt-cancel",
+                                            None,
+                                            "Cancel",
+                                            &applied.theme,
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.resolve_server_prompt(false, cx)
+                                        })),
+                                    )
+                                    .child(
+                                        toolbar_button(
+                                            "server-prompt-accept",
+                                            None,
+                                            if resolving {
+                                                "Working…"
+                                            } else {
+                                                "Connect anyway"
+                                            },
+                                            &applied.theme,
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.resolve_server_prompt(true, cx)
+                                        })),
+                                    ),
+                            ),
+                    ),
+            );
+        }
+        root
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
         let applied = AppliedSettings::get(cx);
         let mut sidebar = div()
@@ -6128,6 +6878,9 @@ impl ChattView {
                                 .child(connection),
                         ),
                 )
+                .child(mini_button("open-servers", "⇄", &applied.theme).on_click(
+                    cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
+                ))
                 .child(
                     mini_button("open-settings", "⚙", &applied.theme).on_click(cx.listener(
                         |this, _, window, cx| this.open_settings(&OpenSettings, window, cx),
@@ -6319,6 +7072,11 @@ impl Render for ChattView {
             composer.set_binding_mode(applied.binding_mode, cx)
         });
         self.advance_video(cx);
+        if self.server_selector_visible() {
+            return self
+                .render_server_selector(cx)
+                .when_some(self.settings.clone(), |root, settings| root.child(settings));
+        }
         if !self.live_players.is_empty() {
             self.advance_live_video();
         }
@@ -6949,6 +7707,32 @@ fn connection_label(model: &ChatModel) -> String {
     }
 }
 
+fn server_matches_query(server: &ServerSummary, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || server.label.to_lowercase().contains(&query)
+        || server.username.to_lowercase().contains(&query)
+        || server.tcp_addr.to_lowercase().contains(&query)
+}
+
+fn server_index_for_label(servers: &[ServerSummary], selected: Option<&str>) -> Option<usize> {
+    let selected = selected?;
+    servers.iter().position(|server| server.label == selected)
+}
+
+fn server_switch_guard_reason(
+    pending_activity: bool,
+    active_transfers: bool,
+) -> Option<&'static str> {
+    if pending_activity {
+        Some("Finish the pending message or upload before switching servers")
+    } else if active_transfers {
+        Some("Wait for or cancel active file transfers before switching servers")
+    } else {
+        None
+    }
+}
+
 fn queued_files_status(count: usize, daemon_ready: bool, room_selected: bool) -> String {
     let noun = if count == 1 { "file" } else { "files" };
     let next_step = if !daemon_ready {
@@ -6979,6 +7763,8 @@ fn empty_state(model: &ChatModel) -> String {
 
 fn operation_label(operation: &Operation) -> &'static str {
     match operation {
+        Operation::SelectServer => "Server selection",
+        Operation::ResolveServerPrompt => "Server security decision",
         Operation::SelectRoom => "Room selection",
         Operation::SendMessage => "Message",
         Operation::RunCommand => "Command",
@@ -7234,6 +8020,64 @@ mod tests {
         assert!(images.retry(fetch.clone()));
         assert!(images.failure(fetch.key).is_none());
         assert_eq!(images.pop_front().unwrap().key, fetch.key);
+    }
+
+    #[test]
+    fn server_search_matches_label_username_and_address_case_insensitively() {
+        let server = ServerSummary {
+            label: "Work Chat".into(),
+            username: "Alice".into(),
+            tcp_addr: "chat.example.test:443".into(),
+            require_native_encryption: true,
+            availability: ServerAvailability::Ready,
+        };
+
+        assert!(server_matches_query(&server, ""));
+        assert!(server_matches_query(&server, " work "));
+        assert!(server_matches_query(&server, "ALICE"));
+        assert!(server_matches_query(&server, "EXAMPLE.TEST"));
+        assert!(!server_matches_query(&server, "personal"));
+    }
+
+    #[test]
+    fn server_selection_uses_stable_labels_across_reordering_and_filtering() {
+        let work = ServerSummary {
+            label: "Work Chat".into(),
+            username: "Alice".into(),
+            tcp_addr: "work.example.test:443".into(),
+            require_native_encryption: true,
+            availability: ServerAvailability::Ready,
+        };
+        let personal = ServerSummary {
+            label: "Personal".into(),
+            username: "alice".into(),
+            tcp_addr: "home.example.test:443".into(),
+            require_native_encryption: true,
+            availability: ServerAvailability::Ready,
+        };
+
+        assert_eq!(
+            server_index_for_label(&[personal.clone(), work.clone()], Some("Work Chat")),
+            Some(1)
+        );
+        assert_eq!(
+            server_index_for_label(&[work, personal], Some("Work Chat")),
+            Some(0)
+        );
+        assert_eq!(server_index_for_label(&[], Some("Work Chat")), None);
+    }
+
+    #[test]
+    fn server_switch_guard_blocks_pending_work_and_active_transfers() {
+        assert_eq!(
+            server_switch_guard_reason(true, false),
+            Some("Finish the pending message or upload before switching servers")
+        );
+        assert_eq!(
+            server_switch_guard_reason(false, true),
+            Some("Wait for or cancel active file transfers before switching servers")
+        );
+        assert_eq!(server_switch_guard_reason(false, false), None);
     }
 
     #[test]

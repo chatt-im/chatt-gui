@@ -101,6 +101,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
 fn install_snapshot(model: &mut ChatModel, snapshot: StateSnapshot) {
     model.active_server = snapshot.active_server;
     model.server_connection = snapshot.connection;
+    model.server_selection = snapshot.server_selection;
     model.local_identity = snapshot.local_identity;
     model.rooms = snapshot.rooms;
     model.selected_room = snapshot.selected_room;
@@ -311,6 +312,12 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             model.server_connection = connection;
             model.active_server = active_server;
         }
+        StateDelta::LocalIdentityChanged { local_identity } => {
+            model.local_identity = local_identity;
+        }
+        StateDelta::ServerSelectionChanged { selection } => {
+            model.server_selection = selection;
+        }
         StateDelta::SecurityChanged { room_id, trust } => {
             if let Some(room) = model.rooms.iter_mut().find(|room| room.id == room_id) {
                 room.trust = trust;
@@ -392,7 +399,8 @@ mod tests {
         frame::{NegotiatedLimits, Operation, RequestOutcome, RequestResult, StateEvent, Welcome},
         model::{
             CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
-            ConnectionState, DaemonInstanceId, Participant, RequestId, VoiceState,
+            ConnectionState, DaemonInstanceId, Participant, RequestId, ServerAvailability,
+            ServerSelectionError, ServerSelectionState, ServerSummary, VoiceState,
         },
     };
 
@@ -413,6 +421,7 @@ mod tests {
         StateSnapshot {
             connection: ConnectionState::Online,
             active_server: Some("local".into()),
+            server_selection: Default::default(),
             local_identity: Some("alice".into()),
             rooms: Vec::new(),
             selected_room: None,
@@ -443,6 +452,55 @@ mod tests {
             reference: None,
             attachment: None,
         }
+    }
+
+    #[test]
+    fn server_selection_delta_replaces_catalog_and_error() {
+        let mut model = ChatModel::default();
+        let mut effect = ReduceEffect::default();
+        let selection = ServerSelectionState {
+            servers: vec![ServerSummary {
+                label: "work".into(),
+                username: "alice".into(),
+                tcp_addr: "127.0.0.1:4000".into(),
+                require_native_encryption: true,
+                availability: ServerAvailability::Ready,
+            }],
+            error: Some(ServerSelectionError {
+                label: Some("work".into()),
+                message: "authentication failed".into(),
+            }),
+            prompt: None,
+        };
+
+        apply_delta(
+            &mut model,
+            StateDelta::ServerSelectionChanged {
+                selection: selection.clone(),
+            },
+            &mut effect,
+        );
+
+        assert_eq!(model.server_selection, selection);
+    }
+
+    #[test]
+    fn local_identity_delta_updates_identity_without_replacing_room_state() {
+        let mut model = ChatModel::default();
+        model.selected_room = Some(RoomId(7));
+        let mut effect = ReduceEffect::default();
+
+        apply_delta(
+            &mut model,
+            StateDelta::LocalIdentityChanged {
+                local_identity: Some("alice".into()),
+            },
+            &mut effect,
+        );
+
+        assert_eq!(model.local_identity.as_deref(), Some("alice"));
+        assert_eq!(model.selected_room, Some(RoomId(7)));
+        assert!(!effect.replace_messages);
     }
 
     #[test]

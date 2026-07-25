@@ -7,11 +7,11 @@ use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate};
 
 use crate::{
     app::{
-        CloseCodeSearch, ClosePreview, CompletionAccept, CompletionAcceptEngaged,
-        CompletionDismiss, CompletionNext, CompletionPrevious, FindInCode, LivePanDown, LivePanUp,
-        LiveReset, LiveZoomIn, LiveZoomOut, NextCodeMatch, OpenMedia, OpenSettings,
-        PreviousCodeMatch, SeekBack, SeekForward, SendMessage, ToggleDeafen, ToggleMute,
-        TogglePlayback, ToggleVoice,
+        CloseCodeSearch, ClosePreview, CloseServerSelector, CompletionAccept,
+        CompletionAcceptEngaged, CompletionDismiss, CompletionNext, CompletionPrevious, FindInCode,
+        LivePanDown, LivePanUp, LiveReset, LiveZoomIn, LiveZoomOut, NextCodeMatch, OpenMedia,
+        OpenSettings, PreviousCodeMatch, SeekBack, SeekForward, SendMessage, ServerActivate,
+        ServerNext, ServerPrevious, ToggleDeafen, ToggleMute, TogglePlayback, ToggleVoice,
     },
     code_viewer, composer,
     config::{
@@ -680,6 +680,7 @@ pub(crate) fn apply_compiled(bindings: Vec<KeyBinding>, cx: &mut App) {
     cx.clear_key_bindings();
     cx.bind_keys(bindings);
     install_fixed_settings_bindings(cx);
+    install_fixed_server_search_bindings(cx);
 }
 
 fn install_fixed_settings_bindings(cx: &mut App) {
@@ -706,6 +707,37 @@ fn install_fixed_settings_bindings(cx: &mut App) {
         KeyBinding::new("secondary-v", composer::Paste, Some("ChattSettingsInput")),
         KeyBinding::new("secondary-c", composer::Copy, Some("ChattSettingsInput")),
         KeyBinding::new("secondary-x", composer::Cut, Some("ChattSettingsInput")),
+    ]);
+}
+
+fn install_fixed_server_search_bindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("backspace", composer::Backspace, Some("ChattServerSearch")),
+        KeyBinding::new("delete", composer::Delete, Some("ChattServerSearch")),
+        KeyBinding::new("left", composer::Left, Some("ChattServerSearch")),
+        KeyBinding::new("right", composer::Right, Some("ChattServerSearch")),
+        KeyBinding::new(
+            "shift-left",
+            composer::SelectLeft,
+            Some("ChattServerSearch"),
+        ),
+        KeyBinding::new(
+            "shift-right",
+            composer::SelectRight,
+            Some("ChattServerSearch"),
+        ),
+        KeyBinding::new(
+            "secondary-a",
+            composer::SelectAll,
+            Some("ChattServerSearch"),
+        ),
+        KeyBinding::new("secondary-v", composer::Paste, Some("ChattServerSearch")),
+        KeyBinding::new("secondary-c", composer::Copy, Some("ChattServerSearch")),
+        KeyBinding::new("secondary-x", composer::Cut, Some("ChattServerSearch")),
+        KeyBinding::new("down", ServerNext, Some("ChattServerSearch")),
+        KeyBinding::new("up", ServerPrevious, Some("ChattServerSearch")),
+        KeyBinding::new("enter", ServerActivate, Some("ChattServerSearch")),
+        KeyBinding::new("escape", CloseServerSelector, Some("ChattServerSearch")),
     ]);
 }
 
