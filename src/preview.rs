@@ -12,9 +12,9 @@ use crate::{
 // previews can retain disproportionately large source and highlighting buffers;
 // consider byte-accounted eviction if preview limits grow.
 pub const HISTORY_LIMIT: usize = 16;
-pub const DEFAULT_PANEL_WIDTH: f32 = 560.0;
 pub const MIN_PANEL_WIDTH: f32 = 320.0;
 pub const MIN_CHAT_WIDTH: f32 = 360.0;
+pub const DEFAULT_CHAT_WIDTH: f32 = 800.0;
 pub const DIVIDER_WIDTH: f32 = 9.0;
 
 const MANUAL_ZOOM_MIN: f32 = 0.1;
@@ -398,10 +398,22 @@ impl ImageViewState {
 }
 
 pub fn clamp_panel_width(width: Pixels, body_width: Pixels) -> Pixels {
+    let (min_width, max_width) = panel_width_bounds(body_width);
+    width.clamp(min_width, max_width)
+}
+
+pub fn default_panel_width(body_width: Pixels) -> Pixels {
+    clamp_panel_width(
+        body_width - px(DEFAULT_CHAT_WIDTH) - px(DIVIDER_WIDTH),
+        body_width,
+    )
+}
+
+fn panel_width_bounds(body_width: Pixels) -> (Pixels, Pixels) {
     let body_width = body_width.max(px(0.0));
     let available = body_width - px(MIN_CHAT_WIDTH) - px(DIVIDER_WIDTH);
     let min_width = px(MIN_PANEL_WIDTH).min(available.max(px(240.0)));
-    width.clamp(min_width, available.max(min_width))
+    (min_width, available.max(min_width))
 }
 
 #[cfg(test)]
@@ -451,6 +463,13 @@ mod tests {
             origin: point(px(0.0), px(0.0)),
             size: size(px(width), px(height)),
         }
+    }
+
+    #[test]
+    fn default_panel_preserves_preferred_chat_width_without_weakening_clamp() {
+        assert_eq!(default_panel_width(px(1_400.0)), px(591.0));
+        assert_eq!(clamp_panel_width(px(1_200.0), px(1_400.0)), px(1_031.0));
+        assert_eq!(clamp_panel_width(px(500.0), px(1_400.0)), px(500.0));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use local_rpc::model::{AttachmentDescriptor, MediaKind};
 
 const GROUP_WINDOW_MS: u64 = 7 * 60 * 1000;
@@ -55,6 +56,8 @@ pub struct MessageListItem {
     pub source: MessageListSource,
     pub continuation: bool,
     pub collapsed_count: Option<usize>,
+    pub day_separator: bool,
+    pub trailing_gap: bool,
 }
 
 impl MessageListItem {
@@ -66,6 +69,8 @@ impl MessageListItem {
         self.source == other.source
             && self.continuation == other.continuation
             && self.collapsed_count == other.collapsed_count
+            && self.day_separator == other.day_separator
+            && self.trailing_gap == other.trailing_gap
     }
 
     pub fn message_index(self) -> Option<usize> {
@@ -202,6 +207,8 @@ pub fn build_message_list(
                     },
                     continuation: false,
                     collapsed_count: Some(section_end - section_start),
+                    day_separator: false,
+                    trailing_gap: false,
                 });
             } else {
                 visible.push(MessageListItem {
@@ -211,11 +218,26 @@ pub fn build_message_list(
                     },
                     continuation: index > group_start,
                     collapsed_count: None,
+                    day_separator: false,
+                    trailing_gap: false,
                 });
             }
         }
     }
 
+    let mut previous_date = None;
+    for item in &mut visible {
+        let Some(message_index) = item.message_index() else {
+            continue;
+        };
+        let date = local_date(messages[message_index].timestamp_ms);
+        item.day_separator = date.is_some() && date != previous_date;
+        if date.is_some() {
+            previous_date = date;
+        }
+    }
+
+    mark_trailing_gaps(&mut visible);
     visible
 }
 
@@ -242,6 +264,8 @@ pub fn build_timeline_list(
                     },
                     continuation: false,
                     collapsed_count: None,
+                    day_separator: false,
+                    trailing_gap: false,
                 });
                 inserted[command_index] = true;
             }
@@ -257,11 +281,24 @@ pub fn build_timeline_list(
                 },
                 continuation: false,
                 collapsed_count: None,
+                day_separator: false,
+                trailing_gap: false,
             });
         }
     }
 
+    mark_trailing_gaps(&mut visible);
     visible
+}
+
+fn mark_trailing_gaps(items: &mut [MessageListItem]) {
+    for index in 0..items.len() {
+        let continues_message = matches!(items[index].source, MessageListSource::Message { .. })
+            && items.get(index + 1).is_some_and(|next| {
+                matches!(next.source, MessageListSource::Message { .. }) && next.continuation
+            });
+        items[index].trailing_gap = !continues_message;
+    }
 }
 
 /// Adds or removes a collapse marker rooted at `message_id`. A newly added
@@ -343,9 +380,32 @@ pub fn format_age(timestamp_ms: u64, current_ms: u64) -> String {
     }
 }
 
+pub fn format_day_label(timestamp_ms: u64, current_ms: u64) -> Option<String> {
+    let date = local_date(timestamp_ms)?;
+    let today = local_date(current_ms)?;
+    Some(format_day_label_for_dates(date, today))
+}
+
+fn local_date(timestamp_ms: u64) -> Option<NaiveDate> {
+    let timestamp_ms = i64::try_from(timestamp_ms).ok()?;
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.with_timezone(&Local).date_naive())
+}
+
+fn format_day_label_for_dates(date: NaiveDate, today: NaiveDate) -> String {
+    if date == today {
+        "Today".to_string()
+    } else if today.pred_opt() == Some(date) {
+        "Yesterday".to_string()
+    } else {
+        date.format("%B %-d, %Y").to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn attachment(file_name: &str, media_kind: MediaKind, content_type: &str) -> Attachment {
         Attachment {
@@ -379,11 +439,38 @@ mod tests {
         }
     }
 
+    fn local_timestamp_ms(year: i32, month: u32, day: u32, hour: u32) -> u64 {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, 0, 0)
+            .single()
+            .expect("test timestamp should be unambiguous")
+            .timestamp_millis() as u64
+    }
+
     #[test]
     fn groups_adjacent_messages_from_same_sender() {
         let messages = vec![message("Mara", 1_000), message("Mara", 60_000)];
         assert!(!is_continuation(&messages, 0));
         assert!(is_continuation(&messages, 1));
+    }
+
+    #[test]
+    fn adds_trailing_space_only_at_visible_group_boundaries() {
+        let messages = vec![
+            message("Mara", 1_000),
+            message("Mara", 2_000),
+            message("Ivo", 3_000),
+        ];
+
+        let visible = build_message_list(&messages, &CollapsedSections::new());
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.trailing_gap)
+                .collect::<Vec<_>>(),
+            vec![false, true, true]
+        );
     }
 
     #[test]
@@ -537,6 +624,93 @@ mod tests {
                 command_index: 0,
                 local_id: 7,
             }
+        );
+    }
+
+    #[test]
+    fn marks_first_visible_message_and_local_day_changes() {
+        let first_day = local_timestamp_ms(2026, 7, 24, 12);
+        let same_day = local_timestamp_ms(2026, 7, 24, 18);
+        let next_day = local_timestamp_ms(2026, 7, 25, 12);
+        let messages = vec![
+            message("Mara", first_day),
+            message("Ivo", same_day),
+            message("Mara", next_day),
+        ];
+
+        let visible = build_message_list(&messages, &CollapsedSections::new());
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.day_separator)
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+    }
+
+    #[test]
+    fn collapsed_roots_keep_visible_day_boundaries() {
+        let first_day = local_timestamp_ms(2026, 7, 24, 23);
+        let next_day = local_timestamp_ms(2026, 7, 25, 0);
+        let next_day_continuation = next_day + 60_000;
+        let messages = vec![
+            message("Mara", first_day),
+            message("Mara", next_day),
+            message("Mara", next_day_continuation),
+        ];
+        let mut collapsed = CollapsedSections::new();
+        toggle_collapsed_section(&messages, &mut collapsed, next_day);
+
+        let visible = build_message_list(&messages, &collapsed);
+
+        assert_eq!(visible.len(), 2);
+        assert!(visible[0].day_separator);
+        assert!(visible[1].day_separator);
+        assert_eq!(visible[1].collapsed_count, Some(2));
+    }
+
+    #[test]
+    fn command_rows_do_not_interrupt_message_day_boundaries() {
+        let first_day = local_timestamp_ms(2026, 7, 24, 12);
+        let next_day = local_timestamp_ms(2026, 7, 25, 12);
+        let messages = vec![
+            message("Mara", first_day),
+            message("Ivo", next_day),
+        ];
+        let rows = vec![LocalCommandRow {
+            local_id: 1,
+            anchor_message_id: Some(first_day),
+            body: "done".into(),
+            error: false,
+            timestamp_ms: first_day,
+        }];
+
+        let visible = build_timeline_list(&messages, &rows, &CollapsedSections::new());
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.day_separator)
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+    }
+
+    #[test]
+    fn formats_relative_and_long_day_labels() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        let older = NaiveDate::from_ymd_opt(2025, 12, 3).unwrap();
+
+        assert_eq!(format_day_label_for_dates(today, today), "Today");
+        assert_eq!(
+            format_day_label_for_dates(yesterday, today),
+            "Yesterday"
+        );
+        assert_eq!(
+            format_day_label_for_dates(older, today),
+            "December 3, 2025"
         );
     }
 

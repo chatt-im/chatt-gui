@@ -39,8 +39,8 @@ use crate::{
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode},
     preview::{
-        CodePreviewState, DEFAULT_PANEL_WIDTH, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH,
-        ImageViewState, PreviewContent, PreviewHistory, PreviewItem, clamp_panel_width,
+        CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, PreviewContent,
+        PreviewHistory, PreviewItem, clamp_panel_width, default_panel_width,
     },
     scroll_capture::capture_scroll,
     settings::{ConfigurationState, SettingsView, SettingsViewEvent},
@@ -83,6 +83,7 @@ use local_rpc::{
 const SIDEBAR_WIDTH: f32 = 232.0;
 const TOP_BAR_HEIGHT: f32 = 52.0;
 const MIN_COMPOSER_HEIGHT: f32 = 64.0;
+const TIMELINE_GROUP_GAP: f32 = 5.0;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PREVIEW_IMAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const VIDEO_THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -94,6 +95,8 @@ const MIN_LIVE_PANE_HEIGHT: f32 = 160.0;
 const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
+const PREVIEW_TAB_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
+const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
 
 fn code_preview_size_error(byte_len: u64) -> Option<&'static str> {
     (byte_len > MAX_CODE_PREVIEW_BYTES).then_some("file too large to preview")
@@ -603,7 +606,7 @@ pub struct ChattView {
     preview_tabs_scroll: ScrollHandle,
     preview_return_focus: Option<WeakFocusHandle>,
     preview_image: ImageViewState,
-    preview_image_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
+    preview_image_viewport: Cell<Option<Bounds<Pixels>>>,
     preview_last_mouse_position: Option<Point<Pixels>>,
     preview_panel_width: Pixels,
     preview_pane_resize: Option<PreviewPaneResize>,
@@ -814,9 +817,11 @@ impl ChattView {
             preview_tabs_scroll: ScrollHandle::new(),
             preview_return_focus: None,
             preview_image: ImageViewState::default(),
-            preview_image_viewport: Rc::new(Cell::new(None)),
+            preview_image_viewport: Cell::new(None),
             preview_last_mouse_position: None,
-            preview_panel_width: px(DEFAULT_PANEL_WIDTH),
+            preview_panel_width: default_panel_width(
+                window.viewport_size().width - px(SIDEBAR_WIDTH),
+            ),
             preview_pane_resize: None,
             list_state,
             collapsed_sections: timeline::CollapsedSections::new(),
@@ -4032,6 +4037,8 @@ impl ChattView {
     fn begin_preview_session(&mut self, window: &Window, cx: &App) {
         if self.preview_history.active().is_none() {
             self.preview_return_focus = window.focused(cx).map(|focus| focus.downgrade());
+            let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
+            self.preview_panel_width = default_panel_width(body_width);
         }
     }
 
@@ -4724,7 +4731,13 @@ impl ChattView {
         }
     }
 
-    fn render_command_row(&self, command_index: usize, local_id: u64, cx: &App) -> AnyElement {
+    fn render_command_row(
+        &self,
+        command_index: usize,
+        local_id: u64,
+        trailing_gap: bool,
+        cx: &App,
+    ) -> AnyElement {
         let Some(row) = self.command_rows.get(command_index) else {
             return div().into_any_element();
         };
@@ -4746,7 +4759,7 @@ impl ChattView {
             .get(&local_id)
             .cloned()
             .unwrap_or_else(|| Rc::new(FormattedMessage::plain(row.body.clone())));
-        div()
+        let command_row = div()
             .id(("command-output", local_id as usize))
             .relative()
             .w_full()
@@ -4820,6 +4833,12 @@ impl ChattView {
                             ),
                     ),
             )
+            .into_any_element();
+
+        div()
+            .w_full()
+            .pb(px(if trailing_gap { TIMELINE_GROUP_GAP } else { 0. }))
+            .child(command_row)
             .into_any_element()
     }
 
@@ -4837,7 +4856,7 @@ impl ChattView {
             local_id,
         } = item.source
         {
-            return self.render_command_row(command_index, local_id, cx);
+            return self.render_command_row(command_index, local_id, item.trailing_gap, cx);
         }
         let Some(message_index) = item.message_index() else {
             return div().into_any_element();
@@ -4877,7 +4896,12 @@ impl ChattView {
         let edited = message.edited;
         let unverified = message.unverified;
         let timestamp_ms = message.timestamp_ms;
-        let timestamp = timeline::format_age(timestamp_ms, timeline::now_ms());
+        let current_ms = timeline::now_ms();
+        let timestamp = timeline::format_age(timestamp_ms, current_ms);
+        let day_separator_label = item
+            .day_separator
+            .then(|| timeline::format_day_label(timestamp_ms, current_ms))
+            .flatten();
         let hover_group: SharedString = format!("message-actions-{message_id}").into();
         let local_actions = (!collapsed && message.local && !message.notice).then(|| {
             (
@@ -4909,14 +4933,15 @@ impl ChattView {
                 }))
         });
         let attachment = (!collapsed).then(|| message.attachment.clone()).flatten();
-        div()
+        let message_row = div()
             .id(("message", message_id as usize))
             .group(hover_group.clone())
             .relative()
             .w_full()
             .pl(px(64.))
             .pr(px(28.))
-            .py(px(if continuation { 3. } else { 10. }))
+            .pt(px(if continuation { 3. } else { 10. }))
+            .pb(px(3.))
             .bg(background)
             .hover(move |row| row.bg(row_hover))
             .when_some(reference_flash_id, |row, flash_id| {
@@ -5126,6 +5151,34 @@ impl ChattView {
                         })),
                     ),
             )
+            .into_any_element();
+
+        let line_color = settings.theme.color(ThemeRole::BorderSubtle);
+        div()
+            .w_full()
+            .pb(px(if item.trailing_gap {
+                TIMELINE_GROUP_GAP
+            } else {
+                0.
+            }))
+            .when_some(day_separator_label, |item, label| {
+                item.child(
+                    div()
+                        .w_full()
+                        .px_4()
+                        .pt_4()
+                        .pb_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(settings.theme.color(ThemeRole::TextDim))
+                        .child(div().h(px(1.)).flex_1().bg(line_color))
+                        .child(label)
+                        .child(div().h(px(1.)).flex_1().bg(line_color)),
+                )
+            })
+            .child(message_row)
             .into_any_element()
     }
 
@@ -5652,21 +5705,12 @@ impl ChattView {
             .expect("media cache lock poisoned")
             .path_for(&active.descriptor);
         let cache_missing = cache_path.is_none();
-        let viewport = self.preview_image_viewport.get().unwrap_or(Bounds {
-            origin: point(
-                window.viewport_size().width - width,
-                px(TOP_BAR_HEIGHT + 80.0),
-            ),
-            size: gpui::size(
-                width,
-                (window.viewport_size().height - px(TOP_BAR_HEIGHT + 80.0)).max(px(1.0)),
-            ),
-        });
+        let viewport = preview_image_viewport_bounds(window.viewport_size(), width);
+        self.preview_image_viewport.set(Some(viewport));
         let geometry = self.preview_image.geometry(viewport);
         let zoom_percent = self.preview_image.zoom_percent(viewport);
         let can_pan = self.preview_image.can_pan(viewport);
         let panning = self.preview_last_mouse_position.is_some() && can_pan;
-        let measured_viewport = self.preview_image_viewport.clone();
 
         let viewport_element = div()
             .id("preview-image-viewport")
@@ -5705,19 +5749,6 @@ impl ChattView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_preview_image_pan(cx)),
-            )
-            .child(
-                canvas(
-                    move |bounds, window, _| {
-                        if measured_viewport.get() != Some(bounds) {
-                            measured_viewport.set(Some(bounds));
-                            window.request_animation_frame();
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
             )
             .when_some(cache_path, |viewport_element, path| {
                 viewport_element.child(
@@ -5780,7 +5811,7 @@ impl ChattView {
             .track_focus(&self.code_viewer_focus)
             .child(
                 div()
-                    .h(px(39.0))
+                    .h(px(PREVIEW_TAB_BAR_HEIGHT))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -5798,6 +5829,38 @@ impl ChattView {
                             .gap_1()
                             .px_2()
                             .bg(settings.theme.color(ThemeRole::Panel))
+                            .child(
+                                preview_control_button("preview-fit", "Fit", &settings.theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fit_preview_image(cx)
+                                    })),
+                            )
+                            .child(
+                                preview_control_button("preview-actual", "1:1", &settings.theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.actual_size_preview_image(cx)
+                                    })),
+                            )
+                            .child(
+                                preview_control_button("preview-zoom-out", "−", &settings.theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.zoom_preview_image(-0.25, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .w(px(44.0))
+                                    .text_center()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{zoom_percent}%")),
+                            )
+                            .child(
+                                preview_control_button("preview-zoom-in", "+", &settings.theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.zoom_preview_image(0.25, cx)
+                                    })),
+                            )
                             .child(
                                 preview_action_button(
                                     "preview-save",
@@ -5820,45 +5883,6 @@ impl ChattView {
                                     }),
                                 ),
                             ),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(41.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .border_b_1()
-                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
-                    .bg(settings.theme.color(ThemeRole::Window))
-                    .child(
-                        preview_control_button("preview-fit", "Fit", &settings.theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.fit_preview_image(cx))),
-                    )
-                    .child(
-                        preview_control_button("preview-actual", "100%", &settings.theme).on_click(
-                            cx.listener(|this, _, _, cx| this.actual_size_preview_image(cx)),
-                        ),
-                    )
-                    .child(
-                        preview_control_button("preview-zoom-out", "−", &settings.theme).on_click(
-                            cx.listener(|this, _, _, cx| this.zoom_preview_image(-0.25, cx)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .w(px(56.0))
-                            .text_center()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{zoom_percent}%")),
-                    )
-                    .child(
-                        preview_control_button("preview-zoom-in", "+", &settings.theme).on_click(
-                            cx.listener(|this, _, _, cx| this.zoom_preview_image(0.25, cx)),
-                        ),
                     ),
             )
             .child(viewport_element)
@@ -5964,7 +5988,7 @@ impl ChattView {
             .track_focus(&self.code_viewer_focus)
             .child(
                 div()
-                    .h(px(39.0))
+                    .h(px(PREVIEW_TAB_BAR_HEIGHT))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -6036,7 +6060,7 @@ impl ChattView {
             .when(self.code_search_open && ready, |panel| {
                 panel.child(
                     div()
-                        .h(px(39.0))
+                        .h(px(PREVIEW_SEARCH_BAR_HEIGHT))
                         .flex_none()
                         .flex()
                         .items_center()
@@ -8719,6 +8743,20 @@ fn image_box_size(descriptor: &AttachmentDescriptor) -> (f32, f32) {
     )
 }
 
+fn preview_image_viewport_bounds(
+    window_size: gpui::Size<Pixels>,
+    panel_width: Pixels,
+) -> Bounds<Pixels> {
+    let chrome_height = px(PREVIEW_TAB_BAR_HEIGHT);
+    Bounds {
+        origin: point(window_size.width - panel_width, chrome_height),
+        size: gpui::size(
+            panel_width,
+            (window_size.height - chrome_height).max(px(1.0)),
+        ),
+    }
+}
+
 fn image_frame(descriptor: &AttachmentDescriptor, palette: &ThemePalette) -> Div {
     let (width, height) = image_box_size(descriptor);
     div()
@@ -8958,6 +8996,16 @@ mod tests {
             notice: false,
             attachment: None,
         }
+    }
+
+    #[test]
+    fn preview_image_viewport_uses_fixed_panel_chrome_without_measurement() {
+        let bounds =
+            preview_image_viewport_bounds(gpui::size(px(1_920.0), px(1_080.0)), px(900.0));
+
+        assert_eq!(PREVIEW_TAB_BAR_HEIGHT, TOP_BAR_HEIGHT);
+        assert_eq!(bounds.origin, point(px(1_020.0), px(52.0)));
+        assert_eq!(bounds.size, gpui::size(px(900.0), px(1_028.0)));
     }
 
     #[test]
