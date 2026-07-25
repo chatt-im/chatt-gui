@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_active_room_clears_room_scoped_state() {
+    fn clearing_active_room_preserves_global_live_shares() {
         let instance = DaemonInstanceId([3; 16]);
         let mut model = ChatModel::default();
         apply(&mut model, welcome(instance));
@@ -737,6 +737,16 @@ mod tests {
             muted: false,
             deafened: false,
         });
+        let live_share = local_rpc::model::LiveShare {
+            room_id: RoomId(2),
+            stream_id: local_rpc::ids::StreamId(9),
+            sender_name: "bob".into(),
+            codec: "avc1.42C00D".into(),
+            coded_width: 320,
+            coded_height: 240,
+            extradata: vec![1],
+        };
+        model.live_shares.push(live_share.clone());
         let effect = apply(
             &mut model,
             DaemonFrame::Event(StateEvent {
@@ -750,6 +760,7 @@ mod tests {
         assert_eq!(model.selected_room, None);
         assert!(model.at_start);
         assert!(model.participants.is_empty());
+        assert_eq!(model.live_shares, vec![live_share]);
     }
 
     #[test]

@@ -2357,7 +2357,7 @@ impl Render for SettingsView {
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(palette.color(ThemeRole::TextDim))
-                .child("RENDERER"),
+                .child("Renderer"),
         );
         for (index, candidate) in SETTINGS_SECTIONS.iter().enumerate() {
             let selected = index == self.active_section;
@@ -2379,7 +2379,7 @@ impl Render for SettingsView {
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(palette.color(ThemeRole::TextDim))
-                .child("CHATT DAEMON"),
+                .child("Chatt daemon"),
         );
         for (remote_index, candidate) in self.remote_sections.iter().enumerate() {
             let index = SETTINGS_SECTIONS.len() + remote_index;
@@ -2427,7 +2427,6 @@ impl Render for SettingsView {
             .items_center()
             .px_3()
             .py_2()
-            .rounded_md()
             .border_1()
             .border_color(if focused == SettingsFocus::Search {
                 palette.color(ThemeRole::BorderFocus)
@@ -2507,7 +2506,6 @@ impl Render for SettingsView {
                         .h(px(10.))
                         .relative()
                         .overflow_hidden()
-                        .rounded_md()
                         .bg(palette.color(ThemeRole::ControlSurface))
                         .child(
                             div()
@@ -2619,7 +2617,6 @@ impl Render for SettingsView {
                 div()
                     .size_full()
                     .overflow_hidden()
-                    .rounded_lg()
                     .border_1()
                     .border_color(palette.color(ThemeRole::BorderStrong))
                     .bg(palette.color(ThemeRole::Raised))
@@ -2864,7 +2861,6 @@ fn render_row(
             .items_center()
             .px_3()
             .py_2()
-            .rounded_md()
             .border_1()
             .border_color(if editor_error.is_some() {
                 palette.color(ThemeRole::StateDanger)
@@ -2880,7 +2876,6 @@ fn render_row(
             .max_w(px(330.))
             .px_3()
             .py_2()
-            .rounded_md()
             .cursor_pointer()
             .bg(palette.color(ThemeRole::ControlSurface))
             .text_sm()
@@ -2934,7 +2929,6 @@ fn render_row(
                     div()
                         .size(px(30.))
                         .flex_none()
-                        .rounded_md()
                         .border_1()
                         .border_color(palette.color(ThemeRole::BorderFocus))
                         .bg(rgba(color)),
@@ -3021,7 +3015,6 @@ fn render_remote_row(
                 .min_h(px(38.))
                 .px_3()
                 .py_2()
-                .rounded_md()
                 .border_1()
                 .border_color(if focused {
                     palette.color(ThemeRole::BorderFocus)
@@ -3037,7 +3030,6 @@ fn render_remote_row(
                 .max_w(px(330.))
                 .px_3()
                 .py_2()
-                .rounded_md()
                 .cursor_text()
                 .bg(palette.color(ThemeRole::Input))
                 .text_sm()
@@ -3060,7 +3052,6 @@ fn render_remote_row(
             .max_w(px(330.))
             .px_3()
             .py_2()
-            .rounded_md()
             .cursor_pointer()
             .bg(palette.color(ThemeRole::ControlSurface))
             .text_sm()
@@ -3092,7 +3083,6 @@ fn render_remote_row(
             .max_w(px(330.))
             .px_3()
             .py_2()
-            .rounded_md()
             .cursor_pointer()
             .bg(palette.color(ThemeRole::ControlSurface))
             .text_sm()
@@ -3356,7 +3346,6 @@ fn render_choice_picker(
                 .w(px(600.))
                 .max_h(px(540.))
                 .overflow_hidden()
-                .rounded_lg()
                 .border_1()
                 .border_color(palette.color(ThemeRole::BorderStrong))
                 .bg(palette.color(ThemeRole::Raised))
@@ -3410,7 +3399,6 @@ fn render_choice_picker(
                                 .min_h(px(40.))
                                 .px_3()
                                 .py_2()
-                                .rounded_md()
                                 .border_1()
                                 .border_color(palette.color(ThemeRole::BorderFocus))
                                 .bg(palette.color(ThemeRole::Input))
@@ -3570,7 +3558,6 @@ fn setting_button(
         .id(id)
         .px_3()
         .py_2()
-        .rounded_md()
         .cursor_pointer()
         .bg(if selected {
             palette.color(ThemeRole::ControlActive)

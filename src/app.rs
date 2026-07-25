@@ -4648,9 +4648,9 @@ impl ChattView {
                                     .text_xs()
                                     .text_color(settings.theme.color(ThemeRole::TextMuted))
                                     .child(if row.error {
-                                        "COMMAND ERROR"
+                                        "Command error"
                                     } else {
-                                        "COMMAND"
+                                        "Command"
                                     }),
                             ),
                     )
@@ -5897,7 +5897,6 @@ impl ChattView {
                                 .flex()
                                 .items_center()
                                 .px_2()
-                                .rounded_md()
                                 .border_1()
                                 .border_color(settings.theme.color(ThemeRole::BorderStrong))
                                 .bg(settings.theme.color(ThemeRole::Input))
@@ -6866,7 +6865,7 @@ impl ChattView {
                             } else {
                                 ThemeRole::TextSubtle
                             }))
-                            .child(candidate_kind_label(*kind).to_ascii_uppercase()),
+                            .child(candidate_kind_label(*kind)),
                     )
                     .child(
                         highlighted_completion_label(
@@ -7095,11 +7094,6 @@ impl ChattView {
                 let pending = pending_target.as_deref() == Some(server.label.as_str());
                 let connectable = server.availability == ServerAvailability::Ready;
                 let row_server = server.clone();
-                let background = applied.theme.color(if selected {
-                    ThemeRole::StateSelected
-                } else {
-                    ThemeRole::ControlSurface
-                });
                 let hover = applied.theme.color(ThemeRole::ControlSurfaceHover);
                 let mut row = div()
                     .id(("server-row", index))
@@ -7109,14 +7103,15 @@ impl ChattView {
                     .flex()
                     .items_center()
                     .gap_4()
-                    .rounded_md()
                     .border_1()
-                    .border_color(applied.theme.color(if current {
+                    .border_color(applied.theme.color(if selected {
+                        ThemeRole::BorderFocus
+                    } else if current {
                         ThemeRole::StateSuccess
                     } else {
                         ThemeRole::BorderSubtle
                     }))
-                    .bg(background)
+                    .bg(applied.theme.color(ThemeRole::ControlSurface))
                     .when(connectable, |row| {
                         row.cursor_pointer()
                             .hover(move |row| row.bg(hover))
@@ -7243,7 +7238,7 @@ impl ChattView {
                     .border_b_1()
                     .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                     .bg(applied.theme.color(ThemeRole::Toolbar))
-                    .child(div().font_weight(FontWeight::BOLD).child("CHATT · SERVERS"))
+                    .child(div().font_weight(FontWeight::BOLD).child("Servers"))
                     .child(div().flex_1())
                     .child(
                         toolbar_button(
@@ -7319,7 +7314,6 @@ impl ChattView {
                                     .items_center()
                                     .gap_2()
                                     .px_3()
-                                    .rounded_md()
                                     .border_1()
                                     .border_color(applied.theme.color(ThemeRole::BorderStrong))
                                     .bg(applied.theme.color(ThemeRole::Input))
@@ -7341,7 +7335,6 @@ impl ChattView {
                                     div()
                                         .px_3()
                                         .py_2()
-                                        .rounded_md()
                                         .bg(applied.theme.color(ThemeRole::ControlSurface))
                                         .text_sm()
                                         .text_color(applied.theme.color(ThemeRole::StateDanger))
@@ -7382,7 +7375,6 @@ impl ChattView {
                             .flex()
                             .flex_col()
                             .gap_3()
-                            .rounded_lg()
                             .border_1()
                             .border_color(applied.theme.color(ThemeRole::StateDanger))
                             .bg(applied.theme.color(ThemeRole::Window))
@@ -7475,16 +7467,7 @@ impl ChattView {
                     .border_b_1()
                     .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                     .font_weight(FontWeight::BOLD)
-                    .child("CHATT"),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .pt_4()
-                    .pb_2()
-                    .text_xs()
-                    .text_color(applied.theme.color(ThemeRole::TextSubtle))
-                    .child("ROOMS"),
+                    .child("Rooms"),
             );
         for room in self.model.rooms.clone() {
             let active = self.model.selected_room == Some(room.id);
@@ -7520,7 +7503,7 @@ impl ChattView {
                     .pb_2()
                     .text_xs()
                     .text_color(applied.theme.color(ThemeRole::TextSubtle))
-                    .child("TRANSFERS"),
+                    .child("Transfers"),
             );
             for transfer in self.model.transfers.clone() {
                 let percent = if transfer.byte_len == 0 {
@@ -7735,7 +7718,6 @@ impl ChattView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_md()
                     .border_1()
                     .border_color(settings.theme.color(ThemeRole::BorderStrong))
                     .bg(settings.theme.color(ThemeRole::Window))
@@ -8203,8 +8185,17 @@ impl Render for ChattView {
                     .h_full()
                     .flex()
                     .flex_col()
+                    .when_some(live_panel, |column, live_panel| column.child(live_panel))
                     .child(
                         div()
+                            .id("room-view")
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
                             .h(px(TOP_BAR_HEIGHT))
                             .flex_none()
                             .flex()
@@ -8355,7 +8346,7 @@ impl Render for ChattView {
                                     },
                                 )),
                             ),
-                    )
+                            )
                     .when(show_config_diagnostic, |panel| {
                         let diagnostic = &applied.diagnostics[0];
                         panel.child(
@@ -8381,7 +8372,6 @@ impl Render for ChattView {
                                 )),
                         )
                     })
-                    .when_some(live_panel, |panel, live_panel| panel.child(live_panel))
                     .when(
                         !self.model.at_start && self.model.older_cursor.is_some(),
                         |panel| {
@@ -8408,17 +8398,30 @@ impl Render for ChattView {
                             )
                         },
                     )
-                    .child(timeline)
-                    .when(count == 0 && self.command_rows.is_empty(), |panel| {
-                        panel.child(
-                            div()
-                                .absolute()
-                                .left(px(SIDEBAR_WIDTH + 30.))
-                                .top(px(TOP_BAR_HEIGHT + 40.))
-                                .text_color(applied.theme.color(ThemeRole::TextDim))
-                                .child(empty_state(&self.model)),
-                        )
-                    })
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(timeline)
+                            .when(count == 0 && self.command_rows.is_empty(), |area| {
+                                area.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(40.))
+                                        .left_0()
+                                        .right_0()
+                                        .px_4()
+                                        .text_center()
+                                        .text_color(
+                                            applied.theme.color(ThemeRole::TextDim),
+                                        )
+                                        .child(empty_state(&self.model)),
+                                )
+                            }),
+                    )
                     .child(
                         div()
                             .relative()
@@ -8490,6 +8493,7 @@ impl Render for ChattView {
                                             .child(self.composer.clone()),
                                     ),
                             ),
+                    ),
                     ),
             )
             .when_some(preview_panel, |root, preview_panel| {
