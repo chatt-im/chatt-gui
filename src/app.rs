@@ -822,14 +822,6 @@ impl ChattView {
     }
 
     fn completion_view(&self, cx: &Context<Self>) -> Option<CompletionView> {
-        if !self.model.is_ready()
-            || self.editing.is_some()
-            || self.pending_command.is_some()
-            || self.file_inspection_pending
-            || self.pending_submission.is_some()
-        {
-            return None;
-        }
         let snapshot = self.composer.read(cx).snapshot();
         let context = completion::completion_context(
             &snapshot.text,
@@ -838,6 +830,15 @@ impl ChattView {
             snapshot.composing,
             &self.model.commands,
         )?;
+        if !matches!(context, CompletionContext::Emoji { .. })
+            && (!self.model.is_ready()
+                || self.editing.is_some()
+                || self.pending_command.is_some()
+                || self.file_inspection_pending
+                || self.pending_submission.is_some())
+        {
+            return None;
+        }
         let context_key = completion::context_key(&context);
         let (options, hint) = match &context {
             CompletionContext::Command { query, .. } => {
@@ -882,6 +883,7 @@ impl ChattView {
                 };
                 (options, hint)
             }
+            CompletionContext::Emoji { query, .. } => (completion::emoji_options(query), None),
         };
         Some(CompletionView {
             context,
@@ -916,6 +918,12 @@ impl ChattView {
                 &view.options,
             ),
         }
+        if let Some(view) = &view
+            && matches!(view.context, CompletionContext::Emoji { .. })
+            && let Some(session) = &mut self.completion_session
+        {
+            completion::engage_first(session, &view.options);
+        }
         if let Some(kind) = request_kind {
             self.request_command_candidates(kind);
         }
@@ -925,8 +933,13 @@ impl ChattView {
                 .is_some_and(|session| session.context_key == view.context_key)
                 && (!view.options.is_empty() || view.hint.is_some())
         });
+        let completion_engaged = completion_open
+            && self
+                .completion_session
+                .as_ref()
+                .is_some_and(|session| session.engaged);
         self.composer.update(cx, |composer, _| {
-            composer.set_completion_open(completion_open)
+            composer.set_completion_state(completion_open, completion_engaged)
         });
         cx.notify();
     }
@@ -1005,6 +1018,8 @@ impl ChattView {
             return;
         };
         if completion::move_selection(session, &view.options, delta) {
+            self.composer
+                .update(cx, |composer, _| composer.set_completion_state(true, true));
             cx.notify();
         }
     }
@@ -1083,6 +1098,8 @@ impl ChattView {
         };
         session.active = Some(key);
         session.engaged = true;
+        self.composer
+            .update(cx, |composer, _| composer.set_completion_state(true, true));
         cx.notify();
     }
 
@@ -5738,6 +5755,7 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let settings = AppliedSettings::get(cx);
+        let emoji_context = matches!(&view.context, CompletionContext::Emoji { .. });
         let active = self
             .completion_session
             .as_ref()
@@ -5834,6 +5852,45 @@ impl ChattView {
                                 .child(detail),
                         )
                     }),
+                CompletionValue::Emoji(record) => div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .flex_none()
+                            .text_xl()
+                            .child(record.unicode.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(220.))
+                            .flex_none()
+                            .truncate()
+                            .text_sm()
+                            .text_color(settings.theme.color(if selected {
+                                ThemeRole::TextInverse
+                            } else {
+                                ThemeRole::TextPrimary
+                            }))
+                            .child(record.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(settings.theme.color(if selected {
+                                ThemeRole::TextInverse
+                            } else {
+                                ThemeRole::TextDim
+                            }))
+                            .child(format!(":{}:", record.shortcode)),
+                    ),
             };
             rows = rows.child(
                 div()
@@ -5913,7 +5970,11 @@ impl ChattView {
                     .text_xs()
                     .text_color(settings.theme.color(ThemeRole::TextDim))
                     .child("↑↓ navigate  ·  Tab complete")
-                    .child("Enter run  ·  Esc close"),
+                    .child(if emoji_context {
+                        "Enter insert  ·  Esc close"
+                    } else {
+                        "Enter run  ·  Esc close"
+                    }),
             )
             .with_animation(
                 ("command-completion-in", 0usize),

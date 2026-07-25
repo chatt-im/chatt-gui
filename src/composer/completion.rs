@@ -2,6 +2,8 @@ use std::ops::Range;
 
 use local_rpc::model::{CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo};
 
+use super::emoji::{self, EmojiRecord};
+
 pub const MAX_VISIBLE_OPTIONS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +15,10 @@ pub enum CompletionContext {
     Argument {
         command: CommandInfo,
         kind: ArgumentKind,
+        query: String,
+        span: Range<usize>,
+    },
+    Emoji {
         query: String,
         span: Range<usize>,
     },
@@ -32,6 +38,7 @@ pub enum OptionKey {
         value: String,
         detail: Option<String>,
     },
+    Emoji(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +48,7 @@ pub enum CompletionValue {
         kind: CommandCandidateKind,
         item: CommandCandidate,
     },
+    Emoji(&'static EmojiRecord),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,12 +83,19 @@ pub fn completion_context(
         || selection.start != selection.end
         || selection.end > text.len()
         || !text.is_char_boundary(selection.end)
-        || !text.starts_with('/')
     {
         return None;
     }
 
     let cursor = selection.end;
+    if !text.starts_with('/') {
+        let trigger = emoji::find_colon_trigger(text, selection)?;
+        return Some(CompletionContext::Emoji {
+            query: trigger.shortcode.to_string(),
+            span: trigger.range,
+        });
+    }
+
     let token_end = text.find(char::is_whitespace).unwrap_or(text.len());
     if cursor <= token_end {
         return Some(CompletionContext::Command {
@@ -122,6 +137,7 @@ pub fn context_key(context: &CompletionContext) -> String {
             span,
             ..
         } => format!("argument:{}:{kind:?}:{}", command.name, span.start),
+        CompletionContext::Emoji { span, .. } => format!("emoji:{}", span.start),
     }
 }
 
@@ -194,10 +210,22 @@ pub fn candidate_options(
         .collect()
 }
 
+pub fn emoji_options(query: &str) -> Vec<CompletionOption> {
+    emoji::suggestions(query, MAX_VISIBLE_OPTIONS)
+        .into_iter()
+        .map(|record| CompletionOption {
+            key: OptionKey::Emoji(record.id),
+            value: CompletionValue::Emoji(record),
+            match_ranges: Vec::new(),
+        })
+        .collect()
+}
+
 pub fn option_label(option: &CompletionOption) -> &str {
     match &option.value {
         CompletionValue::Command(command) => &command.name,
         CompletionValue::Candidate { item, .. } => &item.value,
+        CompletionValue::Emoji(record) => &record.shortcode,
     }
 }
 
@@ -208,11 +236,12 @@ pub fn replacement(context: &CompletionContext, option: &CompletionOption) -> Re
         }
         CompletionValue::Command(command) => command.name.clone(),
         CompletionValue::Candidate { item, .. } => item.value.clone(),
+        CompletionValue::Emoji(record) => record.unicode.clone(),
     };
     let span = match context {
-        CompletionContext::Command { span, .. } | CompletionContext::Argument { span, .. } => {
-            span.clone()
-        }
+        CompletionContext::Command { span, .. }
+        | CompletionContext::Argument { span, .. }
+        | CompletionContext::Emoji { span, .. } => span.clone(),
     };
     Replacement { span, text }
 }
@@ -270,6 +299,21 @@ pub fn move_selection(
         None => 0,
     };
     session.active = Some(options[next].key.clone());
+    session.engaged = true;
+    true
+}
+
+pub fn engage_first(session: &mut AssistSession, options: &[CompletionOption]) -> bool {
+    let Some(first) = options.first() else {
+        return false;
+    };
+    if session
+        .active
+        .as_ref()
+        .is_none_or(|active| !options.iter().any(|option| &option.key == active))
+    {
+        session.active = Some(first.key.clone());
+    }
     session.engaged = true;
     true
 }
@@ -406,6 +450,22 @@ mod tests {
     }
 
     #[test]
+    fn derives_emoji_contexts_outside_slash_command_drafts() {
+        let commands = vec![command("/mute", CommandArgKind::None)];
+        assert_eq!(
+            completion_context("say :sm", 7..7, true, false, &commands),
+            Some(CompletionContext::Emoji {
+                query: "sm".into(),
+                span: 4..7,
+            })
+        );
+        assert!(
+            completion_context("/mute :sm", 9..9, true, false, &commands).is_none(),
+            "slash command contexts retain priority"
+        );
+    }
+
+    #[test]
     fn ignores_escaped_selected_composing_and_normal_mode_inputs() {
         let commands = vec![command("/mute", CommandArgKind::None)];
         for context in [
@@ -475,6 +535,37 @@ mod tests {
                 span: 0..3,
                 text: "/room ".into(),
             }
+        );
+    }
+
+    #[test]
+    fn emoji_acceptance_replaces_the_trigger_without_a_space() {
+        let context = completion_context("say :s", 6..6, true, false, &[]).unwrap();
+        let option = emoji_options("smile").remove(0);
+        assert_eq!(
+            replacement(&context, &option),
+            Replacement {
+                span: 4..6,
+                text: "😄".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn emoji_sessions_can_engage_the_first_result_immediately() {
+        let context = completion_context(":sm", 3..3, true, false, &[]).unwrap();
+        let options = emoji_options("sm");
+        let mut session = open_session(&context);
+
+        assert!(engage_first(&mut session, &options));
+        assert!(session.engaged);
+        assert_eq!(
+            session.active.as_ref(),
+            options.first().map(|option| &option.key)
+        );
+        assert_eq!(
+            option_label(enter_option(&session, &options).unwrap()),
+            "smile"
         );
     }
 }

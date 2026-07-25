@@ -12,6 +12,7 @@ use gpui::{
 mod buffer;
 pub(crate) mod completion;
 mod cursor;
+mod emoji;
 mod highlight;
 mod history;
 mod mode;
@@ -86,6 +87,8 @@ pub struct TextEditor {
     last_yank_revision: u64,
     marked: Option<Range<usize>>,
     completion_open: bool,
+    completion_engaged: bool,
+    expand_emoji_shortcodes: bool,
     last_layout: Vec<ComposerLine>,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Option<Pixels>,
@@ -119,6 +122,8 @@ impl TextEditor {
             last_yank_revision: 0,
             marked: None,
             completion_open: false,
+            completion_engaged: false,
+            expand_emoji_shortcodes: true,
             last_layout: Vec::new(),
             last_bounds: None,
             last_line_height: None,
@@ -145,6 +150,8 @@ impl TextEditor {
             last_yank_revision: 0,
             marked: None,
             completion_open: false,
+            completion_engaged: false,
+            expand_emoji_shortcodes: false,
             last_layout: Vec::new(),
             last_bounds: None,
             last_line_height: None,
@@ -199,6 +206,13 @@ impl TextEditor {
     }
     pub fn set_completion_open(&mut self, open: bool) {
         self.completion_open = open;
+        if !open {
+            self.completion_engaged = false;
+        }
+    }
+    pub fn set_completion_state(&mut self, open: bool, engaged: bool) {
+        self.completion_open = open;
+        self.completion_engaged = open && engaged;
     }
     pub fn replace_completion(
         &mut self,
@@ -212,7 +226,7 @@ impl TextEditor {
         self.reversed = false;
         self.editor.set_cursor_offset(range.end);
         self.marked = None;
-        self.replace_text(None, text, false, window, cx);
+        self.replace_text(None, text, false, false, window, cx);
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.editor.set_text("", Mode::Insert, true);
@@ -369,7 +383,7 @@ impl TextEditor {
         if self.vim_enabled && self.editor.mode() != Mode::Insert {
             self.paste_in_vim_mode(&text, metadata.as_deref(), VimKey::Char('p'), cx);
         } else {
-            self.replace_text(None, &text, false, window, cx);
+            self.replace_text(None, &text, false, true, window, cx);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -444,6 +458,7 @@ impl TextEditor {
         range: Option<Range<usize>>,
         text: &str,
         auto_close_fence: bool,
+        expand_shortcode: bool,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -468,11 +483,22 @@ impl TextEditor {
             text
         };
         self.editor.replace_offsets(range.clone(), text);
-        let end = if close_fence {
+        let mut end = if close_fence {
             range.start + 1
         } else {
             range.start + text.len()
         };
+        if expand_shortcode && self.expand_emoji_shortcodes {
+            let value = self.editor.text();
+            if let Some(completed) = emoji::find_completed_shortcode(&value, end)
+                && let Some(record) = emoji::exact_shortcode(completed.shortcode)
+            {
+                let range = completed.range;
+                self.editor
+                    .replace_offsets(range.clone(), &record.unicode);
+                end = range.start + record.unicode.len();
+            }
+        }
         self.selected = end..end;
         self.editor.set_cursor_offset(end);
         self.marked = None;
@@ -584,6 +610,23 @@ impl TextEditor {
         let Some(key) = vim_key(event) else {
             return;
         };
+        if self.completion_open && self.editor.mode() == Mode::Insert {
+            let action = match key {
+                VimKey::Control('j') => {
+                    Some(Box::new(crate::app::CompletionNext) as Box<dyn gpui::Action>)
+                }
+                VimKey::Control('k') => {
+                    Some(Box::new(crate::app::CompletionPrevious) as Box<dyn gpui::Action>)
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                window.dispatch_action(action, cx);
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+        }
         if self.completion_open && key == VimKey::Escape {
             return;
         }
@@ -858,7 +901,7 @@ impl EntityInputHandler for TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_text(range, text, true, window, cx);
+        self.replace_text(range, text, true, true, window, cx);
     }
     fn replace_and_mark_text_in_range(
         &mut self,
@@ -869,7 +912,7 @@ impl EntityInputHandler for TextEditor {
         cx: &mut Context<Self>,
     ) {
         let text = self.accepted_text(text);
-        self.replace_text(range, text, false, window, cx);
+        self.replace_text(range, text, false, false, window, cx);
         let end = self.selected.end;
         let inserted = end - text.len()..end;
         self.marked = (!text.is_empty()).then_some(inserted.clone());
@@ -1345,7 +1388,13 @@ impl Render for TextEditor {
         let key_context = if self.key_context != "ChattComposer" {
             self.key_context
         } else if !self.vim_enabled || self.editor.mode() == Mode::Insert {
-            "ChattComposer ComposerInsert"
+            if self.completion_engaged {
+                "ChattComposer ComposerInsert CompletionOpen CompletionEngaged"
+            } else if self.completion_open {
+                "ChattComposer ComposerInsert CompletionOpen"
+            } else {
+                "ChattComposer ComposerInsert"
+            }
         } else {
             "ChattComposer VimMode"
         };
@@ -1443,13 +1492,88 @@ impl Focusable for TextEditor {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use gpui::{MouseButton, point};
+    use gpui::{
+        Context, Entity, Focusable, IntoElement, MouseButton, Render, Window, div, point,
+        prelude::*,
+    };
 
     use super::{
         Composer, ComposerImagePaste, ComposerLine, line_for_offset, logical_line_range,
         logical_lines, normalize_range, range_from_utf16, should_auto_close_code_fence,
         visible_line_range, word_range,
     };
+
+    struct CompletionKeyHarness {
+        composer: Entity<Composer>,
+        actions: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Render for CompletionKeyHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .on_action(cx.listener(
+                    |this, _: &crate::app::CompletionNext, _, _| {
+                        this.actions.borrow_mut().push("next")
+                    },
+                ))
+                .on_action(cx.listener(
+                    |this, _: &crate::app::CompletionPrevious, _, _| {
+                        this.actions.borrow_mut().push("previous")
+                    },
+                ))
+                .on_action(cx.listener(
+                    |this, _: &crate::app::CompletionAccept, _, _| {
+                        this.actions.borrow_mut().push("accept")
+                    },
+                ))
+                .on_action(cx.listener(
+                    |this, _: &crate::app::CompletionAcceptEngaged, _, _| {
+                        this.actions.borrow_mut().push("accept-engaged")
+                    },
+                ))
+                .on_action(cx.listener(|this, _: &crate::app::SendMessage, _, _| {
+                    this.actions.borrow_mut().push("send")
+                }))
+                .child(self.composer.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn focused_composer_dispatches_completion_navigation_and_acceptance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let actions = actions.clone();
+            move |window, cx| {
+                let composer = cx.new(|cx| {
+                    let mut composer = Composer::new(cx);
+                    composer.set_completion_state(true, true);
+                    composer
+                });
+                window.focus(&composer.focus_handle(cx), cx);
+                CompletionKeyHarness { composer, actions }
+            }
+        });
+
+        cx.simulate_keystrokes("down up ctrl-j ctrl-k tab enter");
+
+        assert_eq!(
+            actions.borrow().as_slice(),
+            [
+                "next",
+                "previous",
+                "next",
+                "previous",
+                "accept",
+                "accept-engaged"
+            ]
+        );
+    }
 
     #[gpui::test]
     fn platform_paste_shortcut_and_normal_p_read_the_system_clipboard(
@@ -1558,6 +1682,47 @@ mod tests {
         assert_eq!(
             composer.read_with(cx, |composer, _| composer.text()),
             "fallback"
+        );
+    }
+
+    #[gpui::test]
+    fn message_composer_expands_a_completed_emoji_shortcode(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let composer = Composer::new(cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.simulate_keystrokes(": s m i l e :");
+
+        assert_eq!(composer.read_with(cx, |composer, _| composer.text()), "😄");
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.snapshot().selection),
+            "😄".len().."😄".len()
+        );
+    }
+
+    #[gpui::test]
+    fn secondary_text_inputs_keep_emoji_shortcodes_literal(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let editor = Composer::search(cx);
+            window.focus(&editor.focus, cx);
+            editor
+        });
+
+        cx.simulate_keystrokes(": s m i l e :");
+
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.text()),
+            ":smile:"
         );
     }
 
