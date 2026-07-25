@@ -3,6 +3,7 @@ use std::{cell::RefCell, cmp::Ordering, collections::HashMap, ops::Range, rc::Rc
 use chatt_message_format::{
     Token, TokenKind,
     highlight::{self, HlClass, PaletteRole},
+    reference::MessageRef,
 };
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges,
@@ -108,9 +109,17 @@ struct RenderedLink {
     destination: SharedString,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenderedReference {
+    range: Range<usize>,
+    target: MessageRef,
+}
+
 #[derive(Default)]
 struct InteractionState {
     pressed_link: Option<RenderedLink>,
+    pressed_reference: Option<RenderedReference>,
+    hovered_reference: Option<MessageRef>,
 }
 
 /// Parsed and highlighted presentation data cached for one timeline message.
@@ -119,6 +128,7 @@ pub struct FormattedMessage {
     visible: SharedString,
     blocks: Vec<Block>,
     links: Rc<[RenderedLink]>,
+    references: Rc<[RenderedReference]>,
     interaction: RefCell<InteractionState>,
 }
 
@@ -128,6 +138,7 @@ pub(crate) struct PreparedFormattedMessage {
     visible: SharedString,
     blocks: Vec<PreparedBlock>,
     links: Vec<RenderedLink>,
+    references: Vec<RenderedReference>,
 }
 
 impl FormattedMessage {
@@ -140,12 +151,13 @@ impl FormattedMessage {
         let source = source.into();
         let mut tokens = Vec::new();
         chatt_message_format::tokenize(&source, &mut tokens);
-        let (visible, blocks, links) = project_document(&source, &tokens);
+        let (visible, blocks, links, references) = project_document(&source, &tokens);
         PreparedFormattedMessage {
             source,
             visible: visible.into(),
             blocks,
             links,
+            references,
         }
     }
 
@@ -175,6 +187,7 @@ impl FormattedMessage {
             visible: prepared.visible,
             blocks,
             links: prepared.links.into(),
+            references: prepared.references.into(),
             interaction: RefCell::new(InteractionState::default()),
         }
     }
@@ -204,6 +217,7 @@ impl FormattedMessage {
                 }]),
             }],
             links: Rc::from([]),
+            references: Rc::from([]),
             interaction: RefCell::new(InteractionState::default()),
         }
     }
@@ -222,10 +236,16 @@ impl PreparedFormattedMessage {
 fn project_document(
     source: &str,
     tokens: &[Token],
-) -> (String, Vec<PreparedBlock>, Vec<RenderedLink>) {
+) -> (
+    String,
+    Vec<PreparedBlock>,
+    Vec<RenderedLink>,
+    Vec<RenderedReference>,
+) {
     let mut visible = String::new();
     let mut blocks = Vec::new();
     let mut links = Vec::new();
+    let mut references = Vec::new();
     let mut quote_depth = 0usize;
     let mut cursor = 0usize;
 
@@ -244,7 +264,14 @@ fn project_document(
                     matches!(kind, TokenKind::ParagraphEnd)
                 });
                 let projected = project_inline(source, &tokens[cursor + 1..end]);
-                let pieces = append_pieces(&mut visible, projected, &mut links, true, true);
+                let pieces = append_pieces(
+                    &mut visible,
+                    projected,
+                    &mut links,
+                    &mut references,
+                    true,
+                    true,
+                );
                 blocks.push(PreparedBlock {
                     quote_depth,
                     kind: PreparedBlockKind::Paragraph(pieces),
@@ -256,7 +283,14 @@ fn project_document(
                     matches!(kind, TokenKind::HeaderEnd)
                 });
                 let projected = project_inline(source, &tokens[cursor + 1..end]);
-                let pieces = append_pieces(&mut visible, projected, &mut links, true, false);
+                let pieces = append_pieces(
+                    &mut visible,
+                    projected,
+                    &mut links,
+                    &mut references,
+                    true,
+                    false,
+                );
                 blocks.push(PreparedBlock {
                     quote_depth,
                     kind: PreparedBlockKind::Header(pieces),
@@ -286,7 +320,14 @@ fn project_document(
                     cached_runs: RefCell::new(None),
                 };
                 let projected = project_inline(source, &tokens[cursor + 1..end]);
-                let content = append_pieces(&mut visible, projected, &mut links, false, false);
+                let content = append_pieces(
+                    &mut visible,
+                    projected,
+                    &mut links,
+                    &mut references,
+                    false,
+                    false,
+                );
                 blocks.push(PreparedBlock {
                     quote_depth,
                     kind: PreparedBlockKind::ListItem {
@@ -330,8 +371,16 @@ fn project_document(
                     text: code,
                     spans,
                     links: Vec::new(),
+                    references: Vec::new(),
                 };
-                let piece = append_piece(&mut visible, projected, &mut links, true, false);
+                let piece = append_piece(
+                    &mut visible,
+                    projected,
+                    &mut links,
+                    &mut references,
+                    true,
+                    false,
+                );
                 blocks.push(PreparedBlock {
                     quote_depth,
                     kind: PreparedBlockKind::Code { text: piece },
@@ -356,7 +405,7 @@ fn project_document(
         }
     }
 
-    (visible, blocks, links)
+    (visible, blocks, links, references)
 }
 
 fn find_token(tokens: &[Token], start: usize, predicate: impl Fn(&TokenKind) -> bool) -> usize {
@@ -377,6 +426,7 @@ struct ProjectedInline {
     text: String,
     spans: Vec<FormatSpan>,
     links: Vec<(Range<usize>, SharedString)>,
+    references: Vec<(Range<usize>, MessageRef)>,
 }
 
 fn project_inline(source: &str, tokens: &[Token]) -> Vec<ProjectedInline> {
@@ -411,6 +461,12 @@ fn project_inline(source: &str, tokens: &[Token]) -> Vec<ProjectedInline> {
                 });
                 if matches!(token.kind, TokenKind::Url) {
                     projected.links.push((start..end, text.into()));
+                } else if matches!(token.kind, TokenKind::MessageRef)
+                    && let Some(code) =
+                        text.strip_prefix(chatt_message_format::reference::REF_PREFIX)
+                    && let Some(target) = MessageRef::decode(code)
+                {
+                    projected.references.push((start..end, target));
                 }
             }
             TokenKind::HardBreak => {
@@ -427,6 +483,7 @@ fn append_pieces(
     visible: &mut String,
     projected: Vec<ProjectedInline>,
     links: &mut Vec<RenderedLink>,
+    references: &mut Vec<RenderedReference>,
     separated: bool,
     allow_wumboji: bool,
 ) -> Vec<TextPiece> {
@@ -436,6 +493,7 @@ fn append_pieces(
             visible,
             projected,
             links,
+            references,
             separated || index > 0,
             allow_wumboji,
         ));
@@ -447,6 +505,7 @@ fn append_piece(
     visible: &mut String,
     projected: ProjectedInline,
     links: &mut Vec<RenderedLink>,
+    references: &mut Vec<RenderedReference>,
     separated: bool,
     allow_wumboji: bool,
 ) -> TextPiece {
@@ -462,6 +521,15 @@ fn append_piece(
             .map(|(range, destination)| RenderedLink {
                 range: start + range.start..start + range.end,
                 destination,
+            }),
+    );
+    references.extend(
+        projected
+            .references
+            .into_iter()
+            .map(|(range, target)| RenderedReference {
+                range: start + range.start..start + range.end,
+                target,
             }),
     );
     let wumboji = allow_wumboji
@@ -487,11 +555,17 @@ pub struct RenderedMessage {
     text: RenderedText,
 }
 
+type ReferenceClickCallback = Rc<dyn Fn(MessageRef, bool, &mut Window, &mut App)>;
+type ReferenceHoverCallback =
+    Rc<dyn Fn(Option<(MessageRef, Bounds<Pixels>)>, &mut Window, &mut App)>;
+
 /// GPUI element that renders one cached [`FormattedMessage`].
 pub struct FormattedMessageElement {
     message: Rc<FormattedMessage>,
     selection: Option<(MessageSelectionGroup, MessageSelectionKey)>,
     body_color: Option<gpui::Rgba>,
+    on_reference_click: Option<ReferenceClickCallback>,
+    on_reference_hover: Option<ReferenceHoverCallback>,
 }
 
 impl FormattedMessageElement {
@@ -500,6 +574,8 @@ impl FormattedMessageElement {
             message,
             selection: None,
             body_color: None,
+            on_reference_click: None,
+            on_reference_hover: None,
         }
     }
 
@@ -514,6 +590,16 @@ impl FormattedMessageElement {
 
     pub fn body_color(mut self, color: gpui::Rgba) -> Self {
         self.body_color = Some(color);
+        self
+    }
+
+    pub fn on_reference_click(mut self, callback: ReferenceClickCallback) -> Self {
+        self.on_reference_click = Some(callback);
+        self
+    }
+
+    pub fn on_reference_hover(mut self, callback: ReferenceHoverCallback) -> Self {
+        self.on_reference_hover = Some(callback);
         self
     }
 
@@ -637,6 +723,7 @@ impl FormattedMessageElement {
             visible: self.message.visible.clone(),
             lines: lines.into(),
             links: self.message.links.clone(),
+            references: self.message.references.clone(),
         };
         RenderedMessage {
             element: root.into_any_element(),
@@ -659,7 +746,9 @@ impl FormattedMessageElement {
             && rendered
                 .index_for_position(window.mouse_position())
                 .ok()
-                .is_some_and(|index| rendered.link_at(index).is_some());
+                .is_some_and(|index| {
+                    rendered.link_at(index).is_some() || rendered.reference_at(index).is_some()
+                });
         window.set_cursor_style(
             if hovering_link {
                 CursorStyle::PointingHand
@@ -689,7 +778,15 @@ impl FormattedMessageElement {
                     window.prevent_default();
                     return;
                 }
+                if let Ok(index) = position
+                    && let Some(reference) = rendered.reference_at(index)
+                {
+                    message.interaction.borrow_mut().pressed_reference = Some(reference.clone());
+                    window.prevent_default();
+                    return;
+                }
                 message.interaction.borrow_mut().pressed_link = None;
+                message.interaction.borrow_mut().pressed_reference = None;
                 if let Some((group, key)) = selection.as_ref() {
                     let index = match position {
                         Ok(index) | Err(index) => index,
@@ -708,21 +805,71 @@ impl FormattedMessageElement {
         });
 
         window.on_mouse_event({
+            let hitbox = hitbox.clone();
             let rendered = rendered.clone();
             let message = self.message.clone();
-            move |event: &MouseUpEvent, phase, _window, cx| {
+            let on_reference_click = self.on_reference_click.clone();
+            move |event: &MouseUpEvent, phase, window, cx| {
                 if !phase.bubble() || event.button != MouseButton::Left {
                     return;
                 }
-                let Some(pressed) = message.interaction.borrow_mut().pressed_link.take() else {
-                    return;
+                let (pressed_link, pressed_reference) = {
+                    let mut interaction = message.interaction.borrow_mut();
+                    (
+                        interaction.pressed_link.take(),
+                        interaction.pressed_reference.take(),
+                    )
                 };
-                let released = rendered
-                    .index_for_position(event.position)
-                    .ok()
-                    .and_then(|index| rendered.link_at(index));
-                if released == Some(&pressed) {
-                    cx.open_url(&pressed.destination);
+                let released_index = hitbox
+                    .is_hovered(window)
+                    .then(|| rendered.index_for_position(event.position).ok())
+                    .flatten();
+                if let Some(pressed) = pressed_link {
+                    let released = released_index.and_then(|index| rendered.link_at(index));
+                    if released == Some(&pressed) {
+                        cx.open_url(&pressed.destination);
+                    }
+                } else if let Some(pressed) = pressed_reference {
+                    let released = released_index.and_then(|index| rendered.reference_at(index));
+                    if released == Some(&pressed)
+                        && let Some(callback) = on_reference_click.as_ref()
+                    {
+                        callback(pressed.target, event.modifiers.shift, window, cx);
+                    }
+                }
+            }
+        });
+
+        window.on_mouse_event({
+            let hitbox = hitbox.clone();
+            let rendered = rendered.clone();
+            let message = self.message.clone();
+            let on_reference_hover = self.on_reference_hover.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                let hovered = hitbox
+                    .is_hovered(window)
+                    .then(|| rendered.index_for_position(event.position).ok())
+                    .flatten()
+                    .and_then(|index| rendered.reference_at(index));
+                let target = hovered.map(|reference| reference.target);
+                let mut interaction = message.interaction.borrow_mut();
+                if interaction.hovered_reference == target {
+                    return;
+                }
+                interaction.hovered_reference = target;
+                drop(interaction);
+                let hovered = hovered.and_then(|reference| {
+                    rendered
+                        .bounds_for_range(reference.range.clone())
+                        .into_iter()
+                        .next()
+                        .map(|bounds| (reference.target, bounds))
+                });
+                if let Some(callback) = on_reference_hover.as_ref() {
+                    callback(hovered, window, cx);
                 }
             }
         });
@@ -1172,6 +1319,7 @@ struct RenderedText {
     visible: SharedString,
     lines: Rc<[RenderedLine]>,
     links: Rc<[RenderedLink]>,
+    references: Rc<[RenderedReference]>,
 }
 
 impl RenderedText {
@@ -1219,6 +1367,12 @@ impl RenderedText {
 
     fn link_at(&self, index: usize) -> Option<&RenderedLink> {
         self.links.iter().find(|link| link.range.contains(&index))
+    }
+
+    fn reference_at(&self, index: usize) -> Option<&RenderedReference> {
+        self.references
+            .iter()
+            .find(|reference| reference.range.contains(&index))
     }
 
     fn surrounding_word_range(&self, index: usize) -> Range<usize> {
@@ -1975,6 +2129,8 @@ fn selection_autoscroll_delta(distance: Pixels, line_height: Pixels) -> Pixels {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn rendered_text(text: &str) -> RenderedText {
@@ -1982,6 +2138,7 @@ mod tests {
             visible: text.to_string().into(),
             lines: Vec::new().into(),
             links: Vec::new().into(),
+            references: Vec::new().into(),
         }
     }
 
@@ -2002,6 +2159,61 @@ mod tests {
 
     fn visible(source: &str) -> String {
         FormattedMessage::new(source).visible.to_string()
+    }
+
+    #[test]
+    fn only_checksum_valid_message_references_are_interactive() {
+        let target = MessageRef {
+            room_id: local_rpc::ids::RoomId(7),
+            message_id: local_rpc::ids::MessageId(42),
+        };
+        let valid = format!("@@{}", target.encode());
+        let mut damaged = valid.clone().into_bytes();
+        let checksum = damaged.last_mut().unwrap();
+        *checksum = if *checksum == b'0' { b'1' } else { b'0' };
+        let damaged = String::from_utf8(damaged).unwrap();
+        let message = FormattedMessage::new(format!("{valid} {damaged}"));
+
+        assert_eq!(message.references.len(), 1);
+        assert_eq!(message.references[0].target, target);
+        assert_eq!(
+            &message.visible[message.references[0].range.clone()],
+            valid.as_str()
+        );
+    }
+
+    #[gpui::test]
+    fn reference_click_reports_the_shift_modifier(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let cx = cx.add_empty_window();
+        let target = MessageRef {
+            room_id: local_rpc::ids::RoomId(7),
+            message_id: local_rpc::ids::MessageId(42),
+        };
+        let source = format!("@@{}", target.encode());
+        let message = Rc::new(FormattedMessage::new(source.clone()));
+        let clicked = Rc::new(Cell::new(None));
+        let observed = clicked.clone();
+        let drawn = message.clone();
+        let (rendered, _) = cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(500.), px(100.)),
+            move |_, _| {
+                FormattedMessageElement::new(drawn).on_reference_click(Rc::new(
+                    move |target, shift, _, _| observed.set(Some((target, shift))),
+                ))
+            },
+        );
+        let position = rendered.text.bounds_for_range(0..source.len())[0].center();
+        let modifiers = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+
+        cx.simulate_mouse_down(position, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(position, MouseButton::Left, modifiers);
+
+        assert_eq!(clicked.get(), Some((target, true)));
     }
 
     #[test]

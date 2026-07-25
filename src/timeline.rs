@@ -290,6 +290,31 @@ pub fn toggle_collapsed_section(
     true
 }
 
+/// Removes the collapse marker hiding `message_id`, if any.
+pub fn reveal_message(
+    messages: &[Message],
+    collapsed_sections: &mut CollapsedSections,
+    message_id: u64,
+) -> bool {
+    let Some(target_index) = messages.iter().position(|message| message.id == message_id) else {
+        return false;
+    };
+    let containing_root = collapsed_sections.iter().find_map(|(root_id, end_id)| {
+        let root_index = messages.iter().position(|message| message.id == *root_id)?;
+        let mut group_end = root_index + 1;
+        while group_end < messages.len() && is_continuation(messages, group_end) {
+            group_end += 1;
+        }
+        let section_end = end_id
+            .and_then(|end_id| {
+                (root_index + 1..group_end).find(|index| messages[*index].id == end_id)
+            })
+            .unwrap_or(group_end);
+        (target_index >= root_index && target_index < section_end).then_some(*root_id)
+    });
+    containing_root.is_some_and(|root_id| collapsed_sections.remove(&root_id).is_some())
+}
+
 fn message_group_starts(messages: &[Message]) -> impl Iterator<Item = usize> + '_ {
     (0..messages.len()).filter(|index| !is_continuation(messages, *index))
 }
@@ -526,5 +551,20 @@ mod tests {
     fn reserves_bounded_image_space() {
         assert_eq!(media_box_size(400, 300), (400.0, 300.0));
         assert_eq!(media_box_size(4_000, 3_000), (560.0, 420.0));
+    }
+
+    #[test]
+    fn revealing_a_hidden_message_removes_its_containing_collapse() {
+        let messages = vec![
+            message("Mara", 1_000),
+            message("Mara", 2_000),
+            message("Mara", 3_000),
+        ];
+        let mut sections = CollapsedSections::new();
+        toggle_collapsed_section(&messages, &mut sections, 1_000);
+
+        assert!(reveal_message(&messages, &mut sections, 2_000));
+        assert!(sections.is_empty());
+        assert_eq!(build_message_list(&messages, &sections).len(), 3);
     }
 }

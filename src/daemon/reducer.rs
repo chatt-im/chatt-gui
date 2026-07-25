@@ -12,6 +12,8 @@ use crate::{
 pub struct ReduceEffect {
     pub replace_messages: bool,
     pub messages_changed: bool,
+    pub room_snapshot: bool,
+    pub history_changed: bool,
     pub splices: Vec<(usize, usize, usize)>,
     pub request_resync: bool,
     pub request_result: Option<local_rpc::frame::RequestResult>,
@@ -23,6 +25,12 @@ pub struct ReduceEffect {
         local_rpc::model::RequestId,
         local_rpc::model::CommandCandidateKind,
         Vec<local_rpc::model::CommandCandidate>,
+    )>,
+    pub message_reference_resolved: Option<(
+        local_rpc::model::RequestId,
+        local_rpc::ids::RoomId,
+        local_rpc::ids::MessageId,
+        Option<local_rpc::model::Message>,
     )>,
 }
 
@@ -56,6 +64,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
             model.phase = ConnectionPhase::Ready;
             effect.replace_messages = true;
             effect.messages_changed = true;
+            effect.room_snapshot = true;
         }
         DaemonFrame::Event(event) => {
             if model.resync_requested {
@@ -86,6 +95,14 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
             items,
         } => {
             effect.command_candidates = Some((request_id, kind, items));
+        }
+        DaemonFrame::MessageReferenceResolved {
+            request_id,
+            room_id,
+            message_id,
+            message,
+        } => {
+            effect.message_reference_resolved = Some((request_id, room_id, message_id, message));
         }
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
@@ -192,6 +209,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 .collect();
             effect.replace_messages = true;
             effect.messages_changed = true;
+            effect.room_snapshot = true;
         }
         StateDelta::MessagesPrepended {
             room_id,
@@ -204,6 +222,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             }
             model.older_cursor = older_cursor;
             model.at_start = at_start;
+            effect.history_changed = true;
             let mut incoming: Vec<_> = messages.into_iter().map(timeline::from_daemon).collect();
             let first_existing = model.messages.first().map(|message| message.id);
             if incoming.iter().any(|message| {
@@ -242,6 +261,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
             }
             model.older_cursor = older_cursor;
             model.at_start = at_start;
+            effect.history_changed = true;
         }
         StateDelta::MessageUpserted { message } => {
             if !is_active_room(model, message.room_id, effect) {
@@ -632,6 +652,31 @@ mod tests {
             effect.command_candidates,
             Some((request_id, CommandCandidateKind::User, items))
         );
+    }
+
+    #[test]
+    fn message_reference_resolution_is_returned_without_mutating_room_state() {
+        let request_id = RequestId(9);
+        let room_id = RoomId(3);
+        let resolved = message(room_id, 42);
+        let mut model = ChatModel::default();
+
+        let effect = apply(
+            &mut model,
+            DaemonFrame::MessageReferenceResolved {
+                request_id,
+                room_id,
+                message_id: resolved.message_id,
+                message: Some(resolved.clone()),
+            },
+        );
+
+        assert_eq!(
+            effect.message_reference_resolved,
+            Some((request_id, room_id, resolved.message_id, Some(resolved)))
+        );
+        assert!(model.messages.is_empty());
+        assert_eq!(model.selected_room, None);
     }
 
     #[test]

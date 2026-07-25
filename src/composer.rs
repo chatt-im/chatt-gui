@@ -235,6 +235,25 @@ impl TextEditor {
         self.marked = None;
         self.replace_text(None, text, false, false, window, cx);
     }
+
+    pub(crate) fn insert_message_reference(
+        &mut self,
+        reference: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.vim_enabled && self.editor.mode() != Mode::Insert {
+            self.editor
+                .set_primary_mode_preserving_history(Mode::Insert);
+            let cursor = self.editor.cursor_offset();
+            self.selected = cursor..cursor;
+            self.reversed = false;
+            self.marked = None;
+        }
+        let range = self.normalize_range(self.selected.clone());
+        let insertion = message_ref_insertion(&self.editor.text(), range.start, reference);
+        self.replace_text(None, &insertion, false, false, window, cx);
+    }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.editor.set_text("", Mode::Insert, true);
         self.selected = 0..0;
@@ -746,6 +765,20 @@ impl TextEditor {
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
+}
+
+fn message_ref_insertion(source: &str, cursor: usize, reference: &str) -> String {
+    let needs_leading_space = cursor
+        .checked_sub(1)
+        .and_then(|index| source.as_bytes().get(index))
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'@');
+    let mut insertion = String::with_capacity(reference.len() + 2);
+    if needs_leading_space {
+        insertion.push(' ');
+    }
+    insertion.push_str(reference);
+    insertion.push(' ');
+    insertion
 }
 
 fn clamp_offset(text: &str, offset: usize) -> usize {
@@ -1505,8 +1538,8 @@ mod tests {
 
     use super::{
         Composer, ComposerImagePaste, ComposerLine, line_for_offset, logical_line_range,
-        logical_lines, normalize_range, range_from_utf16, should_auto_close_code_fence,
-        visible_line_range, word_range,
+        logical_lines, message_ref_insertion, normalize_range, range_from_utf16,
+        should_auto_close_code_fence, visible_line_range, word_range,
     };
 
     struct CompletionKeyHarness {
@@ -1908,5 +1941,13 @@ mod tests {
         assert!(!should_auto_close_code_fence("``", "`", "tail"));
         assert!(!should_auto_close_code_fence("``", "```", ""));
         assert!(!should_auto_close_code_fence("``", "`", "\n```"));
+    }
+
+    #[test]
+    fn message_reference_insertion_preserves_token_boundaries() {
+        let reference = "@@0410800";
+        assert_eq!(message_ref_insertion("before", 6, reference), " @@0410800 ");
+        assert_eq!(message_ref_insertion("(", 1, reference), "@@0410800 ");
+        assert_eq!(message_ref_insertion("@", 1, reference), " @@0410800 ");
     }
 }

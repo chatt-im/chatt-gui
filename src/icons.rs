@@ -6,7 +6,9 @@ use gpui::{AssetSource, Result, Rgba, SharedString, Svg, prelude::*, px, svg};
 pub(crate) enum IconName {
     AudioOff,
     AudioOn,
+    AtSign,
     Close,
+    CornerUpLeft,
     Copy,
     Download,
     ListChevronsDownUp,
@@ -35,7 +37,9 @@ impl IconName {
         match self {
             Self::AudioOff => "icons/audio-off.svg",
             Self::AudioOn => "icons/audio-on.svg",
+            Self::AtSign => "icons/at-sign.svg",
             Self::Close => "icons/close.svg",
+            Self::CornerUpLeft => "icons/corner-up-left.svg",
             Self::Copy => "icons/copy.svg",
             Self::Download => "icons/download.svg",
             Self::ListChevronsDownUp => "icons/list-chevrons-down-up.svg",
@@ -94,7 +98,9 @@ impl AssetSource for IconAssets {
 const ICON_PATHS: &[&str] = &[
     "icons/audio-off.svg",
     "icons/audio-on.svg",
+    "icons/at-sign.svg",
     "icons/close.svg",
+    "icons/corner-up-left.svg",
     "icons/copy.svg",
     "icons/download.svg",
     "icons/list-chevrons-down-up.svg",
@@ -126,7 +132,13 @@ fn icon_svg(path: &str) -> Option<String> {
         "icons/audio-on.svg" => {
             r#"<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/>"#
         }
+        "icons/at-sign.svg" => {
+            r#"<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/>"#
+        }
         "icons/close.svg" => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
+        "icons/corner-up-left.svg" => {
+            r#"<polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>"#
+        }
         "icons/copy.svg" => {
             r#"<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>"#
         }

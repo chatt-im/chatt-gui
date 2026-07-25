@@ -59,14 +59,15 @@ use crate::{
     },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
+use chatt_message_format::reference::{MessageRef, REF_PREFIX};
 use dbus_message::{FileChooserResponse, OpenFileOptions, open_files};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, Div, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, FontWeight, ListAlignment, ListState, LruImageCache,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels,
-    Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString,
-    Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions,
-    canvas, div, img, list, point, prelude::*, px, relative,
+    Anchor, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, Div,
+    ExternalPaths, FocusHandle, Focusable, FollowMode, FontWeight, ListAlignment, ListState,
+    LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    SharedString, Stateful, Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window,
+    actions, anchored, canvas, deferred, div, img, list, point, prelude::*, px, relative,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
@@ -492,6 +493,73 @@ actions!(
     ]
 );
 
+const REFERENCE_HOVER_DELAY: Duration = Duration::from_millis(200);
+const REFERENCE_JUMP_PAGE_LIMIT: usize = 10;
+const REFERENCE_JUMP_PAGE_SIZE: u16 = 200;
+
+struct MessageReferenceHover {
+    target: MessageRef,
+    anchor: Bounds<Pixels>,
+    visible: bool,
+    message: Option<timeline::Message>,
+    formatted: Option<Rc<FormattedMessage>>,
+    missing: bool,
+    request_id: Option<RequestId>,
+}
+
+struct PendingMessageJump {
+    target: MessageRef,
+    pages_requested: usize,
+    page_request_id: Option<RequestId>,
+    room_request_id: Option<RequestId>,
+}
+
+struct PendingMessageReferenceClick {
+    target: MessageRef,
+    request_id: RequestId,
+}
+
+struct PendingReferenceMediaPreview {
+    target: MessageRef,
+    attachment: Attachment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageReferenceJumpDecision {
+    Found,
+    LoadOlder(local_rpc::ids::MessageId),
+    Unavailable,
+    SearchWindowExhausted,
+}
+
+fn message_reference_jump_decision(
+    messages: &[timeline::Message],
+    target: local_rpc::ids::MessageId,
+    older_cursor: Option<local_rpc::ids::MessageId>,
+    at_start: bool,
+    pages_requested: usize,
+) -> MessageReferenceJumpDecision {
+    if messages
+        .binary_search_by_key(&target.0, |message| message.id)
+        .is_ok()
+    {
+        return MessageReferenceJumpDecision::Found;
+    }
+    if messages.first().is_some_and(|first| target.0 >= first.id) || at_start {
+        return MessageReferenceJumpDecision::Unavailable;
+    }
+    let Some(before) = older_cursor else {
+        return MessageReferenceJumpDecision::Unavailable;
+    };
+    if before.0 <= target.0 {
+        return MessageReferenceJumpDecision::Unavailable;
+    }
+    if pages_requested >= REFERENCE_JUMP_PAGE_LIMIT {
+        return MessageReferenceJumpDecision::SearchWindowExhausted;
+    }
+    MessageReferenceJumpDecision::LoadOlder(before)
+}
+
 pub struct ChattView {
     model: ChatModel,
     daemon: DaemonClient,
@@ -548,6 +616,15 @@ pub struct ChattView {
     last_scroll_frame: Option<Instant>,
     formatted_messages: HashMap<u64, Rc<FormattedMessage>>,
     formatted_command_messages: HashMap<u64, Rc<FormattedMessage>>,
+    message_reference_hover: Option<MessageReferenceHover>,
+    message_reference_hover_task: Option<Task<()>>,
+    message_reference_cache: HashMap<MessageRef, Option<timeline::Message>>,
+    pending_message_reference_click: Option<PendingMessageReferenceClick>,
+    pending_reference_media_preview: Option<PendingReferenceMediaPreview>,
+    pending_message_jump: Option<PendingMessageJump>,
+    message_reference_flash: Option<(MessageRef, u64)>,
+    next_message_reference_flash_id: u64,
+    message_reference_flash_task: Option<Task<()>>,
     timeline_selection: MessageSelectionGroup,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
@@ -747,6 +824,15 @@ impl ChattView {
             last_scroll_frame: None,
             formatted_messages: HashMap::new(),
             formatted_command_messages: HashMap::new(),
+            message_reference_hover: None,
+            message_reference_hover_task: None,
+            message_reference_cache: HashMap::new(),
+            pending_message_reference_click: None,
+            pending_reference_media_preview: None,
+            pending_message_jump: None,
+            message_reference_flash: None,
+            next_message_reference_flash_id: 1,
+            message_reference_flash_task: None,
             timeline_selection,
             videos,
             video_thumbnails,
@@ -1886,6 +1972,11 @@ impl ChattView {
                 self.pending_server_selection = None;
                 self.pending_server_prompt = None;
                 self.server_selection_target = None;
+                self.pending_message_reference_click = None;
+                self.pending_reference_media_preview = None;
+                self.pending_message_jump = None;
+                self.message_reference_flash = None;
+                self.message_reference_flash_task = None;
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Offline · Submission outcome unknown; verify the timeline after reconnecting · {reason}"
@@ -1911,6 +2002,11 @@ impl ChattView {
                 self.pending_server_selection = None;
                 self.pending_server_prompt = None;
                 self.server_selection_target = None;
+                self.pending_message_reference_click = None;
+                self.pending_reference_media_preview = None;
+                self.pending_message_jump = None;
+                self.message_reference_flash = None;
+                self.message_reference_flash_task = None;
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Cannot connect · Submission outcome unknown; verify before retrying · {details}"
@@ -1959,6 +2055,20 @@ impl ChattView {
                 self.eager_image_fetches.cached(&descriptor);
                 self.resume_code_preview_load(&descriptor, cx);
                 self.pump_eager_image_fetches(cx);
+                let pending = self
+                    .pending_reference_media_preview
+                    .as_ref()
+                    .is_some_and(|pending| pending.attachment.descriptor.id == descriptor.id)
+                    .then(|| self.pending_reference_media_preview.take())
+                    .flatten();
+                if let Some(pending) = pending {
+                    self.open_message_reference_attachment(
+                        pending.target,
+                        pending.attachment,
+                        window,
+                        cx,
+                    );
+                }
             }
             DaemonEvent::MediaTransferFailed {
                 transfer_id,
@@ -1968,10 +2078,23 @@ impl ChattView {
                     "attachment transfer failed transfer_id={}: {reason}",
                     transfer_id.0,
                 );
+                let pending_failed =
+                    self.pending_reference_media_preview
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            self.media_cache
+                                .lock()
+                                .expect("media cache lock poisoned")
+                                .active_transfer(&pending.attachment.descriptor)
+                                == Some(transfer_id)
+                        });
                 self.media_cache
                     .lock()
                     .expect("media cache lock poisoned")
                     .cancel(transfer_id);
+                if pending_failed {
+                    self.pending_reference_media_preview = None;
+                }
                 self.eager_image_fetches.failed(transfer_id, reason.clone());
                 self.preview_history
                     .fail_code_transfer(transfer_id, &reason);
@@ -2177,6 +2300,8 @@ impl ChattView {
         let old_server_error = self.model.server_selection.error.clone();
         let old_server_prompt = self.model.server_selection.prompt.clone();
         let effect = reducer::apply(&mut self.model, frame);
+        let reference_room_snapshot = effect.room_snapshot;
+        let reference_history_changed = effect.history_changed;
         if let Some(result) = effect.request_result.as_ref() {
             if self.pending_server_selection == Some(result.request_id) {
                 self.pending_server_selection = None;
@@ -2261,6 +2386,14 @@ impl ChattView {
             self.videos.clear_sessions();
             self.video_thumbnails.clear();
             self.clear_video_interactions();
+            self.message_reference_hover = None;
+            self.message_reference_hover_task = None;
+            self.message_reference_cache.clear();
+            self.pending_message_reference_click = None;
+            self.pending_reference_media_preview = None;
+            self.pending_message_jump = None;
+            self.message_reference_flash = None;
+            self.message_reference_flash_task = None;
         }
         let available = self
             .model
@@ -2288,6 +2421,10 @@ impl ChattView {
             self.formatted_messages.clear();
             self.eager_image_fetches.reset_transient();
         } else if effect.messages_changed {
+            if let Some(room_id) = self.model.selected_room {
+                self.message_reference_cache
+                    .retain(|target, _| target.room_id != room_id);
+            }
             self.formatted_messages.retain(|message_id, _| {
                 self.model
                     .messages
@@ -2334,6 +2471,32 @@ impl ChattView {
             self.command_candidates.insert(kind, items);
             self.refresh_completion(cx);
         }
+        if let Some((request_id, room_id, message_id, message)) = effect.message_reference_resolved
+        {
+            let target = MessageRef {
+                room_id,
+                message_id,
+            };
+            let message = message.map(timeline::from_daemon);
+            let activate = self
+                .pending_message_reference_click
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.request_id == request_id && pending.target == target
+                });
+            if activate {
+                self.pending_message_reference_click = None;
+            }
+            self.message_reference_cache.insert(target, message.clone());
+            self.install_message_reference_preview(target, message.clone(), Some(request_id), cx);
+            if activate {
+                if let Some(message) = message {
+                    self.open_message_reference_target(target, message, window, cx);
+                } else {
+                    self.jump_to_message_reference(target, cx);
+                }
+            }
+        }
         let mut command_result_applied = false;
         if let Some((result, lines)) = effect.command_result {
             command_result_applied = true;
@@ -2367,7 +2530,23 @@ impl ChattView {
         }
         if let Some(result) = effect.request_result {
             let submission_result = self.handle_submission_result(&result, cx);
-            if !submission_result {
+            let reference_jump_request = self.pending_message_jump.as_ref().is_some_and(|jump| {
+                jump.room_request_id == Some(result.request_id)
+                    || jump.page_request_id == Some(result.request_id)
+            });
+            if reference_jump_request
+                && let RequestOutcome::Rejected { message, .. } = &result.outcome
+            {
+                self.pending_message_jump = None;
+                self.status = message.clone().into();
+            } else if reference_jump_request
+                && matches!(&result.outcome, RequestOutcome::Accepted)
+                && let Some(jump) = self.pending_message_jump.as_mut()
+                && jump.room_request_id == Some(result.request_id)
+            {
+                jump.room_request_id = None;
+            }
+            if !submission_result && !reference_jump_request {
                 match result.outcome {
                     RequestOutcome::Accepted => {
                         log::info!(
@@ -2423,6 +2602,14 @@ impl ChattView {
             && self.model.server_selection.error.is_none()
         {
             self.status = connection_label(&self.model).into();
+        }
+        if reference_room_snapshot {
+            self.resume_message_reference_jump(cx);
+        } else if reference_history_changed {
+            if let Some(jump) = self.pending_message_jump.as_mut() {
+                jump.page_request_id = None;
+            }
+            self.resume_message_reference_jump(cx);
         }
     }
 
@@ -2595,6 +2782,13 @@ impl ChattView {
     fn select_room(&mut self, room_id: RoomId, cx: &mut Context<Self>) {
         if !self.model.is_ready() {
             return;
+        }
+        if self
+            .pending_message_jump
+            .as_ref()
+            .is_some_and(|jump| jump.target.room_id != room_id)
+        {
+            self.pending_message_jump = None;
         }
         let request_id = self.request_id();
         self.model.pending.insert(
@@ -2855,7 +3049,7 @@ impl ChattView {
     }
 
     fn load_older(&mut self, cx: &mut Context<Self>) {
-        if !self.model.is_ready() || self.model.at_start {
+        if !self.model.is_ready() || self.model.at_start || self.pending_message_jump.is_some() {
             return;
         }
         let (Some(room_id), before) = (self.model.selected_room, self.model.older_cursor) else {
@@ -2881,6 +3075,462 @@ impl ChattView {
             self.status = error.into();
         } else {
             self.status = "Loading older messages…".into();
+        }
+        cx.notify();
+    }
+
+    fn message_reference_literal(target: MessageRef) -> String {
+        format!("{REF_PREFIX}{}", target.encode())
+    }
+
+    fn quote_message_reference(
+        &mut self,
+        target: MessageRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reference = Self::message_reference_literal(target);
+        self.composer.update(cx, |composer, cx| {
+            composer.insert_message_reference(&reference, window, cx)
+        });
+        window.focus(&self.composer.focus_handle(cx), cx);
+        self.status = "Reference inserted".into();
+        cx.notify();
+    }
+
+    fn copy_message_reference(&mut self, target: MessageRef, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(Self::message_reference_literal(
+            target,
+        )));
+        self.status = "Message reference copied".into();
+        cx.notify();
+    }
+
+    fn hover_message_reference(
+        &mut self,
+        hovered: Option<(MessageRef, Bounds<Pixels>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.message_reference_hover_task = None;
+        let Some((target, anchor)) = hovered else {
+            self.message_reference_hover = None;
+            cx.notify();
+            return;
+        };
+        if let Some(state) = self.message_reference_hover.as_mut()
+            && state.target == target
+        {
+            state.anchor = anchor;
+            return;
+        }
+        self.message_reference_hover = Some(MessageReferenceHover {
+            target,
+            anchor,
+            visible: false,
+            message: None,
+            formatted: None,
+            missing: false,
+            request_id: None,
+        });
+        let executor = cx.background_executor().clone();
+        self.message_reference_hover_task = Some(cx.spawn(async move |this, cx| {
+            executor.timer(REFERENCE_HOVER_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .message_reference_hover
+                    .as_ref()
+                    .is_some_and(|hover| hover.target == target)
+                {
+                    this.begin_message_reference_preview(target, cx);
+                }
+            });
+        }));
+    }
+
+    fn begin_message_reference_preview(&mut self, target: MessageRef, cx: &mut Context<Self>) {
+        let loaded = (self.model.selected_room == Some(target.room_id))
+            .then(|| {
+                self.model
+                    .messages
+                    .binary_search_by_key(&target.message_id.0, |message| message.id)
+                    .ok()
+                    .map(|index| self.model.messages[index].clone())
+            })
+            .flatten();
+        if let Some(message) = loaded {
+            self.install_message_reference_preview(target, Some(message), None, cx);
+            return;
+        }
+        if let Some(cached) = self.message_reference_cache.get(&target).cloned() {
+            self.install_message_reference_preview(target, cached, None, cx);
+            return;
+        }
+        let request_id = self.request_id();
+        let Some(hover) = self
+            .message_reference_hover
+            .as_mut()
+            .filter(|hover| hover.target == target)
+        else {
+            return;
+        };
+        hover.visible = true;
+        hover.request_id = Some(request_id);
+        if let Err(error) = self.daemon.send(ClientFrame::ResolveMessageReference {
+            request_id,
+            room_id: target.room_id,
+            message_id: target.message_id,
+        }) {
+            hover.request_id = None;
+            hover.missing = true;
+            log::error!("could not resolve message reference: {error}");
+        }
+        cx.notify();
+    }
+
+    fn install_message_reference_preview(
+        &mut self,
+        target: MessageRef,
+        message: Option<timeline::Message>,
+        request_id: Option<RequestId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(hover) = self
+            .message_reference_hover
+            .as_mut()
+            .filter(|hover| hover.target == target)
+        else {
+            return;
+        };
+        if request_id.is_some() && hover.request_id != request_id {
+            return;
+        }
+        let formatted = message.as_ref().map(|message| {
+            Rc::new(FormattedMessage::from_prepared(FormattedMessage::prepare(
+                message.body.clone(),
+            )))
+        });
+        hover.visible = true;
+        hover.message = message;
+        hover.formatted = formatted;
+        hover.missing = hover.message.is_none();
+        hover.request_id = None;
+        cx.notify();
+    }
+
+    fn activate_message_reference(
+        &mut self,
+        target: MessageRef,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hover_request = self
+            .message_reference_hover
+            .as_ref()
+            .filter(|hover| hover.target == target)
+            .and_then(|hover| hover.request_id);
+        self.message_reference_hover = None;
+        self.message_reference_hover_task = None;
+        self.pending_message_reference_click = None;
+        self.pending_reference_media_preview = None;
+        if shift {
+            self.jump_to_message_reference(target, cx);
+            return;
+        }
+
+        let loaded = (self.model.selected_room == Some(target.room_id))
+            .then(|| {
+                self.model
+                    .messages
+                    .binary_search_by_key(&target.message_id.0, |message| message.id)
+                    .ok()
+                    .map(|index| self.model.messages[index].clone())
+            })
+            .flatten();
+        if let Some(message) = loaded {
+            self.open_message_reference_target(target, message, window, cx);
+            return;
+        }
+        if let Some(cached) = self.message_reference_cache.get(&target).cloned() {
+            if let Some(message) = cached {
+                self.open_message_reference_target(target, message, window, cx);
+            } else {
+                self.jump_to_message_reference(target, cx);
+            }
+            return;
+        }
+
+        let request_id = hover_request.unwrap_or_else(|| self.request_id());
+        self.pending_message_reference_click =
+            Some(PendingMessageReferenceClick { target, request_id });
+        if hover_request.is_none()
+            && let Err(error) = self.daemon.send(ClientFrame::ResolveMessageReference {
+                request_id,
+                room_id: target.room_id,
+                message_id: target.message_id,
+            })
+        {
+            self.pending_message_reference_click = None;
+            self.status = error.into();
+        } else {
+            self.status = "Opening referenced attachment…".into();
+        }
+        cx.notify();
+    }
+
+    fn open_message_reference_target(
+        &mut self,
+        target: MessageRef,
+        message: timeline::Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attachment) = message.attachment else {
+            self.jump_to_message_reference(target, cx);
+            return;
+        };
+        self.open_message_reference_attachment(target, attachment, window, cx);
+    }
+
+    fn open_message_reference_attachment(
+        &mut self,
+        target: MessageRef,
+        attachment: Attachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let descriptor = attachment.descriptor.clone();
+        if attachment.is_image() {
+            let cached = self
+                .media_cache
+                .lock()
+                .expect("media cache lock poisoned")
+                .path_for(&descriptor)
+                .is_some();
+            if cached {
+                self.pending_reference_media_preview = None;
+                self.open_image_preview(descriptor, window, cx);
+            } else {
+                self.pending_reference_media_preview = Some(PendingReferenceMediaPreview {
+                    target,
+                    attachment: attachment.clone(),
+                });
+                let fetch = EagerImageFetch::new(target.room_id, descriptor.clone());
+                if self.eager_image_fetches.failure(fetch.key).is_some() {
+                    self.retry_eager_image(fetch, window, cx);
+                } else {
+                    self.enqueue_eager_image(fetch, window, cx);
+                }
+                self.status = format!("Loading {}…", descriptor.file_name).into();
+                cx.notify();
+            }
+            return;
+        }
+        if descriptor.media_kind == MediaKind::File && !attachment.is_video() {
+            self.pending_reference_media_preview = None;
+            self.open_code_preview(target.room_id, descriptor, window, cx);
+            return;
+        }
+        if attachment.is_video() {
+            let path = self
+                .media_cache
+                .lock()
+                .expect("media cache lock poisoned")
+                .path_for(&descriptor);
+            if let Some(path) = path {
+                self.pending_reference_media_preview = None;
+                let key = video_key(target.room_id, target.message_id.0, &descriptor);
+                self.videos.ensure_source(key, path.clone());
+                self.toggle_video_theater(
+                    TheaterVideo {
+                        key,
+                        descriptor,
+                        path,
+                    },
+                    cx,
+                );
+            } else {
+                self.pending_reference_media_preview =
+                    Some(PendingReferenceMediaPreview { target, attachment });
+                if let Err(error) =
+                    self.begin_attachment_read(target.room_id, descriptor.clone(), cx)
+                {
+                    self.pending_reference_media_preview = None;
+                    self.status = error.into();
+                }
+            }
+            return;
+        }
+
+        self.pending_reference_media_preview = None;
+        self.status = format!("{} cannot be previewed yet", descriptor.file_name).into();
+        cx.notify();
+    }
+
+    fn jump_to_message_reference(&mut self, target: MessageRef, cx: &mut Context<Self>) {
+        self.message_reference_hover = None;
+        self.message_reference_hover_task = None;
+        if !self.model.is_ready()
+            || !self
+                .model
+                .rooms
+                .iter()
+                .any(|room| room.id == target.room_id)
+        {
+            self.status = "Referenced room is not available".into();
+            cx.notify();
+            return;
+        }
+        self.pending_message_jump = Some(PendingMessageJump {
+            target,
+            pages_requested: 0,
+            page_request_id: None,
+            room_request_id: None,
+        });
+        if self.model.selected_room != Some(target.room_id) {
+            let request_id = self.request_id();
+            self.model.pending.insert(
+                request_id,
+                PendingRequest {
+                    operation: Operation::SelectRoom,
+                    room_id: Some(target.room_id),
+                    draft: None,
+                    transfer_id: None,
+                },
+            );
+            if let Some(jump) = self.pending_message_jump.as_mut() {
+                jump.room_request_id = Some(request_id);
+            }
+            if let Err(error) = self.daemon.send(ClientFrame::SelectRoom {
+                request_id,
+                room_id: target.room_id,
+            }) {
+                self.model.pending.remove(&request_id);
+                self.pending_message_jump = None;
+                self.status = error.into();
+            } else {
+                self.status = "Opening referenced room…".into();
+            }
+            cx.notify();
+            return;
+        }
+        self.resume_message_reference_jump(cx);
+    }
+
+    fn flash_message_reference(&mut self, target: MessageRef, cx: &mut Context<Self>) {
+        let flash_id = self.next_message_reference_flash_id;
+        self.next_message_reference_flash_id =
+            self.next_message_reference_flash_id.wrapping_add(1).max(1);
+        self.message_reference_flash = Some((target, flash_id));
+        self.message_reference_flash_task = None;
+        let executor = cx.background_executor().clone();
+        self.message_reference_flash_task = Some(cx.spawn(async move |this, cx| {
+            executor.timer(Duration::from_millis(1_600)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .message_reference_flash
+                    .is_some_and(|(_, active_id)| active_id == flash_id)
+                {
+                    this.message_reference_flash = None;
+                    this.message_reference_flash_task = None;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn resume_message_reference_jump(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.pending_message_jump.as_ref().map(|jump| jump.target) else {
+            return;
+        };
+        if self.model.selected_room != Some(target.room_id) {
+            return;
+        }
+        if self
+            .pending_message_jump
+            .as_ref()
+            .is_some_and(|jump| jump.page_request_id.is_some())
+        {
+            return;
+        }
+        let pages_requested = self
+            .pending_message_jump
+            .as_ref()
+            .map_or(0, |jump| jump.pages_requested);
+        let before = match message_reference_jump_decision(
+            &self.model.messages,
+            target.message_id,
+            self.model.older_cursor,
+            self.model.at_start,
+            pages_requested,
+        ) {
+            MessageReferenceJumpDecision::Found => {
+                if timeline::reveal_message(
+                    &self.model.messages,
+                    &mut self.collapsed_sections,
+                    target.message_id.0,
+                ) {
+                    self.rebuild_message_list();
+                }
+                if let Some(index) = self
+                    .message_list
+                    .iter()
+                    .position(|item| item.message_id() == Some(target.message_id.0))
+                {
+                    self.list_state.scroll_to_reveal_item(index);
+                    self.flash_message_reference(target, cx);
+                    self.pending_message_jump = None;
+                    self.status = "Jumped to referenced message".into();
+                    cx.notify();
+                }
+                return;
+            }
+            MessageReferenceJumpDecision::Unavailable => {
+                self.pending_message_jump = None;
+                self.status = "Referenced message is not available".into();
+                cx.notify();
+                return;
+            }
+            MessageReferenceJumpDecision::SearchWindowExhausted => {
+                self.pending_message_jump = None;
+                self.status = "Referenced message is outside the current jump search window".into();
+                cx.notify();
+                return;
+            }
+            MessageReferenceJumpDecision::LoadOlder(before) => before,
+        };
+
+        let request_id = self.request_id();
+        self.model.pending.insert(
+            request_id,
+            PendingRequest {
+                operation: Operation::LoadOlder,
+                room_id: Some(target.room_id),
+                draft: None,
+                transfer_id: None,
+            },
+        );
+        let jump = self
+            .pending_message_jump
+            .as_mut()
+            .expect("reference jump remains pending");
+        jump.pages_requested += 1;
+        jump.page_request_id = Some(request_id);
+        if let Err(error) = self.daemon.send(ClientFrame::LoadOlder {
+            request_id,
+            room_id: target.room_id,
+            before: Some(before),
+            limit: REFERENCE_JUMP_PAGE_SIZE,
+        }) {
+            self.model.pending.remove(&request_id);
+            self.pending_message_jump = None;
+            self.status = error.into();
+        } else {
+            self.status = format!(
+                "Finding referenced message… ({}/{REFERENCE_JUMP_PAGE_LIMIT})",
+                jump.pages_requested
+            )
+            .into();
         }
         cx.notify();
     }
@@ -4042,6 +4692,7 @@ impl ChattView {
         let collapsed_count = item.collapsed_count;
         let collapsed = item.is_collapsed();
         let settings = AppliedSettings::get(cx);
+        let reduce_motion = cx.reduce_motion();
         let accent = sender_color(&message.sender, message.local, &settings);
         let background = if collapsed {
             settings.theme.color(ThemeRole::ControlSurface)
@@ -4059,6 +4710,9 @@ impl ChattView {
         });
         let message_id = message.id;
         let room_id = message.room_id;
+        let reference_flash_id = self.message_reference_flash.and_then(|(target, flash_id)| {
+            (target.room_id == room_id && target.message_id.0 == message_id).then_some(flash_id)
+        });
         let formatted_message =
             (!collapsed).then(|| match self.formatted_messages.get(&message.id) {
                 Some(formatted) if formatted.source() == message.body.as_str() => formatted.clone(),
@@ -4070,12 +4724,34 @@ impl ChattView {
         let timestamp_ms = message.timestamp_ms;
         let timestamp = timeline::format_age(timestamp_ms, timeline::now_ms());
         let hover_group: SharedString = format!("message-actions-{message_id}").into();
-        let actions = (!collapsed && message.local && !message.notice).then(|| {
+        let local_actions = (!collapsed && message.local && !message.notice).then(|| {
             (
                 message.room_id,
                 local_rpc::ids::MessageId(message.id),
                 message.attachment.is_none().then(|| message.body.clone()),
             )
+        });
+        let reference_target = (!message.notice && message.id != 0).then_some(MessageRef {
+            room_id,
+            message_id: local_rpc::ids::MessageId(message_id),
+        });
+        let formatted_message = formatted_message.map(|formatted_message| {
+            let click_view = cx.entity().downgrade();
+            let hover_view = cx.entity().downgrade();
+            FormattedMessageElement::new(formatted_message)
+                .selection_group(
+                    self.timeline_selection.clone(),
+                    MessageSelectionKey::Message(message_id),
+                )
+                .on_reference_click(Rc::new(move |target, shift, window, cx| {
+                    let _ = click_view.update(cx, |this, cx| {
+                        this.activate_message_reference(target, shift, window, cx)
+                    });
+                }))
+                .on_reference_hover(Rc::new(move |hovered, _, cx| {
+                    let _ =
+                        hover_view.update(cx, |this, cx| this.hover_message_reference(hovered, cx));
+                }))
         });
         let attachment = (!collapsed).then(|| message.attachment.clone()).flatten();
         div()
@@ -4088,6 +4764,25 @@ impl ChattView {
             .py(px(if continuation { 3. } else { 10. }))
             .bg(background)
             .hover(move |row| row.bg(row_hover))
+            .when_some(reference_flash_id, |row, flash_id| {
+                let flash = div()
+                    .absolute()
+                    .inset_0()
+                    .bg(settings.theme.color(ThemeRole::StateSelected));
+                let flash = if reduce_motion {
+                    flash.opacity(0.65).into_any_element()
+                } else {
+                    flash
+                        .with_animation(
+                            ("message-reference-flash", flash_id as usize),
+                            Animation::new(Duration::from_millis(1_600))
+                                .with_easing(gpui::ease_out_quint()),
+                            |flash, delta| flash.opacity(1.0 - delta),
+                        )
+                        .into_any_element()
+                };
+                row.child(flash)
+            })
             .child(
                 div()
                     .absolute()
@@ -4128,7 +4823,7 @@ impl ChattView {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .pr(px(100.))
+                                    .pr(px(180.))
                                     .child(
                                         div()
                                             .font_weight(FontWeight::SEMIBOLD)
@@ -4173,19 +4868,14 @@ impl ChattView {
                             )
                         })
                         .when_some(formatted_message, |content, formatted_message| {
-                            content
-                                .child(
-                                    FormattedMessageElement::new(formatted_message)
-                                        .selection_group(
-                                            self.timeline_selection.clone(),
-                                            MessageSelectionKey::Message(message_id),
-                                        ),
-                                )
-                                .when_some(attachment, |content, attachment| {
+                            content.child(formatted_message).when_some(
+                                attachment,
+                                |content, attachment| {
                                     content.child(self.render_attachment(
                                         room_id, message_id, attachment, window, cx,
                                     ))
-                                })
+                                },
+                            )
                         }),
                 ),
             )
@@ -4199,39 +4889,69 @@ impl ChattView {
                     .invisible()
                     .group_hover(hover_group, |actions| actions.visible())
                     .when(collapsed, |actions| actions.visible())
-                    .when_some(actions, |actions, (room_id, message_id, edit_body)| {
-                        actions
-                            .when_some(edit_body, |actions, edit_body| {
-                                actions.child(
+                    .when_some(
+                        local_actions,
+                        |actions, (room_id, message_id, edit_body)| {
+                            actions
+                                .when_some(edit_body, |actions, edit_body| {
+                                    actions.child(
+                                        message_action_button(
+                                            ("edit", message_id.0 as usize),
+                                            IconName::Pencil,
+                                            false,
+                                            &settings.theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.begin_edit(
+                                                    room_id,
+                                                    message_id,
+                                                    edit_body.clone(),
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
                                     message_action_button(
-                                        ("edit", message_id.0 as usize),
-                                        IconName::Pencil,
-                                        false,
+                                        ("delete", message_id.0 as usize),
+                                        IconName::Trash,
+                                        true,
                                         &settings.theme,
                                     )
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
-                                            this.begin_edit(
-                                                room_id,
-                                                message_id,
-                                                edit_body.clone(),
-                                                cx,
-                                            )
+                                            this.delete_message(room_id, message_id, cx)
                                         },
                                     )),
                                 )
-                            })
+                        },
+                    )
+                    .when_some(reference_target, |actions, target| {
+                        actions
                             .child(
                                 message_action_button(
-                                    ("delete", message_id.0 as usize),
-                                    IconName::Trash,
-                                    true,
+                                    ("quote-reference", message_id as usize),
+                                    IconName::CornerUpLeft,
+                                    false,
                                     &settings.theme,
                                 )
                                 .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.delete_message(room_id, message_id, cx)
+                                    move |this, _, window, cx| {
+                                        this.quote_message_reference(target, window, cx)
                                     },
+                                )),
+                            )
+                            .child(
+                                message_action_button(
+                                    ("copy-reference", message_id as usize),
+                                    IconName::AtSign,
+                                    false,
+                                    &settings.theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.copy_message_reference(target, cx),
                                 )),
                             )
                     })
@@ -6902,6 +7622,8 @@ impl ChattView {
         if distance == px(0.) {
             return false;
         }
+        self.message_reference_hover = None;
+        self.message_reference_hover_task = None;
 
         crate::frame_stats::record_scroll_input();
         let input_delta = f32::from(event.delta.pixel_delta(px(20.)).y);
@@ -7052,6 +7774,177 @@ impl ChattView {
             );
         }
         row
+    }
+
+    fn render_message_reference_preview(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let hover = self
+            .message_reference_hover
+            .as_ref()
+            .filter(|hover| hover.visible)?;
+        let target = hover.target;
+        let anchor = hover.anchor;
+        let message = hover.message.clone();
+        let formatted = hover.formatted.clone();
+        let missing = hover.missing;
+        let applied = AppliedSettings::get(cx);
+        let room_name = self
+            .model
+            .rooms
+            .iter()
+            .find(|room| room.id == target.room_id)
+            .map(|room| room.name.clone())
+            .unwrap_or_else(|| "Unknown room".into());
+        let attachment = message
+            .as_ref()
+            .and_then(|message| message.attachment.as_ref())
+            .map(|attachment| {
+                self.render_message_reference_attachment(target, attachment.clone(), window, cx)
+            });
+        let card = div()
+            .w(px(400.))
+            .max_w(px(400.))
+            .max_h(px(480.))
+            .overflow_hidden()
+            .p_3()
+            .border_1()
+            .border_color(applied.theme.color(ThemeRole::BorderStrong))
+            .bg(applied.theme.color(ThemeRole::Raised))
+            .shadow_lg()
+            .text_color(applied.theme.color(ThemeRole::TextBody))
+            .child(
+                div()
+                    .mb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .when_some(message.as_ref(), |header, message| {
+                        header.child(message.sender.clone())
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(applied.theme.color(ThemeRole::TextDim))
+                            .child(format!("in {room_name}")),
+                    ),
+            )
+            .when_some(
+                message.as_ref().zip(formatted.as_ref()),
+                |card, (message, formatted)| {
+                    let _ = message;
+                    card.child(FormattedMessageElement::new(formatted.clone()))
+                },
+            )
+            .when_some(attachment, |card, attachment| card.child(attachment))
+            .when(message.is_none(), |card| {
+                card.child(
+                    div()
+                        .text_sm()
+                        .text_color(applied.theme.color(ThemeRole::TextMuted))
+                        .child(if missing {
+                            "Referenced message is not available"
+                        } else {
+                            "Loading referenced message…"
+                        }),
+                )
+            });
+        let position = point(anchor.origin.x, anchor.origin.y - px(6.));
+        Some(
+            deferred(
+                anchored()
+                    .anchor(Anchor::BottomLeft)
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn render_message_reference_attachment(
+        &mut self,
+        target: MessageRef,
+        attachment: Attachment,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_image = attachment.is_image();
+        let descriptor = attachment.descriptor;
+        let settings = AppliedSettings::get(cx);
+        if is_image {
+            let (cache_path, active_transfer) = {
+                let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
+                (
+                    cache.path_for(&descriptor),
+                    cache.active_transfer(&descriptor),
+                )
+            };
+            if let Some(path) = cache_path {
+                let source_width = descriptor.width.unwrap_or(4).max(1) as f32;
+                let source_height = descriptor.height.unwrap_or(3).max(1) as f32;
+                let aspect_ratio = source_width / source_height;
+                let width = 368.0_f32.min(220.0 * aspect_ratio);
+                let height = width / aspect_ratio;
+                return div()
+                    .id(("reference-preview-image", target.message_id.0 as usize))
+                    .mt_2()
+                    .w(px(width))
+                    .max_w_full()
+                    .h(px(height))
+                    .overflow_hidden()
+                    .bg(settings.theme.color(ThemeRole::Panel))
+                    .child(
+                        img(path)
+                            .image_cache(&self.image_cache)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element();
+            }
+            let fetch = EagerImageFetch::new(target.room_id, descriptor.clone());
+            let status = if active_transfer.is_some() {
+                format!("Loading {}…", descriptor.file_name)
+            } else if let Some(reason) = self.eager_image_fetches.failure(fetch.key) {
+                format!("Could not load {} · {reason}", descriptor.file_name)
+            } else {
+                self.enqueue_eager_image(fetch, window, cx);
+                format!("Loading {}…", descriptor.file_name)
+            };
+            return div()
+                .mt_2()
+                .h(px(96.))
+                .w_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(settings.theme.color(ThemeRole::Panel))
+                .text_sm()
+                .text_color(settings.theme.color(ThemeRole::TextMuted))
+                .child(status)
+                .into_any_element();
+        }
+
+        div()
+            .mt_2()
+            .px_2()
+            .py_1()
+            .bg(settings.theme.color(ThemeRole::ControlSurface))
+            .text_sm()
+            .text_color(settings.theme.color(ThemeRole::TextSecondary))
+            .child(format!(
+                "{} · {} bytes",
+                descriptor.file_name, descriptor.byte_len
+            ))
+            .into_any_element()
     }
 }
 
@@ -7221,6 +8114,7 @@ impl Render for ChattView {
         };
         let completion_popup = completion_view.map(|view| self.render_completion_popup(view, cx));
         let queued_file_row = (!self.queued_files.is_empty()).then(|| self.render_queued_files(cx));
+        let message_reference_preview = self.render_message_reference_preview(window, cx);
         div()
             .id("chatt")
             .key_context("Chatt")
@@ -7640,6 +8534,7 @@ impl Render for ChattView {
                 )
                 .child(preview_panel)
             })
+            .when_some(message_reference_preview, |root, preview| root.child(preview))
             .when_some(self.settings.clone(), |root, settings| root.child(settings))
     }
 }
@@ -7899,6 +8794,61 @@ mod tests {
                 height: Some(300),
             },
         )
+    }
+
+    fn jump_message(id: u64) -> timeline::Message {
+        timeline::Message {
+            room_id: RoomId(1),
+            id,
+            sender: "sender".into(),
+            body: String::new(),
+            timestamp_ms: id,
+            local: false,
+            edited: false,
+            unverified: false,
+            notice: false,
+            attachment: None,
+        }
+    }
+
+    #[test]
+    fn reference_jump_uses_ordering_to_stop_after_crossing_a_target() {
+        let messages = vec![jump_message(300), jump_message(400), jump_message(500)];
+
+        assert_eq!(
+            message_reference_jump_decision(
+                &messages,
+                local_rpc::ids::MessageId(350),
+                Some(local_rpc::ids::MessageId(300)),
+                false,
+                1,
+            ),
+            MessageReferenceJumpDecision::Unavailable
+        );
+        assert_eq!(
+            message_reference_jump_decision(
+                &messages,
+                local_rpc::ids::MessageId(200),
+                Some(local_rpc::ids::MessageId(300)),
+                false,
+                1,
+            ),
+            MessageReferenceJumpDecision::LoadOlder(local_rpc::ids::MessageId(300))
+        );
+    }
+
+    #[test]
+    fn reference_jump_budget_is_a_distinct_search_window_outcome() {
+        assert_eq!(
+            message_reference_jump_decision(
+                &[jump_message(300)],
+                local_rpc::ids::MessageId(200),
+                Some(local_rpc::ids::MessageId(300)),
+                false,
+                REFERENCE_JUMP_PAGE_LIMIT,
+            ),
+            MessageReferenceJumpDecision::SearchWindowExhausted
+        );
     }
 
     #[test]
