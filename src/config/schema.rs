@@ -86,21 +86,21 @@ impl Default for ThemeConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct SurfaceColors {
-    #[toml(default = Rgba8::rgb(0x00, 0x00, 0x00))]
+    #[toml(default = Rgba8::rgb(0x16, 0x16, 0x16))]
     pub(crate) window: Rgba8,
-    #[toml(default = Rgba8::rgb(0x0a, 0x0a, 0x0a))]
+    #[toml(default = Rgba8::rgb(0x1d, 0x1d, 0x1d))]
     pub(crate) sidebar: Rgba8,
-    #[toml(default = Rgba8::rgb(0x15, 0x15, 0x15))]
+    #[toml(default = Rgba8::rgb(0x1d, 0x1d, 0x1d))]
     pub(crate) raised: Rgba8,
-    #[toml(default = Rgba8::rgb(0x00, 0x00, 0x00))]
+    #[toml(default = Rgba8::rgb(0x16, 0x16, 0x16))]
     pub(crate) media: Rgba8,
-    #[toml(default = Rgba8::rgb(0x0d, 0x0d, 0x0d))]
+    #[toml(default = Rgba8::rgb(0x1d, 0x1d, 0x1d))]
     pub(crate) toolbar: Rgba8,
-    #[toml(default = Rgba8::rgb(0x12, 0x12, 0x12))]
+    #[toml(default = Rgba8::rgb(0x1d, 0x1d, 0x1d))]
     pub(crate) panel: Rgba8,
-    #[toml(default = Rgba8::rgb(0x21, 0x21, 0x21))]
+    #[toml(default = Rgba8::rgb(0x1d, 0x1d, 0x1d))]
     pub(crate) input: Rgba8,
-    #[toml(default = Rgba8::rgb(0x12, 0x12, 0x12))]
+    #[toml(default = Rgba8::rgb(0x0e, 0x0e, 0x0e))]
     pub(crate) code: Rgba8,
     #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xdd))]
     pub(crate) scrim: Rgba8,
@@ -109,14 +109,14 @@ pub(crate) struct SurfaceColors {
 impl Default for SurfaceColors {
     fn default() -> Self {
         Self {
-            window: Rgba8::rgb(0x00, 0x00, 0x00),
-            sidebar: Rgba8::rgb(0x0a, 0x0a, 0x0a),
-            raised: Rgba8::rgb(0x15, 0x15, 0x15),
-            media: Rgba8::rgb(0x00, 0x00, 0x00),
-            toolbar: Rgba8::rgb(0x0d, 0x0d, 0x0d),
-            panel: Rgba8::rgb(0x12, 0x12, 0x12),
-            input: Rgba8::rgb(0x21, 0x21, 0x21),
-            code: Rgba8::rgb(0x12, 0x12, 0x12),
+            window: Rgba8::rgb(0x16, 0x16, 0x16),
+            sidebar: Rgba8::rgb(0x1d, 0x1d, 0x1d),
+            raised: Rgba8::rgb(0x1d, 0x1d, 0x1d),
+            media: Rgba8::rgb(0x16, 0x16, 0x16),
+            toolbar: Rgba8::rgb(0x1d, 0x1d, 0x1d),
+            panel: Rgba8::rgb(0x1d, 0x1d, 0x1d),
+            input: Rgba8::rgb(0x1d, 0x1d, 0x1d),
+            code: Rgba8::rgb(0x0e, 0x0e, 0x0e),
             scrim: Rgba8::rgba(0x00, 0x00, 0x00, 0xdd),
         }
     }
@@ -161,13 +161,13 @@ impl Default for TextColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct BorderColors {
-    #[toml(default = Rgba8::rgb(0x1f, 0x1f, 0x1f))]
+    #[toml(default = Rgba8::rgb(0x2a, 0x2a, 0x2a))]
     pub(crate) subtle: Rgba8,
-    #[toml(default = Rgba8::rgb(0x2e, 0x2e, 0x2e))]
+    #[toml(default = Rgba8::rgb(0x2a, 0x2a, 0x2a))]
     pub(crate) strong: Rgba8,
-    #[toml(default = Rgba8::rgb(0x29, 0x29, 0x29))]
+    #[toml(default = Rgba8::rgb(0x2a, 0x2a, 0x2a))]
     pub(crate) code: Rgba8,
-    #[toml(default = Rgba8::rgb(0x26, 0x26, 0x26))]
+    #[toml(default = Rgba8::rgb(0x2a, 0x2a, 0x2a))]
     pub(crate) media: Rgba8,
     #[toml(default = Rgba8::rgb(0x73, 0x73, 0x73))]
     pub(crate) focus: Rgba8,
@@ -178,10 +178,10 @@ pub(crate) struct BorderColors {
 impl Default for BorderColors {
     fn default() -> Self {
         Self {
-            subtle: Rgba8::rgb(0x1f, 0x1f, 0x1f),
-            strong: Rgba8::rgb(0x2e, 0x2e, 0x2e),
-            code: Rgba8::rgb(0x29, 0x29, 0x29),
-            media: Rgba8::rgb(0x26, 0x26, 0x26),
+            subtle: Rgba8::rgb(0x2a, 0x2a, 0x2a),
+            strong: Rgba8::rgb(0x2a, 0x2a, 0x2a),
+            code: Rgba8::rgb(0x2a, 0x2a, 0x2a),
+            media: Rgba8::rgb(0x2a, 0x2a, 0x2a),
             focus: Rgba8::rgb(0x73, 0x73, 0x73),
             quote: Rgba8::rgb(0x4a, 0x4a, 0x4a),
         }
@@ -377,7 +377,7 @@ pub(crate) struct MediaColors {
     pub(crate) overlay: Rgba8,
     #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xf2))]
     pub(crate) overlay_strong: Rgba8,
-    #[toml(default = Rgba8::rgb(0x26, 0x26, 0x26))]
+    #[toml(default = Rgba8::rgb(0x2a, 0x2a, 0x2a))]
     pub(crate) border: Rgba8,
     #[toml(default = Rgba8::rgba(0xc8, 0xc8, 0xc8, 0x33))]
     pub(crate) progress_track: Rgba8,
@@ -401,7 +401,7 @@ impl Default for MediaColors {
             viewport: Rgba8::rgb(0x00, 0x00, 0x00),
             overlay: Rgba8::rgba(0x00, 0x00, 0x00, 0xcc),
             overlay_strong: Rgba8::rgba(0x00, 0x00, 0x00, 0xf2),
-            border: Rgba8::rgb(0x26, 0x26, 0x26),
+            border: Rgba8::rgb(0x2a, 0x2a, 0x2a),
             progress_track: Rgba8::rgba(0xc8, 0xc8, 0xc8, 0x33),
             progress_fill: Rgba8::rgb(0xa3, 0xa3, 0xa3),
             progress_knob: Rgba8::rgb(0xe5, 0xe5, 0xe5),
@@ -655,10 +655,13 @@ code-size = 15.5
     fn default_theme_uses_neutral_core_surfaces() {
         let theme = ThemeConfig::default();
 
-        assert_eq!(theme.surfaces.window, Rgba8::rgb(0x00, 0x00, 0x00));
-        assert_eq!(theme.surfaces.input, Rgba8::rgb(0x21, 0x21, 0x21));
+        assert_eq!(theme.surfaces.window, Rgba8::rgb(0x16, 0x16, 0x16));
+        assert_eq!(theme.surfaces.raised, Rgba8::rgb(0x1d, 0x1d, 0x1d));
+        assert_eq!(theme.surfaces.input, Rgba8::rgb(0x1d, 0x1d, 0x1d));
+        assert_eq!(theme.surfaces.code, Rgba8::rgb(0x0e, 0x0e, 0x0e));
         assert_eq!(theme.states.selected, Rgba8::rgb(0x26, 0x26, 0x26));
-        assert_eq!(theme.borders.subtle, Rgba8::rgb(0x1f, 0x1f, 0x1f));
+        assert_eq!(theme.borders.subtle, Rgba8::rgb(0x2a, 0x2a, 0x2a));
+        assert_eq!(theme.borders.media, Rgba8::rgb(0x2a, 0x2a, 0x2a));
         assert_eq!(theme.controls.active, Rgba8::rgb(0x30, 0x30, 0x30));
     }
 

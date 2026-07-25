@@ -77,6 +77,7 @@ impl VimEditor {
             VimAction::JoinLines => self.exec_join_lines(n),
             VimAction::PasteAfter => self.exec_paste_after(n),
             VimAction::PasteBefore => self.exec_paste_before(n),
+            VimAction::PasteSelection => self.exec_paste_selection(n),
             VimAction::Undo => self.exec_undo(),
             VimAction::Redo => self.exec_redo(),
             VimAction::Replace => {
@@ -819,6 +820,94 @@ impl VimEditor {
 
     fn exec_paste_before(&mut self, count: usize) {
         self.exec_paste(count, false);
+    }
+
+    fn exec_paste_selection(&mut self, count: usize) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        if self.yank.lines.is_empty() {
+            return;
+        }
+
+        let paste = self.yank.clone();
+        let pasted_text = self.paste_text().repeat(count);
+        let mut replacements = Vec::new();
+        match selection.kind {
+            VisualKind::Char => {
+                let (start, end) = char_range(&selection);
+                let end_col = buffer::grapheme_end(self.buf.line(end.row).as_ref(), end.col);
+                let start_offset = self.buf.rowcol_to_offset(start.row, start.col) as usize;
+                let end_offset = self.buf.rowcol_to_offset(end.row, end_col) as usize;
+                let replacement = if paste.kind == YankKind::Linewise && !self.single_line {
+                    format!("\n{pasted_text}\n")
+                } else {
+                    pasted_text
+                };
+                replacements.push((start_offset..end_offset, replacement));
+            }
+            VisualKind::Line => {
+                let (start_row, end_row) = selection.rows_ordered();
+                let start_offset = self.buf.line_start(start_row) as usize;
+                let end_offset = if end_row + 1 < self.buf.line_count() {
+                    self.buf.line_start(end_row + 1) as usize
+                } else {
+                    self.buf.len()
+                };
+                let mut replacement = pasted_text;
+                if !self.single_line
+                    && end_offset < self.buf.len()
+                    && !replacement.ends_with('\n')
+                {
+                    replacement.push('\n');
+                }
+                replacements.push((start_offset..end_offset, replacement));
+            }
+            VisualKind::Block => {
+                let (start_row, end_row) = selection.rows_ordered();
+                let (start_col, end_col) = selection.cols_ordered();
+                for (index, row) in (start_row..=end_row).enumerate() {
+                    let line = self.buf.line(row);
+                    let (start, end) = block_span(line.as_ref(), start_col, end_col);
+                    let base = self.buf.line_start(row) as usize;
+                    let replacement = if paste.kind == YankKind::Blockwise {
+                        paste.lines.get(index).cloned().unwrap_or_default()
+                    } else {
+                        pasted_text.clone()
+                    };
+                    replacements.push((base + start..base + end, replacement));
+                }
+            }
+        }
+
+        let first_start = replacements[0].0.start;
+        let first_replacement_len = replacements[0].1.len();
+        self.checkpoint();
+        for (range, replacement) in replacements.into_iter().rev() {
+            self.commit(Edit::replace(
+                range.start as u32,
+                (range.end - range.start) as u32,
+                replacement,
+            ));
+        }
+
+        self.selection = None;
+        self.reset_to_primary_mode();
+        self.cursor = match selection.kind {
+            VisualKind::Line => {
+                let (row, _) = self.buf.offset_to_rowcol(first_start as u32);
+                Cursor {
+                    row,
+                    col: first_nonblank(self.buf.line(row).as_ref()),
+                }
+            }
+            VisualKind::Char | VisualKind::Block => {
+                self.cursor_one_grapheme_before((first_start + first_replacement_len) as u32)
+            }
+        };
+        self.fixup_cursor();
+        self.update_desired_display_col();
+        self.dirty = true;
     }
 
     fn exec_paste(&mut self, count: usize, after: bool) {
@@ -1639,6 +1728,7 @@ pub enum VimAction {
     JoinLines,
     PasteAfter,
     PasteBefore,
+    PasteSelection,
     Undo,
     Redo,
     Replace,
@@ -2948,6 +3038,7 @@ impl VimEditor {
             VimKey::Control('v') => VimAction::EnterVisualBlock,
             VimKey::Char('d') | VimKey::Char('x') => VimAction::DeleteSelection,
             VimKey::Char('c') => VimAction::ChangeSelection,
+            VimKey::Char('p') | VimKey::Char('P') => VimAction::PasteSelection,
             VimKey::Char('s') | VimKey::Char('S') => VimAction::SurroundSelection,
             VimKey::Char('y') => VimAction::YankSelection,
             VimKey::Char('u') => VimAction::CaseSelection(CaseTransform::Lower),
@@ -3302,6 +3393,20 @@ mod tests {
 
         assert_eq!(editor.text(), "aα\nβα\nβb");
         assert_eq!(editor.cursor_offset(), "aα\nβα\n".len());
+    }
+
+    #[test]
+    fn visual_mode_p_replaces_the_selection_with_loaded_clipboard_text() {
+        let mut editor = normal("alpha beta");
+        editor.set_paste_text("clipboard");
+        keys(&mut editor, "vep");
+
+        assert_eq!(editor.text(), "clipboard beta");
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(editor.yank_text_for_clipboard(), "clipboard");
+
+        keys(&mut editor, "u");
+        assert_eq!(editor.text(), "alpha beta");
     }
 
     #[test]

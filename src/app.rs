@@ -5150,12 +5150,13 @@ impl ChattView {
             && let Some(path) = cache_path.clone()
         {
             let preview = descriptor.clone();
-            return image_frame(&descriptor)
+            let hover_border = settings.theme.color(ThemeRole::BorderFocus);
+            return image_frame(&descriptor, &settings.theme)
                 .id(("image-frame", message_id as usize))
                 .mt_2()
                 .overflow_hidden()
                 .cursor_pointer()
-                .hover(|image| image.opacity(0.88))
+                .hover(move |image| image.border_color(hover_border))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_image_preview(preview.clone(), window, cx)
                 }))
@@ -5331,7 +5332,7 @@ impl ChattView {
         action: Option<AnyElement>,
         palette: &ThemePalette,
     ) -> AnyElement {
-        image_frame(descriptor)
+        image_frame(descriptor, palette)
             .id(("image-status", message_id as usize))
             .mt_2()
             .px_3()
@@ -8718,13 +8719,16 @@ fn image_box_size(descriptor: &AttachmentDescriptor) -> (f32, f32) {
     )
 }
 
-fn image_frame(descriptor: &AttachmentDescriptor) -> Div {
+fn image_frame(descriptor: &AttachmentDescriptor, palette: &ThemePalette) -> Div {
     let (width, height) = image_box_size(descriptor);
     div()
         .relative()
         .w(px(width))
         .max_w_full()
         .aspect_ratio(width / height)
+        .border_6()
+        .border_color(palette.color(ThemeRole::BorderMedia))
+        .rounded_xs()
 }
 
 fn connection_label(model: &ChatModel) -> String {

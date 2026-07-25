@@ -1641,6 +1641,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn visual_p_replaces_the_selection_with_system_clipboard_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let mut composer = Composer::new(cx);
+            composer.set_value("alpha beta", cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("clipboard".into()));
+        cx.simulate_keystrokes("v e p");
+
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "clipboard beta"
+        );
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("clipboard")
+        );
+    }
+
+    #[gpui::test]
     fn image_paste_emits_memory_payload_for_shortcut_and_normal_p(cx: &mut gpui::TestAppContext) {
         cx.update(crate::fonts::init);
         cx.update(|cx| {
