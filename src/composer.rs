@@ -12,7 +12,6 @@ use gpui::{
 mod buffer;
 pub(crate) mod completion;
 mod cursor;
-mod emoji;
 mod highlight;
 mod history;
 mod mode;
@@ -21,6 +20,7 @@ mod vim;
 mod visual;
 
 use crate::{
+    emoji,
     fonts::CODE_FONT_FAMILY,
     formatted_message::syntax_color,
     theme::{AppliedSettings, ResolvedSettings, ThemeRole, syntax_role},
@@ -494,8 +494,7 @@ impl TextEditor {
                 && let Some(record) = emoji::exact_shortcode(completed.shortcode)
             {
                 let range = completed.range;
-                self.editor
-                    .replace_offsets(range.clone(), &record.unicode);
+                self.editor.replace_offsets(range.clone(), &record.unicode);
                 end = range.start + record.unicode.len();
             }
         }
@@ -1511,26 +1510,22 @@ mod tests {
     impl Render for CompletionKeyHarness {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
-                .on_action(cx.listener(
-                    |this, _: &crate::app::CompletionNext, _, _| {
-                        this.actions.borrow_mut().push("next")
-                    },
-                ))
-                .on_action(cx.listener(
-                    |this, _: &crate::app::CompletionPrevious, _, _| {
+                .on_action(cx.listener(|this, _: &crate::app::CompletionNext, _, _| {
+                    this.actions.borrow_mut().push("next")
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::app::CompletionPrevious, _, _| {
                         this.actions.borrow_mut().push("previous")
-                    },
-                ))
-                .on_action(cx.listener(
-                    |this, _: &crate::app::CompletionAccept, _, _| {
-                        this.actions.borrow_mut().push("accept")
-                    },
-                ))
-                .on_action(cx.listener(
-                    |this, _: &crate::app::CompletionAcceptEngaged, _, _| {
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &crate::app::CompletionAccept, _, _| {
+                    this.actions.borrow_mut().push("accept")
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::app::CompletionAcceptEngaged, _, _| {
                         this.actions.borrow_mut().push("accept-engaged")
-                    },
-                ))
+                    }),
+                )
                 .on_action(cx.listener(|this, _: &crate::app::SendMessage, _, _| {
                     this.actions.borrow_mut().push("send")
                 }))
@@ -1720,10 +1715,7 @@ mod tests {
 
         cx.simulate_keystrokes(": s m i l e :");
 
-        assert_eq!(
-            editor.read_with(cx, |editor, _| editor.text()),
-            ":smile:"
-        );
+        assert_eq!(editor.read_with(cx, |editor, _| editor.text()), ":smile:");
     }
 
     #[gpui::test]

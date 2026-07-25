@@ -1167,6 +1167,7 @@ impl PlatformTextSystem for NoopTextSystem {
 
         LineLayout {
             font_size,
+            emoji_font_size: font_size,
             width: position,
             ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
             descent: font_size * (metrics.descent / metrics.units_per_em as f32),

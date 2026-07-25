@@ -13,6 +13,7 @@ use gpui::{
 };
 
 use crate::{
+    emoji,
     fonts::{CODE_FONT_FAMILY, UI_FONT_FAMILY},
     icons::{IconName, icon},
     theme::{AppliedSettings, ThemeRole, syntax_role},
@@ -25,6 +26,9 @@ const QUOTE_RAIL_COLOR: u32 = 0x4a4a4a;
 const CODE_BACKGROUND: u32 = 0x0e0e0e;
 const CODE_BORDER: u32 = 0x2a2a2a;
 const MAX_VISIBLE_QUOTE_DEPTH: usize = 8;
+const INLINE_EMOJI_SCALE: f32 = 22.0 / 16.0;
+const WUMBOJI_SIZE_PX: f32 = 32.0;
+const MAX_WUMBOJI_COUNT: usize = 12;
 
 actions!(formatted_message, [Copy]);
 
@@ -52,16 +56,17 @@ struct TextPiece {
     range: Range<usize>,
     text: SharedString,
     spans: Box<[FormatSpan]>,
+    wumboji: bool,
     cached_runs: RefCell<Option<(TextStyle, Arc<[TextRun]>)>>,
 }
 
 #[derive(Debug)]
 enum PreparedBlockKind {
-    Paragraph(TextPiece),
-    Header(TextPiece),
+    Paragraph(Vec<TextPiece>),
+    Header(Vec<TextPiece>),
     ListItem {
         marker: TextPiece,
-        content: TextPiece,
+        content: Vec<TextPiece>,
     },
     Code {
         text: TextPiece,
@@ -77,11 +82,11 @@ struct PreparedBlock {
 
 #[derive(Debug)]
 enum BlockKind {
-    Paragraph(TextPiece),
-    Header(TextPiece),
+    Paragraph(Vec<TextPiece>),
+    Header(Vec<TextPiece>),
     ListItem {
         marker: TextPiece,
-        content: TextPiece,
+        content: Vec<TextPiece>,
     },
     Code {
         text: TextPiece,
@@ -151,8 +156,8 @@ impl FormattedMessage {
             .map(|block| Block {
                 quote_depth: block.quote_depth,
                 kind: match block.kind {
-                    PreparedBlockKind::Paragraph(piece) => BlockKind::Paragraph(piece),
-                    PreparedBlockKind::Header(piece) => BlockKind::Header(piece),
+                    PreparedBlockKind::Paragraph(pieces) => BlockKind::Paragraph(pieces),
+                    PreparedBlockKind::Header(pieces) => BlockKind::Header(pieces),
                     PreparedBlockKind::ListItem { marker, content } => {
                         BlockKind::ListItem { marker, content }
                     }
@@ -183,7 +188,7 @@ impl FormattedMessage {
             visible: text.clone(),
             blocks: vec![Block {
                 quote_depth: 0,
-                kind: BlockKind::Paragraph(TextPiece {
+                kind: BlockKind::Paragraph(vec![TextPiece {
                     range: 0..len,
                     text,
                     spans: vec![FormatSpan {
@@ -194,8 +199,9 @@ impl FormattedMessage {
                         italic: false,
                     }]
                     .into_boxed_slice(),
+                    wumboji: false,
                     cached_runs: RefCell::new(None),
-                }),
+                }]),
             }],
             links: Rc::from([]),
             interaction: RefCell::new(InteractionState::default()),
@@ -238,10 +244,10 @@ fn project_document(
                     matches!(kind, TokenKind::ParagraphEnd)
                 });
                 let projected = project_inline(source, &tokens[cursor + 1..end]);
-                let piece = append_piece(&mut visible, projected, &mut links, true);
+                let pieces = append_pieces(&mut visible, projected, &mut links, true, true);
                 blocks.push(PreparedBlock {
                     quote_depth,
-                    kind: PreparedBlockKind::Paragraph(piece),
+                    kind: PreparedBlockKind::Paragraph(pieces),
                 });
                 cursor = end.saturating_add(1);
             }
@@ -250,10 +256,10 @@ fn project_document(
                     matches!(kind, TokenKind::HeaderEnd)
                 });
                 let projected = project_inline(source, &tokens[cursor + 1..end]);
-                let piece = append_piece(&mut visible, projected, &mut links, true);
+                let pieces = append_pieces(&mut visible, projected, &mut links, true, false);
                 blocks.push(PreparedBlock {
                     quote_depth,
-                    kind: PreparedBlockKind::Header(piece),
+                    kind: PreparedBlockKind::Header(pieces),
                 });
                 cursor = end.saturating_add(1);
             }
@@ -276,15 +282,16 @@ fn project_document(
                         italic: false,
                     }]
                     .into_boxed_slice(),
+                    wumboji: false,
                     cached_runs: RefCell::new(None),
                 };
                 let projected = project_inline(source, &tokens[cursor + 1..end]);
-                let content_piece = append_piece(&mut visible, projected, &mut links, false);
+                let content = append_pieces(&mut visible, projected, &mut links, false, false);
                 blocks.push(PreparedBlock {
                     quote_depth,
                     kind: PreparedBlockKind::ListItem {
                         marker: marker_piece,
-                        content: content_piece,
+                        content,
                     },
                 });
                 cursor = end.saturating_add(1);
@@ -324,7 +331,7 @@ fn project_document(
                     spans,
                     links: Vec::new(),
                 };
-                let piece = append_piece(&mut visible, projected, &mut links, true);
+                let piece = append_piece(&mut visible, projected, &mut links, true, false);
                 blocks.push(PreparedBlock {
                     quote_depth,
                     kind: PreparedBlockKind::Code { text: piece },
@@ -372,12 +379,13 @@ struct ProjectedInline {
     links: Vec<(Range<usize>, SharedString)>,
 }
 
-fn project_inline(source: &str, tokens: &[Token]) -> ProjectedInline {
-    let mut projected = ProjectedInline::default();
+fn project_inline(source: &str, tokens: &[Token]) -> Vec<ProjectedInline> {
+    let mut lines = vec![ProjectedInline::default()];
     let mut bold = false;
     let mut italic = false;
 
     for token in tokens {
+        let projected = lines.last_mut().unwrap();
         match &token.kind {
             TokenKind::BoldStart => bold = true,
             TokenKind::BoldEnd => bold = false,
@@ -406,21 +414,33 @@ fn project_inline(source: &str, tokens: &[Token]) -> ProjectedInline {
                 }
             }
             TokenKind::HardBreak => {
-                let start = projected.text.len();
-                projected.text.push('\n');
-                projected.spans.push(FormatSpan {
-                    start,
-                    end: start + 1,
-                    kind: InlineKind::Plain,
-                    bold,
-                    italic,
-                });
+                lines.push(ProjectedInline::default());
             }
             _ => {}
         }
     }
 
-    projected
+    lines
+}
+
+fn append_pieces(
+    visible: &mut String,
+    projected: Vec<ProjectedInline>,
+    links: &mut Vec<RenderedLink>,
+    separated: bool,
+    allow_wumboji: bool,
+) -> Vec<TextPiece> {
+    let mut pieces = Vec::with_capacity(projected.len());
+    for (index, projected) in projected.into_iter().enumerate() {
+        pieces.push(append_piece(
+            visible,
+            projected,
+            links,
+            separated || index > 0,
+            allow_wumboji,
+        ));
+    }
+    pieces
 }
 
 fn append_piece(
@@ -428,6 +448,7 @@ fn append_piece(
     projected: ProjectedInline,
     links: &mut Vec<RenderedLink>,
     separated: bool,
+    allow_wumboji: bool,
 ) -> TextPiece {
     if separated {
         append_block_separator(visible);
@@ -443,10 +464,13 @@ fn append_piece(
                 destination,
             }),
     );
+    let wumboji = allow_wumboji
+        && emoji::emoji_only_count(&projected.text).is_some_and(|count| count <= MAX_WUMBOJI_COUNT);
     TextPiece {
         range: start..visible.len(),
         text: projected.text.into(),
         spans: projected.spans.into_boxed_slice(),
+        wumboji,
         cached_runs: RefCell::new(None),
     }
 }
@@ -521,8 +545,8 @@ impl FormattedMessageElement {
 
         for (index, block) in self.message.blocks.iter().enumerate() {
             let element = match &block.kind {
-                BlockKind::Paragraph(piece) => render_piece(
-                    piece,
+                BlockKind::Paragraph(pieces) => render_pieces(
+                    pieces,
                     PiecePresentation::Body,
                     block.quote_depth,
                     true,
@@ -531,12 +555,12 @@ impl FormattedMessageElement {
                     window,
                     cx,
                 ),
-                BlockKind::Header(piece) => div()
+                BlockKind::Header(pieces) => div()
                     .w_full()
                     .min_w_0()
                     .text_size(px(message_size + 1.))
-                    .child(render_piece(
-                        piece,
+                    .child(render_pieces(
+                        pieces,
                         PiecePresentation::Header,
                         block.quote_depth,
                         true,
@@ -561,7 +585,7 @@ impl FormattedMessageElement {
                         window,
                         cx,
                     ))
-                    .child(div().flex_1().w_0().child(render_piece(
+                    .child(div().flex_1().w_0().child(render_pieces(
                         content,
                         PiecePresentation::Body,
                         block.quote_depth,
@@ -801,7 +825,13 @@ fn render_piece(
 ) -> AnyElement {
     let text = piece.text.clone();
     let runs = text_runs(piece, presentation, quote_depth, body_color, window, cx);
-    let styled = StyledText::new(text).with_shared_runs(runs);
+    let styled = StyledText::new(text)
+        .with_shared_runs(runs)
+        .with_emoji_scale(if piece.wumboji {
+            1.0
+        } else {
+            INLINE_EMOJI_SCALE
+        });
     lines.push(RenderedLine {
         layout: styled.layout().clone(),
         range: piece.range.clone(),
@@ -809,7 +839,40 @@ fn render_piece(
     div()
         .when(fill_width, |element| element.w_full())
         .min_w_0()
+        .when(piece.wumboji, |element| {
+            element.text_size(px(WUMBOJI_SIZE_PX))
+        })
         .child(styled)
+        .into_any_element()
+}
+
+fn render_pieces(
+    pieces: &[TextPiece],
+    presentation: PiecePresentation,
+    quote_depth: usize,
+    fill_width: bool,
+    body_color: gpui::Rgba,
+    lines: &mut Vec<RenderedLine>,
+    window: &Window,
+    cx: &App,
+) -> AnyElement {
+    div()
+        .when(fill_width, |element| element.w_full())
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .children(pieces.iter().map(|piece| {
+            render_piece(
+                piece,
+                presentation,
+                quote_depth,
+                fill_width,
+                body_color,
+                lines,
+                window,
+                cx,
+            )
+        }))
         .into_any_element()
 }
 
@@ -1977,6 +2040,129 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn marks_each_emoji_only_physical_line_as_wumboji() {
+        let message = FormattedMessage::new("hello 😀\n😀 ❤️ 🇺🇸\nafter");
+        let BlockKind::Paragraph(pieces) = &message.blocks[0].kind else {
+            panic!("expected paragraph");
+        };
+
+        assert_eq!(message.visible.as_ref(), "hello 😀\n😀 ❤️ 🇺🇸\nafter");
+        assert_eq!(pieces.len(), 3);
+        assert!(!pieces[0].wumboji);
+        assert!(pieces[1].wumboji);
+        assert!(!pieces[2].wumboji);
+    }
+
+    #[test]
+    fn caps_wumboji_at_twelve_emoji() {
+        let twelve = "😀".repeat(12);
+        let thirteen = "😀".repeat(13);
+        let message = FormattedMessage::new(format!("{twelve}\n{thirteen}"));
+        let BlockKind::Paragraph(pieces) = &message.blocks[0].kind else {
+            panic!("expected paragraph");
+        };
+
+        assert!(pieces[0].wumboji);
+        assert!(!pieces[1].wumboji);
+    }
+
+    #[gpui::test]
+    fn inline_and_wumboji_emoji_use_their_requested_sizes(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let cx = cx.add_empty_window();
+
+        let unscaled = StyledText::new("😀x").with_emoji_scale(1.);
+        let unscaled_layout = unscaled.layout().clone();
+        let _ = cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(500.), px(100.)),
+            move |_, _| div().text_size(px(16.)).child(unscaled),
+        );
+        let scaled = StyledText::new("😀x").with_emoji_scale(INLINE_EMOJI_SCALE);
+        let scaled_layout = scaled.layout().clone();
+        let _ = cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(500.), px(100.)),
+            move |_, _| div().text_size(px(16.)).child(scaled),
+        );
+        let unscaled_line = &unscaled_layout.line_layouts()[0].unwrapped_layout;
+        let scaled_line = &scaled_layout.line_layouts()[0].unwrapped_layout;
+        if unscaled_line
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .any(|glyph| glyph.is_emoji)
+        {
+            assert_eq!(
+                scaled_line.x_for_index("😀".len()),
+                unscaled_line.x_for_index("😀".len()) * INLINE_EMOJI_SCALE
+            );
+        }
+
+        let (_, inline) = render_message("hello 😀", 500., cx);
+        let inline_layout = &inline.text.lines[0].layout.line_layouts()[0].unwrapped_layout;
+        assert_eq!(inline_layout.font_size, px(16.));
+        assert_eq!(inline_layout.emoji_font_size, px(22.));
+
+        let (_, wumboji) = render_message("😀", 500., cx);
+        let wumboji_layout = &wumboji.text.lines[0].layout.line_layouts()[0].unwrapped_layout;
+        assert_eq!(wumboji_layout.font_size, px(32.));
+        assert_eq!(wumboji_layout.emoji_font_size, px(32.));
+
+        let (_, multiline) = render_message("before\n😀\nafter", 500., cx);
+        assert_eq!(multiline.text.lines.len(), 3);
+        assert_eq!(
+            multiline.text.lines[1].layout.line_layouts()[0]
+                .unwrapped_layout
+                .font_size,
+            px(32.)
+        );
+    }
+
+    #[gpui::test]
+    fn scaled_emoji_participate_in_truncation(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let cx = cx.add_empty_window();
+
+        let unscaled = StyledText::new("😀x");
+        let unscaled_layout = unscaled.layout().clone();
+        let _ = cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(500.), px(100.)),
+            move |_, _| div().text_size(px(16.)).child(unscaled),
+        );
+        let scaled = StyledText::new("😀x").with_emoji_scale(2.);
+        let scaled_layout = scaled.layout().clone();
+        let _ = cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(500.), px(100.)),
+            move |_, _| div().text_size(px(16.)).child(scaled),
+        );
+
+        let unscaled_width = unscaled_layout.line_layouts()[0].unwrapped_layout.width;
+        let scaled_width = scaled_layout.line_layouts()[0].unwrapped_layout.width;
+        if scaled_width == unscaled_width {
+            return;
+        }
+        let truncate_width = (unscaled_width + scaled_width) / 2.;
+        let truncated = StyledText::new("😀x").with_emoji_scale(2.);
+        let truncated_layout = truncated.layout().clone();
+        let _ = cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(500.), px(100.)),
+            move |_, _| {
+                div()
+                    .w(truncate_width)
+                    .truncate()
+                    .text_size(px(16.))
+                    .child(truncated)
+            },
+        );
+
+        assert_ne!(truncated_layout.text(), "😀x");
+    }
+
     #[gpui::test]
     fn list_marker_keeps_intrinsic_width(cx: &mut gpui::TestAppContext) {
         cx.update(crate::fonts::init);
@@ -2014,9 +2200,10 @@ mod tests {
         cx.update(crate::fonts::init);
         let cx = cx.add_empty_window();
         let (message, _) = render_message("plain **bold** text", 500., cx);
-        let BlockKind::Paragraph(piece) = &message.blocks[0].kind else {
+        let BlockKind::Paragraph(pieces) = &message.blocks[0].kind else {
             panic!("expected paragraph");
         };
+        let piece = &pieces[0];
         let first = piece.cached_runs.borrow().as_ref().unwrap().1.clone();
 
         let drawn = message.clone();

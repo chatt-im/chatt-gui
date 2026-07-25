@@ -18,6 +18,7 @@ pub struct LineWrapper {
     text_system: Arc<TextSystem>,
     pub(crate) font_id: FontId,
     pub(crate) font_size: Pixels,
+    pub(crate) emoji_font_size: Pixels,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
 }
@@ -26,11 +27,17 @@ impl LineWrapper {
     /// The maximum indent that can be applied to a line.
     pub const MAX_INDENT: u32 = 256;
 
-    pub(crate) fn new(font_id: FontId, font_size: Pixels, text_system: Arc<TextSystem>) -> Self {
+    pub(crate) fn new_with_emoji_size(
+        font_id: FontId,
+        font_size: Pixels,
+        emoji_font_size: Pixels,
+        text_system: Arc<TextSystem>,
+    ) -> Self {
         Self {
             text_system,
             font_id,
             font_size,
+            emoji_font_size,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
         }
@@ -491,7 +498,12 @@ impl LineWrapper {
             } else {
                 let width = self
                     .text_system
-                    .layout_width(self.font_id, self.font_size, c);
+                    .layout_width_with_emoji_size(
+                        self.font_id,
+                        self.font_size,
+                        self.emoji_font_size,
+                        c,
+                    );
                 self.cached_ascii_char_widths[c as usize] = Some(width);
                 width
             }
@@ -500,7 +512,12 @@ impl LineWrapper {
         } else {
             let width = self
                 .text_system
-                .layout_width(self.font_id, self.font_size, c);
+                .layout_width_with_emoji_size(
+                    self.font_id,
+                    self.font_size,
+                    self.emoji_font_size,
+                    c,
+                );
             self.cached_other_char_widths.insert(c, width);
             width
         }
@@ -689,7 +706,24 @@ mod tests {
         let dispatcher = TestDispatcher::new(0);
         let cx = TestAppContext::build(dispatcher, None);
         let id = cx.text_system().resolve_font(&font(".ZedMono"));
-        LineWrapper::new(id, px(16.), cx.text_system().clone())
+        LineWrapper::new_with_emoji_size(
+            id,
+            px(16.),
+            px(16.),
+            cx.text_system().clone(),
+        )
+    }
+
+    fn build_scaled_emoji_wrapper() -> LineWrapper {
+        let dispatcher = TestDispatcher::new(0);
+        let cx = TestAppContext::build(dispatcher, None);
+        let id = cx.text_system().resolve_font(&font(".ZedMono"));
+        LineWrapper::new_with_emoji_size(
+            id,
+            px(16.),
+            px(32.),
+            cx.text_system().clone(),
+        )
     }
 
     fn generate_test_runs(input_run_len: &[usize]) -> Vec<TextRun> {
@@ -856,6 +890,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
         );
+    }
+
+    #[test]
+    fn scaled_emoji_widths_participate_in_truncation() {
+        let mut unscaled = build_wrapper();
+        let mut scaled = build_scaled_emoji_wrapper();
+        let emoji_width = unscaled.width_for_char('😀');
+
+        assert_eq!(scaled.width_for_char('😀'), emoji_width * 2.);
+
+        let width = emoji_width + unscaled.width_for_char('x') + px(1.);
+        assert_eq!(
+            unscaled.should_truncate_line("😀x", width, "…", TruncateFrom::End),
+            None
+        );
+        assert!(scaled
+            .should_truncate_line("😀x", width, "…", TruncateFrom::End)
+            .is_some());
     }
 
     #[test]

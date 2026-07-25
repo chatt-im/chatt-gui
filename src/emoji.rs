@@ -1,11 +1,13 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::LazyLock,
 };
 
-const DATABASE_BYTES: &[u8] = include_bytes!("../../assets/emoji.db");
+use unicode_segmentation::UnicodeSegmentation;
+
+const DATABASE_BYTES: &[u8] = include_bytes!("../assets/emoji.db");
 const DATABASE_MAGIC: &[u8; 4] = b"TE02";
 const MAX_SHORTCODE_UNITS: usize = 64;
 const EMOJI_GROUPS: [u8; 9] = [0, 1, 3, 4, 5, 6, 7, 8, 9];
@@ -61,6 +63,7 @@ pub(crate) struct EmojiRecord {
 struct EmojiDatabase {
     emoji: Vec<EmojiRecord>,
     by_shortcode: HashMap<String, usize>,
+    by_unicode: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +133,20 @@ pub(crate) fn suggestions(query: &str, limit: usize) -> Vec<&'static EmojiRecord
         .collect()
 }
 
+pub(crate) fn emoji_only_count(value: &str) -> Option<usize> {
+    let mut count = 0;
+    for grapheme in value.graphemes(true) {
+        if grapheme.chars().all(char::is_whitespace) {
+            continue;
+        }
+        if !DATABASE.by_unicode.contains(grapheme) {
+            return None;
+        }
+        count += 1;
+    }
+    (count > 0).then_some(count)
+}
+
 fn compare_match(left: (u8, usize), right: (u8, usize)) -> Ordering {
     let left_record = &DATABASE.emoji[left.1];
     let right_record = &DATABASE.emoji[right.1];
@@ -190,10 +207,7 @@ pub(crate) fn find_colon_trigger(
     })
 }
 
-pub(crate) fn find_completed_shortcode(
-    value: &str,
-    caret: usize,
-) -> Option<ShortcodeRange<'_>> {
+pub(crate) fn find_completed_shortcode(value: &str, caret: usize) -> Option<ShortcodeRange<'_>> {
     if caret == 0
         || caret > value.len()
         || !value.is_char_boundary(caret)
@@ -243,12 +257,9 @@ fn has_valid_boundary(value: &str, colon: usize) -> bool {
     if colon == 0 {
         return true;
     }
-    value[..colon]
-        .chars()
-        .next_back()
-        .is_some_and(|character| {
-            character != ':' && character != '_' && !character.is_alphanumeric()
-        })
+    value[..colon].chars().next_back().is_some_and(|character| {
+        character != ':' && character != '_' && !character.is_alphanumeric()
+    })
 }
 
 fn backtick_run(value: &str, start: usize, end: usize) -> usize {
@@ -277,7 +288,9 @@ fn is_in_markdown_code(value: &str, offset: usize) -> bool {
     let mut inline_ticks = 0;
 
     while line_start <= offset {
-        let newline = value[line_start..].find('\n').map(|index| line_start + index);
+        let newline = value[line_start..]
+            .find('\n')
+            .map(|index| line_start + index);
         let line_end = newline.unwrap_or(value.len());
         let scan_end = offset.min(line_end);
         let mut content_start = line_start;
@@ -486,9 +499,11 @@ fn decode_database(bytes: &[u8]) -> Result<EmojiDatabase, String> {
         by_shortcode.insert(alias, id);
     }
 
+    let by_unicode = emoji.iter().map(|record| record.unicode.clone()).collect();
     Ok(EmojiDatabase {
         emoji,
         by_shortcode,
+        by_unicode,
     })
 }
 
@@ -656,6 +671,14 @@ mod tests {
                 .into_iter()
                 .all(|record| record.group == 0)
         );
+    }
+
+    #[test]
+    fn counts_complete_emoji_graphemes_and_ignores_spacing() {
+        assert_eq!(emoji_only_count("😀 ❤️  🇺🇸"), Some(3));
+        assert_eq!(emoji_only_count(" \t"), None);
+        assert_eq!(emoji_only_count("😀 hello"), None);
+        assert_eq!(emoji_only_count("☺"), None);
     }
 
     #[test]

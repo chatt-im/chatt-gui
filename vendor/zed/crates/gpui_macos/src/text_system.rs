@@ -620,6 +620,7 @@ impl MacTextSystemState {
         LineLayout {
             runs,
             font_size,
+            emoji_font_size: font_size,
             width: typographic_bounds.width.into(),
             ascent: max_ascent.into(),
             descent: max_descent.into(),

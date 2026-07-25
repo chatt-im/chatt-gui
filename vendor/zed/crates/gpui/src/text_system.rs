@@ -206,18 +206,30 @@ impl TextSystem {
     // Consider removing this?
     /// Returns the shaped layout width of for the given character, in the given font and size.
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
+        self.layout_width_with_emoji_size(font_id, font_size, font_size, ch)
+    }
+
+    /// Returns the shaped width of a character with color emoji measured at a
+    /// distinct font size.
+    pub fn layout_width_with_emoji_size(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        emoji_font_size: Pixels,
+        ch: char,
+    ) -> Pixels {
         let mut buffer = [0; 4];
         let buffer = ch.encode_utf8(&mut buffer);
-        self.platform_text_system
-            .layout_line(
-                buffer,
-                font_size,
-                &[FontRun {
-                    len: buffer.len(),
-                    font_id,
-                }],
-            )
-            .width
+        let mut layout = self.platform_text_system.layout_line(
+            buffer,
+            font_size,
+            &[FontRun {
+                len: buffer.len(),
+                font_id,
+            }],
+        );
+        apply_emoji_size_to_layout(&mut layout, emoji_font_size);
+        layout.width
     }
 
     /// Returns the width of an `em`.
@@ -305,14 +317,34 @@ impl TextSystem {
 
     /// Returns a handle to a line wrapper, for the given font and font size.
     pub fn line_wrapper(self: &Arc<Self>, font: Font, font_size: Pixels) -> LineWrapperHandle {
+        self.line_wrapper_with_emoji_size(font, font_size, font_size)
+    }
+
+    /// Returns a line-wrapper handle that measures color emoji at a distinct
+    /// font size.
+    pub fn line_wrapper_with_emoji_size(
+        self: &Arc<Self>,
+        font: Font,
+        font_size: Pixels,
+        emoji_font_size: Pixels,
+    ) -> LineWrapperHandle {
         let lock = &mut self.wrapper_pool.lock();
         let font_id = self.resolve_font(&font);
         let wrappers = lock
-            .entry(FontIdWithSize { font_id, font_size })
+            .entry(FontIdWithSize {
+                font_id,
+                font_size,
+                emoji_font_size,
+            })
             .or_default();
-        let wrapper = wrappers
-            .pop()
-            .unwrap_or_else(|| LineWrapper::new(font_id, font_size, self.clone()));
+        let wrapper = wrappers.pop().unwrap_or_else(|| {
+            LineWrapper::new_with_emoji_size(
+                font_id,
+                font_size,
+                emoji_font_size,
+                self.clone(),
+            )
+        });
 
         LineWrapperHandle {
             wrapper: Some(wrapper),
@@ -514,6 +546,29 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_emoji_size(
+            text,
+            font_size,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+        )
+    }
+
+    /// Shape multi-line text with color emoji rendered at a distinct font size.
+    ///
+    /// Emoji advances are scaled with their glyphs so wrapping and hit testing
+    /// remain consistent with the painted result.
+    pub fn shape_text_with_emoji_size(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        emoji_font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -574,9 +629,12 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
-            let layout = self.line_layout_cache.layout_wrapped_line(
+            let layout = self
+                .line_layout_cache
+                .layout_wrapped_line_with_emoji_size(
                 &line_text,
                 font_size,
+                emoji_font_size,
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
@@ -878,6 +936,7 @@ impl WindowTextSystem {
 struct FontIdWithSize {
     font_id: FontId,
     font_size: Pixels,
+    emoji_font_size: Pixels,
 }
 
 /// A handle into the text system, which can be used to compute the wrapped layout of text
@@ -894,6 +953,7 @@ impl Drop for LineWrapperHandle {
             .get_mut(&FontIdWithSize {
                 font_id: wrapper.font_id,
                 font_size: wrapper.font_size,
+                emoji_font_size: wrapper.emoji_font_size,
             })
             .unwrap()
             .push(wrapper);

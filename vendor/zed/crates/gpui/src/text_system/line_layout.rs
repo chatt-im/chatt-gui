@@ -16,6 +16,8 @@ use super::LineWrapper;
 pub struct LineLayout {
     /// The font size for this line
     pub font_size: Pixels,
+    /// The font size used to paint color emoji in this line.
+    pub emoji_font_size: Pixels,
     /// The width of the line
     pub width: Pixels,
     /// The ascent of the line
@@ -26,6 +28,55 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+}
+
+pub(super) fn apply_emoji_size_to_layout(
+    layout: &mut LineLayout,
+    emoji_font_size: Pixels,
+) {
+    layout.emoji_font_size = emoji_font_size;
+    if emoji_font_size == layout.font_size || layout.font_size == Pixels::ZERO {
+        return;
+    }
+
+    let scale = emoji_font_size / layout.font_size;
+    // Platform layouts expose glyphs in paint order. Consecutive glyphs at
+    // the same x-coordinate form one zero-advance cluster, so complete each
+    // cluster when the next position reveals its advance and shift in place.
+    let mut cumulative = Pixels::ZERO;
+    let mut group_x = None;
+    let mut group_has_emoji = false;
+
+    for run in &mut layout.runs {
+        for glyph in &mut run.glyphs {
+            let shaped_x = glyph.position.x;
+            match group_x {
+                Some(x) if shaped_x == x => {
+                    group_has_emoji |= glyph.is_emoji;
+                }
+                Some(x) => {
+                    if group_has_emoji {
+                        cumulative +=
+                            (shaped_x - x).max(Pixels::ZERO) * (scale - 1.);
+                    }
+                    group_x = Some(shaped_x);
+                    group_has_emoji = glyph.is_emoji;
+                }
+                None => {
+                    group_x = Some(shaped_x);
+                    group_has_emoji = glyph.is_emoji;
+                }
+            }
+            glyph.position.x += cumulative;
+        }
+    }
+
+    if let Some(x) = group_x
+        && group_has_emoji
+    {
+        cumulative += (layout.width - x).max(Pixels::ZERO) * (scale - 1.);
+    }
+    layout.width += cumulative;
 }
 
 /// A run of text that has been shaped .
@@ -509,10 +560,11 @@ impl LineLayoutCache {
         curr_frame.used_wrapped_lines_by_hash.clear();
     }
 
-    pub fn layout_wrapped_line<Text>(
+    pub fn layout_wrapped_line_with_emoji_size<Text>(
         &self,
         text: Text,
         font_size: Pixels,
+        emoji_font_size: Pixels,
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
@@ -524,6 +576,7 @@ impl LineLayoutCache {
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
+            emoji_font_size,
             runs,
             wrap_width,
             force_width: None,
@@ -545,7 +598,13 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let unwrapped_layout = self.layout_line_with_emoji_size::<&SharedString>(
+                &text,
+                font_size,
+                emoji_font_size,
+                runs,
+                None,
+            );
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -559,6 +618,7 @@ impl LineLayoutCache {
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
+                emoji_font_size,
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
@@ -585,9 +645,25 @@ impl LineLayoutCache {
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        self.layout_line_with_emoji_size(text, font_size, font_size, runs, force_width)
+    }
+
+    pub fn layout_line_with_emoji_size<Text>(
+        &self,
+        text: Text,
+        font_size: Pixels,
+        emoji_font_size: Pixels,
+        runs: &[FontRun],
+        force_width: Option<Pixels>,
+    ) -> Arc<LineLayout>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
+            emoji_font_size,
             runs,
             wrap_width: None,
             force_width,
@@ -609,6 +685,7 @@ impl LineLayoutCache {
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
 
+            apply_emoji_size_to_layout(&mut layout, emoji_font_size);
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
             }
@@ -616,6 +693,7 @@ impl LineLayoutCache {
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
+                emoji_font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
@@ -647,6 +725,7 @@ impl LineLayoutCache {
             text_hash,
             text_len,
             font_size,
+            emoji_font_size: font_size,
             runs,
             wrap_width: None,
             force_width,
@@ -658,6 +737,7 @@ impl LineLayoutCache {
                 text_hash: key.text_hash,
                 text_len: key.text_len,
                 font_size: key.font_size,
+                emoji_font_size: key.emoji_font_size,
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
@@ -672,6 +752,7 @@ impl LineLayoutCache {
                 text_hash: key.text_hash,
                 text_len: key.text_len,
                 font_size: key.font_size,
+                emoji_font_size: key.emoji_font_size,
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
@@ -704,6 +785,7 @@ impl LineLayoutCache {
             text_hash,
             text_len,
             font_size,
+            emoji_font_size: font_size,
             runs,
             wrap_width: None,
             force_width,
@@ -716,6 +798,7 @@ impl LineLayoutCache {
                 text_hash: key.text_hash,
                 text_len: key.text_len,
                 font_size: key.font_size,
+                emoji_font_size: key.emoji_font_size,
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
@@ -737,6 +820,7 @@ impl LineLayoutCache {
                     text_hash: key.text_hash,
                     text_len: key.text_len,
                     font_size: key.font_size,
+                    emoji_font_size: key.emoji_font_size,
                     runs: key.runs.as_slice(),
                     wrap_width: key.wrap_width,
                     force_width: key.force_width,
@@ -758,6 +842,7 @@ impl LineLayoutCache {
             .platform_text_system
             .layout_line(&text, font_size, runs);
 
+        apply_emoji_size_to_layout(&mut layout, font_size);
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
         }
@@ -766,6 +851,7 @@ impl LineLayoutCache {
             text_hash,
             text_len,
             font_size,
+            emoji_font_size: font_size,
             runs: SmallVec::from(runs),
             wrap_width: None,
             force_width,
@@ -825,6 +911,7 @@ trait AsCacheKeyRef {
 struct CacheKey {
     text: SharedString,
     font_size: Pixels,
+    emoji_font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -834,6 +921,7 @@ struct CacheKey {
 struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
+    emoji_font_size: Pixels,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -844,6 +932,7 @@ struct HashedCacheKey {
     text_hash: u64,
     text_len: usize,
     font_size: Pixels,
+    emoji_font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -854,6 +943,7 @@ struct HashedCacheKeyRef<'a> {
     text_hash: u64,
     text_len: usize,
     font_size: Pixels,
+    emoji_font_size: Pixels,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
@@ -870,6 +960,7 @@ impl PartialEq for HashedCacheKey {
         self.text_hash == other.text_hash
             && self.text_len == other.text_len
             && self.font_size == other.font_size
+            && self.emoji_font_size == other.emoji_font_size
             && self.runs.as_slice() == other.runs.as_slice()
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
@@ -883,6 +974,7 @@ impl Hash for HashedCacheKey {
         self.text_hash.hash(state);
         self.text_len.hash(state);
         self.font_size.hash(state);
+        self.emoji_font_size.hash(state);
         self.runs.as_slice().hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
@@ -894,6 +986,7 @@ impl PartialEq for HashedCacheKeyRef<'_> {
         self.text_hash == other.text_hash
             && self.text_len == other.text_len
             && self.font_size == other.font_size
+            && self.emoji_font_size == other.emoji_font_size
             && self.runs == other.runs
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
@@ -907,6 +1000,7 @@ impl Hash for HashedCacheKeyRef<'_> {
         self.text_hash.hash(state);
         self.text_len.hash(state);
         self.font_size.hash(state);
+        self.emoji_font_size.hash(state);
         self.runs.hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
@@ -926,6 +1020,7 @@ impl AsCacheKeyRef for CacheKey {
         CacheKeyRef {
             text: &self.text,
             font_size: self.font_size,
+            emoji_font_size: self.emoji_font_size,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
@@ -976,6 +1071,7 @@ mod tests {
     fn make_layout(glyphs: Vec<ShapedGlyph>) -> LineLayout {
         LineLayout {
             font_size: px(16.),
+            emoji_font_size: px(16.),
             width: px(100.),
             ascent: px(12.),
             descent: px(4.),
@@ -1037,6 +1133,55 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0., 8., 16.]);
+    }
+
+    #[test]
+    fn scaled_emoji_reserve_matching_inline_advance() {
+        let mut first = glyph_at(0., 0);
+        first.is_emoji = true;
+        let mut layout = make_layout(vec![first, glyph_at(20., 4), glyph_at(40., 5)]);
+        layout.width = px(50.);
+
+        apply_emoji_size_to_layout(&mut layout, px(24.));
+
+        assert_eq!(layout.emoji_font_size, px(24.));
+        assert_eq!(glyph_x_positions(&layout), vec![0., 30., 50.]);
+        assert_eq!(layout.width, px(60.));
+    }
+
+    #[test]
+    fn scaled_emoji_adjust_consecutive_and_zero_advance_groups_once() {
+        let mut first = glyph_at(0., 0);
+        first.is_emoji = true;
+        let mut modifier = glyph_at(0., 4);
+        modifier.is_emoji = true;
+        let mut second = glyph_at(20., 8);
+        second.is_emoji = true;
+        let mut layout = make_layout(vec![
+            first,
+            modifier,
+            second,
+            glyph_at(40., 12),
+            glyph_at(50., 13),
+        ]);
+        layout.width = px(60.);
+
+        apply_emoji_size_to_layout(&mut layout, px(24.));
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 0., 30., 60., 70.]);
+        assert_eq!(layout.width, px(80.));
+    }
+
+    #[test]
+    fn emoji_size_does_not_move_lines_without_emoji() {
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
+        layout.width = px(24.);
+
+        apply_emoji_size_to_layout(&mut layout, px(24.));
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 8., 16.]);
+        assert_eq!(layout.width, px(24.));
+        assert_eq!(layout.emoji_font_size, px(24.));
     }
 
     #[test]

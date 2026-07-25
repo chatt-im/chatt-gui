@@ -4057,8 +4057,6 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -4071,6 +4069,56 @@ impl Window {
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
+        self.paint_emoji_with_raster_bounds(origin, params, raster_bounds)
+    }
+
+    /// Paints an emoji centered by its raster bounds within a line box.
+    ///
+    /// `origin` is the top-left position of the glyph's inline cell. Unlike
+    /// font metrics, raster bounds reliably describe the visible extent of
+    /// color emoji across platform fonts.
+    pub fn paint_emoji_centered(
+        &mut self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: Default::default(),
+            scale_factor,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        let raster_top = px(raster_bounds.origin.y.0 as f32 / scale_factor);
+        let raster_height = px(raster_bounds.size.height.0 as f32 / scale_factor);
+        let baseline = origin.y + (line_height - raster_height) / 2. - raster_top;
+
+        self.paint_emoji_with_raster_bounds(
+            point(origin.x, baseline),
+            params,
+            raster_bounds,
+        )
+    }
+
+    fn paint_emoji_with_raster_bounds(
+        &mut self,
+        origin: Point<Pixels>,
+        params: RenderGlyphParams,
+        raster_bounds: Bounds<DevicePixels>,
+    ) -> Result<()> {
+        let scale_factor = params.scale_factor;
+        let glyph_origin = origin.scale(scale_factor);
+        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         if !raster_bounds.is_zero() {
             let tile = self
                 .sprite_atlas

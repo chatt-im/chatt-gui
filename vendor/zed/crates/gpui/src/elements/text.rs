@@ -271,7 +271,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, 1., window, cx);
         (layout_id, state)
     }
 
@@ -345,7 +345,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, 1., window, cx);
         (layout_id, state)
     }
 
@@ -393,6 +393,7 @@ pub struct StyledText {
     runs: Option<Arc<[TextRun]>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
+    emoji_scale: f32,
     layout: TextLayout,
 }
 
@@ -404,6 +405,7 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
+            emoji_scale: 1.,
             layout: TextLayout::default(),
         }
     }
@@ -411,6 +413,14 @@ impl StyledText {
     /// Get the layout for this element. This can be used to map indices to pixels and vice versa.
     pub fn layout(&self) -> &TextLayout {
         &self.layout
+    }
+
+    /// Scale color emoji relative to the surrounding text while preserving
+    /// correct inline advances, wrapping, and hit testing.
+    pub fn with_emoji_scale(mut self, scale: f32) -> Self {
+        assert!(scale.is_finite() && scale > 0.);
+        self.emoji_scale = scale;
+        self
     }
 
     /// Set the styling attributes for the given text, as well as
@@ -582,7 +592,9 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(Arc::make_mut(runs), overrides);
         }
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let layout_id =
+            self.layout
+                .layout(self.text.clone(), runs, self.emoji_scale, window, cx);
         (layout_id, ())
     }
 
@@ -639,11 +651,13 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Arc<[TextRun]>>,
+        emoji_scale: f32,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let emoji_font_size = font_size * emoji_scale;
         let line_height = window.pixel_snap(
             text_style
                 .line_height
@@ -704,7 +718,11 @@ impl TextLayout {
                     return size;
                 }
 
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
+                let mut line_wrapper = cx.text_system().line_wrapper_with_emoji_size(
+                    text_style.font(),
+                    font_size,
+                    emoji_font_size,
+                );
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
@@ -718,8 +736,15 @@ impl TextLayout {
                             truncate_from,
                         )
                     } else if let Some(unclipped) = window
-                        .text_system()
-                        .shape_text(text.clone(), font_size, &runs, None, None)
+                    .text_system()
+                        .shape_text_with_emoji_size(
+                            text.clone(),
+                            font_size,
+                            emoji_font_size,
+                            &runs,
+                            None,
+                            None,
+                        )
                         .log_err()
                         && unclipped
                             .iter()
@@ -748,9 +773,10 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text(
+                    .shape_text_with_emoji_size(
                         text,
                         font_size,
+                        emoji_font_size,
                         &runs,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.

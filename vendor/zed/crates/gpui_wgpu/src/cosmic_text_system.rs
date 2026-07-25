@@ -630,6 +630,7 @@ impl CosmicTextSystemState {
         let Some(layout) = layout_lines.first() else {
             return LineLayout {
                 font_size,
+                emoji_font_size: font_size,
                 width: Pixels::ZERO,
                 ascent: Pixels::ZERO,
                 descent: Pixels::ZERO,
@@ -686,6 +687,7 @@ impl CosmicTextSystemState {
 
         LineLayout {
             font_size,
+            emoji_font_size: font_size,
             width: layout.w.into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),

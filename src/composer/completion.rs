@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use local_rpc::model::{CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo};
 
-use super::emoji::{self, EmojiRecord};
+use crate::emoji::{self, EmojiRecord};
 
 pub const MAX_VISIBLE_OPTIONS: usize = 8;
 

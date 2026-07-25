@@ -3,6 +3,7 @@ mod code_viewer;
 mod composer;
 mod config;
 mod daemon;
+mod emoji;
 mod fonts;
 mod formatted_message;
 mod frame_stats;

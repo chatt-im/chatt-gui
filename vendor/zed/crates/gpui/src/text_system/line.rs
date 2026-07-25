@@ -70,6 +70,7 @@ impl ShapedLine {
         let layout = self.layout.as_ref();
         self.layout = Arc::new(LineLayout {
             font_size: layout.font_size,
+            emoji_font_size: layout.emoji_font_size,
             width: layout.width,
             ascent: layout.ascent,
             descent: layout.descent,
@@ -225,6 +226,7 @@ impl ShapedLine {
         let left = ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: self.layout.font_size,
+                emoji_font_size: self.layout.emoji_font_size,
                 width: left_width,
                 ascent: self.layout.ascent,
                 descent: self.layout.descent,
@@ -238,6 +240,7 @@ impl ShapedLine {
         let right = ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: self.layout.font_size,
+                emoji_font_size: self.layout.emoji_font_size,
                 width: right_width,
                 ascent: self.layout.ascent,
                 descent: self.layout.descent,
@@ -411,9 +414,25 @@ where
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            let mut normal_glyph_size = None;
+            let mut emoji_glyph_size = None;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+                max_glyph_size = if glyph.is_emoji
+                    && layout.emoji_font_size != layout.font_size
+                {
+                    *emoji_glyph_size.get_or_insert_with(|| {
+                        text_system
+                            .bounding_box(run.font_id, layout.emoji_font_size)
+                            .size
+                    })
+                } else {
+                    *normal_glyph_size.get_or_insert_with(|| {
+                        text_system
+                            .bounding_box(run.font_id, layout.font_size)
+                            .size
+                    })
+                };
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
                 if glyph_ix == 0 && run_ix == 0 {
                     first_glyph_x = glyph_origin.x;
@@ -562,15 +581,16 @@ where
 
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
-                    let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
-                        window.paint_emoji(
-                            glyph_origin + baseline_offset + vertical_offset,
+                        window.paint_emoji_centered(
+                            glyph_origin,
+                            line_height,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            layout.emoji_font_size,
                         )?;
                     } else {
+                        let vertical_offset = point(px(0.0), glyph.position.y);
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
@@ -814,6 +834,7 @@ mod tests {
         ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
+                emoji_font_size: px(16.0),
                 width: px(width),
                 ascent: px(12.0),
                 descent: px(4.0),
@@ -888,6 +909,7 @@ mod tests {
         let line = ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
+                emoji_font_size: px(16.0),
                 width: px(60.0),
                 ascent: px(12.0),
                 descent: px(4.0),
