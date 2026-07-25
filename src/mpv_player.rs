@@ -16,8 +16,8 @@ use ash::vk;
 use async_channel::Sender as AsyncSender;
 use gpui::PlatformSurface;
 use gpui_wgpu::{
-    VideoTextureGeneration, VulkanVideoDevice, VulkanVideoTexture, WgpuVideoSurface,
-    wgpu::hal::vulkan::QueueHostLock,
+    VideoTextureGeneration, VulkanQueueLocks, VulkanVideoDevice, VulkanVideoTexture,
+    WgpuVideoSurface,
 };
 use libmpv2::{
     Format, Mpv,
@@ -147,6 +147,19 @@ impl MpvPlayer {
         Ok(player)
     }
 
+    pub(crate) fn new_video_smoke_test(
+        gpui_wakeup: AsyncSender<()>,
+        path: &std::path::Path,
+    ) -> Result<Self> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow!("video smoke-test path is not valid UTF-8"))?;
+        let (mut player, _) =
+            Self::new_internal(gpui_wakeup, true, None, None, Some("h264"), None)?;
+        player.load(path)?;
+        Ok(player)
+    }
+
     fn new_internal(
         gpui_wakeup: AsyncSender<()>,
         live: bool,
@@ -188,19 +201,28 @@ impl MpvPlayer {
             .and_then(|native| native.drm_render_node.as_ref())
             .and_then(|path| path.to_str())
             .map(str::to_owned);
-        let default_hwdec = if live {
-            let supports_vulkan_decode = native_candidate
+        let supports_vulkan_decode = live
+            && native_candidate
                 .as_ref()
                 .and_then(|candidate| candidate.as_ref().ok())
                 .is_some_and(|native| {
+                    let queue_family_properties = unsafe {
+                        native
+                            .instance
+                            .get_physical_device_queue_family_properties(native.physical_device)
+                    };
                     supports_vulkan_video_decode(
                         &native.device_extensions,
-                        native.queue_flags,
+                        &native.enabled_queue_families,
+                        &queue_family_properties,
+                        native.synchronization2,
+                        native.video_maintenance1,
                         live_codec,
                     )
                 });
+        let default_hwdec = if live {
             if supports_vulkan_decode {
-                "vulkan,auto-copy-safe"
+                "vulkan"
             } else if cfg!(target_os = "linux") {
                 // Rendering through Vulkan does not imply support for Vulkan
                 // Video. Prefer the Linux copy decoder that auto-probing chose
@@ -221,8 +243,9 @@ impl MpvPlayer {
         } else {
             default_hwdec.to_owned()
         };
+        let require_direct_vulkan = supports_vulkan_decode && hwdec == "vulkan";
         log::info!(
-            "initializing embedded libmpv live={live} hwdec={hwdec} codec={} vaapi_device={} forced_software_render={force_live_software}",
+            "initializing embedded libmpv live={live} hwdec={hwdec} codec={} vaapi_device={} forced_software_render={force_live_software} direct_vulkan_required={require_direct_vulkan}",
             live_codec.unwrap_or("probe-at-load"),
             vaapi_device.as_deref().unwrap_or("none")
         );
@@ -249,6 +272,11 @@ impl MpvPlayer {
             // option. Embedded rendering does not use mpv's OSC anyway.
             set_option!("profile", if live { "low-latency" } else { "fast" });
             set_option!("hwdec", hwdec.as_str());
+            if require_direct_vulkan {
+                // A capable shared Vulkan device must not silently regress to
+                // decoded frames in system RAM followed by a GPU upload.
+                set_option!("hwdec-software-fallback", "no");
+            }
             if let Some(device) = vaapi_device.as_deref() {
                 set_option!("vaapi-device", device);
             }
@@ -274,6 +302,11 @@ impl MpvPlayer {
                 // Screen-share encoders emit frames in display order. Avoid
                 // mpv's two-frame hwdec-copy delay queue: with damage-driven
                 // input those retained frames could remain stale indefinitely.
+                //
+                // This disables FFmpeg frame threading. The Vulkan libmpv
+                // backend therefore has to return its mapped source frame
+                // immediately after submission so inter-frame decode can
+                // reacquire a reference frame's update mutex.
                 set_option!("vd-lavc-low-latency", "yes");
                 set_option!("interpolation", "no");
                 set_option!("stream-buffer-size", "4k");
@@ -613,21 +646,32 @@ impl Drop for MpvPlayer {
     }
 }
 
-struct WgpuQueueLock(Arc<QueueHostLock>);
+struct WgpuQueueLock {
+    inner: Arc<VulkanQueueLocks>,
+}
+
+impl WgpuQueueLock {
+    fn new(inner: Arc<VulkanQueueLocks>) -> Self {
+        Self { inner }
+    }
+}
 
 impl VulkanQueueLock for WgpuQueueLock {
-    fn lock(&self, _family: u32, _index: u32) {
-        self.0.lock();
+    fn lock(&self, family: u32, index: u32) {
+        self.inner.lock(family, index);
     }
 
-    unsafe fn unlock(&self, _family: u32, _index: u32) {
-        unsafe { self.0.unlock() };
+    unsafe fn unlock(&self, family: u32, index: u32) {
+        unsafe { self.inner.unlock(family, index) };
     }
 }
 
 fn supports_vulkan_video_decode(
     device_extensions: &[&CStr],
-    queue_flags: vk::QueueFlags,
+    enabled_queue_families: &[(u32, u32)],
+    queue_family_properties: &[vk::QueueFamilyProperties],
+    synchronization2: bool,
+    video_maintenance1: bool,
     codec: Option<&str>,
 ) -> bool {
     let has = |required: &CStr| {
@@ -635,9 +679,22 @@ fn supports_vulkan_video_decode(
             .iter()
             .any(|extension| *extension == required)
     };
-    if !queue_flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+    let has_decode_queue = enabled_queue_families.iter().any(|&(family, count)| {
+        count > 0
+            && queue_family_properties
+                .get(family as usize)
+                .is_some_and(|properties| {
+                    properties
+                        .queue_flags
+                        .contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+                })
+    });
+    if !has_decode_queue
+        || !synchronization2
+        || !video_maintenance1
         || !has(c"VK_KHR_video_queue")
         || !has(c"VK_KHR_video_decode_queue")
+        || !has(c"VK_KHR_video_maintenance1")
     {
         return false;
     }
@@ -661,6 +718,11 @@ fn supports_vulkan_video_decode(
 
 fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevice>> {
     let native = Arc::new(surface.vulkan_device()?);
+    let queue_family_properties = unsafe {
+        native
+            .instance
+            .get_physical_device_queue_family_properties(native.physical_device)
+    };
     let has_external_memory_fd = native
         .device_extensions
         .iter()
@@ -693,19 +755,43 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_KHR_video_decode_av1");
-    let queue_has_video_decode = native
+    let render_queue_has_video_decode = native
         .queue_flags
         .contains(vk::QueueFlags::VIDEO_DECODE_KHR);
+    let enabled_video_decode_queue_families = native
+        .enabled_queue_families
+        .iter()
+        .filter_map(|&(family, count)| {
+            (count > 0
+                && queue_family_properties
+                    .get(family as usize)
+                    .is_some_and(|properties| {
+                        properties
+                            .queue_flags
+                            .contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+                    }))
+            .then_some(family.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let enabled_video_decode_queue_families = if enabled_video_decode_queue_families.is_empty() {
+        "none".to_owned()
+    } else {
+        enabled_video_decode_queue_families
+    };
     let drm_render_node = native
         .drm_render_node
         .as_deref()
         .map_or_else(|| "none".into(), |path| path.display().to_string());
     log::info!(
-        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} queue_video_decode={} enabled_queue_families={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} drm_render_node={} vulkan_video_core={} vulkan_video_h264={} vulkan_video_h265={} vulkan_video_av1={}",
+        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} render_queue_video_decode={} enabled_queue_families={} enabled_video_decode_queue_families={} synchronization2={} video_maintenance1={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} drm_render_node={} vulkan_video_core={} vulkan_video_h264={} vulkan_video_h265={} vulkan_video_av1={}",
         native.queue_family,
         native.queue_index,
-        queue_has_video_decode,
+        render_queue_has_video_decode,
         native.enabled_queue_families.len(),
+        enabled_video_decode_queue_families,
+        native.synchronization2,
+        native.video_maintenance1,
         native.instance_extensions.len(),
         native.device_extensions.len(),
         has_external_memory_fd,
@@ -719,7 +805,7 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
     );
     if cfg!(target_os = "linux") && !(has_external_memory_fd && has_dma_buf && has_drm_modifiers) {
         log::warn!(
-            "Vulkan device lacks Linux dma-buf import extensions; hardware-decoded video may round-trip through CPU memory"
+            "Vulkan device lacks full Linux dma-buf import support; DRM/VAAPI hardware-frame interop may be unavailable, but native Vulkan Video remains device-local"
         );
     }
     Ok(native)
@@ -780,12 +866,14 @@ fn create_vulkan_context(
             core: vk::PhysicalDeviceFeatures::default(),
             timeline_semaphore: true,
             host_query_reset: true,
+            synchronization2: native.synchronization2,
+            video_maintenance1: native.video_maintenance1,
         },
         graphics_queue: queue,
         compute_queue: queue,
         transfer_queue: queue,
         enabled_queue_families,
-        queue_lock: Arc::new(WgpuQueueLock(native.queue_lock.clone())),
+        queue_lock: Arc::new(WgpuQueueLock::new(native.queue_locks.clone())),
         drm_render_fd,
         latest_frame,
     })
@@ -1524,6 +1612,10 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
                     log::info!(
                         "mpv decoder selected hardware_decoder={value:?} transfer=gpu-to-cpu-before-render"
                     );
+                } else if value == "vulkan" {
+                    log::info!(
+                        "mpv decoder selected hardware_decoder={value:?} transfer=vulkan-hardware-frames-direct no_system_memory_round_trip=true"
+                    );
                 } else {
                     log::info!("mpv decoder selected hardware_decoder={value:?}");
                 }
@@ -1654,6 +1746,7 @@ fn render_worker(
                     diagnostics.rendered += 1;
                     has_frame = true;
                     redraw_pending = false;
+                    playback.note_render();
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                     if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
@@ -1794,6 +1887,7 @@ fn render_worker(
                     diagnostics.rendered += 1;
                     has_frame = true;
                     redraw_pending = false;
+                    playback.note_render();
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                     if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
@@ -1859,6 +1953,7 @@ pub struct PlaybackState {
     pub finished: bool,
     pub frame_ready: bool,
     pub display_size: Option<(u32, u32)>,
+    pub rendered_frames: u64,
 }
 
 #[derive(Default)]
@@ -1869,6 +1964,7 @@ struct SharedPlaybackState {
     finished: AtomicBool,
     frame_ready: AtomicBool,
     display_size: AtomicU64,
+    rendered_frames: AtomicU64,
 }
 
 impl SharedPlaybackState {
@@ -1896,7 +1992,12 @@ impl SharedPlaybackState {
             frame_ready: self.frame_ready.load(Ordering::Acquire),
             display_size: (packed_size != 0)
                 .then_some(((packed_size >> 32) as u32, packed_size as u32)),
+            rendered_frames: self.rendered_frames.load(Ordering::Acquire),
         }
+    }
+
+    fn note_render(&self) {
+        self.rendered_frames.fetch_add(1, Ordering::Release);
     }
 
     fn seek_to(&self, position: f64) {
@@ -1907,6 +2008,7 @@ impl SharedPlaybackState {
     fn reset(&self) {
         self.publish(PlaybackState::default());
         self.frame_ready.store(false, Ordering::Release);
+        self.rendered_frames.store(0, Ordering::Release);
     }
 }
 
@@ -2160,25 +2262,58 @@ mod tests {
             c"VK_KHR_video_queue",
             c"VK_KHR_video_decode_queue",
             c"VK_KHR_video_decode_h264",
+            c"VK_KHR_video_maintenance1",
+        ];
+        let queue_families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::VIDEO_DECODE_KHR,
+                queue_count: 1,
+                ..Default::default()
+            },
         ];
         assert!(supports_vulkan_video_decode(
             &h264,
-            vk::QueueFlags::VIDEO_DECODE_KHR,
+            &[(0, 1), (1, 1)],
+            &queue_families,
+            true,
+            true,
             Some("avc1.64001F")
         ));
         assert!(!supports_vulkan_video_decode(
             &h264,
-            vk::QueueFlags::VIDEO_DECODE_KHR,
+            &[(0, 1), (1, 1)],
+            &queue_families,
+            true,
+            true,
             Some("hvc1.1.6.L93")
         ));
         assert!(!supports_vulkan_video_decode(
             &[c"VK_KHR_video_decode_h264"],
-            vk::QueueFlags::VIDEO_DECODE_KHR,
+            &[(0, 1), (1, 1)],
+            &queue_families,
+            true,
+            true,
             Some("h264")
         ));
         assert!(!supports_vulkan_video_decode(
             &h264,
-            vk::QueueFlags::GRAPHICS,
+            &[(0, 1)],
+            &queue_families,
+            true,
+            true,
+            Some("h264")
+        ));
+        assert!(!supports_vulkan_video_decode(
+            &h264,
+            &[(0, 1), (1, 1)],
+            &queue_families,
+            false,
+            true,
             Some("h264")
         ));
     }

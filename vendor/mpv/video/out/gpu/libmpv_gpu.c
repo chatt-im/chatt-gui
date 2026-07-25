@@ -197,7 +197,17 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
 
     struct ra_fbo target = {.tex = tex, .flip = flip};
     gl_video_render_frame(p->renderer, frame, &target, RENDER_FRAME_DEF);
-    return p->context->fns->done_frame(p->context, frame->display_synced);
+    err = p->context->fns->done_frame(p->context, frame->display_synced);
+
+    // The Vulkan mapper holds AVVkFrame's update mutex while mapped. Keeping
+    // the current image mapped until the next frame arrives deadlocks
+    // single-threaded inter-frame decoders: decoding that next frame needs to
+    // update the current reference frame first. Once done_frame() has handed
+    // the submitted target back to the API user, return the source image to
+    // FFmpeg as well. Its timeline semaphore preserves the GPU dependency.
+    gl_video_release_hwdec_mapping(p->renderer);
+
+    return err;
 }
 
 static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,

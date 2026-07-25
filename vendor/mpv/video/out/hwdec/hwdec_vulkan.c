@@ -148,8 +148,12 @@ static int vulkan_init(struct ra_hwdec *hw)
     device_hwctx->nb_enabled_inst_extensions = vk->vkinst
                                                ? vk->vkinst->num_extensions
                                                : vk->num_instance_extensions;
-    device_hwctx->enabled_dev_extensions = vk->vulkan->extensions;
-    device_hwctx->nb_enabled_dev_extensions = vk->vulkan->num_extensions;
+    device_hwctx->enabled_dev_extensions = vk->vkinst
+        ? vk->vulkan->extensions
+        : (const char *const *)vk->device_extensions;
+    device_hwctx->nb_enabled_dev_extensions = vk->vkinst
+                                               ? vk->vulkan->num_extensions
+                                               : vk->num_device_extensions;
 
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 34, 100)
     device_hwctx->nb_qf = 0;

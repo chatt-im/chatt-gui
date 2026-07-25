@@ -43,6 +43,8 @@ struct mpvk_ctx {
     PFN_vkGetInstanceProcAddr get_proc_addr;
     char **instance_extensions;
     int num_instance_extensions;
+    char **device_extensions;
+    int num_device_extensions;
     struct mpv_vulkan_queue_family *enabled_queue_families;
     int num_enabled_queue_families;
     mpv_vulkan_lock_queue_fn lock_queue;

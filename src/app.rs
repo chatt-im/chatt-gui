@@ -791,10 +791,8 @@ impl ChattView {
         );
         let videos =
             AttachmentVideoManager::new(video_wakeup.clone(), attachment_source_registry.clone());
-        let video_thumbnails = VideoThumbnailCache::new(
-            VIDEO_THUMBNAIL_CACHE_BYTES,
-            video_wakeup.clone(),
-        );
+        let video_thumbnails =
+            VideoThumbnailCache::new(VIDEO_THUMBNAIL_CACHE_BYTES, video_wakeup.clone());
         Self {
             model,
             daemon,

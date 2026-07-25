@@ -49,7 +49,7 @@ codegen-units = 1
 debug = 0
 
 [profile.release]
-debug = 1
+debug = 0
 
 [patch.crates-io]
 naga = { path = "vendor/wgpu/naga" }

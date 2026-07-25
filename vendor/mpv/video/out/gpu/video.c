@@ -1108,6 +1108,14 @@ static void unref_current_image(struct gl_video *p)
     gc_pending_dr_fences(p, false);
 }
 
+void gl_video_release_hwdec_mapping(struct gl_video *p)
+{
+    struct video_image *vimg = &p->image;
+
+    if (vimg->hwdec_mapped && vimg->mpi->imgfmt == IMGFMT_VULKAN)
+        unref_current_image(p);
+}
+
 // If overlay mode is used, make sure to remove the overlay.
 // Be careful with this. Removing the overlay and adding another one will
 // lead to flickering artifacts.

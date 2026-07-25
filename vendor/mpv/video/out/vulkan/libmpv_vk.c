@@ -112,6 +112,9 @@ static int init(struct libmpv_gpu_context *ctx, mpv_render_param *params)
     p->vk.instance_extensions = copy_extensions(
         p, init_params->instance_extensions, init_params->num_instance_extensions);
     p->vk.num_instance_extensions = init_params->num_instance_extensions;
+    p->vk.device_extensions = copy_extensions(
+        p, init_params->device_extensions, init_params->num_device_extensions);
+    p->vk.num_device_extensions = init_params->num_device_extensions;
     p->vk.enabled_queue_families = talloc_memdup(
         p, (void *)init_params->enabled_queue_families,
         init_params->num_enabled_queue_families *

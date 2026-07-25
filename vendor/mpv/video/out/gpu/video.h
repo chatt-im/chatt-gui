@@ -205,6 +205,7 @@ bool gl_video_check_format(struct gl_video *p, int mp_format);
 void gl_video_config(struct gl_video *p, struct mp_image_params *params);
 void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
                            const struct ra_fbo *fbo, int flags);
+void gl_video_release_hwdec_mapping(struct gl_video *p);
 void gl_video_resize(struct gl_video *p,
                      struct mp_rect *src, struct mp_rect *dst,
                      struct mp_osd_res *osd);

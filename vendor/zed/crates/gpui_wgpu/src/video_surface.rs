@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use ash::vk;
 use gpui::{DevicePixels, PlatformSurface, PlatformSurfaceSource, Size};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RawMutex, lock_api::RawMutex as _};
 use std::{
     any::Any,
     ffi::CStr,
@@ -19,18 +19,31 @@ const VIDEO_SURFACE_TRACE_LIMIT: u64 = 16;
 struct RegisteredContext {
     device: Weak<wgpu::Device>,
     queue: Weak<wgpu::Queue>,
+    video: VulkanVideoContext,
 }
 
 static VIDEO_CONTEXT: OnceLock<Mutex<Option<RegisteredContext>>> = OnceLock::new();
 
-pub(crate) fn register_video_context(device: &Arc<wgpu::Device>, queue: &Arc<wgpu::Queue>) {
+#[derive(Clone, Default)]
+pub(crate) struct VulkanVideoContext {
+    pub additional_queue_families: Vec<(u32, u32)>,
+    pub synchronization2: bool,
+    pub video_maintenance1: bool,
+}
+
+pub(crate) fn register_video_context(
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    video: VulkanVideoContext,
+) {
     *VIDEO_CONTEXT.get_or_init(Default::default).lock() = Some(RegisteredContext {
         device: Arc::downgrade(device),
         queue: Arc::downgrade(queue),
+        video,
     });
 }
 
-fn active_context() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+fn active_context() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>, VulkanVideoContext)> {
     let context = VIDEO_CONTEXT
         .get_or_init(Default::default)
         .lock();
@@ -46,7 +59,108 @@ fn active_context() -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
             .queue
             .upgrade()
             .ok_or_else(|| anyhow!("GPUI's wgpu queue was destroyed"))?,
+        context.video.clone(),
     ))
+}
+
+fn enabled_queue_families(
+    render_queue_family: u32,
+    additional_queue_families: &[(u32, u32)],
+) -> Vec<(u32, u32)> {
+    let mut enabled = vec![(render_queue_family, 1)];
+    for &(family, count) in additional_queue_families {
+        if count == 0 {
+            continue;
+        }
+        if let Some((_, enabled_count)) = enabled
+            .iter_mut()
+            .find(|(enabled_family, _)| *enabled_family == family)
+        {
+            *enabled_count = (*enabled_count).max(count);
+        } else {
+            enabled.push((family, count));
+        }
+    }
+    enabled
+}
+
+struct DedicatedQueueLock {
+    family: u32,
+    index: u32,
+    mutex: RawMutex,
+}
+
+/// Host-side synchronization for every Vulkan queue imported into libmpv.
+///
+/// The render queue must share wgpu's own lock. Queues belonging to additional
+/// families are not used by wgpu and therefore receive independent locks, so a
+/// slow or blocked video-decode submission cannot hold up GPUI rendering.
+pub struct VulkanQueueLocks {
+    render_family: u32,
+    render_index: u32,
+    render: Arc<QueueHostLock>,
+    dedicated: Vec<DedicatedQueueLock>,
+}
+
+impl VulkanQueueLocks {
+    fn new(
+        render_family: u32,
+        render_index: u32,
+        render: Arc<QueueHostLock>,
+        enabled_queue_families: &[(u32, u32)],
+    ) -> Self {
+        let dedicated = enabled_queue_families
+            .iter()
+            .flat_map(|&(family, count)| (0..count).map(move |index| (family, index)))
+            .filter(|&(family, index)| family != render_family || index != render_index)
+            .map(|(family, index)| DedicatedQueueLock {
+                family,
+                index,
+                mutex: RawMutex::INIT,
+            })
+            .collect();
+        Self {
+            render_family,
+            render_index,
+            render,
+            dedicated,
+        }
+    }
+
+    pub fn lock(&self, family: u32, index: u32) {
+        if family == self.render_family && index == self.render_index {
+            self.render.lock();
+            return;
+        }
+        self.dedicated_lock(family, index).lock();
+    }
+
+    /// # Safety
+    ///
+    /// The corresponding queue lock must be held by the current thread.
+    pub unsafe fn unlock(&self, family: u32, index: u32) {
+        if family == self.render_family && index == self.render_index {
+            unsafe { self.render.unlock() };
+            return;
+        }
+        unsafe { self.dedicated_lock(family, index).unlock() };
+    }
+
+    fn dedicated_lock(&self, family: u32, index: u32) -> &RawMutex {
+        &self
+            .dedicated
+            .iter()
+            .find(|queue| queue.family == family && queue.index == index)
+            .unwrap_or_else(|| {
+                panic!("libmpv requested unregistered Vulkan queue {family}:{index}")
+            })
+            .mutex
+    }
+
+    #[cfg(test)]
+    fn uses_render_lock(&self, family: u32, index: u32) -> bool {
+        family == self.render_family && index == self.render_index
+    }
 }
 
 /// Native Vulkan objects belonging to GPUI's wgpu device.
@@ -65,7 +179,9 @@ pub struct VulkanVideoDevice {
     /// Queue families created on the logical device and safe for imported
     /// libmpv work. Each tuple is `(family_index, queue_count)`.
     pub enabled_queue_families: Vec<(u32, u32)>,
-    pub queue_lock: Arc<QueueHostLock>,
+    pub queue_locks: Arc<VulkanQueueLocks>,
+    pub synchronization2: bool,
+    pub video_maintenance1: bool,
     /// DRM render node belonging to `physical_device`, when Vulkan exposes an
     /// exact device identity. This is never guessed from enumeration order.
     pub drm_render_node: Option<PathBuf>,
@@ -231,6 +347,7 @@ struct SurfaceState {
 struct VideoSurfaceInner {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    video: VulkanVideoContext,
     width: AtomicU32,
     height: AtomicU32,
     requested_width: AtomicU32,
@@ -249,11 +366,12 @@ pub struct WgpuVideoSurface {
 
 impl WgpuVideoSurface {
     pub fn new(resize: impl Fn(u32, u32) + Send + Sync + 'static) -> Result<Self> {
-        let (device, queue) = active_context()?;
+        let (device, queue, video) = active_context()?;
         Ok(Self {
             inner: Arc::new(VideoSurfaceInner {
                 device,
                 queue,
+                video,
                 width: AtomicU32::new(1),
                 height: AtomicU32::new(1),
                 requested_width: AtomicU32::new(0),
@@ -287,9 +405,17 @@ impl WgpuVideoSurface {
         .get(queue_family as usize)
         .ok_or_else(|| anyhow!("wgpu exported an unknown Vulkan queue family"))?
         .queue_flags;
-        // A raw VkDevice cannot acquire another physical-device queue family
-        // after creation. Only advertise the family wgpu actually requested.
-        let enabled_queue_families = vec![(queue_family, 1)];
+        let queue_index = hal_device.queue_index();
+        let enabled_queue_families = enabled_queue_families(
+            queue_family,
+            &self.inner.video.additional_queue_families,
+        );
+        let queue_locks = Arc::new(VulkanQueueLocks::new(
+            queue_family,
+            queue_index,
+            hal_queue.host_lock(),
+            &enabled_queue_families,
+        ));
         Ok(VulkanVideoDevice {
             instance,
             physical_device,
@@ -300,12 +426,14 @@ impl WgpuVideoSurface {
                 .static_fn()
                 .get_instance_proc_addr,
             queue_family,
-            queue_index: hal_device.queue_index(),
+            queue_index,
             queue_flags,
             instance_extensions,
             device_extensions,
             enabled_queue_families,
-            queue_lock: hal_queue.host_lock(),
+            queue_locks,
+            synchronization2: self.inner.video.synchronization2,
+            video_maintenance1: self.inner.video.video_maintenance1,
             drm_render_node,
         })
     }
@@ -713,4 +841,33 @@ pub(crate) fn video_surface_from_platform(
     source: &PlatformSurface,
 ) -> Option<WgpuVideoSurface> {
     source.0.as_any().downcast_ref::<WgpuVideoSurface>().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VulkanQueueLocks, enabled_queue_families};
+    use std::sync::Arc;
+    use wgpu::hal::vulkan::QueueHostLock;
+
+    #[test]
+    fn preserves_dedicated_vulkan_video_queue_family() {
+        assert_eq!(enabled_queue_families(0, &[(3, 1)]), vec![(0, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn does_not_duplicate_combined_render_and_video_queue_family() {
+        assert_eq!(enabled_queue_families(0, &[(0, 1)]), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn vulkan_dedicated_queue_does_not_use_wgpu_render_lock() {
+        let locks = VulkanQueueLocks::new(
+            0,
+            0,
+            Arc::new(QueueHostLock::default()),
+            &[(0, 1), (3, 1)],
+        );
+        assert!(locks.uses_render_lock(0, 0));
+        assert!(!locks.uses_render_lock(3, 0));
+    }
 }

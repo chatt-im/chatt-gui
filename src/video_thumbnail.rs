@@ -458,8 +458,7 @@ impl ThumbnailExtractor {
         let mut bgra = vec![0u8; maximum_bytes];
         let mut thumbnail = libmpv2_sys::ChattFfmpegThumbnail::default();
         let mut error = [0i8; 512];
-        let byte_len =
-            i64::try_from(source.byte_len()).context("thumbnail source is too large")?;
+        let byte_len = i64::try_from(source.byte_len()).context("thumbnail source is too large")?;
         let mut io = ThumbnailIo {
             cursor: AttachmentCursor::new(Some(source)),
             error: None,
@@ -512,9 +511,8 @@ impl ThumbnailExtractor {
         // deliberately interprets them as BGRA.
         let image = RgbaImage::from_raw(width, height, bgra)
             .ok_or_else(|| anyhow!("thumbnail decoder returned an invalid buffer"))?;
-        let duration =
-            (thumbnail.duration.is_finite() && thumbnail.duration > 0.0)
-                .then_some(thumbnail.duration);
+        let duration = (thumbnail.duration.is_finite() && thumbnail.duration > 0.0)
+            .then_some(thumbnail.duration);
         Ok(ExtractedThumbnail {
             image: Arc::new(RenderImage::new(vec![Frame::new(image)])),
             duration,
@@ -523,11 +521,7 @@ impl ThumbnailExtractor {
     }
 }
 
-unsafe extern "C" fn thumbnail_read(
-    opaque: *mut c_void,
-    buffer: *mut u8,
-    length: i32,
-) -> i32 {
+unsafe extern "C" fn thumbnail_read(opaque: *mut c_void, buffer: *mut u8, length: i32) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if opaque.is_null() || buffer.is_null() || length <= 0 {
             return Err("FFmpeg issued an invalid thumbnail read".to_string());
@@ -566,7 +560,11 @@ unsafe extern "C" fn thumbnail_seek(opaque: *mut c_void, offset: i64, whence: i3
             libc::SEEK_SET => AttachmentSeekMode::Set,
             libc::SEEK_CUR => AttachmentSeekMode::Current,
             libc::SEEK_END => AttachmentSeekMode::End,
-            _ => return Err(format!("FFmpeg issued invalid thumbnail seek mode {whence}")),
+            _ => {
+                return Err(format!(
+                    "FFmpeg issued invalid thumbnail seek mode {whence}"
+                ));
+            }
         };
         unsafe { &mut *opaque.cast::<ThumbnailIo>() }
             .cursor

@@ -28,11 +28,12 @@ pub struct CompositorGpuHint {
 fn create_vulkan_video_device(
     adapter: &wgpu::Adapter,
     descriptor: &wgpu::DeviceDescriptor<'_>,
-) -> Option<anyhow::Result<(wgpu::Device, wgpu::Queue)>> {
+) -> Option<anyhow::Result<(wgpu::Device, wgpu::Queue, crate::VulkanVideoContext)>> {
     let hal_adapter = unsafe { adapter.as_hal::<VulkanApi>() }?;
     let core_extensions = [
         ash::khr::video_queue::NAME,
         ash::khr::video_decode_queue::NAME,
+        ash::khr::video_maintenance1::NAME,
     ];
     if !core_extensions.iter().all(|extension| {
         hal_adapter
@@ -62,6 +63,32 @@ fn create_vulkan_video_device(
         .chain(enabled_codecs.iter().map(|(_, extension)| *extension))
         .collect::<Vec<_>>();
 
+    let instance = hal_adapter.shared_instance().raw_instance();
+    let physical_device = hal_adapter.raw_physical_device();
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let synchronization2_extension_required =
+        properties.api_version < ash::vk::API_VERSION_1_3;
+    if synchronization2_extension_required
+        && !hal_adapter
+            .physical_device_capabilities()
+            .supports_extension(ash::khr::synchronization2::NAME)
+    {
+        return None;
+    }
+    let mut synchronization2 =
+        ash::vk::PhysicalDeviceSynchronization2Features::default();
+    let mut video_maintenance1 =
+        ash::vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default();
+    let mut features = ash::vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut synchronization2)
+        .push_next(&mut video_maintenance1);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    if synchronization2.synchronization2 != ash::vk::TRUE
+        || video_maintenance1.video_maintenance1 != ash::vk::TRUE
+    {
+        return None;
+    }
+
     let queue_families = unsafe {
         hal_adapter
             .shared_instance()
@@ -74,12 +101,26 @@ fn create_vulkan_video_device(
             .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
     })? as u32;
     let video_queue_priorities = [1.0_f32];
+    let mut synchronization2 =
+        ash::vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let mut video_maintenance1 =
+        ash::vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default().video_maintenance1(true);
     let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(|args| {
         for extension in &video_extensions {
             if !args.extensions.contains(&extension) {
                 args.extensions.push(*extension);
             }
         }
+        if synchronization2_extension_required
+            && !args
+                .extensions
+                .contains(&ash::khr::synchronization2::NAME)
+        {
+            args.extensions.push(ash::khr::synchronization2::NAME);
+        }
+        *args.create_info = (*args.create_info)
+            .push_next(&mut synchronization2)
+            .push_next(&mut video_maintenance1);
         if !args
             .queue_create_infos
             .iter()
@@ -109,7 +150,7 @@ fn create_vulkan_video_device(
     };
     let device = unsafe { adapter.create_device_from_hal(open_device, descriptor) }
         .map_err(|error| anyhow::anyhow!("import Vulkan Video device into wgpu: {error}"));
-    Some(device.map(|device| {
+    Some(device.map(|(device, queue)| {
         let enabled_codecs = enabled_codecs
             .iter()
             .map(|(codec, _)| *codec)
@@ -118,7 +159,15 @@ fn create_vulkan_video_device(
         log::info!(
             "Enabled Vulkan Video ({enabled_codecs}) on GPUI device queue_family={video_queue_family}"
         );
-        device
+        (
+            device,
+            queue,
+            crate::VulkanVideoContext {
+                additional_queue_families: vec![(video_queue_family, 1)],
+                synchronization2: true,
+                video_maintenance1: true,
+            },
+        )
     }))
 }
 
@@ -162,7 +211,14 @@ impl WgpuContext {
 
         // Select an adapter by actually testing surface configuration with the real device.
         // This is the only reliable way to determine compatibility on hybrid GPU systems.
-        let (adapter, device, queue, dual_source_blending, color_texture_format) =
+        let (
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
+            video,
+        ) =
             gpui::block_on(Self::select_adapter_and_device(
                 &instance,
                 device_id_filter,
@@ -197,7 +253,11 @@ impl WgpuContext {
             color_texture_format,
             device_lost,
         };
-        crate::register_video_context(&context.device, &context.queue);
+        crate::register_video_context(
+            &context.device,
+            &context.queue,
+            video,
+        );
         Ok(context)
     }
 
@@ -227,7 +287,7 @@ impl WgpuContext {
         );
 
         let device_lost = Arc::new(AtomicBool::new(false));
-        let (device, queue, dual_source_blending, color_texture_format) =
+        let (device, queue, dual_source_blending, color_texture_format, _) =
             Self::create_device(&adapter).await?;
 
         Ok(Self {
@@ -243,7 +303,13 @@ impl WgpuContext {
 
     async fn create_device(
         adapter: &wgpu::Adapter,
-    ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+    ) -> anyhow::Result<(
+        wgpu::Device,
+        wgpu::Queue,
+        bool,
+        TextureFormat,
+        crate::VulkanVideoContext,
+    )> {
         let dual_source_blending = adapter
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
@@ -283,14 +349,17 @@ impl WgpuContext {
             None => None,
         };
         #[cfg(not(target_os = "linux"))]
-        let video_device: Option<(wgpu::Device, wgpu::Queue)> = None;
+        let video_device: Option<(wgpu::Device, wgpu::Queue, crate::VulkanVideoContext)> = None;
 
-        let (device, queue) = match video_device {
-            Some(device) => device,
-            None => adapter
-                .request_device(&descriptor)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?,
+        let (device, queue, video) = match video_device {
+            Some((device, queue, video)) => (device, queue, video),
+            None => {
+                let (device, queue) = adapter
+                    .request_device(&descriptor)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+                (device, queue, crate::VulkanVideoContext::default())
+            }
         };
 
         Ok((
@@ -298,6 +367,7 @@ impl WgpuContext {
             queue,
             dual_source_blending,
             color_atlas_texture_format,
+            video,
         ))
     }
 
@@ -345,6 +415,7 @@ impl WgpuContext {
         wgpu::Queue,
         bool,
         TextureFormat,
+        crate::VulkanVideoContext,
     )> {
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
 
@@ -441,7 +512,13 @@ impl WgpuContext {
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
             match Self::try_adapter_with_surface(&adapter, surface).await {
-                Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
+                Ok((
+                    device,
+                    queue,
+                    dual_source_blending,
+                    color_atlas_texture_format,
+                    video,
+                )) => {
                     log::info!(
                         "Selected GPU (passed configuration test): {} ({:?})",
                         info.name,
@@ -453,6 +530,7 @@ impl WgpuContext {
                         queue,
                         dual_source_blending,
                         color_atlas_texture_format,
+                        video,
                     ));
                 }
                 Err(e) => {
@@ -475,7 +553,13 @@ impl WgpuContext {
     async fn try_adapter_with_surface(
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface<'_>,
-    ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+    ) -> anyhow::Result<(
+        wgpu::Device,
+        wgpu::Queue,
+        bool,
+        TextureFormat,
+        crate::VulkanVideoContext,
+    )> {
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
             anyhow::bail!("no compatible surface formats");
@@ -484,7 +568,13 @@ impl WgpuContext {
             anyhow::bail!("no compatible alpha modes");
         }
 
-        let (device, queue, dual_source_blending, color_atlas_texture_format) =
+        let (
+            device,
+            queue,
+            dual_source_blending,
+            color_atlas_texture_format,
+            video,
+        ) =
             Self::create_device(adapter).await?;
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
@@ -511,6 +601,7 @@ impl WgpuContext {
             queue,
             dual_source_blending,
             color_atlas_texture_format,
+            video,
         ))
     }
 

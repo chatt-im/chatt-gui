@@ -82,6 +82,8 @@ pub struct VulkanFeatures {
     pub core: vk::PhysicalDeviceFeatures,
     pub timeline_semaphore: bool,
     pub host_query_reset: bool,
+    pub synchronization2: bool,
+    pub video_maintenance1: bool,
 }
 
 /// Parameters used to import an application-owned Vulkan device into mpv.
@@ -262,10 +264,20 @@ impl Mpv {
         let mut vulkan_12 = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(params.features.timeline_semaphore)
             .host_query_reset(params.features.host_query_reset);
-        let features = vk::PhysicalDeviceFeatures2::default()
+        let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(params.features.core)
             .push_next(&mut vulkan_11)
             .push_next(&mut vulkan_12);
+        let mut vulkan_13 = vk::PhysicalDeviceVulkan13Features::default()
+            .synchronization2(params.features.synchronization2);
+        if params.features.synchronization2 {
+            features = features.push_next(&mut vulkan_13);
+        }
+        let mut video_maintenance1 = vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default()
+            .video_maintenance1(params.features.video_maintenance1);
+        if params.features.video_maintenance1 {
+            features = features.push_next(&mut video_maintenance1);
+        }
         let mut queue_callback = Box::new(QueueCallbackContext(params.queue_lock));
         let mut raw_init = RawVulkanInitParams {
             instance: params.instance,
