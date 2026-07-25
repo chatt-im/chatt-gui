@@ -23,6 +23,7 @@ image = { version = "0.25", default-features = false }
 itoap = { version = "1.0.1", default-features = false }
 libc = "0.2"
 libmpv2 = { path = "vendor/libmpv2-rs", default-features = false, features = ["render", "vendored"] }
+libmpv2-sys = { path = "vendor/libmpv2-rs/libmpv-sys", features = ["vendored"] }
 log = "0.4"
 naga = { path = "vendor/wgpu/naga", features = ["glsl-in", "spv-out", "wgsl-in"] }
 local_rpc = { package = "chatt-local-rpc", git = "https://github.com/chatt-im/chatt.git", rev = "63c144c745565e2493a5695191d8809c7c689db9" }

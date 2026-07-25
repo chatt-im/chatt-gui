@@ -92,6 +92,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     );
 
     let ffmpeg_lib = build_vendored_ffmpeg(crate_path, out_path);
+    build_ffmpeg_thumbnail(crate_path, out_path, &ffmpeg_lib);
     copy_pkg_config_files(
         &ffmpeg_lib.join("pkgconfig"),
         &pkg_config_libdir,
@@ -226,6 +227,25 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     }
     println!("cargo:rustc-link-lib=static=chatt_vaapi_loader");
     println!("cargo:rustc-link-lib=dylib=dl");
+}
+
+#[cfg(feature = "vendored")]
+fn build_ffmpeg_thumbnail(crate_path: &Path, out_path: &Path, ffmpeg_lib: &Path) {
+    println!(
+        "cargo:rerun-if-changed={}",
+        crate_path.join("ffmpeg_thumbnail.c").display()
+    );
+    let include = ffmpeg_lib
+        .parent()
+        .expect("vendored FFmpeg library directory has no parent")
+        .join("include");
+    cc::Build::new()
+        .file(crate_path.join("ffmpeg_thumbnail.c"))
+        .include(include)
+        .warnings(true)
+        .extra_warnings(true)
+        .out_dir(out_path)
+        .compile("chatt_ffmpeg_thumbnail");
 }
 
 #[cfg(feature = "vendored")]

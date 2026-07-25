@@ -3,7 +3,7 @@ use std::{cell::Cell, rc::Rc, sync::Arc};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Div, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, Pixels, Stateful, Window, canvas, div, img, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, surface,
+    linear_gradient, point, prelude::*, px, relative,
 };
 
 use crate::{
@@ -19,7 +19,10 @@ use crate::{
 pub(crate) enum VideoPlayerEvent {
     PlayerHovered(bool),
     PointerMoved,
-    SurfaceClicked(usize),
+    SurfaceClicked {
+        click_count: usize,
+        unstarted: bool,
+    },
     Play,
     ScrubHovered(f64),
     ScrubHoverCleared,
@@ -39,6 +42,8 @@ pub(crate) enum VideoPlayerEvent {
 }
 
 pub(crate) type VideoPlayerHandler = Rc<dyn Fn(VideoPlayerEvent, &mut Window, &mut App) + 'static>;
+
+pub(crate) const INLINE_VIDEO_ASPECT_RATIO: f32 = 16.0 / 9.0;
 
 pub(crate) struct VideoPlayerConfig {
     pub key: VideoKey,
@@ -104,26 +109,17 @@ pub(crate) fn render_video_player(
             .object_fit(ObjectFit::Contain)
     });
     let surface_layer = video.surface.clone().map(|video_surface| {
-        if theater {
-            let fitted_surface = video_surface.clone();
-            canvas(
-                move |bounds, _, _| fit_video_bounds(bounds, aspect_ratio),
-                move |_, fitted, window, _| {
-                    if let Some(fitted) = fitted {
-                        window.paint_platform_surface(fitted, fitted_surface.clone());
-                    }
-                },
-            )
-            .absolute()
-            .size_full()
-            .into_any_element()
-        } else {
-            div()
-                .absolute()
-                .inset_0()
-                .child(surface(video_surface).size_full())
-                .into_any_element()
-        }
+        canvas(
+            move |bounds, _, _| fit_video_bounds(bounds, aspect_ratio),
+            move |_, fitted, window, _| {
+                if let Some(fitted) = fitted {
+                    window.paint_platform_surface(fitted, video_surface.clone());
+                }
+            },
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
     });
 
     let player_hover = handler.clone();
@@ -139,7 +135,9 @@ pub(crate) fn render_video_player(
         .overflow_hidden()
         .bg(settings.theme.color(ThemeRole::MediaViewport))
         .when(theater, |viewport| viewport.size_full())
-        .when(!theater, |viewport| viewport.aspect_ratio(aspect_ratio))
+        .when(!theater, |viewport| {
+            viewport.aspect_ratio(INLINE_VIDEO_ASPECT_RATIO)
+        })
         .on_hover(move |hovered, window, cx| {
             player_hover(VideoPlayerEvent::PlayerHovered(*hovered), window, cx)
         })
@@ -148,7 +146,10 @@ pub(crate) fn render_video_player(
         })
         .on_click(move |event: &ClickEvent, window, cx| {
             surface_click(
-                VideoPlayerEvent::SurfaceClicked(event.click_count()),
+                VideoPlayerEvent::SurfaceClicked {
+                    click_count: event.click_count(),
+                    unstarted: !has_surface,
+                },
                 window,
                 cx,
             )

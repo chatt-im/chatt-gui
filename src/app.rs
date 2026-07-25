@@ -61,7 +61,8 @@ use crate::{
     },
     video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
     video_player::{
-        VideoPlayerConfig, VideoPlayerEvent, VideoPlayerHandler, aspect_ratio, render_video_player,
+        INLINE_VIDEO_ASPECT_RATIO, VideoPlayerConfig, VideoPlayerEvent, VideoPlayerHandler,
+        aspect_ratio, render_video_player,
     },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
@@ -793,7 +794,6 @@ impl ChattView {
         let video_thumbnails = VideoThumbnailCache::new(
             VIDEO_THUMBNAIL_CACHE_BYTES,
             video_wakeup.clone(),
-            attachment_source_registry.clone(),
         );
         Self {
             model,
@@ -5779,12 +5779,12 @@ impl ChattView {
 
     fn render_video_source_status(
         message_id: u64,
-        descriptor: &AttachmentDescriptor,
+        _descriptor: &AttachmentDescriptor,
         label: String,
         action: Option<AnyElement>,
         palette: &ThemePalette,
     ) -> AnyElement {
-        image_frame(descriptor, palette)
+        video_frame(palette)
             .id(("video-source-status", message_id as usize))
             .mt_2()
             .px_3()
@@ -6648,10 +6648,14 @@ impl ChattView {
         match event {
             VideoPlayerEvent::PlayerHovered(hovered) => self.hover_video_player(key, hovered, cx),
             VideoPlayerEvent::PointerMoved => self.video_pointer_moved(key, cx),
-            VideoPlayerEvent::SurfaceClicked(click_count) => {
-                self.click_video_surface(source, click_count, cx)
+            VideoPlayerEvent::SurfaceClicked {
+                click_count,
+                unstarted,
+            } => self.click_video_surface(source, click_count, unstarted, cx),
+            VideoPlayerEvent::Play => {
+                self.video_surface_click_task.take();
+                self.play_video(key, cx);
             }
-            VideoPlayerEvent::Play => self.play_video(key, cx),
             VideoPlayerEvent::ScrubHovered(fraction) => self.hover_video_scrub(key, fraction, cx),
             VideoPlayerEvent::ScrubHoverCleared => self.clear_video_scrub_hover(key, cx),
             VideoPlayerEvent::ScrubPressed { bounds, event } => {
@@ -6824,6 +6828,7 @@ impl ChattView {
         &mut self,
         source: TheaterVideo,
         click_count: usize,
+        unstarted: bool,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
@@ -6833,6 +6838,11 @@ impl ChattView {
             return;
         }
         if click_count != 1 {
+            return;
+        }
+        if unstarted {
+            self.video_surface_click_task.take();
+            self.play_video(source.key, cx);
             return;
         }
         self.video_surface_click_task.take();
@@ -9285,6 +9295,16 @@ fn image_frame(descriptor: &AttachmentDescriptor, palette: &ThemePalette) -> Div
         .w(px(width))
         .max_w_full()
         .aspect_ratio(width / height)
+        .border_6()
+        .border_color(palette.color(ThemeRole::BorderMedia))
+        .rounded_xs()
+}
+
+fn video_frame(palette: &ThemePalette) -> Div {
+    div()
+        .relative()
+        .w_full()
+        .aspect_ratio(INLINE_VIDEO_ASPECT_RATIO)
         .border_6()
         .border_color(palette.color(ThemeRole::BorderMedia))
         .rounded_xs()

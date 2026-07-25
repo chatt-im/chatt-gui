@@ -1,27 +1,24 @@
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::{CStr, c_void},
+    panic::{AssertUnwindSafe, catch_unwind},
+    slice,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use crate::attachment_source::{
-    AttachmentSourceKey, AttachmentSourceRegistry, RegisteredAttachmentSource,
+    AttachmentCursor, AttachmentSeekMode, AttachmentSource, AttachmentSourceKey,
+    RegisteredAttachmentSource,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::Sender as AsyncSender;
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
-use libmpv2::{
-    Format, Mpv,
-    events::Event,
-    render::{SoftwareRenderTarget, mpv_render_update},
-};
 
-const FORMAT_RGBA: &std::ffi::CStr = c"rgba";
 const MAX_WIDTH: u32 = 1_360;
 const MAX_HEIGHT: u32 = 840;
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_QUEUED_JOBS: usize = 16;
 const MAX_CACHE_ENTRIES: usize = 256;
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
@@ -87,9 +84,9 @@ struct ThumbnailWorkQueue {
 
 type SharedWorkQueue = Arc<(Mutex<ThumbnailWorkQueue>, Condvar)>;
 
-/// A bounded timeline thumbnail cache backed by one lazily-created, persistent
-/// software libmpv core. Extraction is serial so thumbnails never contend for
-/// the application's playback render device.
+/// A bounded timeline thumbnail cache backed by direct FFmpeg first-frame
+/// decoding. Extraction is serial so thumbnail work remains bounded and never
+/// contends for the application's playback render device.
 pub(crate) struct VideoThumbnailCache {
     entries: HashMap<ThumbnailKey, CacheEntry>,
     total_bytes: usize,
@@ -101,17 +98,12 @@ pub(crate) struct VideoThumbnailCache {
     results: mpsc::Receiver<ThumbnailResult>,
     worker_results: mpsc::Sender<ThumbnailResult>,
     wakeup: AsyncSender<()>,
-    source_registry: AttachmentSourceRegistry,
     finished_sources: Vec<AttachmentSourceKey>,
     transport_failures: Vec<(AttachmentSourceKey, String)>,
 }
 
 impl VideoThumbnailCache {
-    pub(crate) fn new(
-        budget_bytes: usize,
-        wakeup: AsyncSender<()>,
-        source_registry: AttachmentSourceRegistry,
-    ) -> Self {
+    pub(crate) fn new(budget_bytes: usize, wakeup: AsyncSender<()>) -> Self {
         let (worker_results, results) = mpsc::channel();
         Self {
             entries: HashMap::new(),
@@ -124,7 +116,6 @@ impl VideoThumbnailCache {
             results,
             worker_results,
             wakeup,
-            source_registry,
             finished_sources: Vec::new(),
             transport_failures: Vec::new(),
         }
@@ -272,10 +263,9 @@ impl VideoThumbnailCache {
         let jobs = self.jobs.clone();
         let results = self.worker_results.clone();
         let wakeup = self.wakeup.clone();
-        let source_registry = self.source_registry.clone();
         thread::Builder::new()
-            .name("mpv-thumbnail".into())
-            .spawn(move || thumbnail_worker(jobs, results, wakeup, source_registry))
+            .name("video-thumbnail".into())
+            .spawn(move || thumbnail_worker(jobs, results, wakeup))
             .map_err(|error| format!("could not start video thumbnail worker: {error}"))?;
         self.worker_started = true;
         Ok(())
@@ -386,10 +376,9 @@ fn thumbnail_worker(
     jobs: SharedWorkQueue,
     results: mpsc::Sender<ThumbnailResult>,
     wakeup: AsyncSender<()>,
-    source_registry: AttachmentSourceRegistry,
 ) {
     log::info!("lazy video thumbnail worker started");
-    let mut extractor = None;
+    let mut extractor = ThumbnailExtractor;
     loop {
         let job = {
             let (jobs, ready) = &*jobs;
@@ -413,15 +402,6 @@ fn thumbnail_worker(
                 Some(jobs.jobs.pop_back().expect("non-empty thumbnail queue"))
             }
         };
-        if extractor.is_none() {
-            extractor = match ThumbnailExtractor::new(source_registry.clone()) {
-                Ok(created) => Some(created),
-                Err(error) => {
-                    log::error!("video thumbnail decoder initialization failed: {error:#}");
-                    None
-                }
-            };
-        }
         let Some(job) = job else {
             continue;
         };
@@ -436,12 +416,9 @@ fn thumbnail_worker(
             },
             job.source.source().byte_len(),
         );
-        let result = match extractor.as_mut() {
-            Some(extractor) => extractor
-                .extract(job.source.url())
-                .map_err(|error| format!("{error:#}")),
-            None => Err("initialize thumbnail libmpv core".into()),
-        };
+        let result = extractor
+            .extract(job.source.source().clone())
+            .map_err(|error| format!("{error:#}"));
         log::info!(
             "video thumbnail extraction completed key={:?} success={} source_failed={} elapsed_ms={:.3}",
             job.key.source_key,
@@ -449,9 +426,6 @@ fn thumbnail_worker(
             job.source.source().has_failed(),
             started_at.elapsed().as_secs_f64() * 1_000.0,
         );
-        if result.is_err() {
-            extractor = None;
-        }
         if results
             .send(ThumbnailResult {
                 key: job.key,
@@ -468,174 +442,160 @@ fn thumbnail_worker(
     log::info!("video thumbnail worker stopped");
 }
 
-struct ThumbnailExtractor {
-    mpv: Arc<Mpv>,
-    render: libmpv2::render::RenderContext,
-    aligned: Vec<u8>,
+struct ThumbnailExtractor;
+
+struct ThumbnailIo {
+    cursor: AttachmentCursor,
+    error: Option<String>,
 }
 
 impl ThumbnailExtractor {
-    fn new(source_registry: AttachmentSourceRegistry) -> Result<Self> {
-        let mpv = Arc::new(
-            Mpv::with_initializer(|initializer| {
-                initializer.set_option("vo", "libmpv")?;
-                initializer.set_option("idle", "yes")?;
-                initializer.set_option("keep-open", "no")?;
-                initializer.set_option("pause", "no")?;
-                initializer.set_option("audio", "no")?;
-                initializer.set_option("sub", "no")?;
-                initializer.set_option("hwdec", "no")?;
-                initializer.set_option("profile", "fast")?;
-                initializer.set_option("untimed", "yes")?;
-                initializer.set_option("video-sync", "display-desync")?;
-                initializer.set_option("cache", "no")?;
-                initializer.set_option("sws-allow-zimg", "no")?;
-                initializer.set_option("sws-scaler", "bilinear")?;
-                initializer.set_option("sws-fast", "yes")?;
-                Ok(())
-            })
-            .context("initialize thumbnail libmpv core")?,
-        );
-        crate::attachment_source::register_mpv_attachment_protocol(&mpv, source_registry)?;
-        mpv.observe_property("duration", Format::Double, 1)?;
-        let render = mpv
-            .create_software_render_context(false)
-            .context("create thumbnail software render context")?;
-        Ok(Self {
-            mpv,
-            render,
-            aligned: Vec::new(),
+    fn extract(&mut self, source: Arc<AttachmentSource>) -> Result<ExtractedThumbnail> {
+        let maximum_bytes = usize::try_from(MAX_WIDTH)?
+            .checked_mul(usize::try_from(MAX_HEIGHT)?)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow!("thumbnail output size overflow"))?;
+        let mut bgra = vec![0u8; maximum_bytes];
+        let mut thumbnail = libmpv2_sys::ChattFfmpegThumbnail::default();
+        let mut error = [0i8; 512];
+        let byte_len =
+            i64::try_from(source.byte_len()).context("thumbnail source is too large")?;
+        let mut io = ThumbnailIo {
+            cursor: AttachmentCursor::new(Some(source)),
+            error: None,
+        };
+        let status = unsafe {
+            libmpv2_sys::chatt_ffmpeg_extract_first_frame(
+                (&mut io as *mut ThumbnailIo).cast(),
+                byte_len,
+                thumbnail_read,
+                thumbnail_seek,
+                i32::try_from(MAX_WIDTH)?,
+                i32::try_from(MAX_HEIGHT)?,
+                bgra.as_mut_ptr(),
+                bgra.len(),
+                &mut thumbnail,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if let Some(error) = io.error {
+            bail!("{error}");
+        }
+        if status != 0 {
+            let error = unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            bail!(
+                "{}",
+                if error.is_empty() {
+                    "FFmpeg thumbnail extraction failed"
+                } else {
+                    &error
+                }
+            );
+        }
+
+        let width = u32::try_from(thumbnail.width)
+            .context("thumbnail decoder returned a negative width")?;
+        let height = u32::try_from(thumbnail.height)
+            .context("thumbnail decoder returned a negative height")?;
+        if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
+            bail!("thumbnail decoder returned invalid dimensions {width}x{height}");
+        }
+        let byte_len = usize::try_from(width)?
+            .checked_mul(usize::try_from(height)?)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow!("thumbnail image size overflow"))?;
+        bgra.truncate(byte_len);
+        // GPUI's RenderImage stores its upload bytes in image::RgbaImage but
+        // deliberately interprets them as BGRA.
+        let image = RgbaImage::from_raw(width, height, bgra)
+            .ok_or_else(|| anyhow!("thumbnail decoder returned an invalid buffer"))?;
+        let duration =
+            (thumbnail.duration.is_finite() && thumbnail.duration > 0.0)
+                .then_some(thumbnail.duration);
+        Ok(ExtractedThumbnail {
+            image: Arc::new(RenderImage::new(vec![Frame::new(image)])),
+            duration,
+            byte_len,
         })
     }
+}
 
-    fn extract(&mut self, source_url: &str) -> Result<ExtractedThumbnail> {
-        self.reset_source()?;
-        let result = self.extract_frame(source_url);
-        let reset = self.reset_source();
-        match (result, reset) {
-            (Ok(thumbnail), Ok(())) => Ok(thumbnail),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error).context("reset thumbnail source after extraction"),
+unsafe extern "C" fn thumbnail_read(
+    opaque: *mut c_void,
+    buffer: *mut u8,
+    length: i32,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if opaque.is_null() || buffer.is_null() || length <= 0 {
+            return Err("FFmpeg issued an invalid thumbnail read".to_string());
+        }
+        let io = unsafe { &mut *opaque.cast::<ThumbnailIo>() };
+        let output = unsafe { slice::from_raw_parts_mut(buffer, length as usize) };
+        io.cursor
+            .read(output)
+            .and_then(|read| i32::try_from(read).context("thumbnail read is too large"))
+            .map_err(|error| format!("{error:#}"))
+    }));
+    match result {
+        Ok(Ok(read)) => read,
+        Ok(Err(error)) => {
+            if !opaque.is_null() {
+                unsafe { &mut *opaque.cast::<ThumbnailIo>() }.error = Some(error);
+            }
+            -1
+        }
+        Err(_) => {
+            if !opaque.is_null() {
+                unsafe { &mut *opaque.cast::<ThumbnailIo>() }.error =
+                    Some("thumbnail read callback panicked".into());
+            }
+            -1
         }
     }
+}
 
-    fn extract_frame(&mut self, source_url: &str) -> Result<ExtractedThumbnail> {
-        self.mpv.set_property("pause", false)?;
-        self.mpv
-            .command("loadfile", &[source_url, "replace"])
-            .context("open video thumbnail attachment source")?;
-
-        let deadline = Instant::now() + EXTRACT_TIMEOUT;
-        let mut source_size = None;
-        let mut duration = None;
-        let mut loaded = false;
-        let mut ended = None;
-        while Instant::now() < deadline {
-            if let Some(event) = self.mpv.wait_event(0.01) {
-                match event? {
-                    Event::FileLoaded => {
-                        loaded = true;
-                        source_size = video_size(&self.mpv).ok().or(source_size);
-                    }
-                    Event::VideoReconfig => {
-                        source_size = video_size(&self.mpv).ok().or(source_size);
-                    }
-                    Event::PropertyChange {
-                        change: libmpv2::events::PropertyData::Double(value),
-                        ..
-                    } => duration = (value.is_finite() && value > 0.0).then_some(value),
-                    Event::EndFile(reason) => ended = Some(format!("{reason:?}")),
-                    _ => {}
-                }
-            }
-            source_size = video_size(&self.mpv).ok().or(source_size);
-            let updates = self.render.update();
-            let has_frame_update = updates & u64::from(mpv_render_update::Frame) != 0;
-            // Very short videos may report EndFile after making their only
-            // frame current but without another edge-triggered update. Render
-            // that retained frame rather than treating normal EOF as failure.
-            if !has_frame_update && ended.is_none() {
-                continue;
-            }
-            if !loaded {
-                if has_frame_update {
-                    self.render.skip_rendering()?;
-                }
-                continue;
-            }
-            let Some((source_width, source_height)) = source_size else {
-                if has_frame_update {
-                    self.render.skip_rendering()?;
-                }
-                continue;
-            };
-            let (width, height) = bounded_size(source_width, source_height);
-            let row_bytes = usize::try_from(width)?
-                .checked_mul(4)
-                .ok_or_else(|| anyhow!("thumbnail row is too large"))?;
-            let stride = row_bytes.next_multiple_of(64);
-            self.aligned.resize(stride * height as usize, 0);
-            self.render.render_software(SoftwareRenderTarget {
-                width,
-                height,
-                format: FORMAT_RGBA,
-                stride,
-                pixels: &mut self.aligned,
-            })?;
-            let mut tight = vec![0; row_bytes * height as usize];
-            for row in 0..height as usize {
-                tight[row * row_bytes..(row + 1) * row_bytes]
-                    .copy_from_slice(&self.aligned[row * stride..row * stride + row_bytes]);
-            }
-            for pixel in tight.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-            let image = RgbaImage::from_raw(width, height, tight)
-                .ok_or_else(|| anyhow!("thumbnail renderer returned an invalid buffer"))?;
-            let byte_len = row_bytes * height as usize;
-            let image = Arc::new(RenderImage::new(vec![Frame::new(image)]));
-            let duration = duration.or_else(|| {
-                self.mpv
-                    .get_property::<f64>("duration")
-                    .ok()
-                    .filter(|value| value.is_finite() && *value > 0.0)
-            });
-            return Ok(ExtractedThumbnail {
-                image,
-                duration,
-                byte_len,
-            });
+unsafe extern "C" fn thumbnail_seek(opaque: *mut c_void, offset: i64, whence: i32) -> i64 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if opaque.is_null() {
+            return Err("FFmpeg issued a thumbnail seek without a source".to_string());
         }
-        if let Some(reason) = ended {
-            bail!("video ended before thumbnail frame was available: {reason}");
+        let mode = match whence {
+            libc::SEEK_SET => AttachmentSeekMode::Set,
+            libc::SEEK_CUR => AttachmentSeekMode::Current,
+            libc::SEEK_END => AttachmentSeekMode::End,
+            _ => return Err(format!("FFmpeg issued invalid thumbnail seek mode {whence}")),
+        };
+        unsafe { &mut *opaque.cast::<ThumbnailIo>() }
+            .cursor
+            .seek(offset, mode)
+            .and_then(|position| {
+                i64::try_from(position).context("thumbnail seek position is too large")
+            })
+            .map_err(|error| format!("{error:#}"))
+    }));
+    match result {
+        Ok(Ok(position)) => position,
+        Ok(Err(error)) => {
+            if !opaque.is_null() {
+                unsafe { &mut *opaque.cast::<ThumbnailIo>() }.error = Some(error);
+            }
+            -1
         }
-        bail!("timed out waiting for the first decoded video frame")
-    }
-
-    fn reset_source(&mut self) -> Result<()> {
-        self.mpv.command("stop", &[])?;
-        while let Some(event) = self.mpv.wait_event(0.0) {
-            event?;
+        Err(_) => {
+            if !opaque.is_null() {
+                unsafe { &mut *opaque.cast::<ThumbnailIo>() }.error =
+                    Some("thumbnail seek callback panicked".into());
+            }
+            -1
         }
-        let updates = self.render.update();
-        if updates & u64::from(mpv_render_update::Frame) != 0 {
-            self.render.skip_rendering()?;
-        }
-        Ok(())
     }
 }
 
 fn retry_delay(failures: u32) -> Duration {
     RETRY_BASE_DELAY * (1 << failures.saturating_sub(1).min(MAX_RETRY_SHIFT))
-}
-
-fn video_size(mpv: &Mpv) -> Result<(u32, u32)> {
-    let width = u32::try_from(mpv.get_property::<i64>("dwidth")?)?;
-    let height = u32::try_from(mpv.get_property::<i64>("dheight")?)?;
-    if width == 0 || height == 0 {
-        bail!("video dimensions are not ready");
-    }
-    Ok((width, height))
 }
 
 fn bounded_size(width: u32, height: u32) -> (u32, u32) {
@@ -651,6 +611,7 @@ fn bounded_size(width: u32, height: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attachment_source::AttachmentSourceRegistry;
     use local_rpc::model::AttachmentId;
     use std::fs::File;
 
@@ -688,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_first_frame_with_persistent_software_context() {
+    fn extracts_first_frame_through_attachment_source() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("thumbnail.mkv");
         let output = std::process::Command::new("ffmpeg")
@@ -716,12 +677,17 @@ mod tests {
 
         let registry = AttachmentSourceRegistry::new(1);
         let source = registered(&registry, key(1), File::open(&path).unwrap());
-        let mut extractor = ThumbnailExtractor::new(registry).unwrap();
+        let mut extractor = ThumbnailExtractor;
         for _ in 0..8 {
-            let thumbnail = extractor.extract(source.url()).unwrap();
+            let thumbnail = extractor.extract(source.source().clone()).unwrap();
             assert_eq!(thumbnail.image.size(0).width.0, 320);
             assert_eq!(thumbnail.image.size(0).height.0, 180);
             assert_eq!(thumbnail.byte_len, 320 * 180 * 4);
+            let pixel = &thumbnail.image.as_bytes(0).unwrap()[..4];
+            assert!(
+                pixel[0] < 32 && pixel[1] < 32 && pixel[2] > 224 && pixel[3] == 255,
+                "GPUI thumbnail bytes should contain opaque red in BGRA order: {pixel:?}",
+            );
         }
     }
 
@@ -732,7 +698,7 @@ mod tests {
         let file = tempfile::tempfile().unwrap();
         file.set_len(1).unwrap();
         let source = registered(&registry, key(1), file);
-        let cache = VideoThumbnailCache::new(1024, wakeup, registry);
+        let cache = VideoThumbnailCache::new(1024, wakeup);
 
         for value in 0..MAX_QUEUED_JOBS as u8 {
             assert!(
@@ -763,7 +729,7 @@ mod tests {
     #[test]
     fn failed_thumbnail_metadata_is_bounded() {
         let (wakeup, _) = async_channel::bounded(1);
-        let mut cache = VideoThumbnailCache::new(1024, wakeup, AttachmentSourceRegistry::new(1));
+        let mut cache = VideoThumbnailCache::new(1024, wakeup);
         for value in 0..(MAX_CACHE_ENTRIES + 20) {
             cache.entries.insert(
                 ThumbnailKey {

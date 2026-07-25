@@ -595,6 +595,7 @@ dependencies = [
  "itoap",
  "libc",
  "libmpv2",
+ "libmpv2-sys",
  "log",
  "naga",
  "tempfile",
