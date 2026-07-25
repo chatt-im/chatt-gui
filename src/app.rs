@@ -4698,8 +4698,6 @@ impl ChattView {
             settings.theme.color(ThemeRole::ControlSurface)
         } else if message.notice {
             settings.theme.color(ThemeRole::Raised)
-        } else if message.local {
-            settings.theme.color(ThemeRole::Panel)
         } else {
             settings.theme.color(ThemeRole::Window)
         };
@@ -7546,7 +7544,6 @@ impl ChattView {
             .local_identity
             .clone()
             .unwrap_or_else(|| "No identity".into());
-        let connection = connection_label(&self.model);
         sidebar.child(div().flex_1()).child(
             div()
                 .h(px(58.))
@@ -7571,15 +7568,8 @@ impl ChattView {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(div().text_sm().child(identity))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(applied.theme.color(ThemeRole::TextMuted))
-                                .child(connection),
-                        ),
+                        .text_sm()
+                        .child(identity),
                 )
                 .child(mini_button("open-servers", "⇄", &applied.theme).on_click(
                     cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
@@ -8436,7 +8426,7 @@ impl Render for ChattView {
                             .py_2()
                             .border_t_1()
                             .border_color(applied.theme.color(ThemeRole::BorderSubtle))
-                            .bg(applied.theme.color(ThemeRole::Toolbar))
+                            .bg(applied.theme.color(ThemeRole::Input))
                             .when_some(completion_popup, |bar, popup| bar.child(popup))
                             .when_some(queued_file_row, |bar, files| bar.child(files))
                             .when_some(self.composer_error.clone(), |bar, error| {

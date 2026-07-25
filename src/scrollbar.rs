@@ -65,9 +65,9 @@ pub(crate) struct OverlayScrollbarColors {
 impl Default for OverlayScrollbarColors {
     fn default() -> Self {
         Self {
-            track: rgba(0x111317dd).into(),
-            thumb: rgba(0x5f6670cc).into(),
-            thumb_hovered: rgba(0x8b929ddd).into(),
+            track: rgba(0x000000dd).into(),
+            thumb: rgba(0x505050cc).into(),
+            thumb_hovered: rgba(0x787878dd).into(),
         }
     }
 }

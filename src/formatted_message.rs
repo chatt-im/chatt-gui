@@ -942,7 +942,7 @@ impl Element for FormattedMessageElement {
                     Pixels::ZERO,
                     cx.try_global::<AppliedSettings>()
                         .map(|settings| settings.0.theme.color(ThemeRole::StateSelection))
-                        .unwrap_or_else(|| rgba(0x5277a866)),
+                        .unwrap_or_else(|| rgba(0xffffff1f)),
                     Edges::default(),
                     Hsla::transparent_black(),
                     BorderStyle::default(),

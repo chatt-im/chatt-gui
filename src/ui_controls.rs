@@ -24,6 +24,7 @@ pub(crate) fn room_button(
         ThemeRole::TextSecondary
     });
     let hover = palette.color(ThemeRole::StateHover);
+    let pressed = palette.color(ThemeRole::StatePressed);
     div()
         .id(id)
         .mx_2()
@@ -34,7 +35,10 @@ pub(crate) fn room_button(
         .gap_2()
         .cursor_pointer()
         .bg(background)
-        .hover(move |button| button.bg(hover))
+        .when(!active, |button| {
+            button.hover(move |button| button.bg(hover))
+        })
+        .active(move |button| button.bg(pressed))
         .text_color(text)
         .child(div().w(px(16.)).text_center().child(sigil))
         .child(div().flex_1().child(label))

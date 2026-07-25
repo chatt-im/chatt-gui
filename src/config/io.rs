@@ -347,7 +347,7 @@ schema-version = 1
 future-root = "kept"
 
 [theme.surfaces]
-window = '#111317'
+window = '#000000'
 future-surface = "#abcdef"
 
 [bindings.future-device]
@@ -364,7 +364,7 @@ future-surface = "#abcdef"
         assert!(rendered.contains("future-surface = \"#abcdef\""));
         assert!(rendered.contains("[bindings.future-device]"));
         assert!(rendered.contains("\"secondary-k\" = \"FutureCommand\""));
-        assert!(rendered.contains("window = '#111317'"));
+        assert!(rendered.contains("window = '#000000'"));
         assert!(rendered.contains("code-size = 15.5"));
     }
 

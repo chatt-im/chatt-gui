@@ -46,7 +46,7 @@ impl ThemeGroup {
             Self::Surfaces => "Background colors for application and media surfaces.",
             Self::Text => "Foreground colors used by messages and interface chrome.",
             Self::Borders => "Borders and focus outlines.",
-            Self::States => "Hover, selection, search, and status colors.",
+            Self::States => "Hover, pressed, selection, search, and status colors.",
             Self::Controls => "Buttons and other interactive controls.",
             Self::Scrollbar => "Overlay scrollbar track and thumb colors.",
             Self::Participants => "Local and remote participant accents.",
@@ -84,6 +84,7 @@ pub(crate) enum ThemeRole {
     BorderQuote,
     StateHover,
     StateRowHover,
+    StatePressed,
     StateSelected,
     StateSelection,
     StateSearch,
@@ -134,7 +135,7 @@ pub(crate) enum ThemeRole {
     MediaMutedText,
 }
 
-pub(crate) const THEME_ROLE_COUNT: usize = 73;
+pub(crate) const THEME_ROLE_COUNT: usize = 74;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ThemeRoleSpec {
@@ -294,6 +295,12 @@ pub(crate) static THEME_ROLES: &[ThemeRoleSpec] = &[
         group: ThemeGroup::States,
         key: "row-hover",
         label: "Row hover",
+    },
+    ThemeRoleSpec {
+        role: ThemeRole::StatePressed,
+        group: ThemeGroup::States,
+        key: "pressed",
+        label: "Pressed",
     },
     ThemeRoleSpec {
         role: ThemeRole::StateSelected,
@@ -613,6 +620,7 @@ impl ThemeConfig {
             ThemeRole::BorderQuote => self.borders.quote,
             ThemeRole::StateHover => self.states.hover,
             ThemeRole::StateRowHover => self.states.row_hover,
+            ThemeRole::StatePressed => self.states.pressed,
             ThemeRole::StateSelected => self.states.selected,
             ThemeRole::StateSelection => self.states.selection,
             ThemeRole::StateSearch => self.states.search,
@@ -691,6 +699,7 @@ impl ThemeConfig {
             ThemeRole::BorderQuote => self.borders.quote = value,
             ThemeRole::StateHover => self.states.hover = value,
             ThemeRole::StateRowHover => self.states.row_hover = value,
+            ThemeRole::StatePressed => self.states.pressed = value,
             ThemeRole::StateSelected => self.states.selected = value,
             ThemeRole::StateSelection => self.states.selection = value,
             ThemeRole::StateSearch => self.states.search = value,

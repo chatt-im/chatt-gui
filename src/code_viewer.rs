@@ -1641,7 +1641,7 @@ impl Element for CodeLineElement {
                 self.settings
                     .as_ref()
                     .map(|settings| settings.theme.color(ThemeRole::StateSelection))
-                    .unwrap_or_else(|| rgba(0x5277a866)),
+                    .unwrap_or_else(|| rgba(0xffffff1f)),
                 Edges::default(),
                 Hsla::transparent_black(),
                 BorderStyle::default(),

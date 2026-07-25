@@ -86,38 +86,38 @@ impl Default for ThemeConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct SurfaceColors {
-    #[toml(default = Rgba8::rgb(0x11, 0x13, 0x17))]
+    #[toml(default = Rgba8::rgb(0x00, 0x00, 0x00))]
     pub(crate) window: Rgba8,
-    #[toml(default = Rgba8::rgb(0x0d, 0x0f, 0x12))]
+    #[toml(default = Rgba8::rgb(0x0a, 0x0a, 0x0a))]
     pub(crate) sidebar: Rgba8,
-    #[toml(default = Rgba8::rgb(0x14, 0x16, 0x1a))]
+    #[toml(default = Rgba8::rgb(0x15, 0x15, 0x15))]
     pub(crate) raised: Rgba8,
-    #[toml(default = Rgba8::rgb(0x08, 0x09, 0x0b))]
+    #[toml(default = Rgba8::rgb(0x00, 0x00, 0x00))]
     pub(crate) media: Rgba8,
-    #[toml(default = Rgba8::rgb(0x14, 0x16, 0x1a))]
+    #[toml(default = Rgba8::rgb(0x0d, 0x0d, 0x0d))]
     pub(crate) toolbar: Rgba8,
-    #[toml(default = Rgba8::rgb(0x19, 0x1c, 0x21))]
+    #[toml(default = Rgba8::rgb(0x12, 0x12, 0x12))]
     pub(crate) panel: Rgba8,
-    #[toml(default = Rgba8::rgb(0x0d, 0x0f, 0x12))]
+    #[toml(default = Rgba8::rgb(0x21, 0x21, 0x21))]
     pub(crate) input: Rgba8,
-    #[toml(default = Rgba8::rgb(0x0e, 0x0e, 0x0e))]
+    #[toml(default = Rgba8::rgb(0x12, 0x12, 0x12))]
     pub(crate) code: Rgba8,
-    #[toml(default = Rgba8::rgba(0x08, 0x09, 0x0b, 0xdd))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xdd))]
     pub(crate) scrim: Rgba8,
 }
 
 impl Default for SurfaceColors {
     fn default() -> Self {
         Self {
-            window: Rgba8::rgb(0x11, 0x13, 0x17),
-            sidebar: Rgba8::rgb(0x0d, 0x0f, 0x12),
-            raised: Rgba8::rgb(0x14, 0x16, 0x1a),
-            media: Rgba8::rgb(0x08, 0x09, 0x0b),
-            toolbar: Rgba8::rgb(0x14, 0x16, 0x1a),
-            panel: Rgba8::rgb(0x19, 0x1c, 0x21),
-            input: Rgba8::rgb(0x0d, 0x0f, 0x12),
-            code: Rgba8::rgb(0x0e, 0x0e, 0x0e),
-            scrim: Rgba8::rgba(0x08, 0x09, 0x0b, 0xdd),
+            window: Rgba8::rgb(0x00, 0x00, 0x00),
+            sidebar: Rgba8::rgb(0x0a, 0x0a, 0x0a),
+            raised: Rgba8::rgb(0x15, 0x15, 0x15),
+            media: Rgba8::rgb(0x00, 0x00, 0x00),
+            toolbar: Rgba8::rgb(0x0d, 0x0d, 0x0d),
+            panel: Rgba8::rgb(0x12, 0x12, 0x12),
+            input: Rgba8::rgb(0x21, 0x21, 0x21),
+            code: Rgba8::rgb(0x12, 0x12, 0x12),
+            scrim: Rgba8::rgba(0x00, 0x00, 0x00, 0xdd),
         }
     }
 }
@@ -125,35 +125,35 @@ impl Default for SurfaceColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct TextColors {
-    #[toml(default = Rgba8::rgb(0xd9, 0xdb, 0xe0))]
+    #[toml(default = Rgba8::rgb(0xe5, 0xe5, 0xe5))]
     pub(crate) primary: Rgba8,
-    #[toml(default = Rgba8::rgb(0x8b, 0x92, 0x9d))]
+    #[toml(default = Rgba8::rgb(0x8f, 0x8f, 0x8f))]
     pub(crate) muted: Rgba8,
     #[toml(default = Rgba8::rgb(0xf0, 0xf0, 0xf0))]
     pub(crate) link: Rgba8,
     #[toml(default = Rgba8::rgb(0xd8, 0xd8, 0xd8))]
     pub(crate) body: Rgba8,
-    #[toml(default = Rgba8::rgb(0x74, 0x7a, 0x84))]
+    #[toml(default = Rgba8::rgb(0x73, 0x73, 0x73))]
     pub(crate) dim: Rgba8,
-    #[toml(default = Rgba8::rgb(0x67, 0x6d, 0x77))]
+    #[toml(default = Rgba8::rgb(0x66, 0x66, 0x66))]
     pub(crate) subtle: Rgba8,
-    #[toml(default = Rgba8::rgb(0xb4, 0xb9, 0xc2))]
+    #[toml(default = Rgba8::rgb(0xb8, 0xb8, 0xb8))]
     pub(crate) secondary: Rgba8,
-    #[toml(default = Rgba8::rgb(0xf0, 0xf2, 0xf5))]
+    #[toml(default = Rgba8::rgb(0xf5, 0xf5, 0xf5))]
     pub(crate) inverse: Rgba8,
 }
 
 impl Default for TextColors {
     fn default() -> Self {
         Self {
-            primary: Rgba8::rgb(0xd9, 0xdb, 0xe0),
-            muted: Rgba8::rgb(0x8b, 0x92, 0x9d),
+            primary: Rgba8::rgb(0xe5, 0xe5, 0xe5),
+            muted: Rgba8::rgb(0x8f, 0x8f, 0x8f),
             link: Rgba8::rgb(0xf0, 0xf0, 0xf0),
             body: Rgba8::rgb(0xd8, 0xd8, 0xd8),
-            dim: Rgba8::rgb(0x74, 0x7a, 0x84),
-            subtle: Rgba8::rgb(0x67, 0x6d, 0x77),
-            secondary: Rgba8::rgb(0xb4, 0xb9, 0xc2),
-            inverse: Rgba8::rgb(0xf0, 0xf2, 0xf5),
+            dim: Rgba8::rgb(0x73, 0x73, 0x73),
+            subtle: Rgba8::rgb(0x66, 0x66, 0x66),
+            secondary: Rgba8::rgb(0xb8, 0xb8, 0xb8),
+            inverse: Rgba8::rgb(0xf5, 0xf5, 0xf5),
         }
     }
 }
@@ -161,15 +161,15 @@ impl Default for TextColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct BorderColors {
-    #[toml(default = Rgba8::rgb(0x27, 0x2a, 0x30))]
+    #[toml(default = Rgba8::rgb(0x1f, 0x1f, 0x1f))]
     pub(crate) subtle: Rgba8,
-    #[toml(default = Rgba8::rgb(0x34, 0x3a, 0x43))]
+    #[toml(default = Rgba8::rgb(0x2e, 0x2e, 0x2e))]
     pub(crate) strong: Rgba8,
-    #[toml(default = Rgba8::rgb(0x2a, 0x2a, 0x2a))]
+    #[toml(default = Rgba8::rgb(0x29, 0x29, 0x29))]
     pub(crate) code: Rgba8,
-    #[toml(default = Rgba8::rgb(0x30, 0x34, 0x3b))]
+    #[toml(default = Rgba8::rgb(0x26, 0x26, 0x26))]
     pub(crate) media: Rgba8,
-    #[toml(default = Rgba8::rgb(0x53, 0x69, 0x87))]
+    #[toml(default = Rgba8::rgb(0x73, 0x73, 0x73))]
     pub(crate) focus: Rgba8,
     #[toml(default = Rgba8::rgb(0x4a, 0x4a, 0x4a))]
     pub(crate) quote: Rgba8,
@@ -178,11 +178,11 @@ pub(crate) struct BorderColors {
 impl Default for BorderColors {
     fn default() -> Self {
         Self {
-            subtle: Rgba8::rgb(0x27, 0x2a, 0x30),
-            strong: Rgba8::rgb(0x34, 0x3a, 0x43),
-            code: Rgba8::rgb(0x2a, 0x2a, 0x2a),
-            media: Rgba8::rgb(0x30, 0x34, 0x3b),
-            focus: Rgba8::rgb(0x53, 0x69, 0x87),
+            subtle: Rgba8::rgb(0x1f, 0x1f, 0x1f),
+            strong: Rgba8::rgb(0x2e, 0x2e, 0x2e),
+            code: Rgba8::rgb(0x29, 0x29, 0x29),
+            media: Rgba8::rgb(0x26, 0x26, 0x26),
+            focus: Rgba8::rgb(0x73, 0x73, 0x73),
             quote: Rgba8::rgb(0x4a, 0x4a, 0x4a),
         }
     }
@@ -191,13 +191,15 @@ impl Default for BorderColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct StateColors {
-    #[toml(default = Rgba8::rgb(0x20, 0x24, 0x2a))]
+    #[toml(default = Rgba8::rgb(0x18, 0x18, 0x18))]
     pub(crate) hover: Rgba8,
-    #[toml(default = Rgba8::rgb(0x1b, 0x1f, 0x25))]
+    #[toml(default = Rgba8::rgb(0x11, 0x11, 0x11))]
     pub(crate) row_hover: Rgba8,
-    #[toml(default = Rgba8::rgb(0x53, 0x69, 0x87))]
+    #[toml(default = Rgba8::rgb(0x24, 0x24, 0x24))]
+    pub(crate) pressed: Rgba8,
+    #[toml(default = Rgba8::rgb(0x26, 0x26, 0x26))]
     pub(crate) selected: Rgba8,
-    #[toml(default = Rgba8::rgba(0x52, 0x77, 0xa8, 0x66))]
+    #[toml(default = Rgba8::rgba(0xff, 0xff, 0xff, 0x1f))]
     pub(crate) selection: Rgba8,
     #[toml(default = Rgba8::rgba(0xd9, 0xa4, 0x41, 0x44))]
     pub(crate) search: Rgba8,
@@ -209,13 +211,13 @@ pub(crate) struct StateColors {
     pub(crate) warning: Rgba8,
     #[toml(default = Rgba8::rgb(0xd9, 0x9a, 0x93))]
     pub(crate) danger: Rgba8,
-    #[toml(default = Rgba8::rgb(0x55, 0x5a, 0x63))]
+    #[toml(default = Rgba8::rgb(0x55, 0x55, 0x55))]
     pub(crate) disabled: Rgba8,
-    #[toml(default = Rgba8::rgba(0x6f, 0x8f, 0xc0, 0x44))]
+    #[toml(default = Rgba8::rgba(0xff, 0xff, 0xff, 0x24))]
     pub(crate) composer_selection: Rgba8,
-    #[toml(default = Rgba8::rgba(0x8c, 0xa9, 0xd8, 0x88))]
+    #[toml(default = Rgba8::rgba(0xd0, 0xd0, 0xd0, 0x88))]
     pub(crate) cursor_normal: Rgba8,
-    #[toml(default = Rgba8::rgba(0x8c, 0xa9, 0xd8, 0xff))]
+    #[toml(default = Rgba8::rgba(0xe5, 0xe5, 0xe5, 0xff))]
     pub(crate) cursor_insert: Rgba8,
     #[toml(default = Rgba8::rgba(0xff, 0xff, 0xff, 0x14))]
     pub(crate) inline_code: Rgba8,
@@ -224,19 +226,20 @@ pub(crate) struct StateColors {
 impl Default for StateColors {
     fn default() -> Self {
         Self {
-            hover: Rgba8::rgb(0x20, 0x24, 0x2a),
-            row_hover: Rgba8::rgb(0x1b, 0x1f, 0x25),
-            selected: Rgba8::rgb(0x53, 0x69, 0x87),
-            selection: Rgba8::rgba(0x52, 0x77, 0xa8, 0x66),
+            hover: Rgba8::rgb(0x18, 0x18, 0x18),
+            row_hover: Rgba8::rgb(0x11, 0x11, 0x11),
+            pressed: Rgba8::rgb(0x24, 0x24, 0x24),
+            selected: Rgba8::rgb(0x26, 0x26, 0x26),
+            selection: Rgba8::rgba(0xff, 0xff, 0xff, 0x1f),
             search: Rgba8::rgba(0xd9, 0xa4, 0x41, 0x44),
             current_search: Rgba8::rgba(0xd9, 0xa4, 0x41, 0x66),
             success: Rgba8::rgb(0x7f, 0x9c, 0x70),
             warning: Rgba8::rgb(0xd9, 0xa0, 0x66),
             danger: Rgba8::rgb(0xd9, 0x9a, 0x93),
-            disabled: Rgba8::rgb(0x55, 0x5a, 0x63),
-            composer_selection: Rgba8::rgba(0x6f, 0x8f, 0xc0, 0x44),
-            cursor_normal: Rgba8::rgba(0x8c, 0xa9, 0xd8, 0x88),
-            cursor_insert: Rgba8::rgba(0x8c, 0xa9, 0xd8, 0xff),
+            disabled: Rgba8::rgb(0x55, 0x55, 0x55),
+            composer_selection: Rgba8::rgba(0xff, 0xff, 0xff, 0x24),
+            cursor_normal: Rgba8::rgba(0xd0, 0xd0, 0xd0, 0x88),
+            cursor_insert: Rgba8::rgba(0xe5, 0xe5, 0xe5, 0xff),
             inline_code: Rgba8::rgba(0xff, 0xff, 0xff, 0x14),
         }
     }
@@ -245,29 +248,29 @@ impl Default for StateColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct ControlColors {
-    #[toml(default = Rgba8::rgb(0x20, 0x23, 0x29))]
+    #[toml(default = Rgba8::rgb(0x18, 0x18, 0x18))]
     pub(crate) surface: Rgba8,
-    #[toml(default = Rgba8::rgb(0x30, 0x35, 0x3d))]
+    #[toml(default = Rgba8::rgb(0x26, 0x26, 0x26))]
     pub(crate) surface_hover: Rgba8,
-    #[toml(default = Rgba8::rgb(0x1b, 0x1e, 0x23))]
+    #[toml(default = Rgba8::rgb(0x17, 0x17, 0x17))]
     pub(crate) button: Rgba8,
-    #[toml(default = Rgba8::rgb(0x29, 0x2d, 0x34))]
+    #[toml(default = Rgba8::rgb(0x24, 0x24, 0x24))]
     pub(crate) button_hover: Rgba8,
-    #[toml(default = Rgba8::rgb(0x53, 0x69, 0x87))]
+    #[toml(default = Rgba8::rgb(0x30, 0x30, 0x30))]
     pub(crate) active: Rgba8,
-    #[toml(default = Rgba8::rgb(0xf0, 0xf2, 0xf5))]
+    #[toml(default = Rgba8::rgb(0xf2, 0xf2, 0xf2))]
     pub(crate) active_text: Rgba8,
 }
 
 impl Default for ControlColors {
     fn default() -> Self {
         Self {
-            surface: Rgba8::rgb(0x20, 0x23, 0x29),
-            surface_hover: Rgba8::rgb(0x30, 0x35, 0x3d),
-            button: Rgba8::rgb(0x1b, 0x1e, 0x23),
-            button_hover: Rgba8::rgb(0x29, 0x2d, 0x34),
-            active: Rgba8::rgb(0x53, 0x69, 0x87),
-            active_text: Rgba8::rgb(0xf0, 0xf2, 0xf5),
+            surface: Rgba8::rgb(0x18, 0x18, 0x18),
+            surface_hover: Rgba8::rgb(0x26, 0x26, 0x26),
+            button: Rgba8::rgb(0x17, 0x17, 0x17),
+            button_hover: Rgba8::rgb(0x24, 0x24, 0x24),
+            active: Rgba8::rgb(0x30, 0x30, 0x30),
+            active_text: Rgba8::rgb(0xf2, 0xf2, 0xf2),
         }
     }
 }
@@ -275,20 +278,20 @@ impl Default for ControlColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct ScrollbarColors {
-    #[toml(default = Rgba8::rgba(0x11, 0x13, 0x17, 0xdd))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xdd))]
     pub(crate) track: Rgba8,
-    #[toml(default = Rgba8::rgba(0x5f, 0x66, 0x70, 0xcc))]
+    #[toml(default = Rgba8::rgba(0x50, 0x50, 0x50, 0xcc))]
     pub(crate) thumb: Rgba8,
-    #[toml(default = Rgba8::rgba(0x8b, 0x92, 0x9d, 0xdd))]
+    #[toml(default = Rgba8::rgba(0x78, 0x78, 0x78, 0xdd))]
     pub(crate) thumb_hover: Rgba8,
 }
 
 impl Default for ScrollbarColors {
     fn default() -> Self {
         Self {
-            track: Rgba8::rgba(0x11, 0x13, 0x17, 0xdd),
-            thumb: Rgba8::rgba(0x5f, 0x66, 0x70, 0xcc),
-            thumb_hover: Rgba8::rgba(0x8b, 0x92, 0x9d, 0xdd),
+            track: Rgba8::rgba(0x00, 0x00, 0x00, 0xdd),
+            thumb: Rgba8::rgba(0x50, 0x50, 0x50, 0xcc),
+            thumb_hover: Rgba8::rgba(0x78, 0x78, 0x78, 0xdd),
         }
     }
 }
@@ -368,44 +371,44 @@ impl Default for SyntaxColors {
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct MediaColors {
-    #[toml(default = Rgba8::rgb(0x08, 0x09, 0x0b))]
+    #[toml(default = Rgba8::rgb(0x00, 0x00, 0x00))]
     pub(crate) viewport: Rgba8,
-    #[toml(default = Rgba8::rgba(0x08, 0x09, 0x0b, 0xcc))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xcc))]
     pub(crate) overlay: Rgba8,
-    #[toml(default = Rgba8::rgba(0x08, 0x09, 0x0b, 0xf2))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xf2))]
     pub(crate) overlay_strong: Rgba8,
-    #[toml(default = Rgba8::rgb(0x30, 0x34, 0x3b))]
+    #[toml(default = Rgba8::rgb(0x26, 0x26, 0x26))]
     pub(crate) border: Rgba8,
-    #[toml(default = Rgba8::rgba(0xc4, 0xc8, 0xd0, 0x33))]
+    #[toml(default = Rgba8::rgba(0xc8, 0xc8, 0xc8, 0x33))]
     pub(crate) progress_track: Rgba8,
-    #[toml(default = Rgba8::rgb(0x74, 0x8b, 0xbd))]
+    #[toml(default = Rgba8::rgb(0xa3, 0xa3, 0xa3))]
     pub(crate) progress_fill: Rgba8,
-    #[toml(default = Rgba8::rgb(0xae, 0xbc, 0xe0))]
+    #[toml(default = Rgba8::rgb(0xe5, 0xe5, 0xe5))]
     pub(crate) progress_knob: Rgba8,
-    #[toml(default = Rgba8::rgba(0x08, 0x09, 0x0b, 0x00))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0x00))]
     pub(crate) gradient_start: Rgba8,
-    #[toml(default = Rgba8::rgba(0x08, 0x09, 0x0b, 0xe8))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xe8))]
     pub(crate) gradient_end: Rgba8,
-    #[toml(default = Rgba8::rgb(0xd9, 0xdb, 0xe0))]
+    #[toml(default = Rgba8::rgb(0xe5, 0xe5, 0xe5))]
     pub(crate) text: Rgba8,
-    #[toml(default = Rgba8::rgb(0x8d, 0x93, 0x9d))]
+    #[toml(default = Rgba8::rgb(0x8f, 0x8f, 0x8f))]
     pub(crate) muted_text: Rgba8,
 }
 
 impl Default for MediaColors {
     fn default() -> Self {
         Self {
-            viewport: Rgba8::rgb(0x08, 0x09, 0x0b),
-            overlay: Rgba8::rgba(0x08, 0x09, 0x0b, 0xcc),
-            overlay_strong: Rgba8::rgba(0x08, 0x09, 0x0b, 0xf2),
-            border: Rgba8::rgb(0x30, 0x34, 0x3b),
-            progress_track: Rgba8::rgba(0xc4, 0xc8, 0xd0, 0x33),
-            progress_fill: Rgba8::rgb(0x74, 0x8b, 0xbd),
-            progress_knob: Rgba8::rgb(0xae, 0xbc, 0xe0),
-            gradient_start: Rgba8::rgba(0x08, 0x09, 0x0b, 0x00),
-            gradient_end: Rgba8::rgba(0x08, 0x09, 0x0b, 0xe8),
-            text: Rgba8::rgb(0xd9, 0xdb, 0xe0),
-            muted_text: Rgba8::rgb(0x8d, 0x93, 0x9d),
+            viewport: Rgba8::rgb(0x00, 0x00, 0x00),
+            overlay: Rgba8::rgba(0x00, 0x00, 0x00, 0xcc),
+            overlay_strong: Rgba8::rgba(0x00, 0x00, 0x00, 0xf2),
+            border: Rgba8::rgb(0x26, 0x26, 0x26),
+            progress_track: Rgba8::rgba(0xc8, 0xc8, 0xc8, 0x33),
+            progress_fill: Rgba8::rgb(0xa3, 0xa3, 0xa3),
+            progress_knob: Rgba8::rgb(0xe5, 0xe5, 0xe5),
+            gradient_start: Rgba8::rgba(0x00, 0x00, 0x00, 0x00),
+            gradient_end: Rgba8::rgba(0x00, 0x00, 0x00, 0xe8),
+            text: Rgba8::rgb(0xe5, 0xe5, 0xe5),
+            muted_text: Rgba8::rgb(0x8f, 0x8f, 0x8f),
         }
     }
 }
@@ -649,6 +652,17 @@ code-size = 15.5
     }
 
     #[test]
+    fn default_theme_uses_neutral_core_surfaces() {
+        let theme = ThemeConfig::default();
+
+        assert_eq!(theme.surfaces.window, Rgba8::rgb(0x00, 0x00, 0x00));
+        assert_eq!(theme.surfaces.input, Rgba8::rgb(0x21, 0x21, 0x21));
+        assert_eq!(theme.states.selected, Rgba8::rgb(0x26, 0x26, 0x26));
+        assert_eq!(theme.borders.subtle, Rgba8::rgb(0x1f, 0x1f, 0x1f));
+        assert_eq!(theme.controls.active, Rgba8::rgb(0x30, 0x30, 0x30));
+    }
+
+    #[test]
     fn bindings_map_sequences_to_commands() {
         let config: GuiConfig = toml_spanner::from_str(
             r#"
@@ -707,7 +721,7 @@ space = "TogglePlayback"
 
         assert!(rendered.contains("schema-version = 1"));
         assert!(rendered.contains("[theme.surfaces]"));
-        assert!(rendered.contains("window = \"#111317\""));
+        assert!(rendered.contains("window = \"#000000\""));
         assert!(rendered.contains("[fonts]"));
         assert!(rendered.contains("message-family = \"IBM Plex Sans\""));
         assert!(rendered.contains("[input]"));
