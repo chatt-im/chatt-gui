@@ -1,8 +1,9 @@
-use std::{env, sync::OnceLock};
+use std::{env, sync::OnceLock, time::Instant};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
 struct StderrLogger {
+    started_at: Instant,
     default_level: LevelFilter,
     chatt_level: LevelFilter,
     video_level: LevelFilter,
@@ -26,7 +27,13 @@ impl Log for StderrLogger {
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            eprintln!("{} {}: {}", record.level(), record.target(), record.args());
+            eprintln!(
+                "[+{:>10.3}ms] {} {}: {}",
+                self.started_at.elapsed().as_secs_f64() * 1_000.0,
+                record.level(),
+                record.target(),
+                record.args(),
+            );
         }
     }
 
@@ -42,6 +49,7 @@ pub fn init() {
         .and_then(parse_simple_level)
         .unwrap_or(LevelFilter::Warn);
     let logger = LOGGER.get_or_init(|| StderrLogger {
+        started_at: Instant::now(),
         default_level: requested
             .as_deref()
             .and_then(parse_simple_level)

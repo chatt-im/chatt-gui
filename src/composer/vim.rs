@@ -855,9 +855,7 @@ impl VimEditor {
                     self.buf.len()
                 };
                 let mut replacement = pasted_text;
-                if !self.single_line
-                    && end_offset < self.buf.len()
-                    && !replacement.ends_with('\n')
+                if !self.single_line && end_offset < self.buf.len() && !replacement.ends_with('\n')
                 {
                     replacement.push('\n');
                 }

@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
     sync::mpsc,
     thread,
 };
@@ -10,6 +9,7 @@ use async_channel::Sender as AsyncSender;
 use gpui::PlatformSurface;
 use local_rpc::{ids::RoomId, model::AttachmentId};
 
+use crate::attachment_source::{AttachmentSourceRegistry, RegisteredAttachmentSource};
 use crate::mpv_player::{AttachmentRenderBackend, MpvPlayer, SeekMode};
 
 const WARM_PLAYER_TARGET: usize = 2;
@@ -53,7 +53,7 @@ impl Default for VideoView {
 }
 
 struct VideoSession {
-    path: PathBuf,
+    source: Option<RegisteredAttachmentSource>,
     player: Option<MpvPlayer>,
     position: f64,
     duration: f64,
@@ -67,9 +67,9 @@ struct VideoSession {
 }
 
 impl VideoSession {
-    fn new(path: PathBuf, touched: u64) -> Self {
+    fn new(source: RegisteredAttachmentSource, touched: u64) -> Self {
         Self {
-            path,
+            source: Some(source),
             player: None,
             position: 0.0,
             duration: 0.0,
@@ -102,10 +102,12 @@ pub(crate) struct AttachmentVideoManager {
     backend: Option<AttachmentRenderBackend>,
     build_in_flight: bool,
     warm_build_suppressed: bool,
+    prepare_requested: bool,
     build_results: mpsc::Receiver<BuildResult>,
     build_result_sender: mpsc::Sender<BuildResult>,
     reaper: mpsc::Sender<MpvPlayer>,
     wakeup: AsyncSender<()>,
+    source_registry: AttachmentSourceRegistry,
     last_interacted: Option<VideoKey>,
     volume: f64,
     last_audible_volume: f64,
@@ -113,7 +115,7 @@ pub(crate) struct AttachmentVideoManager {
 }
 
 impl AttachmentVideoManager {
-    pub(crate) fn new(wakeup: AsyncSender<()>) -> Self {
+    pub(crate) fn new(wakeup: AsyncSender<()>, source_registry: AttachmentSourceRegistry) -> Self {
         let (build_result_sender, build_results) = mpsc::channel();
         let (reaper, retired_players) = mpsc::channel::<MpvPlayer>();
         if let Err(error) = thread::Builder::new()
@@ -134,10 +136,12 @@ impl AttachmentVideoManager {
             backend: None,
             build_in_flight: false,
             warm_build_suppressed: false,
+            prepare_requested: false,
             build_results,
             build_result_sender,
             reaper,
             wakeup,
+            source_registry,
             last_interacted: None,
             volume: 100.0,
             last_audible_volume: 100.0,
@@ -145,7 +149,7 @@ impl AttachmentVideoManager {
         }
     }
 
-    pub(crate) fn ensure_source(&mut self, key: VideoKey, path: PathBuf) {
+    pub(crate) fn ensure_source(&mut self, key: VideoKey, source: RegisteredAttachmentSource) {
         self.clock = self.clock.wrapping_add(1);
         if !self.sessions.contains_key(&key) {
             self.trim_sessions_to(MAX_SESSION_ENTRIES.saturating_sub(1));
@@ -153,9 +157,21 @@ impl AttachmentVideoManager {
         let session = self
             .sessions
             .entry(key)
-            .or_insert_with(|| VideoSession::new(path.clone(), self.clock));
-        session.path = path;
+            .or_insert_with(|| VideoSession::new(source.clone(), self.clock));
+        session.source = Some(source);
         session.touched = self.clock;
+    }
+
+    pub(crate) fn prepare(&mut self) {
+        if self.prepare_requested || !self.standby.is_empty() {
+            return;
+        }
+        self.prepare_requested = true;
+        let mut drain = VideoDrain::default();
+        self.pump_builds(&mut drain);
+        for error in drain.errors {
+            log::warn!("{error}");
+        }
     }
 
     pub(crate) fn view(&self, key: VideoKey) -> VideoView {
@@ -189,10 +205,14 @@ impl AttachmentVideoManager {
         let Some(session) = self.sessions.get_mut(&key) else {
             return Err(anyhow!("video source is no longer cached"));
         };
+        let source = session
+            .source
+            .as_ref()
+            .ok_or_else(|| anyhow!("video source is not ready"))?;
         session.error = None;
         if let Some(player) = session.player.as_mut() {
             if session.finished {
-                player.load_at(&session.path.to_string_lossy(), false, volume, 0.0)?;
+                player.load_at(source.url(), false, volume, 0.0)?;
                 session.position = 0.0;
                 session.duration = 0.0;
                 session.paused = false;
@@ -325,6 +345,16 @@ impl AttachmentVideoManager {
         self.last_visible_interaction()
     }
 
+    pub(crate) fn retained_source_keys(
+        &self,
+    ) -> HashSet<crate::attachment_source::AttachmentSourceKey> {
+        self.sessions
+            .iter()
+            .filter(|(key, session)| session.player.is_some() || self.queued_keys.contains(key))
+            .filter_map(|(_, session)| session.source.as_ref().map(|source| source.source().key()))
+            .collect()
+    }
+
     pub(crate) fn update_visibility(&mut self, visible: &HashSet<VideoKey>) -> VideoDrain {
         let mut drain = VideoDrain::default();
         let keys = self.sessions.keys().copied().collect::<Vec<_>>();
@@ -348,6 +378,13 @@ impl AttachmentVideoManager {
                 self.queued_keys.remove(&key);
             }
             session.visible = is_visible;
+            if !is_visible
+                && session.paused
+                && session.player.is_none()
+                && !self.queued_keys.contains(&key)
+            {
+                session.source = None;
+            }
         }
         self.queued.retain(|key| self.queued_keys.contains(key));
         self.enforce_retained_limit(&mut drain);
@@ -509,9 +546,12 @@ impl AttachmentVideoManager {
         }
 
         let needs_queued_player = !self.queued_keys.is_empty();
-        let needs_warm_player = self.backend.is_some()
-            && !self.warm_build_suppressed
-            && self.standby.len() < WARM_PLAYER_TARGET;
+        let needs_initial_warm_player =
+            self.prepare_requested && self.backend.is_none() && self.standby.is_empty();
+        let needs_warm_player = needs_initial_warm_player
+            || (self.backend.is_some()
+                && !self.warm_build_suppressed
+                && self.standby.len() < WARM_PLAYER_TARGET);
         if !needs_queued_player && !needs_warm_player {
             return;
         }
@@ -519,19 +559,28 @@ impl AttachmentVideoManager {
         let sender = self.build_result_sender.clone();
         let wakeup = self.wakeup.clone();
         let preferred_backend = self.backend.clone();
+        let source_registry = self.source_registry.clone();
         if let Err(error) = thread::Builder::new()
             .name("mpv-builder".into())
             .spawn(move || {
+                let started_at = std::time::Instant::now();
                 log::info!(
                     "asynchronous video player build started cached_backend={}",
                     preferred_backend.is_some()
                 );
-                let result = MpvPlayer::new_attachment(wakeup.clone(), preferred_backend)
-                    .map_err(|error| format!("{error:#}"));
+                let result =
+                    MpvPlayer::new_attachment(wakeup.clone(), preferred_backend, source_registry)
+                        .map_err(|error| format!("{error:#}"));
                 match &result {
-                    Ok(_) => log::info!("asynchronous video player build completed"),
+                    Ok(_) => log::info!(
+                        "asynchronous video player build completed elapsed_ms={:.3}",
+                        started_at.elapsed().as_secs_f64() * 1_000.0,
+                    ),
                     Err(error) => {
-                        log::error!("asynchronous video player build failed: {error}")
+                        log::error!(
+                            "asynchronous video player build failed elapsed_ms={:.3}: {error}",
+                            started_at.elapsed().as_secs_f64() * 1_000.0,
+                        )
                     }
                 }
                 let _ = sender.send(BuildResult(result));
@@ -556,12 +605,15 @@ impl AttachmentVideoManager {
             self.standby.push(player);
             return;
         };
-        if let Err(error) = player.load_at(
-            &session.path.to_string_lossy(),
-            session.paused,
-            self.volume,
-            session.position,
-        ) {
+        let Some(source) = session.source.as_ref() else {
+            session.paused = true;
+            session.error = Some("Video source is not ready".into());
+            let _ = self.reaper.send(player);
+            return;
+        };
+        if let Err(error) =
+            player.load_at(source.url(), session.paused, self.volume, session.position)
+        {
             let error = format!("Could not open video: {error}");
             session.paused = true;
             session.error = Some(error.clone());
@@ -594,6 +646,7 @@ impl AttachmentVideoManager {
             };
             session.frame_ready = false;
             session.display_size = None;
+            session.source = None;
             self.recycle(player);
             drain.changed = true;
         }
@@ -666,6 +719,7 @@ impl Drop for AttachmentVideoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn key(message_id: u64) -> VideoKey {
         VideoKey {
@@ -678,6 +732,27 @@ mod tests {
         }
     }
 
+    fn manager() -> AttachmentVideoManager {
+        let (wakeup, _) = async_channel::bounded(1);
+        AttachmentVideoManager::new(wakeup, AttachmentSourceRegistry::new(1))
+    }
+
+    fn ensure_source(videos: &mut AttachmentVideoManager, key: VideoKey) {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"x").unwrap();
+        let source = crate::attachment_source::AttachmentSource::direct(
+            crate::attachment_source::AttachmentSourceKey {
+                namespace: 1,
+                room_id: key.room_id,
+                attachment_id: key.attachment_id,
+            },
+            file,
+            1,
+        );
+        let source = videos.source_registry.register(source);
+        videos.ensure_source(key, source);
+    }
+
     #[test]
     fn default_video_view_is_paused_at_full_volume() {
         let view = VideoView::default();
@@ -688,14 +763,13 @@ mod tests {
 
     #[test]
     fn volume_is_shared_by_existing_and_future_video_sessions() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let first = key(10);
         let second = key(11);
-        videos.ensure_source(first, PathBuf::from("first.mp4"));
+        ensure_source(&mut videos, first);
 
         videos.set_volume_for(first, 37.0).unwrap();
-        videos.ensure_source(second, PathBuf::from("second.mp4"));
+        ensure_source(&mut videos, second);
 
         assert_eq!(videos.view(first).volume, 37.0);
         assert_eq!(videos.view(second).volume, 37.0);
@@ -703,10 +777,9 @@ mod tests {
 
     #[test]
     fn mute_restores_the_last_audible_shared_volume() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let key = key(12);
-        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        ensure_source(&mut videos, key);
         videos.set_volume_for(key, 64.0).unwrap();
 
         videos.toggle_mute(key).unwrap();
@@ -717,10 +790,9 @@ mod tests {
 
     #[test]
     fn shared_volume_is_clamped_to_mpv_range() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let key = key(13);
-        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        ensure_source(&mut videos, key);
 
         videos.set_volume_for(key, 180.0).unwrap();
         assert_eq!(videos.view(key).volume, 100.0);
@@ -730,10 +802,9 @@ mod tests {
 
     #[test]
     fn discovering_cached_video_does_not_initialize_a_player() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
 
-        videos.ensure_source(key(1), PathBuf::from("video.mp4"));
+        ensure_source(&mut videos, key(1));
 
         assert!(videos.backend.is_none());
         assert!(videos.standby.is_empty());
@@ -742,10 +813,9 @@ mod tests {
 
     #[test]
     fn offscreen_transition_pauses_and_cancels_pending_start() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let key = key(2);
-        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        ensure_source(&mut videos, key);
         let session = videos.sessions.get_mut(&key).unwrap();
         session.visible = true;
         session.paused = false;
@@ -761,8 +831,7 @@ mod tests {
 
     #[test]
     fn failed_warm_replenishment_waits_for_real_demand() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         videos.backend = Some(AttachmentRenderBackend::Software);
         videos.build_in_flight = true;
         videos
@@ -779,12 +848,11 @@ mod tests {
 
     #[test]
     fn removed_message_sources_are_discarded_immediately() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let retained = key(1);
         let removed = key(2);
-        videos.ensure_source(retained, PathBuf::from("retained.mp4"));
-        videos.ensure_source(removed, PathBuf::from("removed.mp4"));
+        ensure_source(&mut videos, retained);
+        ensure_source(&mut videos, removed);
 
         let drain = videos.retain_sources(&HashSet::from([retained]));
 
@@ -795,11 +863,10 @@ mod tests {
 
     #[test]
     fn dormant_session_metadata_is_bounded() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
 
         for message_id in 0..(MAX_SESSION_ENTRIES as u64 + 20) {
-            videos.ensure_source(key(message_id), PathBuf::from("video.mp4"));
+            ensure_source(&mut videos, key(message_id));
         }
 
         assert_eq!(videos.sessions.len(), MAX_SESSION_ENTRIES);
@@ -812,10 +879,9 @@ mod tests {
 
     #[test]
     fn scrubbing_unstarted_video_queues_paused_player_at_target() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let key = key(3);
-        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        ensure_source(&mut videos, key);
         videos.build_in_flight = true;
         videos.sessions.get_mut(&key).unwrap().finished = true;
 
@@ -831,10 +897,9 @@ mod tests {
 
     #[test]
     fn scrub_clamps_thumbnail_duration_target_to_timeline_edges() {
-        let (wakeup, _) = async_channel::bounded(1);
-        let mut videos = AttachmentVideoManager::new(wakeup);
+        let mut videos = manager();
         let key = key(4);
-        videos.ensure_source(key, PathBuf::from("video.mp4"));
+        ensure_source(&mut videos, key);
         videos.build_in_flight = true;
 
         videos.scrub(key, 1.5, 80.0, SeekMode::Keyframes).unwrap();

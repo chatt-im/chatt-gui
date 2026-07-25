@@ -106,6 +106,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         }
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
+        | DaemonFrame::AttachmentSourceOpened { .. }
         | DaemonFrame::BulkChunk(_)
         | DaemonFrame::BulkFinished(_)
         | DaemonFrame::BulkCanceled { .. }

@@ -1,5 +1,6 @@
 mod app;
 mod appearance;
+mod attachment_source;
 mod code_viewer;
 mod composer;
 mod config;

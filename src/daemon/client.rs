@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::Read,
+    os::fd::OwnedFd,
     path::PathBuf,
     sync::{
         Arc,
@@ -29,6 +30,14 @@ pub enum DaemonEvent {
         request_id: RequestId,
         stream_id: local_rpc::ids::StreamId,
         stream: std::os::unix::net::UnixStream,
+    },
+    AttachmentSourceOpened {
+        request_id: RequestId,
+        room_id: local_rpc::ids::RoomId,
+        attachment_id: local_rpc::model::AttachmentId,
+        byte_len: u64,
+        transport: local_rpc::frame::AttachmentSourceTransport,
+        fd: OwnedFd,
     },
     Disconnected(String),
     Incompatible(String),
@@ -259,6 +268,12 @@ impl DaemonClient {
     pub fn retry(&self) {
         let _ = self.commands.try_send(ConnectorCommand::Retry);
     }
+
+    pub fn disconnect_protocol(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        log::error!("disconnecting daemon RPC after protocol error: {reason}");
+        let _ = self.commands.try_send(ConnectorCommand::SessionEnded);
+    }
 }
 
 fn connection_loop(
@@ -339,6 +354,38 @@ fn connection_loop(
                                 }
                                 continue;
                             }
+                            if let DaemonFrame::AttachmentSourceOpened {
+                                request_id,
+                                room_id,
+                                attachment_id,
+                                byte_len,
+                                transport,
+                            } = &frame
+                            {
+                                if fds.len() != 1 {
+                                    break 'connected format!(
+                                        "attachment source open carried {} descriptors instead of one",
+                                        fds.len()
+                                    );
+                                }
+                                let fd = fds.pop().expect("validated attachment source fd");
+                                if events
+                                    .send_blocking(DaemonEvent::AttachmentSourceOpened {
+                                        request_id: *request_id,
+                                        room_id: *room_id,
+                                        attachment_id: *attachment_id,
+                                        byte_len: *byte_len,
+                                        transport: *transport,
+                                        fd,
+                                    })
+                                    .is_err()
+                                {
+                                    let _ = command_tx.send(ConnectorCommand::SessionEnded);
+                                    let _ = writer_thread.join();
+                                    return;
+                                }
+                                continue;
+                            }
                             if !fds.is_empty() {
                                 break 'connected "unexpected descriptors in daemon frame".into();
                             }
@@ -364,6 +411,13 @@ fn connection_loop(
                                 }
                             }
                             if let DaemonFrame::RequestResult(result) = &frame {
+                                if result.operation == Operation::OpenAttachmentSource
+                                    && matches!(result.outcome, RequestOutcome::Accepted)
+                                {
+                                    break 'connected
+                                        "attachment source open completed with an accepted result instead of a descriptor"
+                                            .into();
+                                }
                                 match &result.outcome {
                                     RequestOutcome::Accepted => log::info!(
                                         "daemon request accepted request_id={} operation={:?}",

@@ -10,6 +10,11 @@ use std::{
 
 use crate::{
     appearance::{AppearanceConfig, AppearanceSync},
+    attachment_source::{
+        AttachmentSource, AttachmentSourceKey, AttachmentSourceRegistry,
+        RegisteredAttachmentSource, VideoSourceCache, VideoSourceCandidate, VideoSourcePin,
+        VideoSourceView,
+    },
     code_viewer::{
         CodeDocument, CodeSearchResults, CodeSelection, CodeViewState, MAX_CODE_PREVIEW_BYTES,
         render_code_document,
@@ -176,11 +181,11 @@ struct LivePlayerView {
     viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct TheaterVideo {
     key: VideoKey,
     descriptor: AttachmentDescriptor,
-    path: PathBuf,
+    source: Option<RegisteredAttachmentSource>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -632,6 +637,11 @@ pub struct ChattView {
     timeline_selection: MessageSelectionGroup,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
+    attachment_source_registry: AttachmentSourceRegistry,
+    video_sources: VideoSourceCache,
+    media_namespace_generation: u64,
+    pending_video_plays: HashSet<VideoKey>,
+    video_source_retry_task: Option<Task<()>>,
     video_scrub: Option<VideoScrub>,
     video_volume_drag: Option<VideoVolumeDrag>,
     video_controls: VideoControlsState,
@@ -772,9 +782,19 @@ impl ChattView {
                 });
             });
         });
-        let videos = AttachmentVideoManager::new(video_wakeup.clone());
-        let video_thumbnails =
-            VideoThumbnailCache::new(VIDEO_THUMBNAIL_CACHE_BYTES, video_wakeup.clone());
+        let media_namespace_generation = 1;
+        let attachment_source_registry = AttachmentSourceRegistry::new(media_namespace_generation);
+        let video_sources = VideoSourceCache::new(
+            media_namespace_generation,
+            model.limits.concurrent_attachment_streams,
+        );
+        let videos =
+            AttachmentVideoManager::new(video_wakeup.clone(), attachment_source_registry.clone());
+        let video_thumbnails = VideoThumbnailCache::new(
+            VIDEO_THUMBNAIL_CACHE_BYTES,
+            video_wakeup.clone(),
+            attachment_source_registry.clone(),
+        );
         Self {
             model,
             daemon,
@@ -845,6 +865,11 @@ impl ChattView {
             timeline_selection,
             videos,
             video_thumbnails,
+            attachment_source_registry,
+            video_sources,
+            media_namespace_generation,
+            pending_video_plays: HashSet::new(),
+            video_source_retry_task: None,
             video_scrub: None,
             video_volume_drag: None,
             video_controls: VideoControlsState::default(),
@@ -1663,11 +1688,157 @@ impl ChattView {
 
     fn advance_video(&mut self, cx: &mut Context<Self>) {
         let drain = self.videos.drain();
+        let playback_changed = drain.changed || !drain.errors.is_empty();
         let thumbnails_changed = self.video_thumbnails.drain_results();
+        let finished_sources = self.video_thumbnails.take_finished_sources();
+        let transport_failures = self.video_thumbnails.take_transport_failures();
+        let source_work_changed =
+            thumbnails_changed || !finished_sources.is_empty() || !transport_failures.is_empty();
+        let transport_failure_keys = transport_failures
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<HashSet<_>>();
+        for key in finished_sources {
+            if transport_failure_keys.contains(&key) {
+                self.video_sources
+                    .set_pin(key, VideoSourcePin::Thumbnail, false);
+            } else {
+                self.video_sources.thumbnail_finished(key);
+            }
+        }
+        for (key, error) in transport_failures {
+            self.video_sources.source_failed(key, error, Instant::now());
+        }
         self.apply_video_drain(drain);
+        self.sync_video_source_pins();
+        if source_work_changed || playback_changed {
+            self.pump_video_sources(cx);
+        }
         if thumbnails_changed {
             cx.notify();
         }
+    }
+
+    fn source_key(&self, room_id: RoomId, attachment_id: AttachmentId) -> AttachmentSourceKey {
+        AttachmentSourceKey {
+            namespace: self.media_namespace_generation,
+            room_id,
+            attachment_id,
+        }
+    }
+
+    fn video_descriptor(&self, key: VideoKey) -> Option<AttachmentDescriptor> {
+        self.theater_video
+            .as_ref()
+            .filter(|video| video.key == key)
+            .map(|video| video.descriptor.clone())
+            .or_else(|| {
+                self.model
+                    .messages
+                    .iter()
+                    .find(|message| message.room_id == key.room_id && message.id == key.message_id)
+                    .and_then(|message| message.attachment.as_ref())
+                    .filter(|attachment| attachment.is_video())
+                    .map(|attachment| attachment.descriptor.clone())
+            })
+    }
+
+    fn reset_attachment_source_state(&mut self) {
+        self.videos.clear_sessions();
+        self.video_thumbnails.clear();
+        self.clear_video_interactions();
+        self.pending_video_plays.clear();
+        self.video_source_retry_task.take();
+        self.media_namespace_generation = self.media_namespace_generation.wrapping_add(1).max(1);
+        let canceled = self.video_sources.reset(
+            self.media_namespace_generation,
+            self.model.limits.concurrent_attachment_streams,
+        );
+        for request_id in canceled {
+            self.model.pending.remove(&request_id);
+        }
+        self.attachment_source_registry
+            .clear(self.media_namespace_generation);
+    }
+
+    fn attachment_source_protocol_error(&mut self, reason: &str, cx: &mut Context<Self>) {
+        log::error!("daemon attachment source protocol error: {reason}");
+        self.reset_attachment_source_state();
+        self.daemon.disconnect_protocol(reason);
+        self.status = format!("Video source protocol error · {reason}").into();
+        cx.notify();
+    }
+
+    fn pump_video_sources(&mut self, cx: &mut Context<Self>) {
+        if !self.model.is_ready() {
+            return;
+        }
+        self.video_sources
+            .update_limits(self.model.limits.concurrent_attachment_streams);
+        loop {
+            let request_id = self.request_id();
+            let Some(open) = self.video_sources.start_next(request_id, Instant::now()) else {
+                break;
+            };
+            self.model.pending.insert(
+                request_id,
+                PendingRequest {
+                    operation: Operation::OpenAttachmentSource,
+                    room_id: Some(open.key.room_id),
+                    draft: None,
+                    transfer_id: None,
+                },
+            );
+            let frame = ClientFrame::OpenAttachmentSource {
+                request_id: open.request_id,
+                room_id: open.key.room_id,
+                attachment_id: open.key.attachment_id,
+            };
+            if let Err(error) = self.daemon.send(frame) {
+                self.model.pending.remove(&request_id);
+                self.video_sources
+                    .failed_to_send(request_id, error.clone(), Instant::now());
+                self.status = format!("Could not request video source · {error}").into();
+            }
+        }
+        self.schedule_video_source_retry(cx);
+    }
+
+    fn schedule_video_source_retry(&mut self, cx: &mut Context<Self>) {
+        self.video_source_retry_task.take();
+        let Some(retry_at) = self.video_sources.next_retry_at() else {
+            return;
+        };
+        let delay = retry_at.saturating_duration_since(Instant::now());
+        self.video_source_retry_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_source_retry_task.take();
+                this.pump_video_sources(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn sync_video_source_pins(&mut self) {
+        let playing = self.videos.retained_source_keys();
+        self.video_sources
+            .sync_pins(VideoSourcePin::Playing, &playing);
+        let theater = self
+            .theater_video
+            .as_ref()
+            .map(|video| self.source_key(video.key.room_id, video.key.attachment_id))
+            .into_iter()
+            .collect::<HashSet<_>>();
+        self.video_sources
+            .sync_pins(VideoSourcePin::Theater, &theater);
+        let pending = self
+            .pending_video_plays
+            .iter()
+            .map(|video| self.source_key(video.room_id, video.attachment_id))
+            .collect::<HashSet<_>>();
+        self.video_sources
+            .sync_pins(VideoSourcePin::PendingPlay, &pending);
     }
 
     fn apply_video_drain(&mut self, drain: VideoDrain) {
@@ -1693,11 +1864,11 @@ impl ChattView {
     }
 
     fn update_video_visibility(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
-        let mut visible = self
-            .message_list
-            .get(range)
-            .unwrap_or_default()
-            .iter()
+        let list_len = self.message_list.len();
+        let visible_start = range.start.min(list_len);
+        let visible_end = range.end.min(list_len);
+        let mut visible = (visible_start..visible_end)
+            .filter_map(|index| self.message_list.get(index))
             .filter(|item| !item.is_collapsed())
             .filter_map(|item| item.message_index())
             .filter_map(|index| self.model.messages.get(index))
@@ -1706,9 +1877,70 @@ impl ChattView {
         if let Some(theater) = self.theater_video.as_ref() {
             visible.insert(theater.key);
         }
+
+        let mut ordered_rows = (visible_start..visible_end)
+            .rev()
+            .map(|index| (index, true))
+            .collect::<Vec<_>>();
+        for distance in 0..4 {
+            if let Some(index) = visible_end
+                .checked_add(distance)
+                .filter(|index| *index < list_len)
+            {
+                ordered_rows.push((index, false));
+            }
+            if let Some(index) = visible_start.checked_sub(distance + 1) {
+                ordered_rows.push((index, false));
+            }
+        }
+        let mut seen = HashSet::new();
+        let theater_source_key = self
+            .theater_video
+            .as_ref()
+            .map(|video| self.source_key(video.key.room_id, video.key.attachment_id));
+        let mut candidates = ordered_rows
+            .into_iter()
+            .filter_map(|(index, visible)| {
+                let item = self.message_list.get(index)?;
+                if item.is_collapsed() {
+                    return None;
+                }
+                let message = self.model.messages.get(item.message_index()?)?;
+                let attachment = message
+                    .attachment
+                    .as_ref()?
+                    .is_video()
+                    .then_some(message.attachment.as_ref()?)?;
+                let key = self.source_key(message.room_id, attachment.descriptor.id);
+                seen.insert(key).then(|| VideoSourceCandidate {
+                    key,
+                    descriptor: attachment.descriptor.clone(),
+                    visible,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.retain(|candidate| {
+            theater_source_key == Some(candidate.key)
+                || self
+                    .video_thumbnails
+                    .view(ThumbnailKey {
+                        source_key: candidate.key,
+                    })
+                    .image
+                    .is_none()
+        });
+        if !candidates.is_empty() {
+            self.video_thumbnails.warm();
+        }
+        let canceled = self.video_sources.update_visibility(candidates);
+        for request_id in canceled {
+            self.model.pending.remove(&request_id);
+        }
         let drain = self.videos.update_visibility(&visible);
         let changed = drain.changed || !drain.errors.is_empty();
         self.apply_video_drain(drain);
+        self.sync_video_source_pins();
+        self.pump_video_sources(cx);
         if changed {
             cx.notify();
         }
@@ -2087,6 +2319,7 @@ impl ChattView {
                 self.pending_message_jump = None;
                 self.message_reference_flash = None;
                 self.message_reference_flash_task = None;
+                self.reset_attachment_source_state();
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Offline · Submission outcome unknown; verify the timeline after reconnecting · {reason}"
@@ -2119,6 +2352,7 @@ impl ChattView {
                 self.pending_message_jump = None;
                 self.message_reference_flash = None;
                 self.message_reference_flash_task = None;
+                self.reset_attachment_source_state();
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Cannot connect · Submission outcome unknown; verify before retrying · {details}"
@@ -2215,6 +2449,95 @@ impl ChattView {
             }
             DaemonEvent::Frame(frame) => {
                 self.apply_daemon_state_frame(frame, window, cx);
+            }
+            DaemonEvent::AttachmentSourceOpened {
+                request_id,
+                room_id,
+                attachment_id,
+                byte_len,
+                transport,
+                fd,
+            } => {
+                self.model.pending.remove(&request_id);
+                let Some(key) = self.video_sources.pending_key(request_id) else {
+                    // The visibility/reset path canceled this open while the
+                    // descriptor-bearing response was in flight. Dispose of
+                    // the descriptor here, before any state-machine dispatch.
+                    drop(fd);
+                    self.pump_video_sources(cx);
+                    cx.notify();
+                    return;
+                };
+                let expected_len = self
+                    .video_sources
+                    .pending_descriptor(request_id)
+                    .map(|descriptor| descriptor.byte_len);
+                if key.room_id != room_id
+                    || key.attachment_id != attachment_id
+                    || expected_len != Some(byte_len)
+                {
+                    drop(fd);
+                    self.attachment_source_protocol_error(
+                        "attachment source response identity does not match its request",
+                        cx,
+                    );
+                    return;
+                }
+                let source = match AttachmentSource::from_descriptor(
+                    key,
+                    byte_len,
+                    transport,
+                    fd,
+                    self.model.limits.attachment_read_bytes,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.attachment_source_protocol_error(
+                            &format!("invalid attachment source descriptor: {error:#}"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                let registered = match self.video_sources.opened(
+                    request_id,
+                    source,
+                    &self.attachment_source_registry,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.attachment_source_protocol_error(
+                            &format!("invalid attachment source completion: {error:#}"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                self.videos.prepare();
+                let pending = self
+                    .pending_video_plays
+                    .iter()
+                    .copied()
+                    .filter(|video| self.source_key(video.room_id, video.attachment_id) == key)
+                    .collect::<Vec<_>>();
+                for video in pending {
+                    self.videos.ensure_source(video, registered.clone());
+                    if let Err(error) = self.videos.play(video) {
+                        self.status = format!("Playback failed: {error}").into();
+                    }
+                    self.pending_video_plays.remove(&video);
+                }
+                if !self
+                    .pending_video_plays
+                    .iter()
+                    .any(|video| self.source_key(video.room_id, video.attachment_id) == key)
+                {
+                    self.video_sources
+                        .set_pin(key, VideoSourcePin::PendingPlay, false);
+                }
+                self.sync_video_source_pins();
+                self.pump_video_sources(cx);
+                cx.notify();
             }
             DaemonEvent::LiveShareOpened {
                 request_id,
@@ -2545,9 +2868,6 @@ impl ChattView {
             self.preview_image_viewport.set(None);
             self.preview_last_mouse_position = None;
             self.preview_pane_resize = None;
-            self.videos.clear_sessions();
-            self.video_thumbnails.clear();
-            self.clear_video_interactions();
             self.message_reference_hover = None;
             self.message_reference_hover_task = None;
             self.message_reference_cache.clear();
@@ -2556,6 +2876,9 @@ impl ChattView {
             self.pending_message_jump = None;
             self.message_reference_flash = None;
             self.message_reference_flash_task = None;
+        }
+        if media_namespace_changed || self.model.selected_room != old_selected_room {
+            self.reset_attachment_source_state();
         }
         let available = self
             .model
@@ -2578,8 +2901,6 @@ impl ChattView {
             self.timeline_selection.clear();
         }
         if self.model.selected_room != old_selected_room {
-            self.videos.clear_sessions();
-            self.clear_video_interactions();
             self.formatted_messages.clear();
             self.eager_image_fetches.reset_transient();
         } else if effect.messages_changed {
@@ -2691,6 +3012,30 @@ impl ChattView {
             }
         }
         if let Some(result) = effect.request_result {
+            if result.operation == Operation::OpenAttachmentSource {
+                match result.outcome {
+                    RequestOutcome::Accepted => {
+                        self.attachment_source_protocol_error(
+                            "attachment source open returned an accepted result without a descriptor",
+                            cx,
+                        );
+                    }
+                    RequestOutcome::Rejected { code, message } => {
+                        let matched = self.video_sources.rejected(
+                            result.request_id,
+                            code,
+                            message.clone(),
+                            Instant::now(),
+                        );
+                        if matched {
+                            self.status = message.into();
+                            self.pump_video_sources(cx);
+                            cx.notify();
+                        }
+                    }
+                }
+                return;
+            }
             let submission_result = self.handle_submission_result(&result, cx);
             let reference_jump_request = self.pending_message_jump.as_ref().is_some_and(|jump| {
                 jump.room_request_id == Some(result.request_id)
@@ -3494,33 +3839,25 @@ impl ChattView {
             return;
         }
         if attachment.is_video() {
-            let path = self
-                .media_cache
-                .lock()
-                .expect("media cache lock poisoned")
-                .path_for(&descriptor);
-            if let Some(path) = path {
-                self.pending_reference_media_preview = None;
-                let key = video_key(target.room_id, target.message_id.0, &descriptor);
-                self.videos.ensure_source(key, path.clone());
-                self.toggle_video_theater(
-                    TheaterVideo {
-                        key,
-                        descriptor,
-                        path,
-                    },
-                    cx,
-                );
-            } else {
-                self.pending_reference_media_preview =
-                    Some(PendingReferenceMediaPreview { target, attachment });
-                if let Err(error) =
-                    self.begin_attachment_read(target.room_id, descriptor.clone(), cx)
-                {
-                    self.pending_reference_media_preview = None;
-                    self.status = error.into();
-                }
-            }
+            self.pending_reference_media_preview = None;
+            let key = video_key(target.room_id, target.message_id.0, &descriptor);
+            let source_key = self.source_key(target.room_id, descriptor.id);
+            let source = match self.video_sources.view(source_key) {
+                VideoSourceView::Ready(source) => Some(source),
+                VideoSourceView::Absent
+                | VideoSourceView::Loading
+                | VideoSourceView::Failed { .. } => None,
+            };
+            self.video_sources.promote(source_key, descriptor.clone());
+            self.toggle_video_theater(
+                TheaterVideo {
+                    key,
+                    descriptor,
+                    source,
+                },
+                cx,
+            );
+            self.pump_video_sources(cx);
             return;
         }
 
@@ -5270,6 +5607,75 @@ impl ChattView {
                 &settings.theme,
             );
         }
+        if attachment.is_video() {
+            let key = video_key(room_id, message_id, &descriptor);
+            let source_key = self.source_key(room_id, descriptor.id);
+            let has_cached_poster = self
+                .video_thumbnails
+                .view(ThumbnailKey { source_key })
+                .image
+                .is_some();
+            return match self.video_sources.view(source_key) {
+                VideoSourceView::Ready(source) => {
+                    self.render_attachment_video(key, descriptor, Some(source), false, cx)
+                }
+                VideoSourceView::Failed { reason, retryable } => {
+                    let retry_key = source_key;
+                    let action = mini_button(
+                        ("retry-video-source", message_id as usize),
+                        "Retry",
+                        &settings.theme,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.video_sources.retry(retry_key);
+                        this.pump_video_sources(cx);
+                        cx.notify();
+                    }))
+                    .into_any_element();
+                    let suffix = if retryable {
+                        " · retrying automatically"
+                    } else {
+                        ""
+                    };
+                    Self::render_video_source_status(
+                        message_id,
+                        &descriptor,
+                        format!("Could not load preview · {reason}{suffix}"),
+                        Some(action),
+                        &settings.theme,
+                    )
+                }
+                VideoSourceView::Absent => {
+                    self.video_sources.promote(source_key, descriptor.clone());
+                    self.video_thumbnails.warm();
+                    self.pump_video_sources(cx);
+                    if has_cached_poster {
+                        self.render_attachment_video(key, descriptor, None, false, cx)
+                    } else {
+                        Self::render_video_source_status(
+                            message_id,
+                            &descriptor,
+                            "Loading preview…".into(),
+                            None,
+                            &settings.theme,
+                        )
+                    }
+                }
+                VideoSourceView::Loading => {
+                    if has_cached_poster {
+                        self.render_attachment_video(key, descriptor, None, false, cx)
+                    } else {
+                        Self::render_video_source_status(
+                            message_id,
+                            &descriptor,
+                            "Loading preview…".into(),
+                            None,
+                            &settings.theme,
+                        )
+                    }
+                }
+            };
+        }
         if descriptor.media_kind == MediaKind::File && !attachment.is_video() {
             let open = descriptor.clone();
             let label = if cache_path.is_some() {
@@ -5349,13 +5755,6 @@ impl ChattView {
                 )
                 .into_any_element();
         }
-        if attachment.is_video()
-            && let Some(path) = cache_path
-        {
-            let key = video_key(room_id, message_id, &descriptor);
-            self.videos.ensure_source(key, path.clone());
-            return self.render_attachment_video(key, descriptor, path, false, cx);
-        }
         let fetch = descriptor.clone();
         div()
             .id(("attachment", message_id as usize))
@@ -5375,6 +5774,34 @@ impl ChattView {
                 descriptor.file_name, descriptor.byte_len
             ))
             .on_click(cx.listener(move |this, _, _, cx| this.fetch_attachment(fetch.clone(), cx)))
+            .into_any_element()
+    }
+
+    fn render_video_source_status(
+        message_id: u64,
+        descriptor: &AttachmentDescriptor,
+        label: String,
+        action: Option<AnyElement>,
+        palette: &ThemePalette,
+    ) -> AnyElement {
+        image_frame(descriptor, palette)
+            .id(("video-source-status", message_id as usize))
+            .mt_2()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(palette.color(ThemeRole::Panel))
+            .child(
+                div()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(palette.color(ThemeRole::TextSecondary))
+                    .child(label),
+            )
+            .when_some(action, |status, action| status.child(action))
             .into_any_element()
     }
 
@@ -5831,9 +6258,9 @@ impl ChattView {
                             .bg(settings.theme.color(ThemeRole::Panel))
                             .child(
                                 preview_control_button("preview-fit", "Fit", &settings.theme)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.fit_preview_image(cx)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.fit_preview_image(cx)),
+                                    ),
                             )
                             .child(
                                 preview_control_button("preview-actual", "1:1", &settings.theme)
@@ -6124,18 +6551,24 @@ impl ChattView {
         &mut self,
         key: VideoKey,
         descriptor: AttachmentDescriptor,
-        path: PathBuf,
+        registered_source: Option<RegisteredAttachmentSource>,
         theater: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.videos.ensure_source(key, path.clone());
         let video = self.videos.view(key);
-        let thumbnail = self.video_thumbnails.request(
-            ThumbnailKey {
-                attachment_id: descriptor.id,
-            },
-            path.clone(),
-        );
+        let thumbnail_key = ThumbnailKey {
+            source_key: self.source_key(key.room_id, descriptor.id),
+        };
+        let thumbnail = if let Some(source) = registered_source.as_ref() {
+            let thumbnail = self.video_thumbnails.request(thumbnail_key, source.clone());
+            if thumbnail.pending {
+                self.video_sources
+                    .set_pin(source.source().key(), VideoSourcePin::Thumbnail, true);
+            }
+            thumbnail
+        } else {
+            self.video_thumbnails.view(thumbnail_key)
+        };
         let duration = if video.duration > 0.0 {
             video.duration
         } else {
@@ -6163,7 +6596,7 @@ impl ChattView {
         let source = TheaterVideo {
             key,
             descriptor: descriptor.clone(),
-            path,
+            source: registered_source,
         };
         let view = cx.entity().downgrade();
         let event_source = source.clone();
@@ -6173,10 +6606,13 @@ impl ChattView {
                 this.handle_video_player_event(source, duration, event, cx)
             });
         });
-        let fallback_label = video
-            .error
-            .clone()
-            .unwrap_or_else(|| descriptor.file_name.clone());
+        let fallback_label = video.error.clone().unwrap_or_else(|| {
+            if source.source.is_none() && thumbnail.image.is_none() {
+                "Loading preview…".into()
+            } else {
+                descriptor.file_name.clone()
+            }
+        });
         let aspect_ratio = aspect_ratio(&video, (descriptor.width, descriptor.height));
         render_video_player(
             VideoPlayerConfig {
@@ -6238,13 +6674,34 @@ impl ChattView {
 
     fn play_video(&mut self, key: VideoKey, cx: &mut Context<Self>) {
         self.show_video_controls(key, cx);
-        match self.videos.play(key) {
-            Ok(()) => self.status = "Starting cached attachment…".into(),
-            Err(error) => {
-                log::error!("embedded video play failed key={key:?}: {error:#}");
-                self.status = format!("Playback failed: {error}").into();
+        let source_key = self.source_key(key.room_id, key.attachment_id);
+        match self.video_sources.view(source_key) {
+            VideoSourceView::Ready(source) => {
+                self.pending_video_plays.remove(&key);
+                self.videos.ensure_source(key, source);
+                match self.videos.play(key) {
+                    Ok(()) => self.status = "Starting attachment playback…".into(),
+                    Err(error) => {
+                        log::error!("embedded video play failed key={key:?}: {error:#}");
+                        self.status = format!("Playback failed: {error}").into();
+                    }
+                }
+            }
+            VideoSourceView::Absent | VideoSourceView::Loading | VideoSourceView::Failed { .. } => {
+                if let Some(descriptor) = self.video_descriptor(key) {
+                    self.pending_video_plays.insert(key);
+                    self.video_sources.promote(source_key, descriptor);
+                    self.video_sources
+                        .set_pin(source_key, VideoSourcePin::PendingPlay, true);
+                    self.video_sources.retry(source_key);
+                    self.pump_video_sources(cx);
+                    self.status = "Preparing attachment playback…".into();
+                } else {
+                    self.status = "Video source is no longer available".into();
+                }
             }
         }
+        self.sync_video_source_pins();
         self.schedule_video_controls_hide(key, cx);
         cx.notify();
     }
@@ -6401,6 +6858,12 @@ impl ChattView {
             return;
         }
         self.theater_video = Some(source.clone());
+        let source_key = self.source_key(source.key.room_id, source.key.attachment_id);
+        self.video_sources
+            .promote(source_key, source.descriptor.clone());
+        self.video_sources
+            .set_pin(source_key, VideoSourcePin::Theater, true);
+        self.pump_video_sources(cx);
         self.show_video_controls(source.key, cx);
         self.video_surface_click_task.take();
         cx.notify();
@@ -6416,6 +6879,8 @@ impl ChattView {
         self.video_volume_popup_bounds.set(None);
         self.video_controls.player_hovered = false;
         self.schedule_video_controls_hide(theater.key, cx);
+        self.sync_video_source_pins();
+        self.pump_video_sources(cx);
         cx.notify();
         true
     }
@@ -6457,7 +6922,9 @@ impl ChattView {
             last_seek: Instant::now(),
         });
         if let Err(error) = self.videos.scrub(key, fraction, duration, SeekMode::Exact) {
-            log::error!("embedded video scrub failed key={key:?} fraction={fraction}: {error:#}");
+            log::error!(
+                "embedded video initial scrub failed key={key:?} fraction={fraction}: {error:#}"
+            );
             self.status = format!("Seek failed: {error}").into();
         }
         cx.stop_propagation();
@@ -6485,7 +6952,7 @@ impl ChattView {
             if dispatch_seek
                 && let Err(error) =
                     self.videos
-                        .scrub(scrub.key, fraction, scrub.duration, SeekMode::Keyframes)
+                        .scrub(scrub.key, fraction, scrub.duration, SeekMode::Exact)
             {
                 log::error!(
                     "embedded video drag scrub failed key={:?} fraction={fraction}: {error:#}",
@@ -6503,19 +6970,6 @@ impl ChattView {
         let Some(scrub) = self.video_scrub.take() else {
             return;
         };
-        if let Err(error) = self.videos.scrub(
-            scrub.key,
-            scrub.last_fraction,
-            scrub.duration,
-            SeekMode::Exact,
-        ) {
-            log::error!(
-                "embedded video final scrub failed key={:?} fraction={}: {error:#}",
-                scrub.key,
-                scrub.last_fraction,
-            );
-            self.status = format!("Seek failed: {error}").into();
-        }
         self.schedule_video_controls_hide(scrub.key, cx);
         cx.notify();
     }
@@ -8122,13 +8576,80 @@ impl Render for ChattView {
             self.advance_live_video();
         }
         if let Some(theater) = self.theater_video.clone() {
-            let player = self.render_attachment_video(
-                theater.key,
-                theater.descriptor,
-                theater.path,
-                true,
-                cx,
-            );
+            let source_key = self.source_key(theater.key.room_id, theater.key.attachment_id);
+            let player =
+                match theater
+                    .source
+                    .or_else(|| match self.video_sources.view(source_key) {
+                        VideoSourceView::Ready(source) => Some(source),
+                        _ => None,
+                    }) {
+                    Some(source) => {
+                        if let Some(active) = self.theater_video.as_mut() {
+                            active.source = Some(source.clone());
+                        }
+                        self.render_attachment_video(
+                            theater.key,
+                            theater.descriptor,
+                            Some(source),
+                            true,
+                            cx,
+                        )
+                    }
+                    None => {
+                        let state = self.video_sources.view(source_key);
+                        let cached_poster = self
+                            .video_thumbnails
+                            .view(ThumbnailKey { source_key })
+                            .image
+                            .is_some();
+                        if cached_poster && !matches!(state, VideoSourceView::Failed { .. }) {
+                            self.render_attachment_video(
+                                theater.key,
+                                theater.descriptor,
+                                None,
+                                true,
+                                cx,
+                            )
+                        } else {
+                            let (label, retry) = match state {
+                                VideoSourceView::Failed { reason, .. } => {
+                                    (format!("Could not load video · {reason}"), true)
+                                }
+                                _ => ("Loading preview…".into(), false),
+                            };
+                            let retry_descriptor = theater.descriptor.clone();
+                            div()
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap_3()
+                                .text_color(applied.theme.color(ThemeRole::TextSecondary))
+                                .child(label)
+                                .when(retry, |view| {
+                                    view.child(
+                                        mini_button(
+                                            "retry-theater-video-source",
+                                            "Retry",
+                                            &applied.theme,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.video_sources
+                                                    .promote(source_key, retry_descriptor.clone());
+                                                this.video_sources.retry(source_key);
+                                                this.pump_video_sources(cx);
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .into_any_element()
+                        }
+                    }
+                };
             return div()
                 .id("chatt-video-theater")
                 .key_context("Chatt")
@@ -9000,8 +9521,7 @@ mod tests {
 
     #[test]
     fn preview_image_viewport_uses_fixed_panel_chrome_without_measurement() {
-        let bounds =
-            preview_image_viewport_bounds(gpui::size(px(1_920.0), px(1_080.0)), px(900.0));
+        let bounds = preview_image_viewport_bounds(gpui::size(px(1_920.0), px(1_080.0)), px(900.0));
 
         assert_eq!(PREVIEW_TAB_BAR_HEIGHT, TOP_BAR_HEIGHT);
         assert_eq!(bounds.origin, point(px(1_020.0), px(52.0)));

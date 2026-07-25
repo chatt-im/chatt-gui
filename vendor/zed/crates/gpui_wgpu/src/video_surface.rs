@@ -203,6 +203,24 @@ struct PublishedFrame {
     claimed: bool,
 }
 
+impl PublishedFrame {
+    fn release_if_unclaimed(self) -> Result<(), Self> {
+        if self.claimed {
+            return Err(self);
+        }
+        if let Some(ready_value) = self.ready_value {
+            // This frame was never sampled by wgpu. The next mpv render only
+            // needs to wait for the render that produced it, not for a
+            // consumer signal that will never exist.
+            self.texture
+                .available_value
+                .store(ready_value, Ordering::Release);
+        }
+        self.texture.reusable.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct SurfaceState {
     current: Option<PublishedFrame>,
@@ -458,7 +476,8 @@ impl WgpuVideoSurface {
             ready_value: Some(sync.ready_value),
             available_value: sync.available_value,
             claimed: false,
-        }) {
+        }) && let Err(previous) = previous.release_if_unclaimed()
+        {
             state.obsolete.push(previous);
         }
         if sequence <= VIDEO_SURFACE_TRACE_LIMIT {
@@ -468,7 +487,9 @@ impl WgpuVideoSurface {
 
     pub fn clear(&self) {
         let mut state = self.inner.state.lock();
-        if let Some(previous) = state.current.take() {
+        if let Some(previous) = state.current.take()
+            && let Err(previous) = previous.release_if_unclaimed()
+        {
             state.obsolete.push(previous);
         }
     }
@@ -524,7 +545,8 @@ impl WgpuVideoSurface {
             ready_value: None,
             available_value: 0,
             claimed: false,
-        }) {
+        }) && let Err(previous) = previous.release_if_unclaimed()
+        {
             state.obsolete.push(previous);
         }
         if sequence <= VIDEO_SURFACE_TRACE_LIMIT {

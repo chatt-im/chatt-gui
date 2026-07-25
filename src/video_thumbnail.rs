@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
+use crate::attachment_source::{
+    AttachmentSourceKey, AttachmentSourceRegistry, RegisteredAttachmentSource,
+};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::Sender as AsyncSender;
 use gpui::RenderImage;
@@ -15,7 +17,6 @@ use libmpv2::{
     events::Event,
     render::{SoftwareRenderTarget, mpv_render_update},
 };
-use local_rpc::model::AttachmentId;
 
 const FORMAT_RGBA: &std::ffi::CStr = c"rgba";
 const MAX_WIDTH: u32 = 1_360;
@@ -28,7 +29,7 @@ const MAX_RETRY_SHIFT: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ThumbnailKey {
-    pub attachment_id: AttachmentId,
+    pub source_key: AttachmentSourceKey,
 }
 
 #[derive(Clone, Default)]
@@ -36,6 +37,7 @@ pub(crate) struct ThumbnailView {
     pub image: Option<Arc<RenderImage>>,
     pub duration: Option<f64>,
     pub failed: bool,
+    pub pending: bool,
 }
 
 enum CacheState {
@@ -59,7 +61,7 @@ struct CacheEntry {
 
 struct ThumbnailJob {
     key: ThumbnailKey,
-    path: PathBuf,
+    source: RegisteredAttachmentSource,
     generation: u64,
 }
 
@@ -67,6 +69,7 @@ struct ThumbnailResult {
     key: ThumbnailKey,
     generation: u64,
     result: Result<ExtractedThumbnail, String>,
+    source_failed: bool,
 }
 
 struct ExtractedThumbnail {
@@ -78,6 +81,7 @@ struct ExtractedThumbnail {
 #[derive(Default)]
 struct ThumbnailWorkQueue {
     jobs: VecDeque<ThumbnailJob>,
+    warm: bool,
     closed: bool,
 }
 
@@ -97,10 +101,17 @@ pub(crate) struct VideoThumbnailCache {
     results: mpsc::Receiver<ThumbnailResult>,
     worker_results: mpsc::Sender<ThumbnailResult>,
     wakeup: AsyncSender<()>,
+    source_registry: AttachmentSourceRegistry,
+    finished_sources: Vec<AttachmentSourceKey>,
+    transport_failures: Vec<(AttachmentSourceKey, String)>,
 }
 
 impl VideoThumbnailCache {
-    pub(crate) fn new(budget_bytes: usize, wakeup: AsyncSender<()>) -> Self {
+    pub(crate) fn new(
+        budget_bytes: usize,
+        wakeup: AsyncSender<()>,
+        source_registry: AttachmentSourceRegistry,
+    ) -> Self {
         let (worker_results, results) = mpsc::channel();
         Self {
             entries: HashMap::new(),
@@ -113,6 +124,9 @@ impl VideoThumbnailCache {
             results,
             worker_results,
             wakeup,
+            source_registry,
+            finished_sources: Vec::new(),
+            transport_failures: Vec::new(),
         }
     }
 
@@ -121,10 +135,16 @@ impl VideoThumbnailCache {
         self.entries.clear();
         self.total_bytes = 0;
         self.jobs.0.lock().unwrap().jobs.clear();
+        self.finished_sources.clear();
+        self.transport_failures.clear();
         while self.results.try_recv().is_ok() {}
     }
 
-    pub(crate) fn request(&mut self, key: ThumbnailKey, path: PathBuf) -> ThumbnailView {
+    pub(crate) fn request(
+        &mut self,
+        key: ThumbnailKey,
+        source: RegisteredAttachmentSource,
+    ) -> ThumbnailView {
         self.drain_results();
         self.clock = self.clock.wrapping_add(1);
         let now = Instant::now();
@@ -157,12 +177,13 @@ impl VideoThumbnailCache {
         }
         match self.enqueue(ThumbnailJob {
             key,
-            path,
+            source,
             generation: self.generation,
         }) {
             Ok(dropped) => {
                 if let Some(dropped) = dropped {
                     self.entries.remove(&dropped);
+                    self.finished_sources.push(dropped.source_key);
                 }
             }
             Err(error) => self.record_failure(key, error),
@@ -174,12 +195,23 @@ impl VideoThumbnailCache {
             .unwrap_or_default()
     }
 
+    pub(crate) fn view(&mut self, key: ThumbnailKey) -> ThumbnailView {
+        self.drain_results();
+        self.clock = self.clock.wrapping_add(1);
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return ThumbnailView::default();
+        };
+        entry.touched = self.clock;
+        view_for_entry(entry)
+    }
+
     pub(crate) fn drain_results(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.results.try_recv() {
             if result.generation != self.generation {
                 continue;
             }
+            self.finished_sources.push(result.key.source_key);
             let Some(entry) = self.entries.get_mut(&result.key) else {
                 continue;
             };
@@ -195,6 +227,10 @@ impl VideoThumbnailCache {
                 }
                 Err(error) => {
                     log::warn!("video thumbnail extraction failed: {error}");
+                    if result.source_failed {
+                        self.transport_failures
+                            .push((result.key.source_key, error.clone()));
+                    }
                     entry.failures = entry.failures.saturating_add(1);
                     entry.state = CacheState::Failed {
                         error,
@@ -209,6 +245,26 @@ impl VideoThumbnailCache {
         changed
     }
 
+    pub(crate) fn warm(&mut self) {
+        if let Err(error) = self.start_worker() {
+            log::warn!("video thumbnail warmup failed: {error}");
+            return;
+        }
+        let (jobs, ready) = &*self.jobs;
+        if let Ok(mut jobs) = jobs.lock() {
+            jobs.warm = true;
+            ready.notify_one();
+        }
+    }
+
+    pub(crate) fn take_finished_sources(&mut self) -> Vec<AttachmentSourceKey> {
+        std::mem::take(&mut self.finished_sources)
+    }
+
+    pub(crate) fn take_transport_failures(&mut self) -> Vec<(AttachmentSourceKey, String)> {
+        std::mem::take(&mut self.transport_failures)
+    }
+
     fn start_worker(&mut self) -> Result<(), String> {
         if self.worker_started {
             return Ok(());
@@ -216,9 +272,10 @@ impl VideoThumbnailCache {
         let jobs = self.jobs.clone();
         let results = self.worker_results.clone();
         let wakeup = self.wakeup.clone();
+        let source_registry = self.source_registry.clone();
         thread::Builder::new()
             .name("mpv-thumbnail".into())
-            .spawn(move || thumbnail_worker(jobs, results, wakeup))
+            .spawn(move || thumbnail_worker(jobs, results, wakeup, source_registry))
             .map_err(|error| format!("could not start video thumbnail worker: {error}"))?;
         self.worker_started = true;
         Ok(())
@@ -308,15 +365,20 @@ fn view_for_entry(entry: &CacheEntry) -> ThumbnailView {
             image: Some(image.clone()),
             duration: *duration,
             failed: false,
+            pending: false,
         },
         CacheState::Failed { error, .. } => {
             let _ = error;
             ThumbnailView {
                 failed: true,
+                pending: false,
                 ..ThumbnailView::default()
             }
         }
-        CacheState::Pending => ThumbnailView::default(),
+        CacheState::Pending => ThumbnailView {
+            pending: true,
+            ..ThumbnailView::default()
+        },
     }
 }
 
@@ -324,6 +386,7 @@ fn thumbnail_worker(
     jobs: SharedWorkQueue,
     results: mpsc::Sender<ThumbnailResult>,
     wakeup: AsyncSender<()>,
+    source_registry: AttachmentSourceRegistry,
 ) {
     log::info!("lazy video thumbnail worker started");
     let mut extractor = None;
@@ -334,7 +397,7 @@ fn thumbnail_worker(
                 Ok(jobs) => jobs,
                 Err(_) => break,
             };
-            while jobs.jobs.is_empty() && !jobs.closed {
+            while jobs.jobs.is_empty() && !jobs.warm && !jobs.closed {
                 jobs = match ready.wait(jobs) {
                     Ok(jobs) => jobs,
                     Err(_) => return,
@@ -343,10 +406,15 @@ fn thumbnail_worker(
             if jobs.closed {
                 break;
             }
-            jobs.jobs.pop_back().expect("non-empty thumbnail queue")
+            if jobs.jobs.is_empty() {
+                jobs.warm = false;
+                None
+            } else {
+                Some(jobs.jobs.pop_back().expect("non-empty thumbnail queue"))
+            }
         };
         if extractor.is_none() {
-            extractor = match ThumbnailExtractor::new() {
+            extractor = match ThumbnailExtractor::new(source_registry.clone()) {
                 Ok(created) => Some(created),
                 Err(error) => {
                     log::error!("video thumbnail decoder initialization failed: {error:#}");
@@ -354,12 +422,33 @@ fn thumbnail_worker(
                 }
             };
         }
+        let Some(job) = job else {
+            continue;
+        };
+        let started_at = Instant::now();
+        log::info!(
+            "video thumbnail extraction started key={:?} backend={} byte_len={}",
+            job.key.source_key,
+            if job.source.source().is_remote() {
+                "remote"
+            } else {
+                "direct"
+            },
+            job.source.source().byte_len(),
+        );
         let result = match extractor.as_mut() {
             Some(extractor) => extractor
-                .extract(&job.path)
+                .extract(job.source.url())
                 .map_err(|error| format!("{error:#}")),
             None => Err("initialize thumbnail libmpv core".into()),
         };
+        log::info!(
+            "video thumbnail extraction completed key={:?} success={} source_failed={} elapsed_ms={:.3}",
+            job.key.source_key,
+            result.is_ok(),
+            job.source.source().has_failed(),
+            started_at.elapsed().as_secs_f64() * 1_000.0,
+        );
         if result.is_err() {
             extractor = None;
         }
@@ -368,6 +457,7 @@ fn thumbnail_worker(
                 key: job.key,
                 generation: job.generation,
                 result,
+                source_failed: job.source.source().has_failed(),
             })
             .is_err()
         {
@@ -385,7 +475,7 @@ struct ThumbnailExtractor {
 }
 
 impl ThumbnailExtractor {
-    fn new() -> Result<Self> {
+    fn new(source_registry: AttachmentSourceRegistry) -> Result<Self> {
         let mpv = Arc::new(
             Mpv::with_initializer(|initializer| {
                 initializer.set_option("vo", "libmpv")?;
@@ -406,6 +496,7 @@ impl ThumbnailExtractor {
             })
             .context("initialize thumbnail libmpv core")?,
         );
+        crate::attachment_source::register_mpv_attachment_protocol(&mpv, source_registry)?;
         mpv.observe_property("duration", Format::Double, 1)?;
         let render = mpv
             .create_software_render_context(false)
@@ -417,9 +508,9 @@ impl ThumbnailExtractor {
         })
     }
 
-    fn extract(&mut self, path: &PathBuf) -> Result<ExtractedThumbnail> {
+    fn extract(&mut self, source_url: &str) -> Result<ExtractedThumbnail> {
         self.reset_source()?;
-        let result = self.extract_frame(path);
+        let result = self.extract_frame(source_url);
         let reset = self.reset_source();
         match (result, reset) {
             (Ok(thumbnail), Ok(())) => Ok(thumbnail),
@@ -428,11 +519,11 @@ impl ThumbnailExtractor {
         }
     }
 
-    fn extract_frame(&mut self, path: &PathBuf) -> Result<ExtractedThumbnail> {
+    fn extract_frame(&mut self, source_url: &str) -> Result<ExtractedThumbnail> {
         self.mpv.set_property("pause", false)?;
         self.mpv
-            .command("loadfile", &[&path.to_string_lossy(), "replace"])
-            .with_context(|| format!("open video thumbnail source {path:?}"))?;
+            .command("loadfile", &[source_url, "replace"])
+            .context("open video thumbnail attachment source")?;
 
         let deadline = Instant::now() + EXTRACT_TIMEOUT;
         let mut source_size = None;
@@ -560,14 +651,33 @@ fn bounded_size(width: u32, height: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use local_rpc::model::AttachmentId;
+    use std::fs::File;
 
     fn key(value: u8) -> ThumbnailKey {
         ThumbnailKey {
-            attachment_id: AttachmentId {
-                timestamp_ms: value as u64,
-                transfer_id: local_rpc::ids::FileTransferId(value as u64),
+            source_key: AttachmentSourceKey {
+                namespace: 1,
+                room_id: local_rpc::ids::RoomId(1),
+                attachment_id: AttachmentId {
+                    timestamp_ms: value as u64,
+                    transfer_id: local_rpc::ids::FileTransferId(value as u64),
+                },
             },
         }
+    }
+
+    fn registered(
+        registry: &AttachmentSourceRegistry,
+        key: ThumbnailKey,
+        file: File,
+    ) -> RegisteredAttachmentSource {
+        let byte_len = file.metadata().unwrap().len();
+        registry.register(crate::attachment_source::AttachmentSource::direct(
+            key.source_key,
+            file,
+            byte_len,
+        ))
     }
 
     #[test]
@@ -604,9 +714,11 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        let mut extractor = ThumbnailExtractor::new().unwrap();
+        let registry = AttachmentSourceRegistry::new(1);
+        let source = registered(&registry, key(1), File::open(&path).unwrap());
+        let mut extractor = ThumbnailExtractor::new(registry).unwrap();
         for _ in 0..8 {
-            let thumbnail = extractor.extract(&path).unwrap();
+            let thumbnail = extractor.extract(source.url()).unwrap();
             assert_eq!(thumbnail.image.size(0).width.0, 320);
             assert_eq!(thumbnail.image.size(0).height.0, 180);
             assert_eq!(thumbnail.byte_len, 320 * 180 * 4);
@@ -616,14 +728,18 @@ mod tests {
     #[test]
     fn queued_thumbnail_work_is_bounded_and_prefers_new_requests() {
         let (wakeup, _) = async_channel::bounded(1);
-        let cache = VideoThumbnailCache::new(1024, wakeup);
+        let registry = AttachmentSourceRegistry::new(1);
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(1).unwrap();
+        let source = registered(&registry, key(1), file);
+        let cache = VideoThumbnailCache::new(1024, wakeup, registry);
 
         for value in 0..MAX_QUEUED_JOBS as u8 {
             assert!(
                 cache
                     .enqueue(ThumbnailJob {
                         key: key(value),
-                        path: PathBuf::from("video.mp4"),
+                        source: source.clone(),
                         generation: 0,
                     })
                     .unwrap()
@@ -633,7 +749,7 @@ mod tests {
         let dropped = cache
             .enqueue(ThumbnailJob {
                 key: key(255),
-                path: PathBuf::from("latest.mp4"),
+                source,
                 generation: 0,
             })
             .unwrap();
@@ -647,13 +763,17 @@ mod tests {
     #[test]
     fn failed_thumbnail_metadata_is_bounded() {
         let (wakeup, _) = async_channel::bounded(1);
-        let mut cache = VideoThumbnailCache::new(1024, wakeup);
+        let mut cache = VideoThumbnailCache::new(1024, wakeup, AttachmentSourceRegistry::new(1));
         for value in 0..(MAX_CACHE_ENTRIES + 20) {
             cache.entries.insert(
                 ThumbnailKey {
-                    attachment_id: AttachmentId {
-                        timestamp_ms: value as u64,
-                        transfer_id: local_rpc::ids::FileTransferId(value as u64),
+                    source_key: AttachmentSourceKey {
+                        namespace: 1,
+                        room_id: local_rpc::ids::RoomId(1),
+                        attachment_id: AttachmentId {
+                            timestamp_ms: value as u64,
+                            transfer_id: local_rpc::ids::FileTransferId(value as u64),
+                        },
                     },
                 },
                 CacheEntry {

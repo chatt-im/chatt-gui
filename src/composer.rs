@@ -1641,9 +1641,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn visual_p_replaces_the_selection_with_system_clipboard_text(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn visual_p_replaces_the_selection_with_system_clipboard_text(cx: &mut gpui::TestAppContext) {
         cx.update(crate::fonts::init);
         cx.update(|cx| {
             crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()

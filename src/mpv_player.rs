@@ -101,8 +101,16 @@ impl MpvPlayer {
     pub(crate) fn new_attachment(
         gpui_wakeup: AsyncSender<()>,
         preferred_backend: Option<AttachmentRenderBackend>,
+        source_registry: crate::attachment_source::AttachmentSourceRegistry,
     ) -> Result<(Self, AttachmentRenderBackend)> {
-        Self::new_internal(gpui_wakeup, false, None, preferred_backend, None)
+        Self::new_internal(
+            gpui_wakeup,
+            false,
+            None,
+            preferred_backend,
+            None,
+            Some(source_registry),
+        )
     }
 
     pub fn new_live(
@@ -118,6 +126,7 @@ impl MpvPlayer {
             Some(render_size),
             None,
             Some(&share.codec),
+            None,
         )?;
         let source = crate::live_stream::LiveStreamSource::start(
             player.mpv.clone(),
@@ -144,6 +153,7 @@ impl MpvPlayer {
         fixed_render_size: Option<(u32, u32)>,
         preferred_backend: Option<AttachmentRenderBackend>,
         live_codec: Option<&str>,
+        source_registry: Option<crate::attachment_source::AttachmentSourceRegistry>,
     ) -> Result<(Self, AttachmentRenderBackend)> {
         let force_live_software = live
             && std::env::var("CHATT_LIVE_RENDER_BACKEND")
@@ -276,6 +286,9 @@ impl MpvPlayer {
         })?;
         log::info!("embedded libmpv initialized live={live}");
         let mpv = Arc::new(mpv);
+        if let Some(registry) = source_registry {
+            crate::attachment_source::register_mpv_attachment_protocol(&mpv, registry)?;
+        }
 
         mpv.observe_property("time-pos", Format::Double, 1)
             .context("observe mpv property time-pos")?;
@@ -1238,8 +1251,26 @@ fn control_worker(
     let mut pending_start = None;
     let delay_render_until_reconfiguration = initial_render_size.is_some();
     let mut render_enabled = false;
+    let mut load_started_at = None;
+    let mut seek_started_at = None;
+    let mut deferred_command = None;
     loop {
-        while let Ok(command) = commands.try_recv() {
+        while let Some(mut command) = deferred_command.take().or_else(|| commands.try_recv().ok()) {
+            if is_seek_command(&command) {
+                let mut coalesced = 0u32;
+                while let Ok(next) = commands.try_recv() {
+                    if is_seek_command(&next) {
+                        command = next;
+                        coalesced = coalesced.saturating_add(1);
+                    } else {
+                        deferred_command = Some(next);
+                        break;
+                    }
+                }
+                if coalesced != 0 {
+                    log::info!("coalesced {coalesced} stale video seek commands");
+                }
+            }
             let result = match command {
                 ControlCommand::Load {
                     path,
@@ -1248,6 +1279,8 @@ fn control_worker(
                     position,
                 } => {
                     log::info!("loading media path={path:?}");
+                    load_started_at = Some(Instant::now());
+                    seek_started_at = None;
                     state = PlaybackState {
                         paused,
                         ..PlaybackState::default()
@@ -1278,7 +1311,8 @@ fn control_worker(
                     mpv.set_property("pause", paused)
                 }
                 ControlCommand::SeekAbsolute { seconds, mode } => {
-                    log::debug!("seeking mpv absolute_seconds={seconds} mode={mode:?}");
+                    log::info!("seeking mpv absolute_seconds={seconds} mode={mode:?}");
+                    seek_started_at = Some((Instant::now(), seconds, mode));
                     state.position = seconds;
                     state.finished = false;
                     playback.publish(state);
@@ -1290,9 +1324,10 @@ fn control_worker(
                     position,
                     mode,
                 } => {
-                    log::debug!(
+                    log::info!(
                         "seeking mpv absolute_percent={percent} expected_seconds={position} mode={mode:?}"
                     );
+                    seek_started_at = Some((Instant::now(), position, mode));
                     state.position = position;
                     state.finished = false;
                     playback.publish(state);
@@ -1308,6 +1343,8 @@ fn control_worker(
                 }
                 ControlCommand::Stop => {
                     log::debug!("stopping media while retaining mpv core");
+                    load_started_at = None;
+                    seek_started_at = None;
                     state = PlaybackState {
                         paused: true,
                         ..PlaybackState::default()
@@ -1342,6 +1379,26 @@ fn control_worker(
             }
             let file_loaded = matches!(event.as_ref(), Ok(Event::FileLoaded));
             let video_reconfigured = matches!(event.as_ref(), Ok(Event::VideoReconfig));
+            let playback_restarted = matches!(event.as_ref(), Ok(Event::PlaybackRestart));
+            if file_loaded && let Some(started_at) = load_started_at {
+                log::info!(
+                    "mpv media demux ready elapsed_ms={:.3}",
+                    started_at.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            if playback_restarted {
+                if let Some((started_at, target, mode)) = seek_started_at.take() {
+                    log::info!(
+                        "mpv seek completed target_seconds={target:.3} mode={mode:?} elapsed_ms={:.3}",
+                        started_at.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                } else if let Some(started_at) = load_started_at.take() {
+                    log::info!(
+                        "mpv initial playback ready elapsed_ms={:.3}",
+                        started_at.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                }
+            }
             let mut display_size_changed = false;
             if file_loaded || video_reconfigured {
                 match video_display_size(&mpv) {
@@ -1412,6 +1469,13 @@ fn control_worker(
             }
         }
     }
+}
+
+fn is_seek_command(command: &ControlCommand) -> bool {
+    matches!(
+        command,
+        ControlCommand::SeekAbsolute { .. } | ControlCommand::SeekPercent { .. }
+    )
 }
 
 fn video_display_size(mpv: &Mpv) -> Result<(u32, u32)> {

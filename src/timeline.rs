@@ -674,10 +674,7 @@ mod tests {
     fn command_rows_do_not_interrupt_message_day_boundaries() {
         let first_day = local_timestamp_ms(2026, 7, 24, 12);
         let next_day = local_timestamp_ms(2026, 7, 25, 12);
-        let messages = vec![
-            message("Mara", first_day),
-            message("Ivo", next_day),
-        ];
+        let messages = vec![message("Mara", first_day), message("Ivo", next_day)];
         let rows = vec![LocalCommandRow {
             local_id: 1,
             anchor_message_id: Some(first_day),
@@ -704,14 +701,8 @@ mod tests {
         let older = NaiveDate::from_ymd_opt(2025, 12, 3).unwrap();
 
         assert_eq!(format_day_label_for_dates(today, today), "Today");
-        assert_eq!(
-            format_day_label_for_dates(yesterday, today),
-            "Yesterday"
-        );
-        assert_eq!(
-            format_day_label_for_dates(older, today),
-            "December 3, 2025"
-        );
+        assert_eq!(format_day_label_for_dates(yesterday, today), "Yesterday");
+        assert_eq!(format_day_label_for_dates(older, today), "December 3, 2025");
     }
 
     #[test]
