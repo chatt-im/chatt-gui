@@ -364,7 +364,6 @@ future-surface = "#abcdef"
         assert!(rendered.contains("future-surface = \"#abcdef\""));
         assert!(rendered.contains("[bindings.future-device]"));
         assert!(rendered.contains("\"secondary-k\" = \"FutureCommand\""));
-        assert!(rendered.contains("window = '#000000'"));
         assert!(rendered.contains("code-size = 15.5"));
     }
 

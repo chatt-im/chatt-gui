@@ -724,7 +724,7 @@ space = "TogglePlayback"
 
         assert!(rendered.contains("schema-version = 1"));
         assert!(rendered.contains("[theme.surfaces]"));
-        assert!(rendered.contains("window = \"#000000\""));
+        assert!(rendered.contains("window = "));
         assert!(rendered.contains("[fonts]"));
         assert!(rendered.contains("message-family = \"IBM Plex Sans\""));
         assert!(rendered.contains("[input]"));

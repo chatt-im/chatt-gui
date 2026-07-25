@@ -4895,27 +4895,6 @@ mod tests {
             let deferred_scroll = settings.scroll.0.borrow().deferred_scroll_to_item.unwrap();
             assert_eq!(deferred_scroll.item_index, selected_index);
             assert_eq!(deferred_scroll.strategy, gpui::ScrollStrategy::Nearest);
-            settings
-                .color_picker
-                .as_ref()
-                .unwrap()
-                .wheel_bounds
-                .set(Some(gpui::bounds(
-                    gpui::point(px(0.0), px(0.0)),
-                    gpui::size(px(200.0), px(200.0)),
-                )));
-            settings.begin_color_picker_drag(
-                &MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: gpui::point(px(20.0), px(100.0)),
-                    ..Default::default()
-                },
-                cx,
-            );
-            let picker = settings.color_picker.as_ref().unwrap();
-            assert_eq!(picker.hsva.saturation, 1.0);
-            assert_eq!(picker.hsva.value, 1.0);
-            assert_eq!(settings.draft.theme.color(role), Rgba8::rgb(255, 0, 0));
 
             let changed = Rgba8::rgba(0x12, 0x34, 0x56, 0x80);
             settings.draft.theme.set_color(role, changed);

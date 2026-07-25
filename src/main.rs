@@ -38,6 +38,7 @@ use crate::app::ChattView;
 
 fn main() {
     logger::init();
+    ensure_graphical_backend();
     let mut loaded = config::io::load();
     let binding_diagnostics = key_bindings::validate(&loaded.config);
     if config::validation::has_errors(&binding_diagnostics) {
@@ -102,4 +103,97 @@ fn main() {
 
             cx.activate(true);
         });
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn ensure_graphical_backend() {
+    let wayland_display =
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|display| !display.is_empty());
+    let x11_display = std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty());
+    let headless_override = std::env::var_os("ZED_HEADLESS").is_some();
+    let selected = gpui::guess_compositor();
+
+    log::info!(
+        "GPUI backend selection: selected={selected}, compiled={{wayland: {}, x11: {}}}, environment={{WAYLAND_DISPLAY: {wayland_display}, DISPLAY: {x11_display}, ZED_HEADLESS: {headless_override}}}",
+        cfg!(feature = "wayland"),
+        cfg!(feature = "x11"),
+    );
+
+    if selected == "Headless" {
+        let error = headless_backend_error(
+            cfg!(feature = "wayland"),
+            cfg!(feature = "x11"),
+            wayland_display,
+            x11_display,
+            headless_override,
+        );
+        log::error!("{error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn ensure_graphical_backend() {}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn headless_backend_error(
+    wayland_compiled: bool,
+    x11_compiled: bool,
+    wayland_display: bool,
+    x11_display: bool,
+    headless_override: bool,
+) -> String {
+    if headless_override {
+        return "refusing to start chatt-gui headlessly because ZED_HEADLESS is set; unset it to open a window"
+            .to_owned();
+    }
+
+    let mut unavailable_backends = Vec::new();
+    if wayland_display && !wayland_compiled {
+        unavailable_backends.push("WAYLAND_DISPLAY is set but Wayland support was not compiled in");
+    }
+    if x11_display && !x11_compiled {
+        unavailable_backends.push(
+            "DISPLAY is set but X11 support was not compiled in; rebuild with `--features x11`",
+        );
+    }
+
+    if !unavailable_backends.is_empty() {
+        return format!(
+            "refusing to start chatt-gui headlessly: {}",
+            unavailable_backends.join("; ")
+        );
+    }
+
+    "refusing to start chatt-gui headlessly: neither WAYLAND_DISPLAY nor DISPLAY identifies a supported graphical session"
+        .to_owned()
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+mod tests {
+    use super::headless_backend_error;
+
+    #[test]
+    fn reports_x11_display_without_compiled_x11_support() {
+        assert_eq!(
+            headless_backend_error(true, false, false, true, false),
+            "refusing to start chatt-gui headlessly: DISPLAY is set but X11 support was not compiled in; rebuild with `--features x11`"
+        );
+    }
+
+    #[test]
+    fn reports_explicit_headless_override() {
+        assert_eq!(
+            headless_backend_error(true, true, true, true, true),
+            "refusing to start chatt-gui headlessly because ZED_HEADLESS is set; unset it to open a window"
+        );
+    }
+
+    #[test]
+    fn reports_missing_display_environment() {
+        assert_eq!(
+            headless_backend_error(true, true, false, false, false),
+            "refusing to start chatt-gui headlessly: neither WAYLAND_DISPLAY nor DISPLAY identifies a supported graphical session"
+        );
+    }
 }
