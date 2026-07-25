@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PaintSurface, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, HsvColorWheel, MonochromeSprite,
+    Path, Point, PaintSurface, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -83,6 +83,7 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    hsv_color_wheels: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -650,6 +651,13 @@ impl WgpuRenderer {
             label: Some("gpui_shaders"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(base_shader_source)),
         });
+        let hsv_color_wheel_module =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("gpui_hsv_color_wheel_shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                    "hsv_color_wheel.wgsl"
+                ))),
+            });
 
         let subpixel_shader_source = include_str!("shaders_subpixel.wgsl");
         let subpixel_shader_module = if dual_source_blending {
@@ -737,6 +745,18 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
+        );
+
+        let hsv_color_wheels = create_pipeline(
+            "hsv_color_wheels",
+            "vs_hsv_color_wheel",
+            "fs_hsv_color_wheel",
+            &layouts.globals,
+            &layouts.instances,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &hsv_color_wheel_module,
         );
 
         let shadows = create_pipeline(
@@ -879,6 +899,7 @@ impl WgpuRenderer {
 
         WgpuPipelines {
             quads,
+            hsv_color_wheels,
             shadows,
             path_rasterization,
             paths,
@@ -1240,6 +1261,11 @@ impl WgpuRenderer {
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
                         }
+                        PrimitiveBatch::HsvColorWheels(range) => self.draw_hsv_color_wheels(
+                            &scene.hsv_color_wheels[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                         PrimitiveBatch::Shadows(range) => self.draw_shadows(
                             &scene.shadows[range],
                             &mut instance_offset,
@@ -1360,6 +1386,22 @@ impl WgpuRenderer {
             data,
             quads.len() as u32,
             &self.resources().pipelines.quads,
+            instance_offset,
+            pass,
+        )
+    }
+
+    fn draw_hsv_color_wheels(
+        &self,
+        wheels: &[HsvColorWheel],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(wheels) };
+        self.draw_instances(
+            data,
+            wheels.len() as u32,
+            &self.resources().pipelines.hsv_color_wheels,
             instance_offset,
             pass,
         )

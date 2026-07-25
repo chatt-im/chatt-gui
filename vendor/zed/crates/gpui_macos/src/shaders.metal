@@ -1277,3 +1277,158 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+// --- Dedicated HSV color-wheel pipeline ---
+//
+// This is intentionally a separate primitive and pair of entry points. It
+// adds no branching or per-fragment work to GPUI's ordinary quad pipeline.
+
+struct HsvColorWheelVertexOutput {
+  uint wheel_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct HsvColorWheelFragmentInput {
+  uint wheel_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex HsvColorWheelVertexOutput hsv_color_wheel_vertex(
+    uint vertex_id [[vertex_id]],
+    uint wheel_id [[instance_id]],
+    constant HsvColorWheel *wheels
+        [[buffer(HsvColorWheelInputIndex_Wheels)]],
+    constant Size_DevicePixels *viewport_size
+        [[buffer(HsvColorWheelInputIndex_ViewportSize)]]) {
+  float2 unit_vertex =
+      float2(float(vertex_id & 1), 0.5 * float(vertex_id & 2));
+  HsvColorWheel wheel = wheels[wheel_id];
+  float4 device_position =
+      to_device_position(unit_vertex, wheel.bounds, viewport_size);
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, wheel.bounds, wheel.content_mask.bounds);
+
+  return HsvColorWheelVertexOutput{
+      wheel_id,
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+float3 hsv_color_wheel_hue_to_rgb(float hue) {
+  float r = abs(hue * 6.0 - 3.0) - 1.0;
+  float g = 2.0 - abs(hue * 6.0 - 2.0);
+  float b = 2.0 - abs(hue * 6.0 - 4.0);
+  return clamp(float3(r, g, b), float3(0.0), float3(1.0));
+}
+
+float4 hsv_color_wheel_layer(float4 below, float3 rgb, float mask) {
+  float above_alpha = clamp(mask, 0.0, 1.0);
+  float alpha = above_alpha + below.a * (1.0 - above_alpha);
+  if (alpha <= 0.0) {
+    return float4(0.0);
+  }
+  float3 blended =
+      (rgb * above_alpha + below.rgb * below.a * (1.0 - above_alpha)) /
+      alpha;
+  return float4(blended, alpha);
+}
+
+fragment float4 hsv_color_wheel_fragment(
+    HsvColorWheelFragmentInput input [[stage_in]],
+    constant HsvColorWheel *wheels
+        [[buffer(HsvColorWheelInputIndex_Wheels)]]) {
+  HsvColorWheel wheel = wheels[input.wheel_id];
+  float2 bounds_size = float2(wheel.bounds.size.width, wheel.bounds.size.height);
+  float2 half_size = bounds_size * 0.5;
+  float min_dimension = min(bounds_size.x, bounds_size.y);
+  float2 uv =
+      (input.position.xy -
+       float2(wheel.bounds.origin.x, wheel.bounds.origin.y) -
+       half_size) /
+      (min_dimension * 0.5);
+  float distance = length(uv);
+  float angle = atan2(uv.y, uv.x);
+  float4 color = float4(0.0);
+
+  // Red is at the left and hue advances clockwise in screen coordinates.
+  float pixel_hue = fract(0.5 + angle / (2.0 * M_PI_F) + 1.0);
+  float ring_fe = max(fwidth(distance), 0.0001);
+  float ring_mask =
+      smoothstep(
+          wheel.ring_inner_radius,
+          wheel.ring_inner_radius + ring_fe,
+          distance) *
+      (1.0 - smoothstep(
+          wheel.ring_outer_radius - ring_fe,
+          wheel.ring_outer_radius,
+          distance));
+  color = hsv_color_wheel_layer(
+      color, hsv_color_wheel_hue_to_rgb(pixel_hue), ring_mask);
+
+  // The saturated-hue vertex follows the selected position on the ring.
+  float radius = wheel.triangle_radius;
+  float selected_angle = (wheel.hue - 0.5) * 2.0 * M_PI_F;
+  float angle_cos = cos(selected_angle);
+  float angle_sin = sin(selected_angle);
+  float2 triangle_point = float2(
+      angle_cos * uv.x + angle_sin * uv.y,
+      -angle_sin * uv.x + angle_cos * uv.y);
+  float weight_hue = (2.0 * triangle_point.x / radius + 1.0) / 3.0;
+  float non_hue_weight = 1.0 - weight_hue;
+  float white_minus_black = triangle_point.y / (radius * 0.8660254);
+  float weight_white = (non_hue_weight + white_minus_black) * 0.5;
+  float weight_black = non_hue_weight - weight_white;
+  float3 triangle_rgb =
+      float3(weight_white) +
+      weight_hue * hsv_color_wheel_hue_to_rgb(wheel.hue);
+  float minimum_weight = min(weight_black, min(weight_white, weight_hue));
+  float triangle_fe = max(fwidth(minimum_weight), 0.0001);
+  float triangle_mask = smoothstep(0.0, triangle_fe, minimum_weight);
+  color = hsv_color_wheel_layer(color, triangle_rgb, triangle_mask);
+
+  // Selected hue line.
+  float angle_difference = abs(angle - selected_angle);
+  if (angle_difference > M_PI_F) {
+    angle_difference = 2.0 * M_PI_F - angle_difference;
+  }
+  float arc_distance = angle_difference * distance;
+  float arc_fe = max(fwidth(arc_distance), 0.0001);
+  float line_mask = 1.0 - smoothstep(0.006 - arc_fe, 0.006, arc_distance);
+  float border_mask = 1.0 - smoothstep(0.011 - arc_fe, 0.011, arc_distance);
+  color = hsv_color_wheel_layer(
+      color, float3(0.05), border_mask * ring_mask);
+  color = hsv_color_wheel_layer(
+      color, float3(1.0), line_mask * ring_mask);
+
+  // Selected saturation/value cursor.
+  float2 vertex_black = float2(-radius * 0.5, -radius * 0.8660254);
+  float2 vertex_white = float2(-radius * 0.5, radius * 0.8660254);
+  float2 vertex_hue = float2(radius, 0.0);
+  float3 weights = float3(
+      1.0 - wheel.value,
+      (1.0 - wheel.saturation) * wheel.value,
+      wheel.saturation * wheel.value);
+  float2 local_target =
+      weights.x * vertex_black +
+      weights.y * vertex_white +
+      weights.z * vertex_hue;
+  float2 target = float2(
+      angle_cos * local_target.x - angle_sin * local_target.y,
+      angle_sin * local_target.x + angle_cos * local_target.y);
+  float cursor_distance = length(uv - target);
+  float cursor_fe = max(fwidth(cursor_distance), 0.0001);
+  float outer_mask =
+      1.0 - smoothstep(0.032 - cursor_fe, 0.032, cursor_distance);
+  float line_cursor =
+      1.0 - smoothstep(0.026 - cursor_fe, 0.026, cursor_distance);
+  float inner_mask =
+      1.0 - smoothstep(0.018 - cursor_fe, 0.018, cursor_distance);
+  float4 before_cursor = color;
+  color = hsv_color_wheel_layer(color, float3(0.05), outer_mask);
+  color = hsv_color_wheel_layer(color, float3(1.0), line_cursor);
+  color = mix(color, before_cursor, inner_mask);
+
+  color.a *= wheel.opacity;
+  return color;
+}

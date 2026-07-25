@@ -1,12 +1,14 @@
 mod catalog;
+mod color_picker;
 mod remote;
 
 use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Global, KeyBinding, KeyDownEvent, Render, SharedString, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, div, prelude::*, px, rgba, uniform_list,
+    Global, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, canvas,
+    checkerboard, div, linear_color_stop, linear_gradient, prelude::*, px, rgba, uniform_list,
 };
 
 use crate::{
@@ -24,6 +26,7 @@ use catalog::{
     RowRef, SETTINGS_SECTIONS, ScalarSetting, SettingsSection, help, label, matches_search, path,
     rows,
 };
+use color_picker::{ColorPicker, DragTarget, Hsva};
 use local_rpc::settings as wire_settings;
 use remote::{RemoteField, RemoteSection, RemoteValues};
 
@@ -130,6 +133,7 @@ struct InvalidRemoteEdit {
 #[derive(Clone)]
 enum RowAction {
     Reset,
+    PickColor(ThemeRole),
     Record(BindingScope, BindCommand),
     Font(FontRole, String),
 }
@@ -139,6 +143,8 @@ pub(crate) struct SettingsView {
     focused: SettingsFocus,
     editor: Option<ActiveEditor>,
     choice_picker: Option<ChoicePicker>,
+    color_picker: Option<ColorPicker>,
+    syncing_color_picker_editor: bool,
     invalid_edits: Vec<InvalidEdit>,
     invalid_remote_edits: Vec<InvalidRemoteEdit>,
     action_menu: Option<(RowRef, usize)>,
@@ -216,11 +222,17 @@ impl SettingsView {
             .into_iter()
             .find(|row| !matches!(row, RowRef::Diagnostic(_)))
             .expect("appearance settings contain an editable row");
+        let initial_color_picker = match first_row {
+            RowRef::Theme(role) => Some(ColorPicker::new(role, loaded.config.theme.color(role))),
+            _ => None,
+        };
         let mut this = Self {
             focus: cx.focus_handle(),
             focused: SettingsFocus::Row(first_row),
             editor: None,
             choice_picker: None,
+            color_picker: initial_color_picker,
+            syncing_color_picker_editor: false,
             invalid_edits: Vec::new(),
             invalid_remote_edits: Vec::new(),
             action_menu: None,
@@ -441,6 +453,9 @@ impl SettingsView {
             editor
         });
         let subscription = cx.subscribe(&entity, move |this, editor, _: &ComposerChanged, cx| {
+            if this.syncing_color_picker_editor {
+                return;
+            }
             let value = editor.read(cx).text();
             match target {
                 EditorTarget::Search => {
@@ -502,6 +517,7 @@ impl SettingsView {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
+        let color_panel_was_hidden = self.color_picker.is_none();
         self.action_menu = None;
         self.focused = target;
         match target {
@@ -592,7 +608,30 @@ impl SettingsView {
                 window.focus(&self.focus, cx);
             }
         }
+        self.reconcile_color_picker_with_focus();
+        if color_panel_was_hidden
+            && let SettingsFocus::Row(row @ RowRef::Theme(_)) = target
+            && let Some(index) = self
+                .visible_rows()
+                .iter()
+                .position(|candidate| *candidate == row)
+        {
+            self.scroll
+                .scroll_to_item(index, gpui::ScrollStrategy::Nearest);
+        }
         cx.notify();
+    }
+
+    fn reconcile_color_picker_with_focus(&mut self) {
+        let selected_role = match self.focused {
+            SettingsFocus::Row(RowRef::Theme(role)) => Some(role),
+            _ => None,
+        };
+        if self.color_picker.as_ref().map(|picker| picker.role) == selected_role {
+            return;
+        }
+        self.color_picker =
+            selected_role.map(|role| ColorPicker::new(role, self.draft.theme.color(role)));
     }
 
     fn move_focus(
@@ -651,6 +690,7 @@ impl SettingsView {
             }
             _ => {}
         }
+        self.reconcile_color_picker_with_focus();
         cx.notify();
     }
 
@@ -807,6 +847,7 @@ impl SettingsView {
         let focus = search.focus_handle(cx);
         self.focused = SettingsFocus::RemoteRow(field);
         self.editor = None;
+        self.color_picker = None;
         self.choice_picker = Some(ChoicePicker {
             field,
             query: String::new(),
@@ -1014,6 +1055,12 @@ impl SettingsView {
         match result {
             Ok(changed) => {
                 self.clear_invalid_edit(row);
+                if let RowRef::Theme(role) = row
+                    && let Some(picker) = &mut self.color_picker
+                    && picker.role == role
+                {
+                    picker.hsva = Hsva::from_rgba8(self.draft.theme.color(role));
+                }
                 if changed
                     && matches!(
                         row,
@@ -1024,6 +1071,151 @@ impl SettingsView {
                 }
             }
             Err(error) => self.set_invalid_edit(row, text, error),
+        }
+        cx.notify();
+    }
+
+    fn open_color_picker(
+        &mut self,
+        role: ThemeRole,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.saving {
+            return;
+        }
+        self.choice_picker = None;
+        self.focus_target(SettingsFocus::Row(RowRef::Theme(role)), false, window, cx);
+    }
+
+    fn sync_color_picker_editor(&mut self, role: ThemeRole, color: Rgba8, cx: &mut Context<Self>) {
+        let entity = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.target == EditorTarget::Row(RowRef::Theme(role)))
+            .map(|editor| editor.entity.clone());
+        if let Some(entity) = entity {
+            self.syncing_color_picker_editor = true;
+            entity.update(cx, |editor, cx| editor.set_value(color.to_string(), cx));
+            self.syncing_color_picker_editor = false;
+        }
+    }
+
+    fn update_color_picker_pointer(
+        &mut self,
+        target: DragTarget,
+        position: gpui::Point<gpui::Pixels>,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = &mut self.color_picker else {
+            return;
+        };
+        if !picker.update_from_pointer(target, position) && !force {
+            cx.notify();
+            return;
+        }
+        let role = picker.role;
+        let color = picker.hsva.to_rgba8();
+        let changed = self.draft.theme.color(role) != color;
+        self.draft.theme.set_color(role, color);
+        self.clear_invalid_edit(RowRef::Theme(role));
+        self.sync_color_picker_editor(role, color, cx);
+        if changed {
+            self.preview(cx);
+        }
+        cx.notify();
+    }
+
+    fn begin_color_picker_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .color_picker
+            .as_ref()
+            .and_then(|picker| picker.target_at(event.position))
+        else {
+            return;
+        };
+        let mut promoted = false;
+        if let Some(picker) = &mut self.color_picker {
+            picker.drag_target = Some(target);
+            if target == DragTarget::Hue {
+                if picker.hsva.saturation <= 0.001 {
+                    picker.hsva.saturation = 1.0;
+                    promoted = true;
+                }
+                if picker.hsva.value <= 0.001 {
+                    picker.hsva.value = 1.0;
+                    promoted = true;
+                }
+            }
+        }
+        self.update_color_picker_pointer(target, event.position, promoted, cx);
+    }
+
+    fn drag_color_picker(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .color_picker
+            .as_ref()
+            .and_then(|picker| picker.drag_target)
+        else {
+            return;
+        };
+        if !event.dragging() {
+            if let Some(picker) = &mut self.color_picker {
+                picker.drag_target = None;
+            }
+            return;
+        }
+        self.update_color_picker_pointer(target, event.position, false, cx);
+    }
+
+    fn finish_color_picker_drag(&mut self) {
+        if let Some(picker) = &mut self.color_picker {
+            picker.drag_target = None;
+        }
+    }
+
+    fn apply_color_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some(role) = self.color_picker.as_ref().map(|picker| picker.role) else {
+            return;
+        };
+        if self.invalid_edit(RowRef::Theme(role)).is_some() {
+            self.status_message = Some("Enter a valid hex color before applying.".into());
+            cx.notify();
+            return;
+        }
+        if let Some(picker) = &mut self.color_picker {
+            picker.original = self.draft.theme.color(role);
+            picker.hsva = Hsva::from_rgba8(picker.original);
+            picker.drag_target = None;
+        }
+        if let Some(editor) = &self.editor {
+            window.focus(&editor.entity.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_color_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some((role, original)) = self
+            .color_picker
+            .as_ref()
+            .map(|picker| (picker.role, picker.original))
+        else {
+            return;
+        };
+        let changed = self.draft.theme.color(role) != original;
+        self.draft.theme.set_color(role, original);
+        self.clear_invalid_edit(RowRef::Theme(role));
+        if let Some(picker) = &mut self.color_picker {
+            picker.hsva = Hsva::from_rgba8(original);
+            picker.drag_target = None;
+        }
+        self.sync_color_picker_editor(role, original, cx);
+        if changed {
+            self.preview(cx);
+        }
+        if let Some(editor) = &self.editor {
+            window.focus(&editor.entity.focus_handle(cx), cx);
         }
         cx.notify();
     }
@@ -2119,7 +2311,13 @@ impl SettingsView {
     }
 
     fn row_actions(&self, row: RowRef) -> Vec<(SharedString, RowAction)> {
-        let mut actions = vec![("Reset".into(), RowAction::Reset)];
+        let mut actions = match row {
+            RowRef::Theme(role) => vec![
+                ("Pick color".into(), RowAction::PickColor(role)),
+                ("Reset".into(), RowAction::Reset),
+            ],
+            _ => vec![("Reset".into(), RowAction::Reset)],
+        };
         match row {
             RowRef::Binding(scope, command) => actions.push((
                 if self.recording == Some((scope, command)) {
@@ -2155,12 +2353,19 @@ impl SettingsView {
         actions
     }
 
-    fn run_row_action(&mut self, row: RowRef, index: usize, cx: &mut Context<Self>) {
+    fn run_row_action(
+        &mut self,
+        row: RowRef,
+        index: usize,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((_, action)) = self.row_actions(row).get(index).cloned() else {
             return;
         };
         match action {
             RowAction::Reset => self.reset_row(row, cx),
+            RowAction::PickColor(role) => self.open_color_picker(role, window, cx),
             RowAction::Record(scope, command) => self.start_recording(scope, command, cx),
             RowAction::Font(role, family) => self.choose_font(role, family, cx),
         }
@@ -2248,7 +2453,7 @@ impl SettingsView {
                     self.action_menu = Some((row, (selected + count - 1) % count));
                     cx.notify();
                 }
-                "enter" => self.run_row_action(row, selected, cx),
+                "enter" => self.run_row_action(row, selected, window, cx),
                 _ => return,
             }
             window.prevent_default();
@@ -2398,8 +2603,9 @@ impl SettingsView {
                     index == selected,
                     &palette,
                 )
-                .on_click(move |_, _, cx| {
-                    let _ = action_view.update(cx, |this, cx| this.run_row_action(row, index, cx));
+                .on_click(move |_, window, cx| {
+                    let _ = action_view
+                        .update(cx, |this, cx| this.run_row_action(row, index, window, cx));
                 }),
             );
         }
@@ -2780,6 +2986,12 @@ impl Render for SettingsView {
                 &palette,
             ))
         });
+        let color_picker = self.color_picker.as_ref().and_then(|picker| {
+            if self.focused != SettingsFocus::Row(RowRef::Theme(picker.role)) {
+                return None;
+            }
+            Some(render_color_picker(picker, view.clone(), &palette))
+        });
         window.set_rem_size(px(AppliedSettings::get(cx).fonts.interface_size));
         div()
             .id("settings")
@@ -2865,6 +3077,7 @@ impl Render for SettingsView {
                                 .child(list),
                         ),
                     )
+                    .when_some(color_picker, |modal, picker| modal.child(picker))
                     .child(
                         div()
                             .h(px(58.))
@@ -3019,6 +3232,7 @@ fn render_row(
     let reset_view = view.clone();
     let select_view = view.clone();
     let choice_view = view.clone();
+    let color_view = view.clone();
     let diagnostic_color = match row {
         RowRef::Diagnostic(index)
             if diagnostics
@@ -3098,17 +3312,24 @@ fn render_row(
         })
         .when_some(
             match row {
-                RowRef::Theme(role) => Some(draft.theme.color(role).packed()),
+                RowRef::Theme(role) => Some((role, draft.theme.color(role).packed())),
                 _ => None,
             },
-            |row, color| {
+            |row, (role, color)| {
                 row.child(
                     div()
+                        .id(("settings-color-swatch", role as usize))
                         .size(px(30.))
                         .flex_none()
                         .border_1()
                         .border_color(palette.color(ThemeRole::BorderFocus))
-                        .bg(rgba(color)),
+                        .bg(rgba(color))
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| {
+                            let _ = color_view
+                                .update(cx, |this, cx| this.open_color_picker(role, window, cx));
+                            cx.stop_propagation();
+                        }),
                 )
             },
         )
@@ -3350,6 +3571,274 @@ fn render_remote_row(
             .on_click(move |_, _, cx| {
                 let _ = reset_view.update(cx, |this, cx| this.reset_remote_field(field, cx));
             }),
+        )
+        .into_any_element()
+}
+
+fn render_color_picker(
+    picker: &ColorPicker,
+    view: WeakEntity<SettingsView>,
+    palette: &ThemePalette,
+) -> AnyElement {
+    const WHEEL_SIZE: f32 = 210.0;
+
+    let role = picker.role;
+    let hsva = picker.hsva;
+    let current = hsva.to_rgba8();
+    let original = picker.original;
+    let opaque_packed = (current.packed() & 0xffff_ff00) | 0xff;
+    let transparent_packed = current.packed() & 0xffff_ff00;
+    let wheel_bounds = picker.wheel_bounds.clone();
+    let alpha_bounds = picker.alpha_bounds.clone();
+
+    let wheel_view = view.clone();
+    let alpha_view = view.clone();
+    let move_view = view.clone();
+    let up_view = view.clone();
+    let out_view = view.clone();
+    let cancel_view = view.clone();
+    let apply_view = view.clone();
+
+    let wheel = div()
+        .id(("settings-hsv-color-wheel", role as usize))
+        .relative()
+        .size(px(WHEEL_SIZE))
+        .flex_none()
+        .cursor(gpui::CursorStyle::Crosshair)
+        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            let _ = wheel_view.update(cx, |this, cx| {
+                this.begin_color_picker_drag(event, cx);
+            });
+            cx.stop_propagation();
+        })
+        .child(
+            canvas(
+                move |bounds, _, _| wheel_bounds.set(Some(bounds)),
+                move |bounds, _, window, _| {
+                    window.paint_hsv_color_wheel(bounds, hsva.hue, hsva.saturation, hsva.value);
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
+
+    let alpha = div()
+        .id(("settings-color-alpha", role as usize))
+        .relative()
+        .w_full()
+        .h(px(24.0))
+        .flex_none()
+        .overflow_hidden()
+        .cursor(gpui::CursorStyle::ResizeLeftRight)
+        .bg(palette.color(ThemeRole::ControlSurface))
+        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            let _ = alpha_view.update(cx, |this, cx| {
+                this.begin_color_picker_drag(event, cx);
+            });
+            cx.stop_propagation();
+        })
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(checkerboard(rgba(0xffffff30), 8.0)),
+        )
+        .child(div().absolute().inset_0().bg(linear_gradient(
+            90.0,
+            linear_color_stop(rgba(transparent_packed), 0.0),
+            linear_color_stop(rgba(opaque_packed), 1.0),
+        )))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(gpui::relative(hsva.alpha))
+                .ml(px(-3.0))
+                .w(px(6.0))
+                .border_1()
+                .border_color(rgba(0xffffffff))
+                .bg(rgba(0x11111180)),
+        )
+        .child(
+            canvas(
+                move |bounds, _, _| alpha_bounds.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        );
+
+    let swatch = |id: &'static str, color: Rgba8| {
+        div()
+            .id((id, role as usize))
+            .size(px(42.0))
+            .relative()
+            .overflow_hidden()
+            .border_1()
+            .border_color(palette.color(ThemeRole::BorderStrong))
+            .bg(palette.color(ThemeRole::ControlSurface))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(checkerboard(rgba(0xffffff30), 7.0)),
+            )
+            .child(div().absolute().inset_0().bg(rgba(color.packed())))
+    };
+
+    div()
+        .id("settings-color-picker-panel")
+        .h(px(258.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_5()
+        .px_5()
+        .py_4()
+        .overflow_hidden()
+        .border_t_1()
+        .border_color(palette.color(ThemeRole::BorderStrong))
+        .bg(palette.color(ThemeRole::Toolbar))
+        .shadow_lg()
+        .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+            let _ = move_view.update(cx, |this, cx| this.drag_color_picker(event, cx));
+        })
+        .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
+            let _ = up_view.update(cx, |this, _| this.finish_color_picker_drag());
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_: &MouseUpEvent, _, cx| {
+            let _ = out_view.update(cx, |this, _| this.finish_color_picker_drag());
+        })
+        .child(
+            div()
+                .w(px(180.0))
+                .h_full()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(palette.color(ThemeRole::TextDim))
+                        .child("COLOR EDITOR"),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .child(label(RowRef::Theme(role))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .text_color(palette.color(ThemeRole::TextMuted))
+                        .child(path(RowRef::Theme(role))),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(swatch("settings-color-original", original))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(palette.color(ThemeRole::TextDim))
+                                        .child("Original"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(swatch("settings-color-current", current))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(palette.color(ThemeRole::TextDim))
+                                        .child("Current"),
+                                ),
+                        ),
+                ),
+        )
+        .child(wheel)
+        .child(
+            div()
+                .h_full()
+                .w(px(1.0))
+                .flex_none()
+                .bg(palette.color(ThemeRole::BorderStrong)),
+        )
+        .child(
+            div()
+                .h_full()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Opacity"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(palette.color(ThemeRole::TextMuted))
+                                .child(format!("{:.0}%", hsva.alpha * 100.0)),
+                        ),
+                )
+                .child(alpha)
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .truncate()
+                                .text_color(palette.color(ThemeRole::TextDim))
+                                .child("Drag to preview · Apply keeps · Cancel restores"),
+                        )
+                        .child(
+                            setting_button("cancel-color-picker", "Cancel", false, palette)
+                                .on_click(move |_, window, cx| {
+                                    let _ = cancel_view.update(cx, |this, cx| {
+                                        this.cancel_color_picker(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            setting_button("apply-color-picker", "Apply", true, palette).on_click(
+                                move |_, window, cx| {
+                                    let _ = apply_view.update(cx, |this, cx| {
+                                        this.apply_color_picker(window, cx);
+                                    });
+                                },
+                            ),
+                        ),
+                ),
         )
         .into_any_element()
 }
@@ -4375,6 +4864,86 @@ mod tests {
                     Some(&wire_settings::SettingsValue::Float(80.0))
                 );
             });
+        });
+    }
+
+    #[gpui::test]
+    fn color_picker_cancel_restores_and_apply_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+        let _ = create_settings(cx);
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let settings = SettingsView::new(local_rpc::appearance::AppearanceSessionId(2), cx);
+            window.focus(&settings.focus, cx);
+            settings
+        });
+        let role = ThemeRole::Window;
+
+        settings.update_in(cx, |settings, window, cx| {
+            let original = settings.draft.theme.color(role);
+            assert_eq!(
+                settings.color_picker.as_ref().map(|picker| picker.role),
+                Some(role)
+            );
+            settings.focus_target(SettingsFocus::Search, false, window, cx);
+            assert!(settings.color_picker.is_none());
+            settings.open_color_picker(role, window, cx);
+            assert_eq!(settings.focused, SettingsFocus::Row(RowRef::Theme(role)));
+            let selected_index = settings
+                .visible_rows()
+                .iter()
+                .position(|row| *row == RowRef::Theme(role))
+                .unwrap();
+            let deferred_scroll = settings.scroll.0.borrow().deferred_scroll_to_item.unwrap();
+            assert_eq!(deferred_scroll.item_index, selected_index);
+            assert_eq!(deferred_scroll.strategy, gpui::ScrollStrategy::Nearest);
+            settings
+                .color_picker
+                .as_ref()
+                .unwrap()
+                .wheel_bounds
+                .set(Some(gpui::bounds(
+                    gpui::point(px(0.0), px(0.0)),
+                    gpui::size(px(200.0), px(200.0)),
+                )));
+            settings.begin_color_picker_drag(
+                &MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: gpui::point(px(20.0), px(100.0)),
+                    ..Default::default()
+                },
+                cx,
+            );
+            let picker = settings.color_picker.as_ref().unwrap();
+            assert_eq!(picker.hsva.saturation, 1.0);
+            assert_eq!(picker.hsva.value, 1.0);
+            assert_eq!(settings.draft.theme.color(role), Rgba8::rgb(255, 0, 0));
+
+            let changed = Rgba8::rgba(0x12, 0x34, 0x56, 0x80);
+            settings.draft.theme.set_color(role, changed);
+            settings.color_picker.as_mut().unwrap().hsva = Hsva::from_rgba8(changed);
+            settings.cancel_color_picker(window, cx);
+            assert_eq!(settings.draft.theme.color(role), original);
+            assert!(settings.color_picker.is_some());
+
+            settings.apply_editor_text("#abcdef80", cx);
+            let picker = settings.color_picker.as_ref().unwrap();
+            assert_eq!(picker.hsva.to_rgba8(), Rgba8::rgba(0xab, 0xcd, 0xef, 0x80));
+            settings.apply_color_picker(window, cx);
+            assert_eq!(
+                settings.draft.theme.color(role),
+                Rgba8::rgba(0xab, 0xcd, 0xef, 0x80)
+            );
+            assert_eq!(
+                settings.color_picker.as_ref().unwrap().original,
+                Rgba8::rgba(0xab, 0xcd, 0xef, 0x80)
+            );
+
+            settings.apply_editor_text("not-a-color", cx);
+            settings.apply_color_picker(window, cx);
+            assert!(settings.color_picker.is_some());
+            assert!(settings.invalid_edit(RowRef::Theme(role)).is_some());
+            settings.cancel_color_picker(window, cx);
+            settings.focus_target(SettingsFocus::Search, false, window, cx);
+            assert!(settings.color_picker.is_none());
         });
     }
 }

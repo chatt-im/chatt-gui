@@ -46,6 +46,7 @@ pub struct Scene {
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
+    pub hsv_color_wheels: Vec<HsvColorWheel>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
@@ -62,6 +63,7 @@ impl Scene {
         self.shadows.clear();
         self.quads.clear();
         self.underlines.clear();
+        self.hsv_color_wheels.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
@@ -117,6 +119,10 @@ impl Scene {
                 underline.order = order;
                 self.underlines.push(*underline);
             }
+            Primitive::HsvColorWheel(wheel) => {
+                wheel.order = order;
+                self.hsv_color_wheels.push(*wheel);
+            }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
                 self.monochrome_sprites.push(*sprite);
@@ -153,6 +159,7 @@ impl Scene {
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
+        self.hsv_color_wheels.sort_by_key(|wheel| wheel.order);
         self.monochrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.subpixel_sprites
@@ -179,6 +186,8 @@ impl Scene {
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
             underlines_iter: self.underlines.iter().peekable(),
+            hsv_color_wheels_start: 0,
+            hsv_color_wheels_iter: self.hsv_color_wheels.iter().peekable(),
             monochrome_sprites_start: 0,
             monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
             subpixel_sprites_start: 0,
@@ -205,6 +214,7 @@ pub(crate) enum PrimitiveKind {
     Quad,
     Path,
     Underline,
+    HsvColorWheel,
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
@@ -224,6 +234,7 @@ pub enum Primitive {
     Quad(Quad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
+    HsvColorWheel(HsvColorWheel),
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
@@ -238,6 +249,7 @@ impl Primitive {
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
+            Primitive::HsvColorWheel(wheel) => &wheel.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
@@ -251,6 +263,7 @@ impl Primitive {
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
+            Primitive::HsvColorWheel(wheel) => &wheel.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
@@ -275,6 +288,8 @@ struct BatchIterator<'a> {
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
+    hsv_color_wheels_start: usize,
+    hsv_color_wheels_iter: Peekable<slice::Iter<'a, HsvColorWheel>>,
     monochrome_sprites_start: usize,
     monochrome_sprites_iter: Peekable<slice::Iter<'a, MonochromeSprite>>,
     subpixel_sprites_start: usize,
@@ -299,6 +314,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.underlines_iter.peek().map(|u| u.order),
                 PrimitiveKind::Underline,
+            ),
+            (
+                self.hsv_color_wheels_iter.peek().map(|wheel| wheel.order),
+                PrimitiveKind::HsvColorWheel,
             ),
             (
                 self.monochrome_sprites_iter.peek().map(|s| s.order),
@@ -383,6 +402,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.underlines_start = underlines_end;
                 Some(PrimitiveBatch::Underlines(underlines_start..underlines_end))
+            }
+            PrimitiveKind::HsvColorWheel => {
+                let wheels_start = self.hsv_color_wheels_start;
+                let mut wheels_end = wheels_start + 1;
+                self.hsv_color_wheels_iter.next();
+                while self
+                    .hsv_color_wheels_iter
+                    .next_if(|wheel| (wheel.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    wheels_end += 1;
+                }
+                self.hsv_color_wheels_start = wheels_end;
+                Some(PrimitiveBatch::HsvColorWheels(wheels_start..wheels_end))
             }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -479,6 +512,7 @@ pub enum PrimitiveBatch {
     Quads(Range<usize>),
     Paths(Range<usize>),
     Underlines(Range<usize>),
+    HsvColorWheels(Range<usize>),
     MonochromeSprites {
         texture_id: AtlasTextureId,
         range: Range<usize>,
@@ -531,6 +565,58 @@ pub struct Underline {
 impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
+    }
+}
+
+/// Normalized geometry used by the HSV color-wheel shader.
+///
+/// Coordinates are measured from the center of the shortest side, where the
+/// edge of that side has radius `1.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HsvColorWheelGeometry {
+    /// Outer radius of the hue ring.
+    pub ring_outer_radius: f32,
+    /// Inner radius of the hue ring.
+    pub ring_inner_radius: f32,
+    /// Circumradius of the saturation/value triangle.
+    pub triangle_radius: f32,
+}
+
+/// Geometry shared by color-wheel painting and pointer hit testing.
+pub const HSV_COLOR_WHEEL_GEOMETRY: HsvColorWheelGeometry = HsvColorWheelGeometry {
+    ring_outer_radius: 0.9,
+    ring_inner_radius: 0.72,
+    triangle_radius: 0.62,
+};
+
+/// One shader-rendered HSV hue ring and saturation/value triangle.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct HsvColorWheel {
+    pub order: DrawOrder,
+    pub pad: u32,
+    /// Device-pixel bounds of the primitive.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Device-pixel clipping mask.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Selected hue in `0.0..=1.0`.
+    pub hue: f32,
+    /// Selected saturation in `0.0..=1.0`.
+    pub saturation: f32,
+    /// Selected value in `0.0..=1.0`.
+    pub value: f32,
+    /// Opacity inherited from the containing element.
+    pub opacity: f32,
+    pub ring_outer_radius: f32,
+    pub ring_inner_radius: f32,
+    pub triangle_radius: f32,
+    pub geometry_pad: f32,
+}
+
+impl From<HsvColorWheel> for Primitive {
+    fn from(wheel: HsvColorWheel) -> Self {
+        Primitive::HsvColorWheel(wheel)
     }
 }
 

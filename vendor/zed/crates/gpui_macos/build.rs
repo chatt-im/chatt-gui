@@ -51,6 +51,8 @@ mod macos_build {
             "ShadowInputIndex".into(),
             "Shadow".into(),
             "QuadInputIndex".into(),
+            "HsvColorWheel".into(),
+            "HsvColorWheelInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),
             "Quad".into(),

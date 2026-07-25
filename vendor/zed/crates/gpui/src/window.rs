@@ -6,8 +6,9 @@ use crate::{
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    HSV_COLOR_WHEEL_GEOMETRY, Hsla, HsvColorWheel, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
@@ -3849,6 +3850,37 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+        });
+    }
+
+    /// Paints an HSV hue ring and saturation/value triangle with its current
+    /// selection indicators.
+    ///
+    /// This uses a dedicated scene primitive and renderer pipeline, so it does
+    /// not add work or branching to ordinary quad rendering.
+    pub fn paint_hsv_color_wheel(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        hue: f32,
+        saturation: f32,
+        value: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let geometry = HSV_COLOR_WHEEL_GEOMETRY;
+        self.next_frame.scene.insert_primitive(HsvColorWheel {
+            order: 0,
+            pad: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            hue: hue.rem_euclid(1.0),
+            saturation: saturation.clamp(0.0, 1.0),
+            value: value.clamp(0.0, 1.0),
+            opacity: self.element_opacity(),
+            ring_outer_radius: geometry.ring_outer_radius,
+            ring_inner_radius: geometry.ring_inner_radius,
+            triangle_radius: geometry.triangle_radius,
+            geometry_pad: 0.0,
         });
     }
 
