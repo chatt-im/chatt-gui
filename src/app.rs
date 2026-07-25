@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::{
+    appearance::{AppearanceConfig, AppearanceSync},
     code_viewer::{
         CodeDocument, CodeSearchResults, CodeSelection, CodeViewState, MAX_CODE_PREVIEW_BYTES,
         render_code_document,
@@ -42,7 +43,7 @@ use crate::{
         ImageViewState, PreviewContent, PreviewHistory, PreviewItem, clamp_panel_width,
     },
     scroll_capture::capture_scroll,
-    settings::{SettingsView, SettingsViewEvent},
+    settings::{ConfigurationState, SettingsView, SettingsViewEvent},
     theme::{AppliedSettings, ThemePalette, ThemeRole},
     timeline::{self, Attachment},
     ui_controls::{
@@ -651,6 +652,9 @@ pub struct ChattView {
     settings_subscription: Option<Subscription>,
     settings_remote_session: Option<local_rpc::settings::SettingsSessionId>,
     settings_close_when_opened: bool,
+    appearance_sync: AppearanceSync,
+    next_appearance_session: u32,
+    appearance_reload_task: Option<Task<()>>,
     _code_search_subscription: Subscription,
     _composer_image_paste_subscription: Subscription,
     _composer_state_subscription: Subscription,
@@ -859,6 +863,9 @@ impl ChattView {
             settings_subscription: None,
             settings_remote_session: None,
             settings_close_when_opened: false,
+            appearance_sync: AppearanceSync::new(),
+            next_appearance_session: 1,
+            appearance_reload_task: None,
             _code_search_subscription: code_search_subscription,
             _composer_image_paste_subscription: composer_image_paste_subscription,
             _composer_state_subscription: composer_state_subscription,
@@ -875,6 +882,14 @@ impl ChattView {
         RequestId(id)
     }
 
+    fn appearance_session_id(&mut self) -> local_rpc::appearance::AppearanceSessionId {
+        let serial = self.next_appearance_session.max(1);
+        self.next_appearance_session = serial.wrapping_add(1).max(1);
+        local_rpc::appearance::AppearanceSessionId(
+            (u64::from(std::process::id()) << 32) | u64::from(serial),
+        )
+    }
+
     fn set_composer_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
         log::warn!("composer action failed: {message}");
@@ -889,7 +904,8 @@ impl ChattView {
             return;
         }
         self.settings_close_when_opened = false;
-        let settings = cx.new(SettingsView::new);
+        let appearance_session = self.appearance_session_id();
+        let settings = cx.new(move |cx| SettingsView::new(appearance_session, cx));
         let subscription =
             cx.subscribe(
                 &settings,
@@ -909,6 +925,21 @@ impl ChattView {
                     }
                     SettingsViewEvent::Command(command) => {
                         this.send_settings_command(command.clone(), cx);
+                    }
+                    SettingsViewEvent::LocalAppearancePreview {
+                        session_id,
+                        appearance,
+                    } => {
+                        let loaded = cx.global::<ConfigurationState>().0.clone();
+                        this.appearance_sync.local_preview(
+                            *session_id,
+                            appearance.clone(),
+                            &loaded,
+                            cx,
+                        );
+                    }
+                    SettingsViewEvent::AppearanceCommand(command) => {
+                        this.send_appearance_command(command.clone(), cx);
                     }
                 },
             );
@@ -934,6 +965,78 @@ impl ChattView {
                 settings.remote_command_failed(&error, cx)
             });
         }
+    }
+
+    fn send_appearance_command(
+        &mut self,
+        command: local_rpc::appearance::AppearanceCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let loaded = cx.global::<ConfigurationState>().0.clone();
+        match &command {
+            local_rpc::appearance::AppearanceCommand::Commit {
+                session_id,
+                document,
+                ..
+            } => match AppearanceConfig::from_document(document) {
+                Ok(appearance) => {
+                    self.appearance_sync
+                        .local_commit(*session_id, appearance, &loaded, cx);
+                }
+                Err(error) => {
+                    self.status = format!("Could not apply saved appearance · {error}").into();
+                    cx.notify();
+                    return;
+                }
+            },
+            local_rpc::appearance::AppearanceCommand::End { session_id } => {
+                self.appearance_sync.end_local(*session_id, &loaded, cx);
+            }
+            local_rpc::appearance::AppearanceCommand::Preview { .. } => {}
+        }
+        let request_id = self.request_id();
+        if let Err(error) = self.daemon.send(ClientFrame::Appearance {
+            request_id,
+            command,
+        }) {
+            self.status = format!("Appearance preview is local only · {error}").into();
+            cx.notify();
+        }
+    }
+
+    fn reconcile_committed_appearance(
+        &mut self,
+        appearance: AppearanceConfig,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = cx.global::<ConfigurationState>().0.path.clone() else {
+            return;
+        };
+        let executor = cx.background_executor().clone();
+        self.appearance_reload_task = Some(cx.spawn(async move |this, cx| {
+            let loaded = executor
+                .spawn(async move { crate::config::io::load_path(path) })
+                .await;
+            if !matches!(
+                loaded.status,
+                crate::config::io::SourceStatus::Loaded | crate::config::io::SourceStatus::Missing
+            ) || AppearanceConfig::from_gui(&loaded.config) != appearance
+            {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.appearance_reload_task.take();
+                if let Some(settings) = &this.settings {
+                    if let Err(error) = settings.update(cx, |settings, cx| {
+                        settings.install_external_loaded_if_clean(loaded, cx)
+                    }) {
+                        log::warn!("could not reconcile shared gui.toml: {error}");
+                    }
+                } else if let Err(error) = crate::settings::install_external_loaded(loaded, cx) {
+                    log::warn!("could not reconcile shared gui.toml: {error}");
+                }
+            });
+        }));
     }
 
     fn completion_view(&self, cx: &Context<Self>) -> Option<CompletionView> {
@@ -1952,6 +2055,8 @@ impl ChattView {
             }
             DaemonEvent::Disconnected(reason) => {
                 log::error!("daemon disconnected: {reason}");
+                let loaded = cx.global::<ConfigurationState>().0.clone();
+                self.appearance_sync.disconnected(&loaded, cx);
                 self.clear_command_surface(cx);
                 let submission_outcome_unknown = self.abandon_disconnected_submission(cx);
                 self.media_cache
@@ -1994,6 +2099,8 @@ impl ChattView {
             }
             DaemonEvent::Incompatible(details) => {
                 log::error!("daemon connection is incompatible: {details}");
+                let loaded = cx.global::<ConfigurationState>().0.clone();
+                self.appearance_sync.disconnected(&loaded, cx);
                 self.clear_command_surface(cx);
                 let submission_outcome_unknown = self.abandon_disconnected_submission(cx);
                 self.model.phase = ConnectionPhase::Incompatible {
@@ -2237,6 +2344,52 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         match frame {
+            DaemonFrame::Appearance(event) => {
+                let loaded = cx.global::<ConfigurationState>().0.clone();
+                let (settings_update, reconcile) = match &event {
+                    local_rpc::appearance::AppearanceEvent::Preview { session_id, .. } => {
+                        (Some((Some(*session_id), None)), None)
+                    }
+                    local_rpc::appearance::AppearanceEvent::Committed { document, .. } => {
+                        match AppearanceConfig::from_document(document) {
+                            Ok(appearance) => (
+                                Some((None, Some(Some(appearance.clone())))),
+                                Some(appearance),
+                            ),
+                            Err(error) => {
+                                log::warn!("ignored invalid shared appearance: {error}");
+                                self.status =
+                                    format!("Ignored invalid shared appearance · {error}").into();
+                                cx.notify();
+                                return;
+                            }
+                        }
+                    }
+                    local_rpc::appearance::AppearanceEvent::Cleared { .. } => {
+                        (Some((None, Some(None))), None)
+                    }
+                };
+                if let Err(error) = self.appearance_sync.apply_event(event, &loaded, cx) {
+                    log::warn!("ignored invalid shared appearance: {error}");
+                    self.status = format!("Ignored invalid shared appearance · {error}").into();
+                    cx.notify();
+                } else if let (Some(settings), Some((preview, committed))) =
+                    (&self.settings, settings_update)
+                {
+                    settings.update(cx, |settings, cx| {
+                        if let Some(session_id) = preview {
+                            settings.shared_preview_changed(session_id, cx);
+                        }
+                        if let Some(appearance) = committed {
+                            settings.shared_committed_appearance_changed(appearance.as_ref(), cx);
+                        }
+                    });
+                }
+                if let Some(appearance) = reconcile {
+                    self.reconcile_committed_appearance(appearance, cx);
+                }
+                return;
+            }
             DaemonFrame::SettingsResult(result) => {
                 let opened = match &result.payload {
                     local_rpc::settings::SettingsResultPayload::Document(document)
@@ -2278,8 +2431,12 @@ impl ChattView {
                 return;
             }
             DaemonFrame::Welcome(_) => {
+                self.appearance_sync.daemon_reconnected();
                 if let Some(settings) = &self.settings {
-                    settings.update(cx, |settings, cx| settings.remote_reconnected(cx));
+                    settings.update(cx, |settings, cx| {
+                        settings.remote_reconnected(cx);
+                        settings.republish_appearance(cx);
+                    });
                 }
             }
             _ => {}
@@ -7564,13 +7721,7 @@ impl ChattView {
                         .text_color(applied.theme.color(ThemeRole::ParticipantIdentityText))
                         .child(identity.chars().next().unwrap_or('?').to_string()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .child(identity),
-                )
+                .child(div().flex_1().min_w_0().text_sm().child(identity))
                 .child(mini_button("open-servers", "⇄", &applied.theme).on_click(
                     cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
                 ))

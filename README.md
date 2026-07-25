@@ -83,6 +83,13 @@ bindings take effect after a successful save. A missing file is normal and is
 only created on Save. Invalid or externally changed files are not overwritten
 without an explicit Replace or reload confirmation.
 
+Every valid appearance or typography edit is also relayed immediately through
+the Chatt daemon to all connected GUI instances. The most recently received
+edit controls the live preview. Cancel restores the last committed appearance,
+while Save persists `gui.toml` and makes that appearance the daemon-session
+baseline. A GUI that is offline continues to preview locally and rejoins live
+sharing when it reconnects.
+
 Files use schema version 1, kebab-case setting names, hex colors (`#rgb`,
 `#rgba`, `#rrggbb`, or `#rrggbbaa`), and GPUI key syntax. Partial files inherit
 built-in defaults. Binding tables map sequences to commands; assigning

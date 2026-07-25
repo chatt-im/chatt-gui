@@ -10,6 +10,7 @@ use gpui::{
 };
 
 use crate::{
+    appearance::{AppearanceConfig, SharedCommittedAppearance},
     composer::{ComposerChanged, Mode, TextEditor},
     config::{
         io::{self, LoadedConfig, SaveError, SourceStatus},
@@ -35,9 +36,42 @@ pub(crate) fn install_loaded(loaded: LoadedConfig, cx: &mut App) {
     cx.set_global(ConfigurationState(loaded));
 }
 
+pub(crate) fn install_external_loaded(
+    mut loaded: LoadedConfig,
+    cx: &mut App,
+) -> Result<LoadedConfig, String> {
+    if !matches!(loaded.status, SourceStatus::Loaded | SourceStatus::Missing) {
+        return Err("external gui.toml is not valid".into());
+    }
+    let available_families = cx.text_system().all_font_names();
+    let mut diagnostics = loaded.diagnostics.clone();
+    diagnostics.extend(key_bindings::validate(&loaded.config));
+    diagnostics.extend(theme::font_warnings(&loaded.config, &available_families));
+    if has_errors(&diagnostics) {
+        return Err("external gui.toml contains invalid settings".into());
+    }
+    let bindings = key_bindings::compile(&loaded.config, cx)?;
+    key_bindings::apply_compiled(bindings, cx);
+    theme::apply_appearance(
+        &loaded.config,
+        loaded.status,
+        &diagnostics,
+        &available_families,
+        cx,
+    );
+    loaded.diagnostics = diagnostics;
+    cx.set_global(ConfigurationState(loaded.clone()));
+    Ok(loaded)
+}
+
 pub(crate) enum SettingsViewEvent {
     Closed,
     Command(wire_settings::SettingsCommand),
+    LocalAppearancePreview {
+        session_id: local_rpc::appearance::AppearanceSessionId,
+        appearance: AppearanceConfig,
+    },
+    AppearanceCommand(local_rpc::appearance::AppearanceCommand),
 }
 
 struct PendingSave {
@@ -147,13 +181,24 @@ pub(crate) struct SettingsView {
     key_interceptor: Option<Subscription>,
     scroll: UniformListScrollHandle,
     _save_task: Option<Task<()>>,
+    appearance_session: local_rpc::appearance::AppearanceSessionId,
+    appearance_mutation_seq: u64,
 }
 
 impl EventEmitter<SettingsViewEvent> for SettingsView {}
 
 impl SettingsView {
-    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
-        let loaded = cx.global::<ConfigurationState>().0.clone();
+    pub(crate) fn new(
+        appearance_session: local_rpc::appearance::AppearanceSessionId,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut loaded = cx.global::<ConfigurationState>().0.clone();
+        if let Some(appearance) = cx
+            .try_global::<SharedCommittedAppearance>()
+            .and_then(|shared| shared.0.as_ref())
+        {
+            appearance.merge_into(&mut loaded.config);
+        }
         let committed = AppliedSettings::get(cx);
         let mut system_families = cx.text_system().all_font_names();
         system_families.sort_by_key(|name| name.to_ascii_lowercase());
@@ -218,6 +263,8 @@ impl SettingsView {
             key_interceptor: None,
             scroll: UniformListScrollHandle::new(),
             _save_task: None,
+            appearance_session,
+            appearance_mutation_seq: 0,
         };
         this.materialize_editor(EditorTarget::Row(first_row), cx);
         this
@@ -1425,6 +1472,132 @@ impl SettingsView {
             &self.available_families,
             cx,
         );
+        self.publish_appearance_preview(cx);
+    }
+
+    fn publish_appearance_preview(&mut self, cx: &mut Context<Self>) {
+        let appearance = AppearanceConfig::from_gui(&self.draft);
+        cx.emit(SettingsViewEvent::LocalAppearancePreview {
+            session_id: self.appearance_session,
+            appearance: appearance.clone(),
+        });
+        self.appearance_mutation_seq = self.appearance_mutation_seq.wrapping_add(1).max(1);
+        let mutation_seq = self.appearance_mutation_seq;
+        let document = match appearance.document() {
+            Ok(document) => document,
+            Err(error) => {
+                self.status_message =
+                    Some(format!("Could not share appearance preview · {error}").into());
+                return;
+            }
+        };
+        cx.emit(SettingsViewEvent::AppearanceCommand(
+            local_rpc::appearance::AppearanceCommand::Preview {
+                session_id: self.appearance_session,
+                mutation_seq,
+                document,
+            },
+        ));
+    }
+
+    pub(crate) fn republish_appearance(&mut self, cx: &mut Context<Self>) {
+        if self.local_dirty() {
+            self.publish_appearance_preview(cx);
+        }
+    }
+
+    pub(crate) fn shared_preview_changed(
+        &mut self,
+        session_id: local_rpc::appearance::AppearanceSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_message = Some(if session_id == self.appearance_session {
+            "Sharing live appearance preview.".into()
+        } else {
+            "Live appearance preview is controlled by another GUI.".into()
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn shared_committed_appearance_changed(
+        &mut self,
+        appearance: Option<&AppearanceConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.local_dirty() {
+            self.status_message =
+                Some("Another GUI committed appearance changes; this draft was preserved.".into());
+            cx.notify();
+            return;
+        }
+        let loaded = cx.global::<ConfigurationState>().0.clone();
+        let mut config = loaded.config.clone();
+        if let Some(appearance) = appearance {
+            appearance.merge_into(&mut config);
+        }
+        self.draft = config.clone();
+        self.baseline = config;
+        self.source = loaded.source;
+        self.source_status = loaded.status;
+        self.diagnostics = loaded.diagnostics;
+        self.committed = AppliedSettings::get(cx);
+        self.invalid_edits.clear();
+        if let SettingsFocus::Row(row) = self.focused {
+            self.sync_row_editor(row, cx);
+        }
+        self.status_message = Some(if appearance.is_some() {
+            "Appearance committed by a GUI connected to this daemon.".into()
+        } else {
+            "Shared appearance cleared; using gui.toml.".into()
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn install_external_loaded_if_clean(
+        &mut self,
+        loaded: LoadedConfig,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        if self.local_dirty() {
+            self.status_message =
+                Some("gui.toml changed in another GUI; reload or replace this draft.".into());
+            cx.notify();
+            return Ok(false);
+        }
+        let loaded = install_external_loaded(loaded, cx)?;
+        self.draft = loaded.config.clone();
+        self.baseline = loaded.config.clone();
+        self.source = loaded.source;
+        self.source_status = loaded.status;
+        self.diagnostics = loaded.diagnostics;
+        self.path = loaded.path;
+        self.committed = AppliedSettings::get(cx);
+        self.invalid_edits.clear();
+        if let SettingsFocus::Row(row) = self.focused {
+            self.sync_row_editor(row, cx);
+        }
+        self.status_message = Some("Loaded appearance saved by another GUI.".into());
+        cx.notify();
+        Ok(true)
+    }
+
+    fn commit_shared_appearance(&mut self, config: &GuiConfig, cx: &mut Context<Self>) {
+        self.appearance_mutation_seq = self.appearance_mutation_seq.wrapping_add(1).max(1);
+        let document = match AppearanceConfig::from_gui(config).document() {
+            Ok(document) => document,
+            Err(error) => {
+                self.status_message =
+                    Some(format!("Saved, but could not share appearance · {error}").into());
+                return;
+            }
+        };
+        cx.emit(SettingsViewEvent::AppearanceCommand(
+            local_rpc::appearance::AppearanceCommand::Commit {
+                session_id: self.appearance_session,
+                mutation_seq: self.appearance_mutation_seq,
+                document,
+            },
+        ));
     }
 
     fn choose(&mut self, setting: ScalarSetting, value: usize, cx: &mut Context<Self>) {
@@ -1590,9 +1763,11 @@ impl SettingsView {
         if self.saving {
             return;
         }
-        cx.set_text_rendering_mode(theme::rendering_mode(self.committed.rendering));
-        cx.set_global(AppliedSettings(self.committed.clone()));
-        cx.refresh_windows();
+        cx.emit(SettingsViewEvent::AppearanceCommand(
+            local_rpc::appearance::AppearanceCommand::End {
+                session_id: self.appearance_session,
+            },
+        ));
         cx.emit(SettingsViewEvent::Closed);
     }
 
@@ -1758,20 +1933,21 @@ impl SettingsView {
                     .pending_save
                     .take()
                     .expect("successful save retains its exact configuration snapshot");
+                let saved_config = saved.config.clone();
                 self.confirm_replace = false;
                 key_bindings::apply_compiled(saved.bindings, cx);
                 self.source = Some(source.clone());
                 self.source_status = SourceStatus::Loaded;
-                self.baseline = saved.config.clone();
-                self.diagnostics = validate(&saved.config);
+                self.baseline = saved_config.clone();
+                self.diagnostics = validate(&saved_config);
                 self.diagnostics
-                    .extend(key_bindings::validate(&saved.config));
+                    .extend(key_bindings::validate(&saved_config));
                 self.diagnostics.extend(theme::font_warnings(
-                    &saved.config,
+                    &saved_config,
                     &self.available_families,
                 ));
                 self.committed = theme::apply_appearance(
-                    &saved.config,
+                    &saved_config,
                     SourceStatus::Loaded,
                     &self.diagnostics,
                     &self.available_families,
@@ -1779,11 +1955,12 @@ impl SettingsView {
                 );
                 cx.set_global(ConfigurationState(LoadedConfig {
                     path: self.path.clone(),
-                    config: saved.config,
+                    config: saved_config.clone(),
                     source: Some(source),
                     status: SourceStatus::Loaded,
                     diagnostics: self.diagnostics.clone(),
                 }));
+                self.commit_shared_appearance(&saved_config, cx);
                 if self.dirty() {
                     self.preview(cx);
                     self.status_message =
@@ -3598,7 +3775,7 @@ mod tests {
                 },
                 cx,
             );
-            cx.new(SettingsView::new)
+            cx.new(|cx| SettingsView::new(local_rpc::appearance::AppearanceSessionId(1), cx))
         })
     }
 
@@ -3714,7 +3891,7 @@ mod tests {
             );
         });
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let mut settings = SettingsView::new(cx);
+            let mut settings = SettingsView::new(local_rpc::appearance::AppearanceSessionId(1), cx);
             settings.install_remote_document(searchable_choice_document(), false);
             window.focus(&settings.focus, cx);
             settings
@@ -3893,7 +4070,7 @@ mod tests {
             );
         });
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let settings = SettingsView::new(cx);
+            let settings = SettingsView::new(local_rpc::appearance::AppearanceSessionId(1), cx);
             let focus = settings.focus_handle(cx);
             window.focus(&focus, cx);
             settings
@@ -3969,6 +4146,44 @@ mod tests {
             });
             assert_eq!(AppliedSettings::get(cx).binding_mode, BindingMode::Vim);
         });
+    }
+
+    #[gpui::test]
+    fn appearance_preview_broadcasts_every_valid_draft_immediately(cx: &mut gpui::TestAppContext) {
+        let settings = create_settings(cx);
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update({
+            let settings = settings.clone();
+            let commands = commands.clone();
+            move |cx| {
+                cx.subscribe(&settings, move |_, event: &SettingsViewEvent, _| {
+                    if let SettingsViewEvent::AppearanceCommand(command) = event {
+                        commands.borrow_mut().push(command.clone());
+                    }
+                })
+            }
+        });
+
+        settings.update(cx, |settings, cx| {
+            settings.apply_editor_text("#010203", cx);
+            settings.apply_editor_text("#040506", cx);
+        });
+        cx.run_until_parked();
+        let commands = commands.borrow();
+        assert_eq!(commands.len(), 2);
+        let local_rpc::appearance::AppearanceCommand::Preview {
+            mutation_seq,
+            document,
+            ..
+        } = &commands[1]
+        else {
+            panic!("appearance edit emits a preview");
+        };
+        assert_eq!(*mutation_seq, 2);
+        let appearance = AppearanceConfig::from_document(document).unwrap();
+        let mut config = GuiConfig::default();
+        appearance.merge_into(&mut config);
+        assert_eq!(config.theme.color(ThemeRole::Window), Rgba8::rgb(4, 5, 6));
     }
 
     #[gpui::test]

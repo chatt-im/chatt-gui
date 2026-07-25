@@ -1,4 +1,5 @@
 mod app;
+mod appearance;
 mod code_viewer;
 mod composer;
 mod config;
@@ -82,6 +83,7 @@ fn main() {
             key_bindings::install(&loaded.config, cx)
                 .expect("built-in GUI key bindings must compile");
             settings::install_loaded(loaded.clone(), cx);
+            appearance::install(cx);
             frame_stats::start(cx);
 
             let bounds = Bounds::centered(None, size(px(1240.0), px(820.0)), cx);
