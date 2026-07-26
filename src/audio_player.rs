@@ -86,6 +86,7 @@ pub(crate) fn render_audio_player(
     });
 
     let scrub = handler.clone();
+    let error = audio.error.clone();
     let timeline = div()
         .id((player_id.clone(), "timeline"))
         .relative()
@@ -118,33 +119,46 @@ pub(crate) fn render_audio_player(
             .absolute()
             .size_full(),
         )
-        .child(
-            div()
-                .relative()
-                .w_full()
-                .h(rems_from_px(3.0))
-                .rounded_full()
-                .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(progress))
-                        .rounded_full()
-                        .bg(settings.theme.color(ThemeRole::MediaProgressFill)),
-                )
-                .when(duration > 0.0, |track| {
-                    track.child(
+        .when(error.is_none(), |timeline| {
+            timeline.child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(rems_from_px(3.0))
+                    .rounded_full()
+                    .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
+                    .child(
                         div()
-                            .absolute()
-                            .left(relative(progress))
-                            .ml(rems_from_px(-4.0))
-                            .top(rems_from_px(-2.5))
-                            .size(rems_from_px(8.0))
+                            .h_full()
+                            .w(relative(progress))
                             .rounded_full()
-                            .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
+                            .bg(settings.theme.color(ThemeRole::MediaProgressFill)),
                     )
-                }),
-        );
+                    .when(duration > 0.0, |track| {
+                        track.child(
+                            div()
+                                .absolute()
+                                .left(relative(progress))
+                                .ml(rems_from_px(-4.0))
+                                .top(rems_from_px(-2.5))
+                                .size(rems_from_px(8.0))
+                                .rounded_full()
+                                .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
+                        )
+                    }),
+            )
+        })
+        .when_some(error, |timeline, error| {
+            timeline.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(settings.theme.color(ThemeRole::StateDanger))
+                    .child(error),
+            )
+        });
 
     let mute = handler.clone();
     let volume_icon = if audio.volume <= 0.0 {
@@ -215,11 +229,6 @@ pub(crate) fn render_audio_player(
     } else {
         "--:--".into()
     };
-    let status = audio
-        .error
-        .as_deref()
-        .map(str::to_owned)
-        .or_else(|| audio.loading.then(|| "Starting audio…".to_string()));
     let cycle_speed = handler.clone();
     let speed_button = div()
         .id((player_id.clone(), "speed"))
@@ -253,8 +262,6 @@ pub(crate) fn render_audio_player(
         .px_3()
         .py_2()
         .flex()
-        .flex_col()
-        .gap_1()
         .rounded_sm()
         .border_1()
         .border_color(settings.theme.color(ThemeRole::MediaBorder))
@@ -295,21 +302,6 @@ pub(crate) fn render_audio_player(
                         .child(volume),
                 ),
         )
-        .when_some(status, |player, status| {
-            player.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .pl(rems_from_px(40.0))
-                    .text_xs()
-                    .text_color(settings.theme.color(if audio.error.is_some() {
-                        ThemeRole::StateDanger
-                    } else {
-                        ThemeRole::TextMuted
-                    }))
-                    .child(status),
-            )
-        })
 }
 
 fn format_playback_speed(speed: f64) -> String {
