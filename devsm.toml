@@ -27,6 +27,7 @@ allow_multiple = true
 cli.forward_arguments = true
 env.RUST_BACKTRACE = "1"
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.CHATT_MPV_LOG = "info"
 env.CHATT_GUI_MEDIA_LOG = { if.profile = "logged", then = "1", or_else = "" }
 env.CHATT_GUI_RENDER_LOG = { if.profile = "logged", then = "1", or_else = "" }
 env.CHATT_GUI_RPC_LOG = { if.profile = "logged", then = "1", or_else = "" }

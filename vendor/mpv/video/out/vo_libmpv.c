@@ -547,8 +547,8 @@ static void flip_page(struct vo *vo)
     while (ctx->next_frame) {
         if (mp_cond_timedwait_until(&ctx->video_wait, &ctx->lock, until)) {
             if (ctx->next_frame) {
-                MP_VERBOSE(vo, "mpv_render_context_render() not being called "
-                           "or stuck.\n");
+                MP_INFO(vo, "mpv_render_context_render() was not called within "
+                        "the 200 ms frame deadline.\n");
                 goto done;
             }
         }
@@ -568,7 +568,8 @@ static void flip_page(struct vo *vo)
         if (!ctx->flip_count)
             break;
         if (mp_cond_timedwait_until(&ctx->video_wait, &ctx->lock, until)) {
-            MP_VERBOSE(vo, "mpv_render_report_swap() not being called.\n");
+            MP_INFO(vo, "mpv_render_report_swap() was not called within the "
+                    "200 ms frame deadline.\n");
             goto done;
         }
     }

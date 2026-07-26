@@ -420,7 +420,8 @@ fn connection_loop(
                                             .into();
                                 }
                                 match &result.outcome {
-                                    RequestOutcome::Accepted => {
+                                    RequestOutcome::Accepted =>
+                                    {
                                         #[cfg(feature = "diagnostic-logs")]
                                         if crate::logger::rpc_logging_enabled() {
                                             kvlog::info!(
@@ -550,10 +551,7 @@ fn handle_bulk_frame(
                         .send_blocking(DaemonEvent::MediaCached(descriptor))
                         .is_err()
                     {
-                        kvlog::error!(
-                            "could not deliver attachment-cached event",
-                            transfer_id
-                        );
+                        kvlog::error!("could not deliver attachment-cached event", transfer_id);
                     }
                 }
                 Err(reason) => cancel_failed_download(transfer_id, reason, commands, events),

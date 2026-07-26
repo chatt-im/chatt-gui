@@ -168,22 +168,22 @@ impl Drop for LiveDiagnostics {
     fn drop(&mut self) {
         #[cfg(feature = "diagnostic-logs")]
         {
-        let state = self.state.lock().unwrap();
-        let average_ms = if state.rendered_outputs == 0 {
-            0.0
-        } else {
-            state.total_latency_us as f64 / state.rendered_outputs as f64 / 1_000.0
-        };
-        if crate::logger::render_logging_enabled() {
-            kvlog::info!(
-                "live video latency summary",
-                group = "render",
-                input_frames = state.latest_input.map_or(0, |(sequence, _)| sequence),
-                render_outputs = state.rendered_outputs,
-                receive_to_render_avg_ms = average_ms,
-                receive_to_render_max_ms = state.max_latency_us as f64 / 1_000.0
-            );
-        }
+            let state = self.state.lock().unwrap();
+            let average_ms = if state.rendered_outputs == 0 {
+                0.0
+            } else {
+                state.total_latency_us as f64 / state.rendered_outputs as f64 / 1_000.0
+            };
+            if crate::logger::render_logging_enabled() {
+                kvlog::info!(
+                    "live video latency summary",
+                    group = "render",
+                    input_frames = state.latest_input.map_or(0, |(sequence, _)| sequence),
+                    render_outputs = state.rendered_outputs,
+                    receive_to_render_avg_ms = average_ms,
+                    receive_to_render_max_ms = state.max_latency_us as f64 / 1_000.0
+                );
+            }
         }
     }
 }

@@ -34,6 +34,8 @@ const RENDER_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const RENDER_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 const AUDIO_POSITION_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const INITIAL_RENDER_TRACE_LIMIT: u64 = 8;
+static NEXT_MPV_PLAYER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MPV_LOAD_ID: AtomicU64 = AtomicU64::new(1);
 // The update callback coalesces notifications while one render update is
 // pending, so at most one pre-seek frame update can still reach the render
 // worker. Preserve one additional invalidation for the post-seek frame.
@@ -82,6 +84,7 @@ impl AttachmentRenderBackend {
 
 /// A libmpv client with dedicated control and render threads.
 pub struct MpvPlayer {
+    player_id: u64,
     control_sender: mpsc::Sender<ControlCommand>,
     control_thread: Option<thread::JoinHandle<()>>,
     render_sender: mpsc::Sender<RenderMessage>,
@@ -103,6 +106,7 @@ pub struct MpvPlayer {
 /// Audio shares the attachment protocol and playback state machine with video,
 /// but deliberately owns no GPUI surface or render thread.
 pub(crate) struct MpvAudioPlayer {
+    player_id: u64,
     control_sender: mpsc::Sender<ControlCommand>,
     control_thread: Option<thread::JoinHandle<()>>,
     playback: Arc<SharedPlaybackState>,
@@ -169,6 +173,7 @@ impl MpvPlayer {
         live_codec: Option<&str>,
         source_registry: Option<crate::attachment_source::AttachmentSourceRegistry>,
     ) -> Result<(Self, AttachmentRenderBackend)> {
+        let player_id = NEXT_MPV_PLAYER_ID.fetch_add(1, Ordering::Relaxed);
         let force_live_software = live
             && std::env::var("CHATT_LIVE_RENDER_BACKEND")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("software"));
@@ -184,6 +189,7 @@ impl MpvPlayer {
         };
         kvlog::info!(
             "video player construction started",
+            player_id,
             live,
             preferred_backend = preferred_backend_name
         );
@@ -249,6 +255,7 @@ impl MpvPlayer {
         let require_direct_vulkan = supports_vulkan_decode && hwdec == "vulkan";
         kvlog::info!(
             "initializing embedded libmpv",
+            player_id,
             live,
             hwdec = %hwdec,
             codec = live_codec.unwrap_or("probe-at-load"),
@@ -324,7 +331,7 @@ impl MpvPlayer {
             kvlog::error!("embedded libmpv initialization failed", live, err = %error);
             error
         })?;
-        kvlog::info!("embedded libmpv initialized", live);
+        kvlog::info!("embedded libmpv initialized", player_id, live);
         let mpv = Arc::new(mpv);
         if let Some(registry) = source_registry {
             crate::attachment_source::register_mpv_attachment_protocol(&mpv, registry)?;
@@ -339,12 +346,16 @@ impl MpvPlayer {
             .context("observe mpv property current-vo")?;
         mpv.observe_property("hwdec-interop", Format::String, 9)
             .context("observe mpv property hwdec-interop")?;
-        kvlog::info!("libmpv playback properties registered", live);
+        kvlog::info!("libmpv playback properties registered", player_id, live);
 
         let mpv_log_level = crate::logger::native_mpv_log_level();
         mpv.request_log_messages(mpv_log_level)
             .with_context(|| format!("request native mpv log level {mpv_log_level}"))?;
-        kvlog::info!("native mpv logging enabled", min_level = %mpv_log_level);
+        kvlog::info!(
+            "native mpv logging enabled",
+            player_id,
+            min_level = %mpv_log_level
+        );
         if live {
             kvlog::info!(
                 "live playback latency mode enabled",
@@ -364,6 +375,7 @@ impl MpvPlayer {
                     .context("create preferred libmpv software render context")?;
                 kvlog::info!(
                     "video render backend selected",
+                    player_id,
                     backend = "software",
                     upload = "wgpu",
                     latest_frame = live,
@@ -386,6 +398,7 @@ impl MpvPlayer {
                     .expect("non-software render preference must have a Vulkan probe result");
                 kvlog::info!(
                     "creating libmpv Vulkan render context",
+                    player_id,
                     live,
                     cached_decision
                 );
@@ -395,6 +408,7 @@ impl MpvPlayer {
                     Ok((context, native)) => {
                         kvlog::info!(
                             "video render backend selected",
+                            player_id,
                             backend = "vulkan",
                             sharing = "wgpu-device",
                             latest_frame = live,
@@ -419,6 +433,7 @@ impl MpvPlayer {
                         )?;
                         kvlog::info!(
                             "video render backend selected",
+                            player_id,
                             backend = "software",
                             upload = "wgpu",
                             latest_frame = live
@@ -467,6 +482,7 @@ impl MpvPlayer {
             .name("mpv-render".into())
             .spawn(move || {
                 render_worker(
+                    player_id,
                     backend,
                     video_surface,
                     render_pending,
@@ -504,6 +520,7 @@ impl MpvPlayer {
                 .name("mpv-control".into())
                 .spawn(move || {
                     control_worker(
+                        player_id,
                         control_mpv,
                         control_commands,
                         control_playback,
@@ -527,12 +544,14 @@ impl MpvPlayer {
 
         kvlog::info!(
             "video player construction completed",
+            player_id,
             live,
             backend = selected_backend.name()
         );
 
         Ok((
             Self {
+                player_id,
                 control_sender,
                 control_thread: Some(control_thread),
                 render_sender,
@@ -567,12 +586,18 @@ impl MpvPlayer {
         volume: f64,
         position: f64,
     ) -> Result<()> {
+        let startup = StartupLogContext {
+            player_id: self.player_id,
+            load_id: NEXT_MPV_LOAD_ID.fetch_add(1, Ordering::Relaxed),
+            started_at: Instant::now(),
+        };
         self.playback.reset();
         self.requested_paused = paused;
         self.render_sender
-            .send(RenderMessage::Reset)
+            .send(RenderMessage::Reset { startup })
             .map_err(|_| anyhow!("mpv render thread stopped"))?;
         self.send_control(ControlCommand::Load {
+            startup,
             path: path.to_owned(),
             paused,
             volume: volume.clamp(0.0, 100.0),
@@ -669,7 +694,8 @@ impl MpvAudioPlayer {
         source_registry: crate::attachment_source::AttachmentSourceRegistry,
         audio_output: Option<&str>,
     ) -> Result<Self> {
-        kvlog::info!("audio player construction started");
+        let player_id = NEXT_MPV_PLAYER_ID.fetch_add(1, Ordering::Relaxed);
+        kvlog::info!("audio player construction started", player_id);
         let mpv = Mpv::with_initializer(|initializer| {
             macro_rules! set_option {
                 ($name:literal, $value:expr) => {
@@ -715,6 +741,7 @@ impl MpvAudioPlayer {
             .name("mpv-audio-control".into())
             .spawn(move || {
                 control_worker(
+                    player_id,
                     control_mpv,
                     control_commands,
                     control_playback,
@@ -724,8 +751,9 @@ impl MpvAudioPlayer {
                 );
             })
             .context("spawn mpv audio control thread")?;
-        kvlog::info!("audio player construction completed");
+        kvlog::info!("audio player construction completed", player_id);
         Ok(Self {
+            player_id,
             control_sender,
             control_thread: Some(control_thread),
             playback,
@@ -746,6 +774,11 @@ impl MpvAudioPlayer {
         self.playback.reset();
         self.requested_paused = paused;
         self.send_control(ControlCommand::Load {
+            startup: StartupLogContext {
+                player_id: self.player_id,
+                load_id: NEXT_MPV_LOAD_ID.fetch_add(1, Ordering::Relaxed),
+                started_at: Instant::now(),
+            },
             path: path.to_owned(),
             paused,
             volume: volume.clamp(0.0, 100.0),
@@ -1130,6 +1163,7 @@ impl SeekMode {
 
 pub(crate) enum ControlCommand {
     Load {
+        startup: StartupLogContext,
         path: String,
         paused: bool,
         volume: f64,
@@ -1161,9 +1195,24 @@ enum RenderMessage {
         height: u32,
         redraw: bool,
     },
-    Reset,
+    Reset {
+        startup: StartupLogContext,
+    },
     ReleaseResources,
     Shutdown,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StartupLogContext {
+    player_id: u64,
+    load_id: u64,
+    started_at: Instant,
+}
+
+impl StartupLogContext {
+    fn elapsed_ms(self) -> f64 {
+        self.started_at.elapsed().as_secs_f64() * 1_000.0
+    }
 }
 
 enum RenderBackend {
@@ -1477,6 +1526,9 @@ fn next_ring_texture(
 }
 
 struct RenderDiagnostics {
+    player_id: u64,
+    startup: Option<StartupLogContext>,
+    unconfigured_started_at: Option<Instant>,
     started_at: Instant,
     last_summary: Instant,
     last_pressure_log: Option<Instant>,
@@ -1491,9 +1543,12 @@ struct RenderDiagnostics {
 }
 
 impl RenderDiagnostics {
-    fn new() -> Self {
+    fn new(player_id: u64) -> Self {
         let now = Instant::now();
         Self {
+            player_id,
+            startup: None,
+            unconfigured_started_at: None,
             started_at: now,
             last_summary: now,
             last_pressure_log: None,
@@ -1508,13 +1563,58 @@ impl RenderDiagnostics {
         }
     }
 
+    fn start_load(&mut self, startup: StartupLogContext) {
+        self.startup = Some(startup);
+        self.unconfigured_started_at = None;
+    }
+
     fn note_unconfigured(&mut self) {
         self.unconfigured += 1;
+        let now = Instant::now();
+        let first_unconfigured_at = *self.unconfigured_started_at.get_or_insert(now);
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::render_logging_enabled() {
+            if let Some(startup) = self.startup {
+                kvlog::info!(
+                    "video frame left pending before texture generation",
+                    group = "render",
+                    player_id = startup.player_id,
+                    load_id = startup.load_id,
+                    startup_elapsed_ms = startup.elapsed_ms(),
+                    pending_elapsed_ms =
+                        now.duration_since(first_unconfigured_at).as_secs_f64() * 1_000.0,
+                    pending_frame_acknowledged = false,
+                    occurrence = self.unconfigured
+                );
+            } else {
+                kvlog::info!(
+                    "video frame left pending before texture generation",
+                    group = "render",
+                    player_id = self.player_id,
+                    pending_elapsed_ms =
+                        now.duration_since(first_unconfigured_at).as_secs_f64() * 1_000.0,
+                    pending_frame_acknowledged = false,
+                    occurrence = self.unconfigured
+                );
+            }
+        }
+    }
+
+    fn note_first_render(&mut self, operation: &str, operation_started_at: Instant) {
+        self.unconfigured_started_at = None;
+        let Some(startup) = self.startup.take() else {
+            return;
+        };
         #[cfg(feature = "diagnostic-logs")]
         if crate::logger::render_logging_enabled() {
             kvlog::info!(
-                "video frame arrived before texture generation",
-                group = "render"
+                "mpv startup first render completed",
+                group = "render",
+                player_id = startup.player_id,
+                load_id = startup.load_id,
+                startup_elapsed_ms = startup.elapsed_ms(),
+                operation_elapsed_ms = operation_started_at.elapsed().as_secs_f64() * 1_000.0,
+                operation
             );
         }
     }
@@ -1585,6 +1685,7 @@ struct RenderControl {
 }
 
 fn control_worker(
+    player_id: u64,
     mpv: Arc<Mpv>,
     commands: mpsc::Receiver<ControlCommand>,
     playback: Arc<SharedPlaybackState>,
@@ -1593,14 +1694,14 @@ fn control_worker(
     render: Option<RenderControl>,
 ) {
     let rendered = render.is_some();
-    kvlog::info!("mpv control worker started", rendered);
+    kvlog::info!("mpv control worker started", player_id, rendered);
     let mut state = PlaybackState::default();
     let initial_render_size = render.as_ref().and_then(|render| render.initial_size);
     let mut configured_size = initial_render_size;
     let mut pending_start = None;
     let delay_render_until_reconfiguration = initial_render_size.is_some();
     let mut render_enabled = false;
-    let mut load_started_at = None;
+    let mut startup = None;
     let mut seek_started_at = None;
     let mut last_audio_position_wakeup = Instant::now()
         .checked_sub(AUDIO_POSITION_WAKE_INTERVAL)
@@ -1632,6 +1733,7 @@ fn control_worker(
             }
             let result = match command {
                 ControlCommand::Load {
+                    startup: new_startup,
                     path,
                     paused,
                     volume,
@@ -1640,9 +1742,16 @@ fn control_worker(
                 } => {
                     #[cfg(feature = "diagnostic-logs")]
                     if crate::logger::media_logging_enabled() {
-                        kvlog::info!("loading media", group = "media", path = %path);
+                        kvlog::info!(
+                            "loading media",
+                            group = "media",
+                            player_id = new_startup.player_id,
+                            load_id = new_startup.load_id,
+                            startup_elapsed_ms = new_startup.elapsed_ms(),
+                            path = %path
+                        );
                     }
-                    load_started_at = Some(Instant::now());
+                    startup = Some(new_startup);
                     seek_started_at = None;
                     state = PlaybackState {
                         paused,
@@ -1669,6 +1778,9 @@ fn control_worker(
                             kvlog::info!(
                                 "mpv accepted loadfile",
                                 group = "media",
+                                player_id = new_startup.player_id,
+                                load_id = new_startup.load_id,
+                                startup_elapsed_ms = new_startup.elapsed_ms(),
                                 paused,
                                 volume,
                                 speed,
@@ -1748,12 +1860,9 @@ fn control_worker(
                 ControlCommand::Stop => {
                     #[cfg(feature = "diagnostic-logs")]
                     if crate::logger::media_logging_enabled() {
-                        kvlog::info!(
-                            "stopping media while retaining mpv core",
-                            group = "media"
-                        );
+                        kvlog::info!("stopping media while retaining mpv core", group = "media");
                     }
-                    load_started_at = None;
+                    startup = None;
                     seek_started_at = None;
                     state = PlaybackState {
                         paused: true,
@@ -1804,13 +1913,15 @@ fn control_worker(
                     ..
                 })
             );
-            if file_loaded && let Some(_started_at) = load_started_at {
+            if file_loaded && let Some(startup) = startup {
                 #[cfg(feature = "diagnostic-logs")]
                 if crate::logger::media_logging_enabled() {
                     kvlog::info!(
                         "mpv media demux ready",
                         group = "media",
-                        elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
+                        player_id = startup.player_id,
+                        load_id = startup.load_id,
+                        elapsed_ms = startup.elapsed_ms()
                     );
                 }
             }
@@ -1826,15 +1937,29 @@ fn control_worker(
                             elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
                         );
                     }
-                } else if let Some(_started_at) = load_started_at.take() {
+                } else if let Some(startup) = startup.take() {
                     #[cfg(feature = "diagnostic-logs")]
                     if crate::logger::media_logging_enabled() {
                         kvlog::info!(
                             "mpv initial playback ready",
                             group = "media",
-                            elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
+                            player_id = startup.player_id,
+                            load_id = startup.load_id,
+                            elapsed_ms = startup.elapsed_ms()
                         );
                     }
+                }
+            }
+            if video_reconfigured && let Some(startup) = startup {
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::render_logging_enabled() {
+                    kvlog::info!(
+                        "mpv startup video reconfiguration received",
+                        group = "render",
+                        player_id = startup.player_id,
+                        load_id = startup.load_id,
+                        startup_elapsed_ms = startup.elapsed_ms()
+                    );
                 }
             }
             let mut display_size_changed = false;
@@ -1873,7 +1998,8 @@ fn control_worker(
                             let _ = errors.send(message.into());
                         }
                     }
-                    Err(_error) => {
+                    Err(_error) =>
+                    {
                         #[cfg(feature = "diagnostic-logs")]
                         if crate::logger::render_logging_enabled() {
                             kvlog::info!(
@@ -2061,10 +2187,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
         Event::PlaybackRestart => {
             #[cfg(feature = "diagnostic-logs")]
             if crate::logger::media_logging_enabled() {
-                kvlog::info!(
-                    "mpv playback resumed after discontinuity",
-                    group = "media"
-                );
+                kvlog::info!("mpv playback resumed after discontinuity", group = "media");
             }
             false
         }
@@ -2093,14 +2216,10 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
 fn relay_mpv_log(level: libmpv2::LogLevel, prefix: &str, text: &str) {
     let text = text.trim_end_matches(['\r', '\n']);
     let level = match level {
-        libmpv2::mpv_log_level::Fatal | libmpv2::mpv_log_level::Error => {
-            log::Level::Error
-        }
+        libmpv2::mpv_log_level::Fatal | libmpv2::mpv_log_level::Error => log::Level::Error,
         libmpv2::mpv_log_level::Warn => log::Level::Warn,
         libmpv2::mpv_log_level::Info => log::Level::Info,
-        libmpv2::mpv_log_level::V | libmpv2::mpv_log_level::Debug => {
-            log::Level::Debug
-        }
+        libmpv2::mpv_log_level::V | libmpv2::mpv_log_level::Debug => log::Level::Debug,
         libmpv2::mpv_log_level::Trace => log::Level::Trace,
         _ => return,
     };
@@ -2108,6 +2227,7 @@ fn relay_mpv_log(level: libmpv2::LogLevel, prefix: &str, text: &str) {
 }
 
 fn render_worker(
+    player_id: u64,
     mut backend: RenderBackend,
     surface: WgpuVideoSurface,
     pending: Arc<AtomicBool>,
@@ -2120,8 +2240,12 @@ fn render_worker(
     frame_invalidated: Arc<SeekFrameInvalidation>,
 ) {
     let backend_name = backend.name();
-    kvlog::info!("video render worker started", backend = backend_name);
-    let mut diagnostics = RenderDiagnostics::new();
+    kvlog::info!(
+        "video render worker started",
+        player_id,
+        backend = backend_name
+    );
+    let mut diagnostics = RenderDiagnostics::new(player_id);
     let mut has_frame = false;
     let mut enabled = false;
     let mut redraw_pending = false;
@@ -2185,6 +2309,7 @@ fn render_worker(
             continue;
         }
         let message = message.unwrap();
+        let operation_started_at = Instant::now();
         let (operation, result) = match message {
             RenderMessage::Update => {
                 diagnostics.callbacks += 1;
@@ -2275,12 +2400,16 @@ fn render_worker(
                 });
                 ("resize", result)
             }
-            RenderMessage::Reset => {
+            RenderMessage::Reset { startup } => {
+                diagnostics.start_load(startup);
                 #[cfg(feature = "diagnostic-logs")]
                 if crate::logger::render_logging_enabled() {
                     kvlog::info!(
                         "resetting published video frame",
                         group = "render",
+                        player_id = startup.player_id,
+                        load_id = startup.load_id,
+                        startup_elapsed_ms = startup.elapsed_ms(),
                         backend = backend_name
                     );
                 }
@@ -2316,6 +2445,7 @@ fn render_worker(
             Ok(rendered) => {
                 if rendered {
                     diagnostics.rendered += 1;
+                    diagnostics.note_first_render(operation, operation_started_at);
                     has_frame = true;
                     redraw_pending = false;
                     playback.frame_ready.store(true, Ordering::Release);
@@ -2490,6 +2620,30 @@ mod tests {
         assert_eq!(shared.snapshot().display_size, Some((1_080, 1_920)));
         shared.reset();
         assert_eq!(shared.snapshot().display_size, None);
+    }
+
+    #[test]
+    fn startup_render_diagnostics_scope_pending_frame_to_current_load() {
+        let mut diagnostics = RenderDiagnostics::new(7);
+        let first = StartupLogContext {
+            player_id: 7,
+            load_id: 11,
+            started_at: Instant::now(),
+        };
+        diagnostics.start_load(first);
+        diagnostics.note_unconfigured();
+        assert!(diagnostics.unconfigured_started_at.is_some());
+        assert_eq!(diagnostics.startup.unwrap().load_id, 11);
+
+        let second = StartupLogContext {
+            player_id: 7,
+            load_id: 12,
+            started_at: Instant::now(),
+        };
+        diagnostics.start_load(second);
+        assert!(diagnostics.unconfigured_started_at.is_none());
+        diagnostics.note_first_render("resize", Instant::now());
+        assert!(diagnostics.startup.is_none());
     }
 
     #[test]

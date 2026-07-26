@@ -30,6 +30,7 @@ use local_rpc::{
 
 const BLOCK_BYTES: usize = 256 * 1024;
 const BLOCK_CACHE_ENTRIES: usize = 8;
+const STARTUP_READ_TRACE_LIMIT: u64 = 8;
 const MPV_PROTOCOL: &str = "chatt-media";
 const MPV_SCHEME: &str = "chatt-media://";
 
@@ -950,6 +951,7 @@ pub(crate) struct AttachmentCursor {
     opened_at: Instant,
     read_count: u64,
     bytes_read: u64,
+    read_elapsed: Duration,
     seek_count: u64,
 }
 
@@ -969,6 +971,7 @@ impl AttachmentCursor {
             opened_at: Instant::now(),
             read_count: 0,
             bytes_read: 0,
+            read_elapsed: Duration::ZERO,
             seek_count: 0,
         }
     }
@@ -991,9 +994,10 @@ impl AttachmentCursor {
             .position
             .checked_add(read as u64)
             .ok_or_else(|| anyhow!("attachment cursor position overflow"))?;
+        let elapsed = started_at.elapsed();
         self.read_count = self.read_count.saturating_add(1);
         self.bytes_read = self.bytes_read.saturating_add(read as u64);
-        let elapsed = started_at.elapsed();
+        self.read_elapsed = self.read_elapsed.saturating_add(elapsed);
         if self.read_count == 1 {
             #[cfg(feature = "diagnostic-logs")]
             if crate::logger::media_logging_enabled() {
@@ -1005,11 +1009,16 @@ impl AttachmentCursor {
                     room_id = key.room_id,
                     attachment_timestamp_ms = key.attachment_id.timestamp_ms,
                     attachment_transfer_id = key.attachment_id.transfer_id,
-                    backend = if source.is_remote() { "remote" } else { "direct" },
+                    backend = if source.is_remote() {
+                        "remote"
+                    } else {
+                        "direct"
+                    },
                     offset,
                     requested = output.len(),
                     read,
-                    elapsed_ms = elapsed.as_secs_f64() * 1_000.0
+                    elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                    cumulative_read_ms = self.read_elapsed.as_secs_f64() * 1_000.0
                 );
             }
         } else if elapsed >= Duration::from_millis(10) {
@@ -1020,12 +1029,42 @@ impl AttachmentCursor {
                 room_id = key.room_id,
                 attachment_timestamp_ms = key.attachment_id.timestamp_ms,
                 attachment_transfer_id = key.attachment_id.transfer_id,
-                backend = if source.is_remote() { "remote" } else { "direct" },
+                backend = if source.is_remote() {
+                    "remote"
+                } else {
+                    "direct"
+                },
                 offset,
                 requested = output.len(),
                 read,
-                elapsed_ms = elapsed.as_secs_f64() * 1_000.0
+                elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                ordinal = self.read_count,
+                cumulative_read_ms = self.read_elapsed.as_secs_f64() * 1_000.0
             );
+        } else if self.read_count <= STARTUP_READ_TRACE_LIMIT {
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                let key = source.key();
+                kvlog::info!(
+                    "attachment protocol startup read",
+                    group = "media",
+                    namespace = key.namespace,
+                    room_id = key.room_id,
+                    attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                    attachment_transfer_id = key.attachment_id.transfer_id,
+                    backend = if source.is_remote() {
+                        "remote"
+                    } else {
+                        "direct"
+                    },
+                    ordinal = self.read_count,
+                    offset,
+                    requested = output.len(),
+                    read,
+                    elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                    cumulative_read_ms = self.read_elapsed.as_secs_f64() * 1_000.0
+                );
+            }
         }
         Ok(read)
     }
@@ -1096,11 +1135,16 @@ impl Drop for AttachmentCursor {
                 room_id = key.room_id,
                 attachment_timestamp_ms = key.attachment_id.timestamp_ms,
                 attachment_transfer_id = key.attachment_id.transfer_id,
-                backend = if _source.is_remote() { "remote" } else { "direct" },
+                backend = if _source.is_remote() {
+                    "remote"
+                } else {
+                    "direct"
+                },
                 reads = self.read_count,
                 size = self.bytes_read,
                 seeks = self.seek_count,
                 final_offset = self.position,
+                cumulative_read_ms = self.read_elapsed.as_secs_f64() * 1_000.0,
                 elapsed_ms = self.opened_at.elapsed().as_secs_f64() * 1_000.0
             );
         }
@@ -1140,7 +1184,11 @@ fn protocol_open(registry: &mut AttachmentSourceRegistry, uri: &str) -> Attachme
                 room_id = key.room_id,
                 attachment_timestamp_ms = key.attachment_id.timestamp_ms,
                 attachment_transfer_id = key.attachment_id.transfer_id,
-                backend = if _source.is_remote() { "remote" } else { "direct" },
+                backend = if _source.is_remote() {
+                    "remote"
+                } else {
+                    "direct"
+                },
                 size = _source.byte_len(),
                 elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0
             );
@@ -1329,6 +1377,9 @@ mod tests {
         assert_eq!(&bytes, b"45");
         second.read(&mut bytes).unwrap();
         assert_eq!(&bytes, b"89");
+        assert_eq!(first.read_count, 1);
+        assert_eq!(first.bytes_read, 2);
+        assert!(first.read_elapsed <= first.opened_at.elapsed());
 
         assert_eq!(first.seek(-100, AttachmentSeekMode::Current).unwrap(), 0);
         assert_eq!(first.seek(100, AttachmentSeekMode::Current).unwrap(), 10);

@@ -34,6 +34,7 @@
 #include "options/m_config.h"
 #include "options/options.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "misc/bstr.h"
 #include "common/av_common.h"
 #include "common/codecs.h"
@@ -215,6 +216,7 @@ typedef struct lavc_ctx {
     const char *decoder;
     bool hwdec_failed;
     bool hwdec_notified;
+    int64_t hwdec_attempt_started;
     bool force_eof;
     int wait_for_keyframe; // max number of frames to wait for keyframe after reset
 
@@ -582,9 +584,15 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                     continue;
                 }
 
+                int64_t attempt_started = mp_time_ns();
+                MP_INFO(vd, "Hardware decoding attempt started (%s).\n",
+                        hwdec->name);
                 if (hwdec->lavc_device) {
                     ctx->hwdec_dev = hwdec_create_dev(vd, hwdec, hwdec_auto);
                     if (!ctx->hwdec_dev) {
+                        MP_INFO(vd, "Hardware decoding attempt failed (%s) "
+                                "after %.3f ms.\n", hwdec->name,
+                                MP_TIME_NS_TO_MS(mp_time_ns() - attempt_started));
                         MP_VERBOSE(vd, "Could not create device.\n");
                         continue;
                     }
@@ -594,6 +602,9 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                     if (fns && fns->is_codec_allowed &&
                         !fns->is_codec_allowed(ctx->hwdec_dev, hwdec->codec->id))
                     {
+                        MP_INFO(vd, "Hardware decoding attempt rejected (%s) "
+                                "after %.3f ms.\n", hwdec->name,
+                                MP_TIME_NS_TO_MS(mp_time_ns() - attempt_started));
                         MP_WARN(vd, "Hardware decoding of '%s' is disabled on this "
                                     "device.\n", codec);
                         av_buffer_unref(&ctx->hwdec_dev);
@@ -601,6 +612,9 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                     }
                     if (fns && fns->is_emulated && fns->is_emulated(ctx->hwdec_dev)) {
                         if (hwdec_auto) {
+                            MP_INFO(vd, "Hardware decoding attempt skipped (%s) "
+                                    "after %.3f ms.\n", hwdec->name,
+                                    MP_TIME_NS_TO_MS(mp_time_ns() - attempt_started));
                             MP_VERBOSE(vd, "Not using emulated API.\n");
                             av_buffer_unref(&ctx->hwdec_dev);
                             continue;
@@ -622,6 +636,7 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 
                 ctx->use_hwdec = true;
                 ctx->hwdec = *hwdec;
+                ctx->hwdec_attempt_started = attempt_started;
                 break;
             }
             if (ctx->use_hwdec)
@@ -682,6 +697,15 @@ static void force_fallback(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
 
+    bstr failed = ctx->num_attempted_hwdecs
+        ? ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]
+        : bstr0("unknown");
+    if (ctx->hwdec_attempt_started) {
+        MP_INFO(vd, "Hardware decoding attempt failed (%.*s) after %.3f ms.\n",
+                BSTR_P(failed),
+                MP_TIME_NS_TO_MS(mp_time_ns() - ctx->hwdec_attempt_started));
+        ctx->hwdec_attempt_started = 0;
+    }
     uninit_avctx(vd);
     int lev = ctx->hwdec_notified ? MSGL_WARN : MSGL_V;
     mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
@@ -705,6 +729,7 @@ static void reinit(struct mp_filter *vd)
     TA_FREEP(&ctx->attempted_hwdecs);
     ctx->num_attempted_hwdecs = 0;
     ctx->hwdec_notified = false;
+    ctx->hwdec_attempt_started = 0;
 
     select_and_set_hwdec(vd);
 
@@ -1377,6 +1402,13 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
 
     if (!ctx->hwdec_notified) {
         if (ctx->use_hwdec) {
+            if (ctx->hwdec_attempt_started) {
+                MP_INFO(vd, "Hardware decoding attempt produced first frame "
+                        "(%s) after %.3f ms.\n", ctx->hwdec.name,
+                        MP_TIME_NS_TO_MS(mp_time_ns() -
+                                             ctx->hwdec_attempt_started));
+                ctx->hwdec_attempt_started = 0;
+            }
             MP_INFO(vd, "Using hardware decoding (%s).\n",
                     ctx->hwdec.method_name);
         } else {

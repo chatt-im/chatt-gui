@@ -869,10 +869,7 @@ impl ChattView {
                         cx.notify();
                         #[cfg(feature = "diagnostic-logs")]
                         if crate::logger::rpc_logging_enabled() {
-                            kvlog::info!(
-                                "daemon event batch notified view",
-                                group = "daemon-rpc"
-                            );
+                            kvlog::info!("daemon event batch notified view", group = "daemon-rpc");
                         }
                     })
                     .is_err()

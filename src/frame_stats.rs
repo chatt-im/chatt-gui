@@ -1,14 +1,12 @@
-use std::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(feature = "diagnostic-logs", test))]
 use std::time::Duration;
 #[cfg(feature = "diagnostic-logs")]
 use std::time::Instant;
 
-use gpui::{App, Window};
 #[cfg(feature = "diagnostic-logs")]
 use gpui::profiler;
+use gpui::{App, Window};
 
 #[cfg(feature = "diagnostic-logs")]
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
