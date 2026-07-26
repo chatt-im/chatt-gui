@@ -210,25 +210,24 @@ impl MpvPlayer {
             .and_then(|native| native.drm_render_node.as_ref())
             .and_then(|path| path.to_str())
             .map(str::to_owned);
-        let supports_vulkan_decode = live
-            && native_candidate
-                .as_ref()
-                .and_then(|candidate| candidate.as_ref().ok())
-                .is_some_and(|native| {
-                    let queue_family_properties = unsafe {
-                        native
-                            .instance
-                            .get_physical_device_queue_family_properties(native.physical_device)
-                    };
-                    supports_vulkan_video_decode(
-                        &native.device_extensions,
-                        &native.enabled_queue_families,
-                        &queue_family_properties,
-                        native.synchronization2,
-                        native.video_maintenance1,
-                        live_codec,
-                    )
-                });
+        let supports_vulkan_decode = native_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.as_ref().ok())
+            .is_some_and(|native| {
+                let queue_family_properties = unsafe {
+                    native
+                        .instance
+                        .get_physical_device_queue_family_properties(native.physical_device)
+                };
+                supports_vulkan_video_decode(
+                    &native.device_extensions,
+                    &native.enabled_queue_families,
+                    &queue_family_properties,
+                    native.synchronization2,
+                    native.video_maintenance1,
+                    live_codec,
+                )
+            });
         let default_hwdec = if live {
             if supports_vulkan_decode {
                 "vulkan"
@@ -241,8 +240,10 @@ impl MpvPlayer {
             } else {
                 "auto-copy-safe"
             }
+        } else if supports_vulkan_decode {
+            attachment_hwdec_policy(true)
         } else {
-            "vulkan,auto-safe"
+            attachment_hwdec_policy(false)
         };
         let hwdec = if live {
             std::env::var("CHATT_LIVE_HWDEC")
@@ -252,6 +253,14 @@ impl MpvPlayer {
         } else {
             default_hwdec.to_owned()
         };
+        if !live {
+            kvlog::info!(
+                "attachment decoder policy selected",
+                player_id,
+                vulkan_video_usable = supports_vulkan_decode,
+                hwdec = %hwdec
+            );
+        }
         let require_direct_vulkan = supports_vulkan_decode && hwdec == "vulkan";
         kvlog::info!(
             "initializing embedded libmpv",
@@ -903,6 +912,16 @@ impl VulkanQueueLock for WgpuQueueLock {
     }
 }
 
+fn attachment_hwdec_policy(supports_vulkan_decode: bool) -> &'static str {
+    if supports_vulkan_decode {
+        "vulkan,auto-safe"
+    } else if cfg!(target_os = "linux") {
+        "vaapi-copy,auto-copy-safe"
+    } else {
+        "auto-copy-safe"
+    }
+}
+
 fn supports_vulkan_video_decode(
     device_extensions: &[&CStr],
     enabled_queue_families: &[(u32, u32)],
@@ -935,20 +954,24 @@ fn supports_vulkan_video_decode(
     {
         return false;
     }
+    let supports_h264 = has(c"VK_KHR_video_decode_h264");
+    let supports_h265 = has(c"VK_KHR_video_decode_h265");
+    let supports_av1 = has(c"VK_KHR_video_decode_av1");
     match codec {
         Some(codec) if codec.starts_with("avc1.") || codec.eq_ignore_ascii_case("h264") => {
-            has(c"VK_KHR_video_decode_h264")
+            supports_h264
         }
         Some(codec)
             if codec.starts_with("hvc1.")
                 || codec.starts_with("hev1.")
                 || codec.eq_ignore_ascii_case("hevc") =>
         {
-            has(c"VK_KHR_video_decode_h265")
+            supports_h265
         }
         Some(codec) if codec.starts_with("av01.") || codec.eq_ignore_ascii_case("av1") => {
-            has(c"VK_KHR_video_decode_av1")
+            supports_av1
         }
+        None => supports_h264 || supports_h265 || supports_av1,
         _ => false,
     }
 }
@@ -3055,7 +3078,7 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_decode_requires_core_and_matching_codec_extensions() {
+    fn vulkan_decode_accepts_an_enabled_dedicated_decode_queue() {
         let h264 = [
             c"VK_KHR_video_queue",
             c"VK_KHR_video_decode_queue",
@@ -3081,6 +3104,14 @@ mod tests {
             true,
             true,
             Some("avc1.64001F")
+        ));
+        assert!(supports_vulkan_video_decode(
+            &h264,
+            &[(0, 1), (1, 1)],
+            &queue_families,
+            true,
+            true,
+            None
         ));
         assert!(!supports_vulkan_video_decode(
             &h264,
@@ -3114,6 +3145,23 @@ mod tests {
             true,
             Some("h264")
         ));
+    }
+
+    #[test]
+    fn attachment_decoder_policy_skips_only_impossible_vulkan_video() {
+        assert_eq!(
+            attachment_hwdec_policy(true),
+            "vulkan,auto-safe",
+            "libmpv retains authoritative stream probing when the imported device is usable"
+        );
+        assert_eq!(
+            attachment_hwdec_policy(false),
+            if cfg!(target_os = "linux") {
+                "vaapi-copy,auto-copy-safe"
+            } else {
+                "auto-copy-safe"
+            }
+        );
     }
 
     #[test]
