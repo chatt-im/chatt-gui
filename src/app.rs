@@ -57,6 +57,7 @@ use crate::{
         composer_add_button, icon_button, message_action_button, mini_button,
         preview_action_button, preview_control_button, preview_status, room_button, toolbar_button,
     },
+    ui_scale::rems_from_px,
     video_controls::{
         CONTROLS_ANIMATION_DURATION, CONTROLS_HIDE_DELAY, VideoControlsState, VideoScrub,
         VideoVolumeDrag, horizontal_fraction, vertical_fraction, volume_scroll_delta,
@@ -450,11 +451,14 @@ fn zoom_live_pan(
     )
 }
 
-fn clamp_live_pane_height(height: Pixels, window_height: Pixels) -> Pixels {
-    let available =
-        window_height - px(TOP_BAR_HEIGHT) - px(MIN_CHAT_PANE_HEIGHT) - px(LIVE_PANE_DIVIDER_SIZE);
-    let min_height =
-        px(MIN_LIVE_PANE_HEIGHT).min(available.max(px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT)));
+fn clamp_live_pane_height(height: Pixels, window_height: Pixels, rem_size: Pixels) -> Pixels {
+    let available = window_height
+        - crate::ui_scale::scaled_px(TOP_BAR_HEIGHT, rem_size)
+        - crate::ui_scale::scaled_px(MIN_CHAT_PANE_HEIGHT, rem_size)
+        - crate::ui_scale::scaled_px(LIVE_PANE_DIVIDER_SIZE, rem_size);
+    let min_height = crate::ui_scale::scaled_px(MIN_LIVE_PANE_HEIGHT, rem_size).min(available.max(
+        crate::ui_scale::scaled_px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT, rem_size),
+    ));
     height.clamp(min_height, available.max(min_height))
 }
 
@@ -738,6 +742,7 @@ pub struct ChattView {
     composer_error: Option<SharedString>,
     status: SharedString,
     typography_revision: u64,
+    ui_scale_revision: u64,
     settings: Option<gpui::Entity<SettingsView>>,
     settings_subscription: Option<Subscription>,
     settings_remote_session: Option<local_rpc::settings::SettingsSessionId>,
@@ -914,7 +919,9 @@ impl ChattView {
             preview_image_viewport: Cell::new(None),
             preview_last_mouse_position: None,
             preview_panel_width: default_panel_width(
-                window.viewport_size().width - px(SIDEBAR_WIDTH),
+                window.viewport_size().width
+                    - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, crate::ui_scale::rem_size(cx)),
+                crate::ui_scale::rem_size(cx),
             ),
             preview_pane_resize: None,
             list_state,
@@ -970,6 +977,7 @@ impl ChattView {
             composer_error: None,
             status: "Discovering Chatt daemon…".into(),
             typography_revision: AppliedSettings::get(cx).typography_revision,
+            ui_scale_revision: crate::ui_scale::revision(cx),
             settings: None,
             settings_subscription: None,
             settings_remote_session: None,
@@ -2340,8 +2348,11 @@ impl ChattView {
         let Some(bounds) = self.live_pane_bounds.get() else {
             return;
         };
-        let start_height =
-            clamp_live_pane_height(bounds.size.height, window.viewport_size().height);
+        let start_height = clamp_live_pane_height(
+            bounds.size.height,
+            window.viewport_size().height,
+            window.rem_size(),
+        );
         self.live_pane_height = Some(start_height);
         self.live_pane_resize = Some(LivePaneResize {
             start_y: event.position.y,
@@ -2367,6 +2378,7 @@ impl ChattView {
         self.live_pane_height = Some(clamp_live_pane_height(
             resize.start_height + event.position.y - resize.start_y,
             window.viewport_size().height,
+            window.rem_size(),
         ));
         cx.stop_propagation();
         cx.notify();
@@ -4555,8 +4567,9 @@ impl ChattView {
     fn begin_preview_session(&mut self, window: &Window, cx: &App) {
         if self.preview_history.active().is_none() {
             self.preview_return_focus = window.focused(cx).map(|focus| focus.downgrade());
-            let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
-            self.preview_panel_width = default_panel_width(body_width);
+            let body_width = window.viewport_size().width
+                - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
+            self.preview_panel_width = default_panel_width(body_width, window.rem_size());
         }
     }
 
@@ -5216,8 +5229,10 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
-        self.preview_panel_width = clamp_panel_width(self.preview_panel_width, body_width);
+        let body_width = window.viewport_size().width
+            - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
+        self.preview_panel_width =
+            clamp_panel_width(self.preview_panel_width, body_width, window.rem_size());
         self.preview_pane_resize = Some(PreviewPaneResize {
             start_x: event.position.x,
             start_width: self.preview_panel_width,
@@ -5239,10 +5254,12 @@ impl ChattView {
             self.finish_preview_pane_resize(cx);
             return;
         }
-        let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
+        let body_width = window.viewport_size().width
+            - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
         self.preview_panel_width = clamp_panel_width(
             resize.start_width + resize.start_x - event.position.x,
             body_width,
+            window.rem_size(),
         );
         cx.stop_propagation();
         cx.notify();
@@ -5286,28 +5303,28 @@ impl ChattView {
             .id(("command-output", local_id as usize))
             .relative()
             .w_full()
-            .pl(px(64.))
-            .pr(px(28.))
-            .py(px(9.))
+            .pl(rems_from_px(64.))
+            .pr(rems_from_px(28.))
+            .py(rems_from_px(9.))
             .bg(settings.theme.color(ThemeRole::Raised))
             .hover(move |row| row.bg(row_hover))
             .child(
                 div()
                     .absolute()
-                    .left(px(64.))
+                    .left(rems_from_px(64.))
                     .top_0()
                     .bottom_0()
-                    .w(px(3.))
+                    .w(rems_from_px(3.))
                     .bg(accent),
             )
             .child(
                 div()
                     .absolute()
                     .left_0()
-                    .top(px(9.))
-                    .h(px(24.))
-                    .w(px(64.))
-                    .pr(px(8.))
+                    .top(rems_from_px(9.))
+                    .h(rems_from_px(24.))
+                    .w(rems_from_px(64.))
+                    .pr(rems_from_px(8.))
                     .flex()
                     .items_center()
                     .justify_end()
@@ -5318,12 +5335,12 @@ impl ChattView {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(860.))
+                    .max_w(rems_from_px(860.))
                     .min_w_0()
-                    .pl(px(15.))
+                    .pl(rems_from_px(15.))
                     .child(
                         div()
-                            .h(px(24.))
+                            .min_h(rems_from_px(24.))
                             .flex()
                             .items_center()
                             .gap_2()
@@ -5360,7 +5377,11 @@ impl ChattView {
 
         div()
             .w_full()
-            .pb(px(if trailing_gap { TIMELINE_GROUP_GAP } else { 0. }))
+            .pb(rems_from_px(if trailing_gap {
+                TIMELINE_GROUP_GAP
+            } else {
+                0.
+            }))
             .child(command_row)
             .into_any_element()
     }
@@ -5461,10 +5482,10 @@ impl ChattView {
             .group(hover_group.clone())
             .relative()
             .w_full()
-            .pl(px(64.))
-            .pr(px(28.))
-            .pt(px(if continuation { 3. } else { 10. }))
-            .pb(px(3.))
+            .pl(rems_from_px(64.))
+            .pr(rems_from_px(28.))
+            .pt(rems_from_px(if continuation { 3. } else { 10. }))
+            .pb(rems_from_px(3.))
             .bg(background)
             .hover(move |row| row.bg(row_hover))
             .when_some(reference_flash_id, |row, flash_id| {
@@ -5489,20 +5510,20 @@ impl ChattView {
             .child(
                 div()
                     .absolute()
-                    .left(px(64.))
+                    .left(rems_from_px(64.))
                     .top_0()
                     .bottom_0()
-                    .w(px(3.))
+                    .w(rems_from_px(3.))
                     .bg(accent),
             )
             .child(
                 div()
                     .absolute()
                     .left_0()
-                    .top(px(if continuation { 3. } else { 10. }))
-                    .h(px(24.))
-                    .w(px(64.))
-                    .pr(px(8.))
+                    .top(rems_from_px(if continuation { 3. } else { 10. }))
+                    .h(rems_from_px(24.))
+                    .w(rems_from_px(64.))
+                    .pr(rems_from_px(8.))
                     .flex()
                     .items_center()
                     .justify_end()
@@ -5515,78 +5536,89 @@ impl ChattView {
                     .child(timestamp),
             )
             .child(
-                div().relative().w_full().max_w(px(860.)).pl(px(15.)).child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .when(!continuation, |content| {
-                            content.child(
-                                div()
-                                    .h(px(24.))
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .pr(px(180.))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(accent)
-                                            .child(sender),
-                                    )
-                                    .when(!collapsed && edited, |meta| {
-                                        meta.child(
+                div()
+                    .relative()
+                    .w_full()
+                    .max_w(rems_from_px(860.))
+                    .pl(rems_from_px(15.))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .when(!continuation, |content| {
+                                content.child(
+                                    div()
+                                        .min_h(rems_from_px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .pr(rems_from_px(180.))
+                                        .child(
                                             div()
-                                                .text_xs()
-                                                .text_color(
-                                                    settings.theme.color(ThemeRole::TextDim),
-                                                )
-                                                .child("edited"),
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(accent)
+                                                .child(sender),
                                         )
-                                    })
-                                    .when(!collapsed && unverified, |meta| {
-                                        meta.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(
-                                                    settings.theme.color(ThemeRole::StateWarning),
-                                                )
-                                                .child("unverified"),
-                                        )
-                                    })
-                                    .when_some(collapsed_count, |meta, count| {
-                                        meta.child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(
-                                                    settings.theme.color(ThemeRole::TextMuted),
-                                                )
-                                                .child(format!(
-                                                    "· {count} {} collapsed",
-                                                    if count == 1 { "message" } else { "messages" }
-                                                )),
-                                        )
-                                    }),
-                            )
-                        })
-                        .when_some(formatted_message, |content, formatted_message| {
-                            content.child(formatted_message).when_some(
-                                attachment,
-                                |content, attachment| {
-                                    content.child(self.render_attachment(
-                                        room_id, message_id, attachment, window, cx,
-                                    ))
-                                },
-                            )
-                        }),
-                ),
+                                        .when(!collapsed && edited, |meta| {
+                                            meta.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(
+                                                        settings.theme.color(ThemeRole::TextDim),
+                                                    )
+                                                    .child("edited"),
+                                            )
+                                        })
+                                        .when(!collapsed && unverified, |meta| {
+                                            meta.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(
+                                                        settings
+                                                            .theme
+                                                            .color(ThemeRole::StateWarning),
+                                                    )
+                                                    .child("unverified"),
+                                            )
+                                        })
+                                        .when_some(collapsed_count, |meta, count| {
+                                            meta.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(
+                                                        settings.theme.color(ThemeRole::TextMuted),
+                                                    )
+                                                    .child(format!(
+                                                        "· {count} {} collapsed",
+                                                        if count == 1 {
+                                                            "message"
+                                                        } else {
+                                                            "messages"
+                                                        }
+                                                    )),
+                                            )
+                                        }),
+                                )
+                            })
+                            .when_some(formatted_message, |content, formatted_message| {
+                                content.child(formatted_message).when_some(
+                                    attachment,
+                                    |content, attachment| {
+                                        content.child(self.render_attachment(
+                                            room_id, message_id, attachment, window, cx,
+                                        ))
+                                    },
+                                )
+                            }),
+                    ),
             )
             .child(
                 div()
                     .absolute()
-                    .top(px(if continuation { 1. } else { 7. }))
-                    .right(px(28.))
+                    .top(rems_from_px(if continuation { 1. } else { 7. }))
+                    .right(rems_from_px(28.))
                     .flex()
                     .gap_1()
                     .invisible()
@@ -5679,7 +5711,7 @@ impl ChattView {
         let line_color = settings.theme.color(ThemeRole::BorderSubtle);
         div()
             .w_full()
-            .pb(px(if item.trailing_gap {
+            .pb(rems_from_px(if item.trailing_gap {
                 TIMELINE_GROUP_GAP
             } else {
                 0.
@@ -6239,7 +6271,7 @@ impl ChattView {
             tabs = tabs.child(
                 div()
                     .h_full()
-                    .max_w(px(210.0))
+                    .max_w(rems_from_px(210.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -6286,7 +6318,7 @@ impl ChattView {
                     .child(
                         div()
                             .id(close_id)
-                            .w(px(28.0))
+                            .w(rems_from_px(28.0))
                             .h_full()
                             .flex_none()
                             .flex()
@@ -6324,7 +6356,8 @@ impl ChattView {
             .expect("media cache lock poisoned")
             .get(active.descriptor.id);
         let cache_missing = cached_attachment.is_none();
-        let viewport = preview_image_viewport_bounds(window.viewport_size(), width);
+        let viewport =
+            preview_image_viewport_bounds(window.viewport_size(), width, window.rem_size());
         self.preview_image_viewport.set(Some(viewport));
         let geometry = self.preview_image.geometry(viewport);
         let zoom_percent = self.preview_image.zoom_percent(viewport);
@@ -6432,9 +6465,10 @@ impl ChattView {
             .track_focus(&self.code_viewer_focus)
             .child(
                 div()
-                    .h(px(PREVIEW_TAB_BAR_HEIGHT))
+                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
                     .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .min_w_0()
                     .border_b_1()
@@ -6470,7 +6504,7 @@ impl ChattView {
                             )
                             .child(
                                 div()
-                                    .w(px(44.0))
+                                    .w(rems_from_px(44.0))
                                     .text_center()
                                     .text_xs()
                                     .text_color(muted)
@@ -6522,7 +6556,8 @@ impl ChattView {
             .expect("code preview panel requires code content")
             .clone();
         let ready = matches!(&preview.state, CodePreviewState::Ready(_));
-        let compact_search = width < px(360.0);
+        let compact_search =
+            width < crate::ui_scale::scaled_px(360.0, crate::ui_scale::rem_size(cx));
         let active_match = self
             .code_search_open
             .then(|| {
@@ -6609,9 +6644,10 @@ impl ChattView {
             .track_focus(&self.code_viewer_focus)
             .child(
                 div()
-                    .h(px(PREVIEW_TAB_BAR_HEIGHT))
+                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
                     .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .min_w_0()
                     .border_b_1()
@@ -6681,18 +6717,19 @@ impl ChattView {
             .when(self.code_search_open && ready, |panel| {
                 panel.child(
                     div()
-                        .h(px(PREVIEW_SEARCH_BAR_HEIGHT))
+                        .min_h(rems_from_px(PREVIEW_SEARCH_BAR_HEIGHT))
                         .flex_none()
                         .flex()
+                        .flex_wrap()
                         .items_center()
-                        .gap(if compact_search { px(4.0) } else { px(8.0) })
-                        .px(if compact_search { px(4.0) } else { px(8.0) })
+                        .gap(rems_from_px(if compact_search { 4.0 } else { 8.0 }))
+                        .px(rems_from_px(if compact_search { 4.0 } else { 8.0 }))
                         .border_b_1()
                         .border_color(settings.theme.color(ThemeRole::BorderSubtle))
                         .bg(settings.theme.color(ThemeRole::Window))
                         .child(
                             div()
-                                .h(px(30.0))
+                                .min_h(rems_from_px(30.0))
                                 .min_w_0()
                                 .flex_1()
                                 .flex()
@@ -6706,13 +6743,13 @@ impl ChattView {
                         )
                         .child(
                             div()
-                                .w(if compact_search {
-                                    px(48.0)
+                                .w(rems_from_px(if compact_search {
+                                    48.0
                                 } else if active_match_hidden {
-                                    px(112.0)
+                                    112.0
                                 } else {
-                                    px(70.0)
-                                })
+                                    70.0
+                                }))
                                 .flex_none()
                                 .text_right()
                                 .text_xs()
@@ -7630,7 +7667,9 @@ impl ChattView {
         let pane_height = resizable
             .then_some(self.live_pane_height)
             .flatten()
-            .map(|height| clamp_live_pane_height(height, window.viewport_size().height));
+            .map(|height| {
+                clamp_live_pane_height(height, window.viewport_size().height, window.rem_size())
+            });
         if resizable {
             self.live_pane_height = pane_height;
         }
@@ -7667,7 +7706,7 @@ impl ChattView {
                     .left_0()
                     .right_0()
                     .bottom_0()
-                    .h(px(LIVE_PANE_DIVIDER_SIZE))
+                    .h(rems_from_px(LIVE_PANE_DIVIDER_SIZE))
                     .cursor_row_resize()
                     .hover({
                         let hover = settings.theme.color(ThemeRole::StateSelection);
@@ -7735,6 +7774,7 @@ impl ChattView {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_1()
                         .px_3()
@@ -7828,7 +7868,9 @@ impl ChattView {
                         .when(fullscreen || constrained, |viewport| {
                             viewport.flex_1().min_h_0()
                         })
-                        .when(!fullscreen && !constrained, |viewport| viewport.h(px(320.)))
+                        .when(!fullscreen && !constrained, |viewport| {
+                            viewport.h(rems_from_px(320.))
+                        })
                         .bg(settings.theme.color(ThemeRole::MediaViewport))
                         .cursor(if dragging {
                             gpui::CursorStyle::ClosedHand
@@ -7880,6 +7922,7 @@ impl ChattView {
             card = card.child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_1()
                     .px_3()
@@ -7932,13 +7975,15 @@ impl ChattView {
                             selected,
                             &settings.theme,
                         )
-                        .w(px(138.))
-                        .flex_none(),
+                        .max_w(rems_from_px(138.))
+                        .min_w_0()
+                        .flex_1(),
                     )
                     .child(
                         div()
-                            .w(px(190.))
-                            .flex_none()
+                            .max_w(rems_from_px(190.))
+                            .min_w_0()
+                            .flex_1()
                             .truncate()
                             .text_xs()
                             .text_color(settings.theme.color(if selected {
@@ -7969,7 +8014,7 @@ impl ChattView {
                     .gap_3()
                     .child(
                         div()
-                            .w(px(72.))
+                            .max_w(rems_from_px(72.))
                             .flex_none()
                             .text_xs()
                             .text_color(settings.theme.color(if selected {
@@ -7986,8 +8031,9 @@ impl ChattView {
                             selected,
                             &settings.theme,
                         )
-                        .w(px(220.))
-                        .flex_none(),
+                        .max_w(rems_from_px(220.))
+                        .min_w_0()
+                        .flex_1(),
                     )
                     .when_some(item.detail.clone(), |row, detail| {
                         row.child(
@@ -8012,15 +8058,16 @@ impl ChattView {
                     .gap_3()
                     .child(
                         div()
-                            .w(px(48.))
+                            .w(rems_from_px(48.))
                             .flex_none()
                             .text_xl()
                             .child(record.unicode.clone()),
                     )
                     .child(
                         div()
-                            .w(px(220.))
-                            .flex_none()
+                            .max_w(rems_from_px(220.))
+                            .min_w_0()
+                            .flex_1()
                             .truncate()
                             .text_sm()
                             .text_color(settings.theme.color(if selected {
@@ -8047,7 +8094,7 @@ impl ChattView {
             rows = rows.child(
                 div()
                     .id(("completion-option", index))
-                    .h(px(40.))
+                    .min_h(rems_from_px(40.))
                     .w_full()
                     .flex_none()
                     .flex()
@@ -8085,7 +8132,7 @@ impl ChattView {
         if let Some(hint) = view.hint {
             rows = rows.child(
                 div()
-                    .h(px(40.))
+                    .min_h(rems_from_px(40.))
                     .w_full()
                     .flex_none()
                     .flex()
@@ -8102,17 +8149,17 @@ impl ChattView {
         div()
             .id("command-completion")
             .absolute()
-            .left(px(79.))
-            .right(px(28.))
+            .left(rems_from_px(79.))
+            .right(rems_from_px(28.))
             .bottom(relative(1.))
-            .mb(px(6.))
+            .mb(rems_from_px(6.))
             .border_1()
             .border_color(settings.theme.color(ThemeRole::BorderStrong))
             .bg(settings.theme.color(ThemeRole::Raised))
             .child(rows)
             .child(
                 div()
-                    .h(px(28.))
+                    .min_h(rems_from_px(28.))
                     .w_full()
                     .flex()
                     .items_center()
@@ -8131,7 +8178,7 @@ impl ChattView {
             .with_animation(
                 ("command-completion-in", 0usize),
                 Animation::new(Duration::from_millis(90)).with_easing(gpui::ease_out_quint()),
-                |popup, delta| popup.opacity(delta).mb(px(2. + 4. * delta)),
+                |popup, delta| popup.opacity(delta).mb(rems_from_px(2. + 4. * delta)),
             )
             .into_any_element()
     }
@@ -8162,7 +8209,7 @@ impl ChattView {
             list = list.child(
                 div()
                     .flex_1()
-                    .min_h(px(220.))
+                    .min_h(rems_from_px(220.))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -8177,7 +8224,7 @@ impl ChattView {
                     )
                     .child(
                         div()
-                            .max_w(px(520.))
+                            .max_w(rems_from_px(520.))
                             .text_sm()
                             .text_color(applied.theme.color(ThemeRole::TextMuted))
                             .child(
@@ -8190,7 +8237,7 @@ impl ChattView {
             list = list.child(
                 div()
                     .flex_1()
-                    .min_h(px(180.))
+                    .min_h(rems_from_px(180.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -8234,7 +8281,7 @@ impl ChattView {
                     })
                     .child(
                         div()
-                            .w(px(28.))
+                            .w(rems_from_px(28.))
                             .flex_none()
                             .text_center()
                             .text_color(applied.theme.color(if selected {
@@ -8298,7 +8345,7 @@ impl ChattView {
                 row = if !connectable {
                     row.child(
                         div()
-                            .max_w(px(190.))
+                            .max_w(rems_from_px(190.))
                             .text_right()
                             .text_xs()
                             .text_color(applied.theme.color(ThemeRole::StateWarning))
@@ -8307,7 +8354,7 @@ impl ChattView {
                 } else if !server.require_transport_encryption {
                     row.child(
                         div()
-                            .max_w(px(190.))
+                            .max_w(rems_from_px(190.))
                             .text_right()
                             .text_xs()
                             .text_color(applied.theme.color(ThemeRole::StateWarning))
@@ -8341,9 +8388,10 @@ impl ChattView {
             .text_color(applied.theme.color(ThemeRole::TextPrimary))
             .child(
                 div()
-                    .h(px(TOP_BAR_HEIGHT))
+                    .min_h(rems_from_px(TOP_BAR_HEIGHT))
                     .flex_none()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_3()
                     .px_4()
@@ -8390,7 +8438,7 @@ impl ChattView {
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(760.))
+                            .max_w(rems_from_px(760.))
                             .h_full()
                             .flex()
                             .flex_col()
@@ -8419,7 +8467,7 @@ impl ChattView {
                             )
                             .child(
                                 div()
-                                    .h(px(36.))
+                                    .min_h(rems_from_px(36.))
                                     .w_full()
                                     .flex_none()
                                     .flex()
@@ -8480,7 +8528,7 @@ impl ChattView {
                     .bg(applied.theme.color(ThemeRole::MediaViewport))
                     .child(
                         div()
-                            .w(px(620.))
+                            .w(rems_from_px(620.))
                             .max_w_full()
                             .mx_4()
                             .p_5()
@@ -8561,7 +8609,8 @@ impl ChattView {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
         let applied = AppliedSettings::get(cx);
         let mut sidebar = div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(rems_from_px(SIDEBAR_WIDTH))
+            .max_w(relative(0.5))
             .h_full()
             .flex_none()
             .flex()
@@ -8571,7 +8620,7 @@ impl ChattView {
             .bg(applied.theme.color(ThemeRole::Sidebar))
             .child(
                 div()
-                    .h(px(TOP_BAR_HEIGHT))
+                    .min_h(rems_from_px(TOP_BAR_HEIGHT))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -8660,7 +8709,7 @@ impl ChattView {
             .unwrap_or_else(|| "No identity".into());
         sidebar.child(div().flex_1()).child(
             div()
-                .h(px(58.))
+                .min_h(rems_from_px(58.))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -8670,7 +8719,7 @@ impl ChattView {
                 .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                 .child(
                     div()
-                        .size(px(30.))
+                        .size(rems_from_px(30.))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -8802,7 +8851,7 @@ impl ChattView {
             .flex()
             .flex_wrap()
             .gap_2()
-            .pl(px(51.))
+            .pl(rems_from_px(51.))
             .pr_2()
             .pb_2();
         for file in self.queued_files.files() {
@@ -8810,8 +8859,8 @@ impl ChattView {
             row = row.child(
                 div()
                     .id(("queued-file", id as usize))
-                    .max_w(px(260.))
-                    .h(px(28.))
+                    .max_w(rems_from_px(260.))
+                    .min_h(rems_from_px(28.))
                     .px_2()
                     .flex()
                     .items_center()
@@ -8830,7 +8879,7 @@ impl ChattView {
                     .child(
                         div()
                             .id(("remove-queued-file", id as usize))
-                            .size(px(18.))
+                            .size(rems_from_px(18.))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -8885,9 +8934,9 @@ impl ChattView {
                 self.render_message_reference_attachment(target, attachment.clone(), window, cx)
             });
         let card = div()
-            .w(px(400.))
-            .max_w(px(400.))
-            .max_h(px(480.))
+            .w(rems_from_px(400.))
+            .max_w(rems_from_px(400.))
+            .max_h(rems_from_px(480.))
             .overflow_hidden()
             .p_3()
             .border_1()
@@ -8934,13 +8983,16 @@ impl ChattView {
                         }),
                 )
             });
-        let position = point(anchor.origin.x, anchor.origin.y - px(6.));
+        let position = point(
+            anchor.origin.x,
+            anchor.origin.y - crate::ui_scale::scaled_px(6.0, window.rem_size()),
+        );
         Some(
             deferred(
                 anchored()
                     .anchor(Anchor::BottomLeft)
                     .position(position)
-                    .snap_to_window_with_margin(px(8.))
+                    .snap_to_window_with_margin(crate::ui_scale::scaled_px(8.0, window.rem_size()))
                     .child(card),
             )
             .into_any_element(),
@@ -8971,9 +9023,9 @@ impl ChattView {
                 return div()
                     .id(("reference-preview-image", target.message_id.0 as usize))
                     .mt_2()
-                    .w(px(width))
+                    .w(rems_from_px(width))
                     .max_w_full()
-                    .h(px(height))
+                    .h(rems_from_px(height))
                     .overflow_hidden()
                     .bg(settings.theme.color(ThemeRole::Panel))
                     .child(
@@ -8999,7 +9051,7 @@ impl ChattView {
             };
             return div()
                 .mt_2()
-                .h(px(96.))
+                .min_h(rems_from_px(96.))
                 .w_full()
                 .px_2()
                 .flex()
@@ -9035,9 +9087,13 @@ impl Render for ChattView {
                 applied.source_status,
                 crate::config::io::SourceStatus::Missing
             );
-        window.set_rem_size(px(applied.fonts.interface_size));
-        if self.typography_revision != applied.typography_revision {
+        window.set_rem_size(crate::ui_scale::rem_size(cx));
+        let ui_scale_revision = crate::ui_scale::revision(cx);
+        if self.typography_revision != applied.typography_revision
+            || self.ui_scale_revision != ui_scale_revision
+        {
             self.typography_revision = applied.typography_revision;
+            self.ui_scale_revision = ui_scale_revision;
             self.preview_history.reset_code_measurements();
         }
         self.composer.update(cx, |composer, cx| {
@@ -9235,8 +9291,10 @@ impl Render for ChattView {
         let resizing_live_pane = self.live_pane_resize.is_some();
         let active_preview = self.preview_history.active().cloned();
         let preview_panel = active_preview.map(|active| {
-            let body_width = window.viewport_size().width - px(SIDEBAR_WIDTH);
-            self.preview_panel_width = clamp_panel_width(self.preview_panel_width, body_width);
+            let body_width = window.viewport_size().width
+                - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
+            self.preview_panel_width =
+                clamp_panel_width(self.preview_panel_width, body_width, window.rem_size());
             self.render_preview_panel(active, self.preview_panel_width, window, cx)
         });
         let resizing_preview_pane = self.preview_pane_resize.is_some();
@@ -9366,9 +9424,10 @@ impl Render for ChattView {
                             .flex_col()
                             .child(
                                 div()
-                            .h(px(TOP_BAR_HEIGHT))
+                            .min_h(rems_from_px(TOP_BAR_HEIGHT))
                             .flex_none()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_3()
                             .px_4()
@@ -9382,6 +9441,8 @@ impl Render for ChattView {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(selected_name.clone()),
                             )
@@ -9547,7 +9608,7 @@ impl Render for ChattView {
                         |panel| {
                             panel.child(
                                 div()
-                                    .h(px(34.))
+                                    .min_h(rems_from_px(34.))
                                     .flex_none()
                                     .flex()
                                     .items_center()
@@ -9580,7 +9641,7 @@ impl Render for ChattView {
                                 area.child(
                                     div()
                                         .absolute()
-                                        .top(px(40.))
+                                        .top(rems_from_px(40.))
                                         .left_0()
                                         .right_0()
                                         .px_4()
@@ -9596,13 +9657,13 @@ impl Render for ChattView {
                         div()
                             .relative()
                             .key_context(completion_key_context)
-                            .min_h(px(MIN_COMPOSER_HEIGHT))
+                            .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
                             .flex_none()
                             .flex()
                             .flex_col()
                             .items_stretch()
-                            .pl(px(28.))
-                            .pr(px(28.))
+                            .pl(rems_from_px(28.))
+                            .pr(rems_from_px(28.))
                             .py_2()
                             .border_t_1()
                             .border_color(applied.theme.color(ThemeRole::BorderSubtle))
@@ -9637,13 +9698,13 @@ impl Render for ChattView {
                                     .items_center()
                                     .child(
                                         div()
-                                            .w(px(36.))
-                                            .h(px(40.))
+                                            .w(rems_from_px(36.))
+                                            .min_h(rems_from_px(40.))
                                             .flex_none()
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .mr(px(15.))
+                                            .mr(rems_from_px(15.))
                                             .child(composer_add_button(
                                                 can_attach,
                                                 &applied.theme,
@@ -9656,7 +9717,7 @@ impl Render for ChattView {
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .min_h(px(40.))
+                                            .min_h(rems_from_px(40.))
                                             .flex_1()
                                             .flex()
                                             .items_center()
@@ -9670,7 +9731,7 @@ impl Render for ChattView {
                 root.child(
                     div()
                         .id("preview-pane-resize")
-                        .w(px(PREVIEW_DIVIDER_WIDTH))
+                        .w(rems_from_px(PREVIEW_DIVIDER_WIDTH))
                         .h_full()
                         .flex_none()
                         .flex()
@@ -9698,7 +9759,7 @@ impl Render for ChattView {
                                 this.finish_preview_pane_resize(cx)
                             }),
                         )
-                        .child(div().w(px(3.0)).h_full().bg(applied.theme.color(
+                        .child(div().w(rems_from_px(3.0)).h_full().bg(applied.theme.color(
                             if resizing_preview_pane {
                                 ThemeRole::BorderFocus
                             } else {
@@ -9750,8 +9811,9 @@ fn image_box_size(descriptor: &AttachmentDescriptor) -> (f32, f32) {
 fn preview_image_viewport_bounds(
     window_size: gpui::Size<Pixels>,
     panel_width: Pixels,
+    rem_size: Pixels,
 ) -> Bounds<Pixels> {
-    let chrome_height = px(PREVIEW_TAB_BAR_HEIGHT);
+    let chrome_height = crate::ui_scale::scaled_px(PREVIEW_TAB_BAR_HEIGHT, rem_size);
     Bounds {
         origin: point(window_size.width - panel_width, chrome_height),
         size: gpui::size(
@@ -9765,7 +9827,7 @@ fn image_frame(descriptor: &AttachmentDescriptor, palette: &ThemePalette) -> Div
     let (width, height) = image_box_size(descriptor);
     div()
         .relative()
-        .w(px(width))
+        .w(rems_from_px(width))
         .max_w_full()
         .aspect_ratio(width / height)
         .border_6()
@@ -10052,7 +10114,11 @@ mod tests {
 
     #[test]
     fn preview_image_viewport_uses_fixed_panel_chrome_without_measurement() {
-        let bounds = preview_image_viewport_bounds(gpui::size(px(1_920.0), px(1_080.0)), px(900.0));
+        let bounds = preview_image_viewport_bounds(
+            gpui::size(px(1_920.0), px(1_080.0)),
+            px(900.0),
+            px(16.0),
+        );
 
         assert_eq!(PREVIEW_TAB_BAR_HEIGHT, TOP_BAR_HEIGHT);
         assert_eq!(bounds.origin, point(px(1_020.0), px(52.0)));
@@ -10569,10 +10635,16 @@ mod tests {
     #[test]
     fn live_pane_height_preserves_both_video_and_chat() {
         assert_eq!(
-            clamp_live_pane_height(px(100.0), px(900.0)),
+            clamp_live_pane_height(px(100.0), px(900.0), px(16.0)),
             px(MIN_LIVE_PANE_HEIGHT),
         );
-        assert_eq!(clamp_live_pane_height(px(900.0), px(900.0)), px(699.0),);
-        assert_eq!(clamp_live_pane_height(px(900.0), px(300.0)), px(99.0),);
+        assert_eq!(
+            clamp_live_pane_height(px(900.0), px(900.0), px(16.0)),
+            px(699.0),
+        );
+        assert_eq!(
+            clamp_live_pane_height(px(900.0), px(300.0), px(16.0)),
+            px(99.0),
+        );
     }
 }

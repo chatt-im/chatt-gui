@@ -18,6 +18,7 @@ use crate::{
     fonts::{CODE_FONT_FAMILY, UI_FONT_FAMILY},
     icons::{IconName, icon},
     theme::{AppliedSettings, ThemeRole, syntax_role},
+    ui_scale::rems_from_px,
 };
 
 const BODY_COLOR: u32 = 0xd8d8d8;
@@ -613,6 +614,11 @@ impl FormattedMessageElement {
         let code_size = applied
             .as_ref()
             .map_or(14.0, |settings| settings.fonts.code_size);
+        let interface_size = applied
+            .as_ref()
+            .map_or(16.0, |settings| settings.fonts.interface_size);
+        let message_rems = crate::ui_scale::font_rems(message_size, interface_size);
+        let code_rems = crate::ui_scale::font_rems(code_size, interface_size);
         let body_color = self
             .body_color
             .or_else(|| {
@@ -627,7 +633,7 @@ impl FormattedMessageElement {
             .min_w_0()
             .flex()
             .flex_col()
-            .text_size(px(message_size));
+            .text_size(message_rems);
 
         for (index, block) in self.message.blocks.iter().enumerate() {
             let element = match &block.kind {
@@ -644,7 +650,10 @@ impl FormattedMessageElement {
                 BlockKind::Header(pieces) => div()
                     .w_full()
                     .min_w_0()
-                    .text_size(px(message_size + 1.))
+                    .text_size(crate::ui_scale::font_rems(
+                        message_size + 1.0,
+                        interface_size,
+                    ))
                     .child(render_pieces(
                         pieces,
                         PiecePresentation::Header,
@@ -695,9 +704,9 @@ impl FormattedMessageElement {
                     &mut lines,
                     window,
                     cx,
-                    code_size,
+                    code_rems,
                 ),
-                BlockKind::Blank => div().h(px(7.)).into_any_element(),
+                BlockKind::Blank => div().h(rems_from_px(7.)).into_any_element(),
             };
 
             let element = div()
@@ -705,7 +714,7 @@ impl FormattedMessageElement {
                 .min_w_0()
                 .when(
                     index > 0 && !matches!(block.kind, BlockKind::Blank),
-                    |this| this.pt(px(5.)),
+                    |this| this.pt(rems_from_px(5.)),
                 )
                 .child(element)
                 .into_any_element();
@@ -983,12 +992,19 @@ fn render_piece(
         layout: styled.layout().clone(),
         range: piece.range.clone(),
     });
+    let wumboji_size = cx.try_global::<AppliedSettings>().map_or_else(
+        || crate::ui_scale::font_rems(WUMBOJI_SIZE_PX, 16.0),
+        |settings| {
+            crate::ui_scale::font_rems(
+                settings.0.fonts.message_size * 2.0,
+                settings.0.fonts.interface_size,
+            )
+        },
+    );
     div()
         .when(fill_width, |element| element.w_full())
         .min_w_0()
-        .when(piece.wumboji, |element| {
-            element.text_size(px(WUMBOJI_SIZE_PX))
-        })
+        .when(piece.wumboji, |element| element.text_size(wumboji_size))
         .child(styled)
         .into_any_element()
 }
@@ -1032,14 +1048,14 @@ fn render_code_block(
     lines: &mut Vec<RenderedLine>,
     window: &Window,
     cx: &App,
-    code_size: f32,
+    code_size: gpui::Rems,
 ) -> AnyElement {
     let applied = cx
         .try_global::<AppliedSettings>()
         .map(|settings| settings.0.clone());
     let code = piece.text.clone();
     let content = if code.is_empty() {
-        div().h(px(20.)).into_any_element()
+        div().h(rems_from_px(20.)).into_any_element()
     } else {
         let runs = text_runs(
             piece,
@@ -1071,9 +1087,9 @@ fn render_code_block(
         .relative()
         .w_full()
         .min_w_0()
-        .px(px(8.))
-        .py(px(8.))
-        .pr(px(40.))
+        .px(rems_from_px(8.))
+        .py(rems_from_px(8.))
+        .pr(rems_from_px(40.))
         .bg(applied
             .as_ref()
             .map(|settings| settings.theme.color(ThemeRole::CodeSurface))
@@ -1085,7 +1101,7 @@ fn render_code_block(
                 .map(|settings| settings.theme.color(ThemeRole::BorderCode))
                 .unwrap_or_else(|| rgb(CODE_BORDER)),
         )
-        .text_size(px(code_size))
+        .text_size(code_size)
         .font_family(
             applied
                 .as_ref()
@@ -1097,9 +1113,9 @@ fn render_code_block(
             div()
                 .id(("copy-code", piece.range.start))
                 .absolute()
-                .top(px(4.))
-                .right(px(4.))
-                .size(px(28.))
+                .top(rems_from_px(4.))
+                .right(rems_from_px(4.))
+                .size(rems_from_px(28.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1138,7 +1154,7 @@ fn wrap_quote(mut element: AnyElement, depth: usize, color: gpui::Rgba) -> AnyEl
         element = div()
             .w_full()
             .min_w_0()
-            .pl(px(10.))
+            .pl(rems_from_px(10.))
             .border_l_4()
             .border_color(color)
             .child(element)
@@ -2030,7 +2046,10 @@ where
         }
         if self.group.is_pending() {
             let pointer = window.mouse_position();
-            let line_height = self.group.active_line_height().unwrap_or(px(16.));
+            let line_height = self
+                .group
+                .active_line_height()
+                .unwrap_or_else(|| window.line_height());
             let margin = line_height.min(bounds.size.height / 3.);
             let delta = if pointer.y < bounds.top() + margin {
                 -selection_autoscroll_delta(bounds.top() + margin - pointer.y, line_height)

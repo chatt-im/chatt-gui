@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, Rgba, SharedString, Svg, prelude::*, px, svg};
+use gpui::{AssetSource, Result, Rgba, SharedString, Svg, prelude::*, svg};
+
+use crate::ui_scale::rems_from_px;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IconName {
@@ -71,7 +73,7 @@ pub(crate) fn icon(name: IconName, size: f32, color: Rgba) -> Svg {
     // leaves `Svg::paint` without a color and it skips drawing altogether.
     svg()
         .path(name.path())
-        .size(px(size))
+        .size(rems_from_px(size))
         .flex_none()
         .text_color(color)
 }

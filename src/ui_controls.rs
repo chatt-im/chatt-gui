@@ -1,8 +1,9 @@
-use gpui::{AnyElement, Div, SharedString, Stateful, div, prelude::*, px};
+use gpui::{AnyElement, Div, SharedString, Stateful, div, prelude::*};
 
 use crate::{
     icons::{IconName, icon},
     theme::{ThemePalette, ThemeRole},
+    ui_scale::rems_from_px,
 };
 
 pub(crate) fn room_button(
@@ -28,7 +29,7 @@ pub(crate) fn room_button(
     div()
         .id(id)
         .mx_2()
-        .h(px(34.))
+        .min_h(rems_from_px(34.))
         .px_2()
         .flex()
         .items_center()
@@ -40,8 +41,14 @@ pub(crate) fn room_button(
         })
         .active(move |button| button.bg(pressed))
         .text_color(text)
-        .child(div().w(px(16.)).text_center().child(sigil))
-        .child(div().flex_1().child(label))
+        .child(
+            div()
+                .w(rems_from_px(16.))
+                .flex_none()
+                .text_center()
+                .child(sigil),
+        )
+        .child(div().min_w_0().flex_1().truncate().child(label))
         .when(unread > 0, |button| {
             button.child(
                 div()
@@ -62,7 +69,7 @@ pub(crate) fn toolbar_button(
     let hover = palette.color(ThemeRole::ControlButtonHover);
     div()
         .id(id)
-        .h(px(30.))
+        .min_h(rems_from_px(30.))
         .px_2()
         .flex()
         .items_center()
@@ -90,7 +97,7 @@ pub(crate) fn mini_button(
     let hover = palette.color(ThemeRole::ControlSurfaceHover);
     div()
         .id(id)
-        .h(px(28.))
+        .min_h(rems_from_px(28.))
         .px_2()
         .flex()
         .items_center()
@@ -111,7 +118,7 @@ pub(crate) fn icon_button(
     let active_text = palette.color(ThemeRole::ControlActiveText);
     div()
         .id(id)
-        .size(px(28.))
+        .size(rems_from_px(28.))
         .flex()
         .items_center()
         .justify_center()
@@ -136,7 +143,7 @@ pub(crate) fn message_action_button(
     });
     div()
         .id(id)
-        .size(px(28.))
+        .size(rems_from_px(28.))
         .flex()
         .items_center()
         .justify_center()
@@ -164,7 +171,7 @@ pub(crate) fn composer_add_button(ready: bool, palette: &ThemePalette) -> Statef
     let hover = palette.color(ThemeRole::TextPrimary);
     div()
         .id("add-media")
-        .size(px(36.))
+        .size(rems_from_px(36.))
         .flex()
         .items_center()
         .justify_center()
@@ -183,8 +190,7 @@ pub(crate) fn preview_action_button(
     let hover_text = palette.color(ThemeRole::TextPrimary);
     div()
         .id(id)
-        .w(px(28.0))
-        .h(px(28.0))
+        .size(rems_from_px(28.0))
         .flex()
         .items_center()
         .justify_center()
@@ -224,8 +230,8 @@ pub(crate) fn preview_control_button(
     let hover = palette.color(ThemeRole::ControlActive);
     div()
         .id(id)
-        .min_w(px(32.0))
-        .h(px(28.0))
+        .min_w(rems_from_px(32.0))
+        .min_h(rems_from_px(28.0))
         .px_2()
         .flex()
         .items_center()

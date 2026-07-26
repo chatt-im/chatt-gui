@@ -984,6 +984,7 @@ pub(crate) fn apply_appearance(
     ));
     cx.set_text_rendering_mode(rendering_mode(resolved.rendering));
     cx.set_global(AppliedSettings(resolved.clone()));
+    crate::ui_scale::configured_interface_size_changed(resolved.fonts.interface_size, cx);
     cx.refresh_windows();
     resolved
 }

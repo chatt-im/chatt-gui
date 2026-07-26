@@ -19,6 +19,7 @@ use crate::{
         validation::ConfigDiagnostic,
     },
     formatted_message,
+    ui_scale::{DecreaseUiScale, IncreaseUiScale, ResetUiScale},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -93,6 +94,12 @@ const CHAT_COMPOSER_INSERT: &str =
 const COMPLETION_OPEN: &str = "ChattComposer && ComposerInsert && CompletionOpen && !ChattSettings";
 const COMPLETION_ENGAGED: &str =
     "ChattComposer && ComposerInsert && CompletionEngaged && !ChattSettings";
+const UI_SCALE_CONTEXT: &str = "Chatt";
+
+#[cfg(target_os = "windows")]
+const UI_SCALE_IN_DEFAULTS: &[&str] = &["ctrl-=", "ctrl-shift-="];
+#[cfg(not(target_os = "windows"))]
+const UI_SCALE_IN_DEFAULTS: &[&str] = &["ctrl-=", "ctrl-+"];
 
 pub(crate) static BINDINGS: &[BindingSpec] = &[
     BindingSpec {
@@ -110,6 +117,30 @@ pub(crate) static BINDINGS: &[BindingSpec] = &[
         help: Some("The sidebar gear remains available if this is unbound."),
         contexts: &[CHAT],
         defaults: &["secondary-,"],
+    },
+    BindingSpec {
+        scope: BindingScope::Application,
+        command: BindCommand::IncreaseUiScale,
+        label: "Increase UI scale",
+        help: Some("Temporarily scales the entire interface for this session."),
+        contexts: &[UI_SCALE_CONTEXT],
+        defaults: UI_SCALE_IN_DEFAULTS,
+    },
+    BindingSpec {
+        scope: BindingScope::Application,
+        command: BindCommand::DecreaseUiScale,
+        label: "Decrease UI scale",
+        help: Some("Temporarily scales the entire interface for this session."),
+        contexts: &[UI_SCALE_CONTEXT],
+        defaults: &["ctrl--"],
+    },
+    BindingSpec {
+        scope: BindingScope::Application,
+        command: BindCommand::ResetUiScale,
+        label: "Reset UI scale",
+        help: Some("Restores the interface scale configured in GUI settings."),
+        contexts: &[UI_SCALE_CONTEXT],
+        defaults: &["ctrl-0"],
     },
     BindingSpec {
         scope: BindingScope::Composer,
@@ -745,6 +776,9 @@ fn make_action(scope: BindingScope, command: BindCommand) -> Box<dyn Action> {
     match (scope, command) {
         (BindingScope::Application, BindCommand::OpenMedia) => Box::new(OpenMedia),
         (BindingScope::Application, BindCommand::OpenSettings) => Box::new(OpenSettings),
+        (BindingScope::Application, BindCommand::IncreaseUiScale) => Box::new(IncreaseUiScale),
+        (BindingScope::Application, BindCommand::DecreaseUiScale) => Box::new(DecreaseUiScale),
+        (BindingScope::Application, BindCommand::ResetUiScale) => Box::new(ResetUiScale),
         (BindingScope::NonInput, BindCommand::ToggleMute) => Box::new(ToggleMute),
         (BindingScope::NonInput, BindCommand::ToggleDeafen) => Box::new(ToggleDeafen),
         (BindingScope::NonInput, BindCommand::ToggleVoice) => Box::new(ToggleVoice),
@@ -827,7 +861,7 @@ mod tests {
             .iter()
             .map(|binding| binding.defaults.len() * binding.contexts.len())
             .sum::<usize>();
-        assert_eq!(expanded_default_count, 48);
+        assert_eq!(expanded_default_count, 52);
         assert_eq!(
             effective_scope(&GuiConfig::default().bindings, BindingScope::Composer)
                 .iter()

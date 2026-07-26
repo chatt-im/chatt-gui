@@ -10,6 +10,7 @@ use crate::{
     icons::{IconName, icon},
     media_controls::format_time,
     theme::{ResolvedSettings, ThemeRole},
+    ui_scale::rems_from_px,
     video_controls::{
         CONTROLS_ANIMATION_DURATION, ControlsPhase, VOLUME_ANIMATION_DURATION, horizontal_fraction,
     },
@@ -184,7 +185,7 @@ pub(crate) fn render_video_player(
             div()
                 .id(("video-center-play", key.message_id as usize))
                 .absolute()
-                .size(px(52.0))
+                .size(rems_from_px(52.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -220,7 +221,7 @@ pub(crate) fn render_video_player(
             .id(("video-timeline", key.message_id as usize))
             .relative()
             .w_full()
-            .h(px(20.0))
+            .h(rems_from_px(20.0))
             .flex()
             .items_center()
             .when(duration > 0.0, |timeline| {
@@ -264,10 +265,10 @@ pub(crate) fn render_video_player(
                 timeline.child(
                     div()
                         .absolute()
-                        .bottom(px(18.0))
+                        .bottom(rems_from_px(18.0))
                         .left(relative(tooltip_fraction))
-                        .ml(px(-24.0))
-                        .min_w(px(48.0))
+                        .ml(rems_from_px(-24.0))
+                        .min_w(rems_from_px(48.0))
                         .px_2()
                         .py_1()
                         .border_1()
@@ -283,7 +284,7 @@ pub(crate) fn render_video_player(
                 div()
                     .relative()
                     .w_full()
-                    .h(px(if scrub_active { 5.0 } else { 3.0 }))
+                    .h(rems_from_px(if scrub_active { 5.0 } else { 3.0 }))
                     .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
                     .child(
                         div()
@@ -295,9 +296,9 @@ pub(crate) fn render_video_player(
                                 progress.child(
                                     div()
                                         .absolute()
-                                        .right(px(-4.0))
-                                        .top(px(-2.0))
-                                        .size(px(9.0))
+                                        .right(rems_from_px(-4.0))
+                                        .top(rems_from_px(-2.0))
+                                        .size(rems_from_px(9.0))
                                         .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
                                 )
                             }),
@@ -317,7 +318,7 @@ pub(crate) fn render_video_player(
         let mut volume_control = div()
             .id(("video-volume", key.message_id as usize))
             .relative()
-            .size(px(36.0))
+            .size(rems_from_px(36.0))
             .flex_none()
             .on_hover(move |hovered, window, cx| {
                 volume_hover(VideoPlayerEvent::VolumeHovered(*hovered), window, cx)
@@ -351,10 +352,10 @@ pub(crate) fn render_video_player(
             let popup = div()
                 .id(("video-volume-popup", key.message_id as usize))
                 .absolute()
-                .left(px(-2.0))
-                .bottom(px(40.0))
-                .w(px(40.0))
-                .h(px(112.0))
+                .left(rems_from_px(-2.0))
+                .bottom(rems_from_px(40.0))
+                .w(rems_from_px(40.0))
+                .h(rems_from_px(112.0))
                 .flex()
                 .flex_col()
                 .items_center()
@@ -385,7 +386,7 @@ pub(crate) fn render_video_player(
                 .child(
                     div()
                         .relative()
-                        .w(px(12.0))
+                        .w(rems_from_px(12.0))
                         .flex_1()
                         .flex()
                         .justify_center()
@@ -413,7 +414,7 @@ pub(crate) fn render_video_player(
                         .child(
                             div()
                                 .relative()
-                                .w(px(4.0))
+                                .w(rems_from_px(4.0))
                                 .h_full()
                                 .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
                                 .child(
@@ -428,10 +429,10 @@ pub(crate) fn render_video_player(
                                 .child(
                                     div()
                                         .absolute()
-                                        .left(px(-3.0))
+                                        .left(rems_from_px(-3.0))
                                         .bottom(relative(volume_fraction))
-                                        .mb(px(-4.0))
-                                        .size(px(10.0))
+                                        .mb(rems_from_px(-4.0))
+                                        .size(rems_from_px(10.0))
                                         .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
                                 ),
                         ),
@@ -439,7 +440,11 @@ pub(crate) fn render_video_player(
                 .with_animation(
                     ("video-volume-popup-in", key.message_id as usize),
                     Animation::new(VOLUME_ANIMATION_DURATION).with_easing(gpui::ease_out_quint()),
-                    |popup, delta| popup.opacity(delta).bottom(px(36.0 + 4.0 * delta)),
+                    |popup, delta| {
+                        popup
+                            .opacity(delta)
+                            .bottom(rems_from_px(36.0 + 4.0 * delta))
+                    },
                 );
             volume_control = volume_control.child(popup);
         }
@@ -447,8 +452,9 @@ pub(crate) fn render_video_player(
         let play = handler.clone();
         let theater_toggle = handler.clone();
         let control_row = div()
-            .h(px(38.0))
+            .min_h(rems_from_px(38.0))
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_1()
             .child(
@@ -505,9 +511,9 @@ pub(crate) fn render_video_player(
             .left_0()
             .right_0()
             .bottom_0()
-            .pt(px(if theater { 48.0 } else { 34.0 }))
-            .px(px(if theater { 18.0 } else { 10.0 }))
-            .pb(px(if theater { 12.0 } else { 7.0 }))
+            .pt(rems_from_px(if theater { 48.0 } else { 34.0 }))
+            .px(rems_from_px(if theater { 18.0 } else { 10.0 }))
+            .pb(rems_from_px(if theater { 12.0 } else { 7.0 }))
             .bg(linear_gradient(
                 180.0,
                 linear_color_stop(settings.theme.color(ThemeRole::MediaGradientStart), 0.0),
@@ -528,7 +534,11 @@ pub(crate) fn render_video_player(
                         ("video-controls-show", serial as usize),
                         Animation::new(CONTROLS_ANIMATION_DURATION)
                             .with_easing(gpui::ease_out_quint()),
-                        |controls, delta| controls.opacity(delta).bottom(px(-4.0 * (1.0 - delta))),
+                        |controls, delta| {
+                            controls
+                                .opacity(delta)
+                                .bottom(rems_from_px(-4.0 * (1.0 - delta)))
+                        },
                     )
                     .into_any_element(),
                 ControlsPhase::Hiding(serial) => controls
@@ -536,7 +546,11 @@ pub(crate) fn render_video_player(
                         ("video-controls-hide", serial as usize),
                         Animation::new(CONTROLS_ANIMATION_DURATION)
                             .with_easing(gpui::ease_out_quint()),
-                        |controls, delta| controls.opacity(1.0 - delta).bottom(px(-4.0 * delta)),
+                        |controls, delta| {
+                            controls
+                                .opacity(1.0 - delta)
+                                .bottom(rems_from_px(-4.0 * delta))
+                        },
                     )
                     .into_any_element(),
                 _ => controls.into_any_element(),
@@ -566,7 +580,7 @@ fn video_control_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(36.0))
+        .size(rems_from_px(36.0))
         .flex_none()
         .flex()
         .items_center()

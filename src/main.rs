@@ -29,6 +29,7 @@ mod settings;
 mod theme;
 mod timeline;
 mod ui_controls;
+mod ui_scale;
 mod video_controls;
 mod video_manager;
 mod video_player;
@@ -85,6 +86,7 @@ fn main() {
                 &available_families,
                 cx,
             );
+            ui_scale::install(cx);
             key_bindings::install(&loaded.config, cx)
                 .expect("built-in GUI key bindings must compile");
             settings::install_loaded(loaded.clone(), cx);

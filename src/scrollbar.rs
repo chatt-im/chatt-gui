@@ -9,9 +9,26 @@ use gpui::{
 
 use crate::theme::{ResolvedSettings, ThemeRole};
 
-const SCROLLBAR_SIZE: Pixels = px(12.0);
-const SCROLLBAR_PADDING: Pixels = px(2.0);
-const SCROLLBAR_MIN_THUMB: Pixels = px(28.0);
+const SCROLLBAR_SIZE: f32 = 12.0;
+const SCROLLBAR_PADDING: f32 = 2.0;
+const SCROLLBAR_MIN_THUMB: f32 = 28.0;
+
+#[derive(Clone, Copy)]
+struct ScrollbarMetrics {
+    size: Pixels,
+    padding: Pixels,
+    min_thumb: Pixels,
+}
+
+impl ScrollbarMetrics {
+    fn scaled(rem_size: Pixels) -> Self {
+        Self {
+            size: crate::ui_scale::scaled_px(SCROLLBAR_SIZE, rem_size),
+            padding: crate::ui_scale::scaled_px(SCROLLBAR_PADDING, rem_size),
+            min_thumb: crate::ui_scale::scaled_px(SCROLLBAR_MIN_THUMB, rem_size),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScrollbarAxis {
@@ -150,16 +167,21 @@ impl Element for OverlayScrollbars {
         _: &mut App,
     ) -> Self::PrepaintState {
         let base_handle = self.scroll_handle.0.borrow().base_handle.clone();
-        scrollbar_geometries(bounds, base_handle.max_offset(), base_handle.offset())
-            .into_iter()
-            .map(|geometry| ScrollbarLayout {
-                hitbox: window.insert_hitbox(
-                    geometry.track_bounds,
-                    HitboxBehavior::BlockMouseExceptScroll,
-                ),
-                geometry,
-            })
-            .collect()
+        scrollbar_geometries_scaled(
+            bounds,
+            base_handle.max_offset(),
+            base_handle.offset(),
+            window.rem_size(),
+        )
+        .into_iter()
+        .map(|geometry| ScrollbarLayout {
+            hitbox: window.insert_hitbox(
+                geometry.track_bounds,
+                HitboxBehavior::BlockMouseExceptScroll,
+            ),
+            geometry,
+        })
+        .collect()
     }
 
     fn paint(
@@ -186,7 +208,7 @@ impl Element for OverlayScrollbars {
             ));
             window.paint_quad(quad(
                 layout.geometry.thumb_bounds,
-                Corners::all(px(3.0)),
+                Corners::all(crate::ui_scale::scaled_px(3.0, window.rem_size())),
                 if hovered {
                     self.colors.thumb_hovered
                 } else {
@@ -288,15 +310,26 @@ impl Element for OverlayScrollbars {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn scrollbar_geometries(
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
     offset: Point<Pixels>,
 ) -> Vec<ScrollbarGeometry> {
+    scrollbar_geometries_scaled(bounds, max_offset, offset, px(16.0))
+}
+
+fn scrollbar_geometries_scaled(
+    bounds: Bounds<Pixels>,
+    max_offset: Point<Pixels>,
+    offset: Point<Pixels>,
+    rem_size: Pixels,
+) -> Vec<ScrollbarGeometry> {
+    let metrics = ScrollbarMetrics::scaled(rem_size);
     let horizontal = max_offset.x > Pixels::ZERO;
     let vertical = max_offset.y > Pixels::ZERO;
     let corner = if horizontal && vertical {
-        SCROLLBAR_SIZE
+        metrics.size
     } else {
         Pixels::ZERO
     };
@@ -305,15 +338,16 @@ pub(crate) fn scrollbar_geometries(
         && let Some(geometry) = scrollbar_geometry(
             ScrollbarAxis::Vertical,
             Bounds::new(
-                point(bounds.right() - SCROLLBAR_SIZE, bounds.top()),
+                point(bounds.right() - metrics.size, bounds.top()),
                 size(
-                    SCROLLBAR_SIZE,
+                    metrics.size,
                     (bounds.size.height - corner).max(Pixels::ZERO),
                 ),
             ),
             bounds.size.height,
             max_offset.y,
             offset.y,
+            metrics,
         )
     {
         geometries.push(geometry);
@@ -322,15 +356,13 @@ pub(crate) fn scrollbar_geometries(
         && let Some(geometry) = scrollbar_geometry(
             ScrollbarAxis::Horizontal,
             Bounds::new(
-                point(bounds.left(), bounds.bottom() - SCROLLBAR_SIZE),
-                size(
-                    (bounds.size.width - corner).max(Pixels::ZERO),
-                    SCROLLBAR_SIZE,
-                ),
+                point(bounds.left(), bounds.bottom() - metrics.size),
+                size((bounds.size.width - corner).max(Pixels::ZERO), metrics.size),
             ),
             bounds.size.width,
             max_offset.x,
             offset.x,
+            metrics,
         )
     {
         geometries.push(geometry);
@@ -344,34 +376,35 @@ fn scrollbar_geometry(
     viewport_length: Pixels,
     max_offset: Pixels,
     offset: Pixels,
+    metrics: ScrollbarMetrics,
 ) -> Option<ScrollbarGeometry> {
     let track_length = axis_size(axis, track_bounds.size);
-    let available = track_length - 2.0 * SCROLLBAR_PADDING;
+    let available = track_length - 2.0 * metrics.padding;
     if available <= Pixels::ZERO || viewport_length <= Pixels::ZERO || max_offset <= Pixels::ZERO {
         return None;
     }
     let content_length = viewport_length + max_offset;
     let thumb_length = (available * (viewport_length / content_length))
-        .max(SCROLLBAR_MIN_THUMB)
+        .max(metrics.min_thumb)
         .min(available);
     let thumb_travel = (available - thumb_length).max(Pixels::ZERO);
     let fraction = (-offset / max_offset).clamp(0.0, 1.0);
     let thumb_offset = thumb_travel * fraction;
-    let thumb_track_start = axis_origin(axis, track_bounds) + SCROLLBAR_PADDING;
+    let thumb_track_start = axis_origin(axis, track_bounds) + metrics.padding;
     let thumb_bounds = match axis {
         ScrollbarAxis::Horizontal => Bounds::new(
             point(
                 thumb_track_start + thumb_offset,
-                track_bounds.top() + SCROLLBAR_PADDING,
+                track_bounds.top() + metrics.padding,
             ),
-            size(thumb_length, SCROLLBAR_SIZE - 2.0 * SCROLLBAR_PADDING),
+            size(thumb_length, metrics.size - 2.0 * metrics.padding),
         ),
         ScrollbarAxis::Vertical => Bounds::new(
             point(
-                track_bounds.left() + SCROLLBAR_PADDING,
+                track_bounds.left() + metrics.padding,
                 thumb_track_start + thumb_offset,
             ),
-            size(SCROLLBAR_SIZE - 2.0 * SCROLLBAR_PADDING, thumb_length),
+            size(metrics.size - 2.0 * metrics.padding, thumb_length),
         ),
     };
     Some(ScrollbarGeometry {
@@ -454,22 +487,41 @@ mod tests {
             .unwrap();
         assert_eq!(
             vertical.track_bounds.bottom(),
-            bounds.bottom() - SCROLLBAR_SIZE
+            bounds.bottom() - px(SCROLLBAR_SIZE)
         );
         assert_eq!(
             horizontal.track_bounds.right(),
-            bounds.right() - SCROLLBAR_SIZE
+            bounds.right() - px(SCROLLBAR_SIZE)
         );
+    }
+
+    #[test]
+    fn scrollbar_geometry_scales_with_the_window_rem_size() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(200.0)));
+        let geometries = scrollbar_geometries_scaled(
+            bounds,
+            point(px(600.0), px(400.0)),
+            point(px(-40.0), px(-80.0)),
+            px(32.0),
+        );
+        let vertical = geometries
+            .iter()
+            .find(|geometry| geometry.axis == ScrollbarAxis::Vertical)
+            .unwrap();
+        assert_eq!(vertical.track_bounds.size.width, px(24.0));
+        assert_eq!(vertical.thumb_bounds.size.width, px(16.0));
+        assert!(vertical.thumb_bounds.size.height >= px(56.0));
     }
 
     #[test]
     fn drag_positions_clamp_to_scroll_endpoints() {
         let geometry = scrollbar_geometry(
             ScrollbarAxis::Horizontal,
-            Bounds::new(point(px(0.0), px(0.0)), size(px(200.0), SCROLLBAR_SIZE)),
+            Bounds::new(point(px(0.0), px(0.0)), size(px(200.0), px(SCROLLBAR_SIZE))),
             px(200.0),
             px(600.0),
             Pixels::ZERO,
+            ScrollbarMetrics::scaled(px(16.0)),
         )
         .unwrap();
         let pointer_offset = geometry.thumb_bounds.size.width / 2.0;

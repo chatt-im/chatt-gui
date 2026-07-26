@@ -397,23 +397,30 @@ impl ImageViewState {
     }
 }
 
-pub fn clamp_panel_width(width: Pixels, body_width: Pixels) -> Pixels {
-    let (min_width, max_width) = panel_width_bounds(body_width);
+pub fn clamp_panel_width(width: Pixels, body_width: Pixels, rem_size: Pixels) -> Pixels {
+    let (min_width, max_width) = panel_width_bounds(body_width, rem_size);
     width.clamp(min_width, max_width)
 }
 
-pub fn default_panel_width(body_width: Pixels) -> Pixels {
+pub fn default_panel_width(body_width: Pixels, rem_size: Pixels) -> Pixels {
     clamp_panel_width(
-        body_width - px(DEFAULT_CHAT_WIDTH) - px(DIVIDER_WIDTH),
+        body_width
+            - crate::ui_scale::scaled_px(DEFAULT_CHAT_WIDTH, rem_size)
+            - crate::ui_scale::scaled_px(DIVIDER_WIDTH, rem_size),
         body_width,
+        rem_size,
     )
 }
 
-fn panel_width_bounds(body_width: Pixels) -> (Pixels, Pixels) {
+fn panel_width_bounds(body_width: Pixels, rem_size: Pixels) -> (Pixels, Pixels) {
     let body_width = body_width.max(px(0.0));
-    let available = body_width - px(MIN_CHAT_WIDTH) - px(DIVIDER_WIDTH);
-    let min_width = px(MIN_PANEL_WIDTH).min(available.max(px(240.0)));
-    (min_width, available.max(min_width))
+    let divider = crate::ui_scale::scaled_px(DIVIDER_WIDTH, rem_size);
+    let usable = (body_width - divider).max(px(0.0));
+    let available = usable - crate::ui_scale::scaled_px(MIN_CHAT_WIDTH, rem_size);
+    let constrained_floor = (usable / 2.0).min(crate::ui_scale::scaled_px(240.0, rem_size));
+    let min_width =
+        crate::ui_scale::scaled_px(MIN_PANEL_WIDTH, rem_size).min(available.max(constrained_floor));
+    (min_width, available.max(min_width).min(usable))
 }
 
 #[cfg(test)]
@@ -467,9 +474,24 @@ mod tests {
 
     #[test]
     fn default_panel_preserves_preferred_chat_width_without_weakening_clamp() {
-        assert_eq!(default_panel_width(px(1_400.0)), px(591.0));
-        assert_eq!(clamp_panel_width(px(1_200.0), px(1_400.0)), px(1_031.0));
-        assert_eq!(clamp_panel_width(px(500.0), px(1_400.0)), px(500.0));
+        assert_eq!(default_panel_width(px(1_400.0), px(16.0)), px(591.0));
+        assert_eq!(
+            clamp_panel_width(px(1_200.0), px(1_400.0), px(16.0)),
+            px(1_031.0)
+        );
+        assert_eq!(
+            clamp_panel_width(px(500.0), px(1_400.0), px(16.0)),
+            px(500.0)
+        );
+    }
+
+    #[test]
+    fn panel_constraints_scale_with_the_window_rem_size() {
+        assert_eq!(default_panel_width(px(2_800.0), px(32.0)), px(1_182.0));
+        assert_eq!(
+            clamp_panel_width(px(2_400.0), px(2_800.0), px(32.0)),
+            px(2_062.0)
+        );
     }
 
     #[test]

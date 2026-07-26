@@ -2,7 +2,7 @@ use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
     App, Bounds, Div, ElementId, MouseButton, MouseDownEvent, Pixels, Stateful, Window, canvas,
-    div, prelude::*, px, relative,
+    div, prelude::*, relative,
 };
 
 use crate::{
@@ -10,6 +10,7 @@ use crate::{
     icons::{IconName, icon},
     media_controls::format_time,
     theme::{ResolvedSettings, ThemeRole},
+    ui_scale::rems_from_px,
 };
 
 pub(crate) enum AudioPlayerEvent {
@@ -88,9 +89,9 @@ pub(crate) fn render_audio_player(
     let timeline = div()
         .id((player_id.clone(), "timeline"))
         .relative()
-        .min_w(px(80.0))
+        .min_w(rems_from_px(80.0))
         .flex_1()
-        .h(px(24.0))
+        .h(rems_from_px(24.0))
         .flex()
         .items_center()
         .when(duration > 0.0 && duration.is_finite(), |timeline| {
@@ -121,7 +122,7 @@ pub(crate) fn render_audio_player(
             div()
                 .relative()
                 .w_full()
-                .h(px(3.0))
+                .h(rems_from_px(3.0))
                 .rounded_full()
                 .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
                 .child(
@@ -136,9 +137,9 @@ pub(crate) fn render_audio_player(
                         div()
                             .absolute()
                             .left(relative(progress))
-                            .ml(px(-4.0))
-                            .top(px(-2.5))
-                            .size(px(8.0))
+                            .ml(rems_from_px(-4.0))
+                            .top(rems_from_px(-2.5))
+                            .size(rems_from_px(8.0))
                             .rounded_full()
                             .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
                     )
@@ -157,8 +158,8 @@ pub(crate) fn render_audio_player(
     let volume = div()
         .id((player_id.clone(), "volume-slider"))
         .relative()
-        .w(px(64.0))
-        .h(px(30.0))
+        .w(rems_from_px(64.0))
+        .h(rems_from_px(30.0))
         .flex_none()
         .flex()
         .items_center()
@@ -187,7 +188,7 @@ pub(crate) fn render_audio_player(
             div()
                 .relative()
                 .w_full()
-                .h(px(3.0))
+                .h(rems_from_px(3.0))
                 .rounded_full()
                 .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
                 .child(
@@ -201,9 +202,9 @@ pub(crate) fn render_audio_player(
                     div()
                         .absolute()
                         .left(relative(volume_fraction))
-                        .ml(px(-4.0))
-                        .top(px(-2.5))
-                        .size(px(8.0))
+                        .ml(rems_from_px(-4.0))
+                        .top(rems_from_px(-2.5))
+                        .size(rems_from_px(8.0))
                         .rounded_full()
                         .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
                 ),
@@ -222,8 +223,8 @@ pub(crate) fn render_audio_player(
     let cycle_speed = handler.clone();
     let speed_button = div()
         .id((player_id.clone(), "speed"))
-        .h(px(28.0))
-        .min_w(px(44.0))
+        .min_h(rems_from_px(28.0))
+        .min_w(rems_from_px(44.0))
         .px_2()
         .flex_none()
         .flex()
@@ -263,13 +264,14 @@ pub(crate) fn render_audio_player(
                 .w_full()
                 .min_w_0()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap_2()
                 .child(play_button)
                 .child(timeline)
                 .child(
                     div()
-                        .min_w(px(74.0))
+                        .min_w(rems_from_px(74.0))
                         .flex_none()
                         .text_right()
                         .text_xs()
@@ -298,7 +300,7 @@ pub(crate) fn render_audio_player(
                 div()
                     .w_full()
                     .min_w_0()
-                    .pl(px(40.0))
+                    .pl(rems_from_px(40.0))
                     .text_xs()
                     .text_color(settings.theme.color(if audio.error.is_some() {
                         ThemeRole::StateDanger
@@ -325,7 +327,7 @@ fn audio_control_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(30.0))
+        .size(rems_from_px(30.0))
         .flex_none()
         .flex()
         .items_center()

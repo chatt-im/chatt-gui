@@ -998,6 +998,7 @@ where
             &self.scroll_handle,
             &self.view_state,
             bounds,
+            window.line_height(),
         ) {
             cx.refresh_windows();
         }
@@ -1012,7 +1013,9 @@ where
                 &self.scroll_handle,
                 bounds,
                 window.mouse_position(),
-                self.selection.active_line_height().unwrap_or(px(16.0)),
+                self.selection
+                    .active_line_height()
+                    .unwrap_or_else(|| window.line_height()),
             )
         {
             cx.refresh_windows();
@@ -1098,6 +1101,7 @@ fn reveal_pending_match(
     scroll_handle: &UniformListScrollHandle,
     view_state: &CodeViewState,
     viewport: Bounds<Pixels>,
+    line_height: Pixels,
 ) -> bool {
     let Some(search_match) = view_state.0.pending_reveal.get() else {
         return false;
@@ -1130,7 +1134,7 @@ fn reveal_pending_match(
     };
     let absolute_start = participant.text_bounds.left() + start_x.min(end_x);
     let absolute_end = participant.text_bounds.left() + start_x.max(end_x);
-    let margin = px(16.0).min(viewport.size.width / 4.0);
+    let margin = line_height.min(viewport.size.width / 4.0);
     let visible_left = viewport.left() + margin;
     let visible_right = viewport.right() - margin;
 
@@ -1247,7 +1251,10 @@ pub fn render_code_document(
     let line_count = document.line_count();
     let widest_line = view_state.widest_line(&document);
     let digits = line_count.max(1).ilog10() as f32 + 1.0;
-    let gutter_width = px(18.0 + digits * 8.5);
+    let (code_size, interface_size) = settings.as_ref().map_or((14.0, 16.0), |settings| {
+        (settings.fonts.code_size, settings.fonts.interface_size)
+    });
+    let code_rems = crate::ui_scale::font_rems(code_size, interface_size);
     let list_document = document.clone();
     let list_view_state = view_state.clone();
     let list_selection = selection.clone();
@@ -1258,6 +1265,8 @@ pub fn render_code_document(
         move |range, window, _| {
             let settings = list_settings.clone();
             let line_height = window.line_height();
+            let gutter_width =
+                code_rems.to_pixels(window.rem_size()) * ((18.0 + digits * 8.5) / 14.0);
             range
                 .map(|line| {
                     let number = line_number(line + 1);
@@ -1316,9 +1325,7 @@ pub fn render_code_document(
                 .map(|settings| settings.fonts.code_family.clone())
                 .unwrap_or_else(|| CODE_FONT_FAMILY.into()),
         )
-        .text_size(px(settings
-            .as_ref()
-            .map_or(14.0, |settings| settings.fonts.code_size)))
+        .text_size(code_rems)
         .text_color(
             settings
                 .as_ref()

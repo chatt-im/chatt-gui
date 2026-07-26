@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     Global, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, canvas,
-    checkerboard, div, linear_color_stop, linear_gradient, prelude::*, px, rgba, uniform_list,
+    checkerboard, div, linear_color_stop, linear_gradient, prelude::*, rgba, uniform_list,
 };
 
 use crate::{
@@ -21,6 +21,7 @@ use crate::{
     },
     key_bindings::{self, BindingScope},
     theme::{self, AppliedSettings, FontRole, ThemePalette, ThemeRole},
+    ui_scale::rems_from_px,
 };
 use catalog::{
     RowRef, SETTINGS_SECTIONS, ScalarSetting, SettingsSection, help, label, matches_search, path,
@@ -2623,6 +2624,10 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let palette = ThemePalette::from_config(&self.draft.theme);
+        let logical_width = f32::from(window.viewport_size().width)
+            / f32::from(crate::ui_scale::rem_size(cx))
+            * crate::ui_scale::BASE_REM_SIZE;
+        let compact = logical_width < 900.0;
         let remote_section = self.remote_section();
         let (section_title, section_help) = match remote_section {
             Some(section) => self
@@ -2680,6 +2685,7 @@ impl Render for SettingsView {
                                 invalid.map(|edit| edit.error.clone()),
                                 row_view.clone(),
                                 &row_palette,
+                                compact,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -2713,6 +2719,7 @@ impl Render for SettingsView {
                                 row_view.clone(),
                                 &row_palette,
                                 diagnostic_source.as_deref(),
+                                compact,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -2725,14 +2732,17 @@ impl Render for SettingsView {
         };
 
         let mut navigation = div()
-            .w(px(190.))
             .flex_none()
             .flex()
-            .flex_col()
             .gap_1()
             .p_3()
-            .border_r_1()
-            .border_color(palette.color(ThemeRole::BorderSubtle));
+            .border_color(palette.color(ThemeRole::BorderSubtle))
+            .when(compact, |navigation| {
+                navigation.w_full().flex_row().flex_wrap().border_b_1()
+            })
+            .when(!compact, |navigation| {
+                navigation.w(rems_from_px(190.)).flex_col().border_r_1()
+            });
         navigation = navigation.child(
             div()
                 .px_2()
@@ -2804,8 +2814,9 @@ impl Render for SettingsView {
         let search_view = view.clone();
         let search = div()
             .id("settings-search")
-            .w(px(360.))
-            .min_h(px(38.))
+            .w(rems_from_px(360.))
+            .max_w_full()
+            .min_h(rems_from_px(38.))
             .flex()
             .items_center()
             .px_3()
@@ -2875,7 +2886,7 @@ impl Render for SettingsView {
             let meter_width = 220.0 * (self.remote_meter_rms * 7.0).clamp(0.0, 1.0);
             let peak_width = 220.0 * (self.remote_meter_peak * 5.0).clamp(0.0, 1.0);
             div()
-                .h(px(54.))
+                .min_h(rems_from_px(54.))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -2885,8 +2896,8 @@ impl Render for SettingsView {
                 .border_color(palette.color(ThemeRole::BorderSubtle))
                 .child(
                     div()
-                        .w(px(220.))
-                        .h(px(10.))
+                        .w(rems_from_px(220.))
+                        .h(rems_from_px(10.))
                         .relative()
                         .overflow_hidden()
                         .bg(palette.color(ThemeRole::ControlSurface))
@@ -2896,7 +2907,7 @@ impl Render for SettingsView {
                                 .top_0()
                                 .bottom_0()
                                 .left_0()
-                                .w(px(peak_width))
+                                .w(rems_from_px(peak_width))
                                 .bg(palette.color(ThemeRole::StateWarning)),
                         )
                         .child(
@@ -2905,7 +2916,7 @@ impl Render for SettingsView {
                                 .top_0()
                                 .bottom_0()
                                 .left_0()
-                                .w(px(meter_width))
+                                .w(rems_from_px(meter_width))
                                 .bg(palette.color(ThemeRole::StateSuccess)),
                         ),
                 )
@@ -2992,7 +3003,7 @@ impl Render for SettingsView {
             }
             Some(render_color_picker(picker, view.clone(), &palette))
         });
-        window.set_rem_size(px(AppliedSettings::get(cx).fonts.interface_size));
+        window.set_rem_size(crate::ui_scale::rem_size(cx));
         div()
             .id("settings")
             .key_context("ChattSettings")
@@ -3015,9 +3026,10 @@ impl Render for SettingsView {
                     .font_family(AppliedSettings::get(cx).fonts.interface_family.clone())
                     .child(
                         div()
-                            .h(px(64.))
+                            .min_h(rems_from_px(64.))
                             .flex_none()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_3()
                             .px_5()
@@ -3041,48 +3053,57 @@ impl Render for SettingsView {
                             }),
                     )
                     .child(
-                        div().flex_1().min_h_0().flex().child(navigation).child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .px_5()
-                                        .py_3()
-                                        .border_b_1()
-                                        .border_color(palette.color(ThemeRole::BorderSubtle))
-                                        .child(
-                                            div()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(section_title),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(palette.color(ThemeRole::TextMuted))
-                                                .child(section_help),
-                                        ),
-                                )
-                                .when_some(audio_toolbar, |content, toolbar| content.child(toolbar))
-                                .when_some(self.action_menu, |content, (row, selected)| {
-                                    content.child(self.render_action_menu(
-                                        row,
-                                        selected,
-                                        view.clone(),
-                                    ))
-                                })
-                                .child(list),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .when(compact, |body| body.flex_col())
+                            .child(navigation)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .px_5()
+                                            .py_3()
+                                            .border_b_1()
+                                            .border_color(palette.color(ThemeRole::BorderSubtle))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(section_title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(palette.color(ThemeRole::TextMuted))
+                                                    .child(section_help),
+                                            ),
+                                    )
+                                    .when_some(audio_toolbar, |content, toolbar| {
+                                        content.child(toolbar)
+                                    })
+                                    .when_some(self.action_menu, |content, (row, selected)| {
+                                        content.child(self.render_action_menu(
+                                            row,
+                                            selected,
+                                            view.clone(),
+                                        ))
+                                    })
+                                    .child(list),
+                            ),
                     )
                     .when_some(color_picker, |modal, picker| modal.child(picker))
                     .child(
                         div()
-                            .h(px(58.))
+                            .min_h(rems_from_px(58.))
                             .flex_none()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .px_4()
@@ -3196,9 +3217,10 @@ fn render_row(
     view: WeakEntity<SettingsView>,
     palette: &ThemePalette,
     source: Option<&str>,
+    compact: bool,
 ) -> AnyElement {
     if let RowRef::Diagnostic(index) = row {
-        return render_diagnostic_row(index, diagnostics, draft, palette, source);
+        return render_diagnostic_row(index, diagnostics, draft, palette, source, compact);
     }
     let row_label = match row {
         RowRef::Diagnostic(index) => diagnostics
@@ -3246,8 +3268,9 @@ fn render_row(
     };
     let value = if let Some(editor) = editor {
         div()
-            .w(px(330.))
-            .min_h(px(36.))
+            .w(rems_from_px(330.))
+            .max_w_full()
+            .min_h(rems_from_px(36.))
             .flex()
             .items_center()
             .px_3()
@@ -3264,7 +3287,7 @@ fn render_row(
     } else if let RowRef::Choice(setting) = row {
         div()
             .id(("settings-choice", setting as usize))
-            .max_w(px(330.))
+            .max_w(rems_from_px(330.))
             .px_3()
             .py_2()
             .cursor_pointer()
@@ -3281,7 +3304,7 @@ fn render_row(
             .into_any_element()
     } else {
         div()
-            .max_w(px(330.))
+            .max_w(rems_from_px(330.))
             .truncate()
             .text_sm()
             .text_color(diagnostic_color)
@@ -3290,9 +3313,10 @@ fn render_row(
     };
     div()
         .id(("settings-row", row_id(row)))
-        .h(px(84.))
+        .h(rems_from_px(if compact { 132.0 } else { 84.0 }))
         .w_full()
         .flex()
+        .when(compact, |row| row.flex_wrap())
         .items_center()
         .gap_3()
         .px_5()
@@ -3319,7 +3343,7 @@ fn render_row(
                 row.child(
                     div()
                         .id(("settings-color-swatch", role as usize))
-                        .size(px(30.))
+                        .size(rems_from_px(30.))
                         .flex_none()
                         .border_1()
                         .border_color(palette.color(ThemeRole::BorderFocus))
@@ -3360,8 +3384,10 @@ fn render_row(
         )
         .child(
             div()
-                .w(px(330.))
-                .flex_none()
+                .when(compact, |column| column.w_full().flex_auto())
+                .when(!compact, |column| {
+                    column.w(rems_from_px(330.)).max_w_full().flex_none()
+                })
                 .flex()
                 .flex_col()
                 .child(value)
@@ -3396,6 +3422,7 @@ fn render_remote_row(
     editor_error: Option<SharedString>,
     view: WeakEntity<SettingsView>,
     palette: &ThemePalette,
+    compact: bool,
 ) -> AnyElement {
     let field = descriptor.id;
     let enabled = draft.is_some();
@@ -3409,8 +3436,8 @@ fn render_remote_row(
         if let Some(editor) = editor {
             div()
                 .id(("settings-remote-editor", remote_field_id(field)))
-                .max_w(px(330.))
-                .min_h(px(38.))
+                .max_w(rems_from_px(330.))
+                .min_h(rems_from_px(38.))
                 .px_3()
                 .py_2()
                 .border_1()
@@ -3425,7 +3452,7 @@ fn render_remote_row(
         } else {
             div()
                 .id(("settings-remote-text", remote_field_id(field)))
-                .max_w(px(330.))
+                .max_w(rems_from_px(330.))
                 .px_3()
                 .py_2()
                 .cursor_text()
@@ -3447,7 +3474,7 @@ fn render_remote_row(
     } else if descriptor.control.kind == wire_settings::CONTROL_SEARCHABLE_CHOICE {
         div()
             .id(("settings-remote-picker", remote_field_id(field)))
-            .max_w(px(330.))
+            .max_w(rems_from_px(330.))
             .px_3()
             .py_2()
             .cursor_pointer()
@@ -3478,7 +3505,7 @@ fn render_remote_row(
     } else {
         div()
             .id(("settings-remote-choice", remote_field_id(field)))
-            .max_w(px(330.))
+            .max_w(rems_from_px(330.))
             .px_3()
             .py_2()
             .cursor_pointer()
@@ -3500,9 +3527,10 @@ fn render_remote_row(
     };
     div()
         .id(("settings-remote-row", remote_field_id(field)))
-        .h(px(84.))
+        .h(rems_from_px(if compact { 132.0 } else { 84.0 }))
         .w_full()
         .flex()
+        .when(compact, |row| row.flex_wrap())
         .items_center()
         .gap_3()
         .px_5()
@@ -3545,8 +3573,10 @@ fn render_remote_row(
         )
         .child(
             div()
-                .w(px(330.))
-                .flex_none()
+                .when(compact, |column| column.w_full().flex_auto())
+                .when(!compact, |column| {
+                    column.w(rems_from_px(330.)).max_w_full().flex_none()
+                })
                 .flex()
                 .flex_col()
                 .child(value)
@@ -3602,7 +3632,7 @@ fn render_color_picker(
     let wheel = div()
         .id(("settings-hsv-color-wheel", role as usize))
         .relative()
-        .size(px(WHEEL_SIZE))
+        .size(rems_from_px(WHEEL_SIZE))
         .flex_none()
         .cursor(gpui::CursorStyle::Crosshair)
         .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
@@ -3626,7 +3656,7 @@ fn render_color_picker(
         .id(("settings-color-alpha", role as usize))
         .relative()
         .w_full()
-        .h(px(24.0))
+        .h(rems_from_px(24.0))
         .flex_none()
         .overflow_hidden()
         .cursor(gpui::CursorStyle::ResizeLeftRight)
@@ -3654,8 +3684,8 @@ fn render_color_picker(
                 .top_0()
                 .bottom_0()
                 .left(gpui::relative(hsva.alpha))
-                .ml(px(-3.0))
-                .w(px(6.0))
+                .ml(rems_from_px(-3.0))
+                .w(rems_from_px(6.0))
                 .border_1()
                 .border_color(rgba(0xffffffff))
                 .bg(rgba(0x11111180)),
@@ -3672,7 +3702,7 @@ fn render_color_picker(
     let swatch = |id: &'static str, color: Rgba8| {
         div()
             .id((id, role as usize))
-            .size(px(42.0))
+            .size(rems_from_px(42.0))
             .relative()
             .overflow_hidden()
             .border_1()
@@ -3689,7 +3719,7 @@ fn render_color_picker(
 
     div()
         .id("settings-color-picker-panel")
-        .h(px(258.0))
+        .h(rems_from_px(258.0))
         .flex_none()
         .flex()
         .items_center()
@@ -3712,7 +3742,7 @@ fn render_color_picker(
         })
         .child(
             div()
-                .w(px(180.0))
+                .w(rems_from_px(180.0))
                 .h_full()
                 .flex_none()
                 .flex()
@@ -3776,7 +3806,7 @@ fn render_color_picker(
         .child(
             div()
                 .h_full()
-                .w(px(1.0))
+                .w(rems_from_px(1.0))
                 .flex_none()
                 .bg(palette.color(ThemeRole::BorderStrong)),
         )
@@ -3858,7 +3888,7 @@ fn render_choice_picker(
     let item_count = items.len();
     let list: AnyElement = if items.is_empty() {
         div()
-            .h(px(330.))
+            .h(rems_from_px(330.))
             .flex()
             .flex_col()
             .items_center()
@@ -3899,7 +3929,7 @@ fn render_choice_picker(
                                 "settings-choice-picker-option",
                                 usize::from(field.0) * 10_000 + index,
                             ))
-                            .h(px(78.))
+                            .h(rems_from_px(78.))
                             .w_full()
                             .flex()
                             .items_center()
@@ -3985,7 +4015,7 @@ fn render_choice_picker(
             },
         )
         .track_scroll(&scroll)
-        .h(px(330.))
+        .h(rems_from_px(330.))
         .w_full()
         .into_any_element()
     };
@@ -4009,8 +4039,8 @@ fn render_choice_picker(
         .child(
             div()
                 .id("settings-choice-picker")
-                .w(px(600.))
-                .max_h(px(540.))
+                .w(rems_from_px(600.))
+                .max_h(rems_from_px(540.))
                 .overflow_hidden()
                 .border_1()
                 .border_color(palette.color(ThemeRole::BorderStrong))
@@ -4062,7 +4092,7 @@ fn render_choice_picker(
                         .child(
                             div()
                                 .flex_1()
-                                .min_h(px(40.))
+                                .min_h(rems_from_px(40.))
                                 .px_3()
                                 .py_2()
                                 .border_1()
@@ -4105,6 +4135,7 @@ fn render_diagnostic_row(
     draft: &GuiConfig,
     palette: &ThemePalette,
     source: Option<&str>,
+    compact: bool,
 ) -> AnyElement {
     let Some(diagnostic) = diagnostics.get(index) else {
         return div().into_any_element();
@@ -4126,9 +4157,10 @@ fn render_diagnostic_row(
     });
     div()
         .id(("settings-diagnostic", index))
-        .h(px(104.))
+        .h(rems_from_px(if compact { 144.0 } else { 104.0 }))
         .w_full()
         .flex()
+        .when(compact, |row| row.flex_wrap())
         .items_center()
         .gap_4()
         .px_5()
@@ -4137,8 +4169,8 @@ fn render_diagnostic_row(
         .bg(palette.color(ThemeRole::Raised))
         .child(
             div()
-                .w(px(220.))
-                .flex_none()
+                .when(compact, |column| column.w_full())
+                .when(!compact, |column| column.w(rems_from_px(220.)).flex_none())
                 .min_w_0()
                 .child(
                     div()

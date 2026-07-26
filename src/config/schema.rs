@@ -498,6 +498,9 @@ pub(crate) type BindingTable = BTreeMap<String, BindCommand>;
 pub(crate) enum BindCommand {
     OpenMedia,
     OpenSettings,
+    IncreaseUiScale,
+    DecreaseUiScale,
+    ResetUiScale,
     ToggleMute,
     ToggleDeafen,
     ToggleVoice,

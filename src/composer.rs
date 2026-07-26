@@ -4,9 +4,9 @@ use gpui::{
     App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
     FontStyle, FontWeight, GlobalElementId, Hsla, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ShapedLine, SharedString,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*,
-    px, relative, rgb, rgba, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Rems, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
+    point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 mod buffer;
@@ -24,6 +24,7 @@ use crate::{
     fonts::CODE_FONT_FAMILY,
     formatted_message::syntax_color,
     theme::{AppliedSettings, ResolvedSettings, ThemeRole, syntax_role},
+    ui_scale::rems_from_px,
 };
 use chatt_message_format::highlight::PaletteRole;
 use highlight::{ComposerColor, ComposerSyntax, ComposerTextStyle, ComposerTypeface};
@@ -80,7 +81,7 @@ pub struct TextEditor {
     multiline: bool,
     vim_enabled: bool,
     accepts_image_paste: bool,
-    min_height: Pixels,
+    min_height: Rems,
     selected: Range<usize>,
     reversed: bool,
     mouse_anchor: Option<usize>,
@@ -115,7 +116,7 @@ impl TextEditor {
             multiline: true,
             vim_enabled: binding_mode == crate::config::schema::BindingMode::Vim,
             accepts_image_paste: true,
-            min_height: px(42.),
+            min_height: rems_from_px(42.),
             selected: 0..0,
             reversed: false,
             mouse_anchor: None,
@@ -143,7 +144,7 @@ impl TextEditor {
             multiline: false,
             vim_enabled: false,
             accepts_image_paste: false,
-            min_height: px(28.),
+            min_height: rems_from_px(28.),
             selected: 0..0,
             reversed: false,
             mouse_anchor: None,
@@ -1294,7 +1295,7 @@ impl Element for ComposerElement {
                         let left = bounds.left() + line.layout.x_for_index(start);
                         let mut right = bounds.left() + line.layout.x_for_index(end);
                         if selects_newline {
-                            right += px(4.);
+                            right += font_size * 0.25;
                         }
                         Some(fill(
                             Bounds::from_corners(point(left, top), point(right, top + line_height)),
@@ -1317,11 +1318,15 @@ impl Element for ComposerElement {
                     .x_for_index(cursor_line.local_offset(next))
                     - cursor_x
             } else {
-                px(8.)
+                font_size * 0.5
             };
-            if width > px(2.) { width } else { px(8.) }
+            if width > font_size * 0.125 {
+                width
+            } else {
+                font_size * 0.5
+            }
         } else {
-            px(2.)
+            crate::ui_scale::scaled_px(2.0, window.rem_size())
         };
         let cursor = (input.vim_enabled || input.selected.is_empty()).then(|| {
             fill(
@@ -1394,7 +1399,9 @@ impl Element for ComposerElement {
             input.last_layout = state.lines.clone();
             input.last_bounds = Some(bounds);
             input.last_line_height = Some(line_height);
-            let columns = (bounds.size.width / px(8.)).max(1.) as u16;
+            let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+            let columns =
+                (f32::from(bounds.size.width) / f32::from(font_size * 0.5)).max(1.0) as u16;
             input
                 .editor
                 .set_layout(columns, state.lines.len().max(1) as u16);
@@ -1413,7 +1420,10 @@ impl Render for TextEditor {
                     .as_ref()
                     .map(|fonts| fonts.message_family.clone())
                     .unwrap_or_else(|| "IBM Plex Sans".into()),
-                fonts.as_ref().map_or(16.0, |fonts| fonts.message_size),
+                fonts.as_ref().map_or_else(
+                    || crate::ui_scale::font_rems(16.0, 16.0),
+                    |fonts| crate::ui_scale::font_rems(fonts.message_size, fonts.interface_size),
+                ),
             )
         } else {
             (
@@ -1421,7 +1431,7 @@ impl Render for TextEditor {
                     .as_ref()
                     .map(|fonts| fonts.interface_family.clone())
                     .unwrap_or_else(|| ".SystemUIFont".into()),
-                fonts.as_ref().map_or(16.0, |fonts| fonts.interface_size),
+                gpui::rems(1.0),
             )
         };
         let key_context = if self.key_context != "ChattComposer" {
@@ -1441,7 +1451,7 @@ impl Render for TextEditor {
             .flex()
             .items_center()
             .font_family(family)
-            .text_size(px(size))
+            .text_size(size)
             .key_context(key_context)
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
