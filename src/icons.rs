@@ -16,6 +16,7 @@ pub(crate) enum IconName {
     ListChevronsDownUp,
     ListChevronsUpDown,
     Maximize,
+    Menu,
     Mic,
     MicOff,
     Minimize,
@@ -47,6 +48,7 @@ impl IconName {
             Self::ListChevronsDownUp => "icons/list-chevrons-down-up.svg",
             Self::ListChevronsUpDown => "icons/list-chevrons-up-down.svg",
             Self::Maximize => "icons/maximize.svg",
+            Self::Menu => "icons/menu.svg",
             Self::Mic => "icons/mic.svg",
             Self::MicOff => "icons/mic-off.svg",
             Self::Minimize => "icons/minimize.svg",
@@ -108,6 +110,7 @@ const ICON_PATHS: &[&str] = &[
     "icons/list-chevrons-down-up.svg",
     "icons/list-chevrons-up-down.svg",
     "icons/maximize.svg",
+    "icons/menu.svg",
     "icons/mic.svg",
     "icons/mic-off.svg",
     "icons/minimize.svg",
@@ -138,6 +141,7 @@ fn icon_svg(path: &str) -> Option<String> {
             r#"<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/>"#
         }
         "icons/close.svg" => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
+        "icons/menu.svg" => r#"<path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h16"/>"#,
         "icons/corner-up-left.svg" => {
             r#"<polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>"#
         }

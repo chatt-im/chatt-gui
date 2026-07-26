@@ -47,15 +47,17 @@ use crate::{
     mpv_player::{MpvPlayer, SeekMode},
     preview::{
         CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, PreviewContent,
-        PreviewHistory, PreviewItem, clamp_panel_width, default_panel_width,
+        PreviewHistory, PreviewItem, clamp_chat_width, default_chat_width,
+        panel_width_for_chat_width,
     },
     scroll_capture::capture_scroll,
     settings::{ConfigurationState, SettingsView, SettingsViewEvent},
     theme::{AppliedSettings, ThemePalette, ThemeRole},
     timeline::{self, Attachment, AttachmentRenderKind},
     ui_controls::{
-        composer_add_button, icon_button, message_action_button, mini_button,
-        preview_action_button, preview_control_button, preview_status, room_button, toolbar_button,
+        compact_action_button, composer_add_button, icon_button, message_action_button,
+        mini_button, preview_action_button, preview_control_button, preview_status, room_button,
+        sidebar_footer_button, toolbar_button,
     },
     ui_scale::rems_from_px,
     video_controls::{
@@ -268,7 +270,7 @@ struct LivePaneResize {
 #[derive(Clone, Copy, Debug)]
 struct PreviewPaneResize {
     start_x: Pixels,
-    start_width: Pixels,
+    start_chat_width: Pixels,
 }
 
 #[derive(Clone)]
@@ -661,6 +663,11 @@ pub struct ChattView {
     suppress_completion_refresh: bool,
     server_search_input: gpui::Entity<Composer>,
     server_selector_open: bool,
+    composer_menu_open: bool,
+    composer_menu_action_taken: bool,
+    composer_menu_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    show_rooms_sidebar: bool,
+    show_top_status_bar: bool,
     selected_server_label: Option<String>,
     server_list_scroll: ScrollHandle,
     pending_server_selection: Option<RequestId>,
@@ -687,7 +694,7 @@ pub struct ChattView {
     preview_image: ImageViewState,
     preview_image_viewport: Cell<Option<Bounds<Pixels>>>,
     preview_last_mouse_position: Option<Point<Pixels>>,
-    preview_panel_width: Pixels,
+    preview_chat_width: Pixels,
     preview_pane_resize: Option<PreviewPaneResize>,
     list_state: ListState,
     collapsed_sections: timeline::CollapsedSections,
@@ -753,6 +760,7 @@ pub struct ChattView {
     _code_search_subscription: Subscription,
     _composer_image_paste_subscription: Subscription,
     _composer_state_subscription: Subscription,
+    _composer_focus_subscription: Subscription,
     _composer_blur_subscription: Subscription,
     _server_search_subscription: Subscription,
     _daemon_task: Task<()>,
@@ -792,6 +800,9 @@ impl ChattView {
                 }
             });
         let composer_focus = composer.focus_handle(cx);
+        let composer_focus_subscription = cx.on_focus(&composer_focus, window, |this, _, cx| {
+            this.dismiss_composer_menu(cx);
+        });
         let composer_blur_subscription = cx.on_blur(&composer_focus, window, |this, _, cx| {
             if this.completion_session.take().is_some() {
                 this.composer
@@ -892,6 +903,11 @@ impl ChattView {
             suppress_completion_refresh: false,
             server_search_input,
             server_selector_open: false,
+            composer_menu_open: false,
+            composer_menu_action_taken: false,
+            composer_menu_trigger_bounds: Rc::new(Cell::new(None)),
+            show_rooms_sidebar: true,
+            show_top_status_bar: true,
             selected_server_label: None,
             server_list_scroll: ScrollHandle::new(),
             pending_server_selection: None,
@@ -918,7 +934,7 @@ impl ChattView {
             preview_image: ImageViewState::default(),
             preview_image_viewport: Cell::new(None),
             preview_last_mouse_position: None,
-            preview_panel_width: default_panel_width(
+            preview_chat_width: default_chat_width(
                 window.viewport_size().width
                     - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, crate::ui_scale::rem_size(cx)),
                 crate::ui_scale::rem_size(cx),
@@ -988,6 +1004,7 @@ impl ChattView {
             _code_search_subscription: code_search_subscription,
             _composer_image_paste_subscription: composer_image_paste_subscription,
             _composer_state_subscription: composer_state_subscription,
+            _composer_focus_subscription: composer_focus_subscription,
             _composer_blur_subscription: composer_blur_subscription,
             _server_search_subscription: server_search_subscription,
             _daemon_task: daemon_task,
@@ -1018,6 +1035,8 @@ impl ChattView {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_menu_open = false;
+        self.composer_menu_action_taken = false;
         if let Some(settings) = self.settings.as_ref() {
             window.focus(&settings.focus_handle(cx), cx);
             return;
@@ -3569,6 +3588,8 @@ impl ChattView {
             cx.notify();
             return;
         }
+        self.composer_menu_open = false;
+        self.composer_menu_action_taken = false;
         self.server_selector_open = true;
         self.selected_server_label = self.model.active_server.clone();
         self.server_search_input
@@ -3577,6 +3598,37 @@ impl ChattView {
             self.server_list_scroll.scroll_to_item(index);
         }
         window.focus(&self.server_search_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn toggle_composer_menu(&mut self, cx: &mut Context<Self>) {
+        if self.composer_menu_open {
+            self.dismiss_composer_menu(cx);
+            return;
+        }
+        self.composer_menu_open = true;
+        self.composer_menu_action_taken = false;
+        cx.notify();
+    }
+
+    fn dismiss_composer_menu(&mut self, cx: &mut Context<Self>) {
+        if !self.composer_menu_open {
+            return;
+        }
+        self.composer_menu_open = false;
+        self.composer_menu_action_taken = false;
+        cx.notify();
+    }
+
+    fn toggle_rooms_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.show_rooms_sidebar = !self.show_rooms_sidebar;
+        self.composer_menu_action_taken = true;
+        cx.notify();
+    }
+
+    fn toggle_top_status_bar(&mut self, cx: &mut Context<Self>) {
+        self.show_top_status_bar = !self.show_top_status_bar;
+        self.composer_menu_action_taken = true;
         cx.notify();
     }
 
@@ -4567,10 +4619,18 @@ impl ChattView {
     fn begin_preview_session(&mut self, window: &Window, cx: &App) {
         if self.preview_history.active().is_none() {
             self.preview_return_focus = window.focused(cx).map(|focus| focus.downgrade());
-            let body_width = window.viewport_size().width
-                - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
-            self.preview_panel_width = default_panel_width(body_width, window.rem_size());
+            let body_width = self.chat_body_width(window);
+            self.preview_chat_width = default_chat_width(body_width, window.rem_size());
         }
+    }
+
+    fn chat_body_width(&self, window: &Window) -> Pixels {
+        window.viewport_size().width
+            - if self.show_rooms_sidebar {
+                crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size())
+            } else {
+                px(0.)
+            }
     }
 
     fn restore_preview_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5229,13 +5289,12 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let body_width = window.viewport_size().width
-            - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
-        self.preview_panel_width =
-            clamp_panel_width(self.preview_panel_width, body_width, window.rem_size());
+        let body_width = self.chat_body_width(window);
+        self.preview_chat_width =
+            clamp_chat_width(self.preview_chat_width, body_width, window.rem_size());
         self.preview_pane_resize = Some(PreviewPaneResize {
             start_x: event.position.x,
-            start_width: self.preview_panel_width,
+            start_chat_width: self.preview_chat_width,
         });
         cx.stop_propagation();
         cx.notify();
@@ -5254,10 +5313,9 @@ impl ChattView {
             self.finish_preview_pane_resize(cx);
             return;
         }
-        let body_width = window.viewport_size().width
-            - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
-        self.preview_panel_width = clamp_panel_width(
-            resize.start_width + resize.start_x - event.position.x,
+        let body_width = self.chat_body_width(window);
+        self.preview_chat_width = clamp_chat_width(
+            resize.start_chat_width + event.position.x - resize.start_x,
             body_width,
             window.rem_size(),
         );
@@ -5484,8 +5542,8 @@ impl ChattView {
             .w_full()
             .pl(rems_from_px(64.))
             .pr(rems_from_px(28.))
-            .pt(rems_from_px(if continuation { 3. } else { 10. }))
-            .pb(rems_from_px(3.))
+            .pt(rems_from_px(if continuation { 3. } else { 6. }))
+            .pb(rems_from_px(if continuation { 3. } else { 6. }))
             .bg(background)
             .hover(move |row| row.bg(row_hover))
             .when_some(reference_flash_id, |row, flash_id| {
@@ -5520,12 +5578,12 @@ impl ChattView {
                 div()
                     .absolute()
                     .left_0()
-                    .top(rems_from_px(if continuation { 3. } else { 10. }))
+                    .top(rems_from_px(if continuation { 3. } else { 6. }))
                     .h(rems_from_px(24.))
                     .w(rems_from_px(64.))
-                    .pr(rems_from_px(8.))
+                    .pr(rems_from_px(15.))
                     .flex()
-                    .items_center()
+                    .items_end()
                     .justify_end()
                     .text_xs()
                     .text_color(settings.theme.color(ThemeRole::TextDim))
@@ -5533,7 +5591,7 @@ impl ChattView {
                         time.invisible()
                             .group_hover(hover_group.clone(), |time| time.visible())
                     })
-                    .child(timestamp),
+                    .child(div().child(timestamp)),
             )
             .child(
                 div()
@@ -5550,7 +5608,7 @@ impl ChattView {
                                     div()
                                         .min_h(rems_from_px(24.))
                                         .flex()
-                                        .items_center()
+                                        .items_end()
                                         .gap_2()
                                         .pr(rems_from_px(180.))
                                         .child(
@@ -6486,18 +6544,21 @@ impl ChattView {
                             .bg(settings.theme.color(ThemeRole::Panel))
                             .child(
                                 preview_control_button("preview-fit", "Fit", &settings.theme)
+                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.fit_preview_image(cx)),
                                     ),
                             )
                             .child(
                                 preview_control_button("preview-actual", "1:1", &settings.theme)
+                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.actual_size_preview_image(cx)
                                     })),
                             )
                             .child(
                                 preview_control_button("preview-zoom-out", "−", &settings.theme)
+                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.zoom_preview_image(-0.25, cx)
                                     })),
@@ -6512,6 +6573,7 @@ impl ChattView {
                             )
                             .child(
                                 preview_control_button("preview-zoom-in", "+", &settings.theme)
+                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.zoom_preview_image(0.25, cx)
                                     })),
@@ -8150,7 +8212,7 @@ impl ChattView {
             .id("command-completion")
             .absolute()
             .left(rems_from_px(79.))
-            .right(rems_from_px(28.))
+            .right(rems_from_px(79.))
             .bottom(relative(1.))
             .mb(rems_from_px(6.))
             .border_1()
@@ -8574,7 +8636,7 @@ impl ChattView {
                                     .justify_end()
                                     .gap_2()
                                     .child(
-                                        toolbar_button(
+                                        compact_action_button(
                                             "server-prompt-cancel",
                                             None,
                                             "Cancel",
@@ -8585,7 +8647,7 @@ impl ChattView {
                                         })),
                                     )
                                     .child(
-                                        toolbar_button(
+                                        compact_action_button(
                                             "server-prompt-accept",
                                             None,
                                             if resolving {
@@ -8709,17 +8771,17 @@ impl ChattView {
             .unwrap_or_else(|| "No identity".into());
         sidebar.child(div().flex_1()).child(
             div()
-                .min_h(rems_from_px(58.))
+                .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap_3()
-                .px_3()
+                .pl_3()
                 .border_t_1()
                 .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                 .child(
                     div()
                         .size(rems_from_px(30.))
+                        .mr_3()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -8728,15 +8790,112 @@ impl ChattView {
                         .child(identity.chars().next().unwrap_or('?').to_string()),
                 )
                 .child(div().flex_1().min_w_0().text_sm().child(identity))
-                .child(mini_button("open-servers", "⇄", &applied.theme).on_click(
-                    cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
-                ))
                 .child(
-                    mini_button("open-settings", "⚙", &applied.theme).on_click(cx.listener(
+                    sidebar_footer_button("open-servers", "⇄", &applied.theme).on_click(
+                        cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
+                    ),
+                )
+                .child(
+                    sidebar_footer_button("open-settings", "⚙", &applied.theme).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_settings(&OpenSettings, window, cx)
+                        }),
+                    ),
+                ),
+        )
+    }
+
+    fn render_composer_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let applied = AppliedSettings::get(cx);
+        let row_hover = applied.theme.color(ThemeRole::ControlSurfaceHover);
+        let muted = applied.theme.color(ThemeRole::TextMuted);
+        let menu_row = |id: &'static str, label: &'static str, value: &'static str| {
+            div()
+                .id(id)
+                .min_h(rems_from_px(34.))
+                .w_full()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .cursor_pointer()
+                .hover(move |row| row.bg(row_hover))
+                .child(div().flex_1().child(label))
+                .child(div().text_xs().text_color(muted).child(value))
+        };
+
+        deferred(
+            div()
+                .id("composer-menu-popup")
+                .absolute()
+                .right_0()
+                .bottom(relative(1.))
+                .mb(rems_from_px(8.))
+                .w(rems_from_px(224.))
+                .py_1()
+                .border_1()
+                .border_color(applied.theme.color(ThemeRole::BorderStrong))
+                .bg(applied.theme.color(ThemeRole::Raised))
+                .shadow_lg()
+                .occlude()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if !*hovered && this.composer_menu_action_taken {
+                        this.dismiss_composer_menu(cx);
+                    }
+                }))
+                .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    if this
+                        .composer_menu_trigger_bounds
+                        .get()
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
+                    this.dismiss_composer_menu(cx);
+                }))
+                .child(
+                    menu_row(
+                        "composer-menu-rooms",
+                        "Rooms sidebar",
+                        if self.show_rooms_sidebar {
+                            "Shown"
+                        } else {
+                            "Hidden"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_rooms_sidebar(cx))),
+                )
+                .child(
+                    menu_row(
+                        "composer-menu-status",
+                        "Top status bar",
+                        if self.show_top_status_bar {
+                            "Shown"
+                        } else {
+                            "Hidden"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_top_status_bar(cx))),
+                )
+                .child(
+                    div()
+                        .mx_2()
+                        .my_1()
+                        .border_t_1()
+                        .border_color(applied.theme.color(ThemeRole::BorderSubtle)),
+                )
+                .child(
+                    menu_row("composer-menu-servers", "Switch server", "").on_click(
+                        cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
+                    ),
+                )
+                .child(
+                    menu_row("composer-menu-settings", "Settings", "").on_click(cx.listener(
                         |this, _, window, cx| this.open_settings(&OpenSettings, window, cx),
                     )),
                 ),
         )
+        .into_any_element()
     }
 
     fn scroll_timeline(
@@ -8853,6 +9012,7 @@ impl ChattView {
             .gap_2()
             .pl(rems_from_px(51.))
             .pr_2()
+            .pt_2()
             .pb_2();
         for file in self.queued_files.files() {
             let id = file.id;
@@ -9291,11 +9451,10 @@ impl Render for ChattView {
         let resizing_live_pane = self.live_pane_resize.is_some();
         let active_preview = self.preview_history.active().cloned();
         let preview_panel = active_preview.map(|active| {
-            let body_width = window.viewport_size().width
-                - crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size());
-            self.preview_panel_width =
-                clamp_panel_width(self.preview_panel_width, body_width, window.rem_size());
-            self.render_preview_panel(active, self.preview_panel_width, window, cx)
+            let body_width = self.chat_body_width(window);
+            let panel_width =
+                panel_width_for_chat_width(self.preview_chat_width, body_width, window.rem_size());
+            self.render_preview_panel(active, panel_width, window, cx)
         });
         let resizing_preview_pane = self.preview_pane_resize.is_some();
         let completion_view = self.completion_view(cx).filter(|view| {
@@ -9319,6 +9478,11 @@ impl Render for ChattView {
         let completion_popup = completion_view.map(|view| self.render_completion_popup(view, cx));
         let queued_file_row = (!self.queued_files.is_empty()).then(|| self.render_queued_files(cx));
         let message_reference_preview = self.render_message_reference_preview(window, cx);
+        let sidebar = self.show_rooms_sidebar.then(|| self.render_sidebar(cx));
+        let composer_menu = self
+            .composer_menu_open
+            .then(|| self.render_composer_menu(cx));
+        let composer_menu_trigger_bounds = self.composer_menu_trigger_bounds.clone();
         div()
             .id("chatt")
             .key_context("Chatt")
@@ -9405,7 +9569,7 @@ impl Render for ChattView {
                     .size_full(),
                 )
             })
-            .child(self.render_sidebar(cx))
+            .when_some(sidebar, |root, sidebar| root.child(sidebar))
             .child(
                 div()
                     .flex_1()
@@ -9422,7 +9586,8 @@ impl Render for ChattView {
                             .w_full()
                             .flex()
                             .flex_col()
-                            .child(
+                            .when(self.show_top_status_bar, |panel| {
+                                panel.child(
                                 div()
                             .min_h(rems_from_px(TOP_BAR_HEIGHT))
                             .flex_none()
@@ -9576,8 +9741,9 @@ impl Render for ChattView {
                                         this.toggle_voice(&ToggleVoice, window, cx)
                                     },
                                 )),
-                            ),
                             )
+                            )
+                            })
                     .when(show_config_diagnostic, |panel| {
                         let diagnostic = &applied.diagnostics[0];
                         panel.child(
@@ -9616,7 +9782,7 @@ impl Render for ChattView {
                                     .border_b_1()
                                     .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                                     .child(
-                                        toolbar_button(
+                                        compact_action_button(
                                             "load-older",
                                             Some(IconName::Download),
                                             "Load older messages",
@@ -9664,16 +9830,17 @@ impl Render for ChattView {
                             .items_stretch()
                             .pl(rems_from_px(28.))
                             .pr(rems_from_px(28.))
-                            .py_2()
                             .border_t_1()
                             .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                             .bg(applied.theme.color(ThemeRole::Input))
+                            .when_some(composer_menu, |bar, menu| bar.child(menu))
                             .when_some(completion_popup, |bar, popup| bar.child(popup))
                             .when_some(queued_file_row, |bar, files| bar.child(files))
                             .when_some(self.composer_error.clone(), |bar, error| {
                                 bar.child(
                                     div()
                                         .mb_1()
+                                        .mt_2()
                                         .text_sm()
                                         .text_color(applied.theme.color(ThemeRole::StateWarning))
                                         .child(format!(
@@ -9685,6 +9852,7 @@ impl Render for ChattView {
                                 bar.child(
                                     div()
                                         .mb_1()
+                                        .mt_2()
                                         .text_sm()
                                         .text_color(applied.theme.color(ThemeRole::TextMuted))
                                         .child(
@@ -9694,24 +9862,31 @@ impl Render for ChattView {
                             })
                             .child(
                                 div()
+                                    .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
                                     .flex()
-                                    .items_center()
+                                    .items_stretch()
                                     .child(
                                         div()
-                                            .w(rems_from_px(36.))
-                                            .min_h(rems_from_px(40.))
+                                            .id("add-media-region")
+                                            .ml(rems_from_px(-28.))
+                                            .w(rems_from_px(64.))
+                                            .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
                                             .flex_none()
                                             .flex()
                                             .items_center()
                                             .justify_center()
+                                            .cursor_pointer()
                                             .mr(rems_from_px(15.))
                                             .child(composer_add_button(
                                                 can_attach,
                                                 &applied.theme,
-                                            ).on_click(
-                                                cx.listener(|this, _, window, cx| {
+                                            ))
+                                            .on_click(cx.listener(
+                                                |this, _, window, cx| {
+                                                    this.composer_menu_open = false;
+                                                    this.composer_menu_action_taken = false;
                                                     this.open_media(&OpenMedia, window, cx)
-                                                }),
+                                                },
                                             )),
                                     )
                                     .child(
@@ -9722,6 +9897,45 @@ impl Render for ChattView {
                                             .flex()
                                             .items_center()
                                             .child(self.composer.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-menu")
+                                            .relative()
+                                            .ml(rems_from_px(15.))
+                                            .mr(rems_from_px(-28.))
+                                            .w(rems_from_px(64.))
+                                            .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .child(
+                                                canvas(
+                                                    move |bounds, _, _| {
+                                                        composer_menu_trigger_bounds
+                                                            .set(Some(bounds));
+                                                    },
+                                                    |_, _, _, _| {},
+                                                )
+                                                .absolute()
+                                                .size_full(),
+                                            )
+                                            .child(icon(
+                                                IconName::Menu,
+                                                24.0,
+                                                applied.theme.color(
+                                                    if self.composer_menu_open {
+                                                        ThemeRole::TextPrimary
+                                                    } else {
+                                                        ThemeRole::TextMuted
+                                                    },
+                                                ),
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_composer_menu(cx)
+                                            })),
                                     ),
                             ),
                     ),

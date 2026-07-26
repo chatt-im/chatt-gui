@@ -402,14 +402,26 @@ pub fn clamp_panel_width(width: Pixels, body_width: Pixels, rem_size: Pixels) ->
     width.clamp(min_width, max_width)
 }
 
-pub fn default_panel_width(body_width: Pixels, rem_size: Pixels) -> Pixels {
-    clamp_panel_width(
-        body_width
-            - crate::ui_scale::scaled_px(DEFAULT_CHAT_WIDTH, rem_size)
-            - crate::ui_scale::scaled_px(DIVIDER_WIDTH, rem_size),
+pub fn clamp_chat_width(width: Pixels, body_width: Pixels, rem_size: Pixels) -> Pixels {
+    let usable = (body_width - crate::ui_scale::scaled_px(DIVIDER_WIDTH, rem_size)).max(px(0.0));
+    usable - clamp_panel_width(usable - width, body_width, rem_size)
+}
+
+pub fn default_chat_width(body_width: Pixels, rem_size: Pixels) -> Pixels {
+    clamp_chat_width(
+        crate::ui_scale::scaled_px(DEFAULT_CHAT_WIDTH, rem_size),
         body_width,
         rem_size,
     )
+}
+
+pub fn panel_width_for_chat_width(
+    chat_width: Pixels,
+    body_width: Pixels,
+    rem_size: Pixels,
+) -> Pixels {
+    let usable = (body_width - crate::ui_scale::scaled_px(DIVIDER_WIDTH, rem_size)).max(px(0.0));
+    clamp_panel_width(usable - chat_width, body_width, rem_size)
 }
 
 fn panel_width_bounds(body_width: Pixels, rem_size: Pixels) -> (Pixels, Pixels) {
@@ -473,8 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn default_panel_preserves_preferred_chat_width_without_weakening_clamp() {
-        assert_eq!(default_panel_width(px(1_400.0), px(16.0)), px(591.0));
+    fn panel_width_clamp_preserves_chat_space() {
         assert_eq!(
             clamp_panel_width(px(1_200.0), px(1_400.0), px(16.0)),
             px(1_031.0)
@@ -486,8 +497,29 @@ mod tests {
     }
 
     #[test]
+    fn fixed_chat_width_gives_window_growth_to_the_preview_panel() {
+        let chat_width = default_chat_width(px(1_400.0), px(16.0));
+        assert_eq!(chat_width, px(800.0));
+        assert_eq!(
+            panel_width_for_chat_width(chat_width, px(1_400.0), px(16.0)),
+            px(591.0)
+        );
+        assert_eq!(
+            panel_width_for_chat_width(chat_width, px(1_800.0), px(16.0)),
+            px(991.0)
+        );
+    }
+
+    #[test]
     fn panel_constraints_scale_with_the_window_rem_size() {
-        assert_eq!(default_panel_width(px(2_800.0), px(32.0)), px(1_182.0));
+        assert_eq!(
+            panel_width_for_chat_width(
+                default_chat_width(px(2_800.0), px(32.0)),
+                px(2_800.0),
+                px(32.0),
+            ),
+            px(1_182.0)
+        );
         assert_eq!(
             clamp_panel_width(px(2_400.0), px(2_800.0), px(32.0)),
             px(2_062.0)

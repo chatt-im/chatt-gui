@@ -69,6 +69,34 @@ pub(crate) fn toolbar_button(
     let hover = palette.color(ThemeRole::ControlButtonHover);
     div()
         .id(id)
+        .min_h(rems_from_px(52.))
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .cursor_pointer()
+        .hover(move |button| button.bg(hover))
+        .text_xs()
+        .when_some(icon_name, |button, icon_name| {
+            button.child(icon(
+                icon_name,
+                15.0,
+                palette.color(ThemeRole::TextSecondary),
+            ))
+        })
+        .child(label)
+}
+
+pub(crate) fn compact_action_button(
+    id: &'static str,
+    icon_name: Option<IconName>,
+    label: &'static str,
+    palette: &ThemePalette,
+) -> Stateful<Div> {
+    let hover = palette.color(ThemeRole::ControlButtonHover);
+    div()
+        .id(id)
         .min_h(rems_from_px(30.))
         .px_2()
         .flex()
@@ -106,6 +134,27 @@ pub(crate) fn mini_button(
         .bg(palette.color(ThemeRole::ControlSurface))
         .hover(move |button| button.bg(hover))
         .text_xs()
+        .child(label)
+}
+
+pub(crate) fn sidebar_footer_button(
+    id: &'static str,
+    label: &'static str,
+    palette: &ThemePalette,
+) -> Stateful<Div> {
+    let hover = palette.color(ThemeRole::ControlSurfaceHover);
+    div()
+        .id(id)
+        .w(rems_from_px(48.))
+        .min_h(rems_from_px(64.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_lg()
+        .text_color(palette.color(ThemeRole::TextMuted))
+        .hover(move |button| button.bg(hover))
         .child(label)
 }
 
@@ -171,14 +220,14 @@ pub(crate) fn composer_add_button(ready: bool, palette: &ThemePalette) -> Statef
     let hover = palette.color(ThemeRole::TextPrimary);
     div()
         .id("add-media")
-        .size(rems_from_px(36.))
+        .size(rems_from_px(40.))
         .flex()
         .items_center()
         .justify_center()
         .cursor_pointer()
         .text_color(color)
         .hover(move |button| button.text_color(hover))
-        .child(icon(IconName::Plus, 24.0, color))
+        .child(icon(IconName::Plus, 30.0, color))
 }
 
 pub(crate) fn preview_action_button(
@@ -190,7 +239,8 @@ pub(crate) fn preview_action_button(
     let hover_text = palette.color(ThemeRole::TextPrimary);
     div()
         .id(id)
-        .size(rems_from_px(28.0))
+        .w(rems_from_px(36.0))
+        .min_h(rems_from_px(52.0))
         .flex()
         .items_center()
         .justify_center()
