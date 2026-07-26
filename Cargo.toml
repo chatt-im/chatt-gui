@@ -10,6 +10,7 @@ wayland = ["gpui/wayland", "gpui_platform/wayland"]
 x11 = ["gpui/x11", "gpui_platform/x11"]
 
 [dependencies]
+mimalloc = { version = "0.1.52", features = ["override"] }
 anyhow = "1"
 ash = "0.38"
 async-channel = "2.5"
