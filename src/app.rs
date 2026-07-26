@@ -867,7 +867,13 @@ impl ChattView {
                         }
                         this.install_prepared_messages(prepared);
                         cx.notify();
-                        log::debug!("daemon event batch notified ChattView");
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::rpc_logging_enabled() {
+                            kvlog::info!(
+                                "daemon event batch notified view",
+                                group = "daemon-rpc"
+                            );
+                        }
                     })
                     .is_err()
                 {
@@ -1049,7 +1055,7 @@ impl ChattView {
 
     fn set_composer_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
-        log::warn!("composer action failed: {message}");
+        kvlog::warn!("composer action failed", err = %message);
         self.status = message.clone();
         self.composer_error = Some(message);
         cx.notify();
@@ -1189,10 +1195,10 @@ impl ChattView {
                     if let Err(error) = settings.update(cx, |settings, cx| {
                         settings.install_external_loaded_if_clean(loaded, cx)
                     }) {
-                        log::warn!("could not reconcile shared gui.toml: {error}");
+                        kvlog::warn!("could not reconcile shared gui.toml", err = %error);
                     }
                 } else if let Err(error) = crate::settings::install_external_loaded(loaded, cx) {
-                    log::warn!("could not reconcile shared gui.toml: {error}");
+                    kvlog::warn!("could not reconcile shared gui.toml", err = %error);
                 }
             });
         }));
@@ -1915,7 +1921,7 @@ impl ChattView {
     }
 
     fn attachment_source_protocol_error(&mut self, reason: &str, cx: &mut Context<Self>) {
-        log::error!("daemon attachment source protocol error: {reason}");
+        kvlog::error!("daemon attachment source protocol error", err = %reason);
         self.reset_attachment_source_state();
         self.daemon.disconnect_protocol(reason);
         self.status = format!("Attachment source protocol error · {reason}").into();
@@ -2002,7 +2008,7 @@ impl ChattView {
 
     fn apply_video_drain(&mut self, drain: VideoDrain) {
         for error in &drain.errors {
-            log::error!("embedded video failed: {error}");
+            kvlog::error!("embedded video failed", err = %error);
         }
         if let Some(error) = drain.errors.last() {
             self.status = error.clone().into();
@@ -2014,7 +2020,7 @@ impl ChattView {
             self.video_sources.source_failed(key, error, Instant::now());
         }
         for error in &drain.errors {
-            log::error!("embedded audio failed: {error}");
+            kvlog::error!("embedded audio failed", err = %error);
         }
         if let Some(error) = drain.errors.last() {
             self.status = error.clone().into();
@@ -2136,9 +2142,10 @@ impl ChattView {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    log::error!(
-                        "screen-share playback failed stream_id={}: {error:#}",
-                        stream_id.0
+                    kvlog::error!(
+                        "screen-share playback failed",
+                        stream_id,
+                        err = %error
                     );
                     ended.push((*stream_id, format!("Screen share failed · {error:#}")));
                 }
@@ -2476,7 +2483,7 @@ impl ChattView {
                 self.model.phase = ConnectionPhase::Syncing;
             }
             DaemonEvent::Disconnected(reason) => {
-                log::error!("daemon disconnected: {reason}");
+                kvlog::error!("daemon disconnected", err = %reason);
                 let loaded = cx.global::<ConfigurationState>().0.clone();
                 self.appearance_sync.disconnected(&loaded, cx);
                 self.clear_command_surface(cx);
@@ -2521,7 +2528,7 @@ impl ChattView {
                 self.settings_close_when_opened = false;
             }
             DaemonEvent::Incompatible(details) => {
-                log::error!("daemon connection is incompatible: {details}");
+                kvlog::error!("daemon connection is incompatible", err = %details);
                 let loaded = cx.global::<ConfigurationState>().0.clone();
                 self.appearance_sync.disconnected(&loaded, cx);
                 self.clear_command_surface(cx);
@@ -2559,10 +2566,11 @@ impl ChattView {
                 finish_request,
                 reason,
             } => {
-                log::error!(
-                    "upload failed begin_request={} finish_request={}: {reason}",
-                    begin_request.0,
-                    finish_request.0,
+                kvlog::error!(
+                    "upload failed",
+                    begin_request,
+                    finish_request,
+                    err = %reason
                 );
                 self.model.pending.remove(&begin_request);
                 self.model.pending.remove(&finish_request);
@@ -2573,14 +2581,14 @@ impl ChattView {
                 }
             }
             DaemonEvent::MediaCached(descriptor) => {
-                log::info!(
-                    "attachment cached attachment_timestamp_ms={} attachment_transfer_id={} file={:?} media_kind={:?} content_type={:?} bytes={}",
-                    descriptor.id.timestamp_ms,
-                    descriptor.id.transfer_id.0,
-                    descriptor.file_name,
-                    descriptor.media_kind,
-                    descriptor.content_type,
-                    descriptor.byte_len,
+                kvlog::info!(
+                    "attachment cached",
+                    attachment_timestamp_ms = descriptor.id.timestamp_ms,
+                    attachment_transfer_id = descriptor.id.transfer_id,
+                    path = %descriptor.file_name,
+                    media_kind = descriptor.media_kind,
+                    content_type = %descriptor.content_type,
+                    size = descriptor.byte_len
                 );
                 self.status = format!("Cached {}", descriptor.file_name).into();
                 self.eager_image_fetches.cached(&descriptor);
@@ -2605,10 +2613,7 @@ impl ChattView {
                 transfer_id,
                 reason,
             } => {
-                log::error!(
-                    "attachment transfer failed transfer_id={}: {reason}",
-                    transfer_id.0,
-                );
+                kvlog::error!("attachment transfer failed", transfer_id, err = %reason);
                 let pending_failed =
                     self.pending_reference_media_preview
                         .as_ref()
@@ -2892,7 +2897,7 @@ impl ChattView {
                                 Some(appearance),
                             ),
                             Err(error) => {
-                                log::warn!("ignored invalid shared appearance: {error}");
+                                kvlog::warn!("ignored invalid shared appearance", err = %error);
                                 self.status =
                                     format!("Ignored invalid shared appearance · {error}").into();
                                 cx.notify();
@@ -2905,7 +2910,7 @@ impl ChattView {
                     }
                 };
                 if let Err(error) = self.appearance_sync.apply_event(event, &loaded, cx) {
-                    log::warn!("ignored invalid shared appearance: {error}");
+                    kvlog::warn!("ignored invalid shared appearance", err = %error);
                     self.status = format!("Ignored invalid shared appearance · {error}").into();
                     cx.notify();
                 } else if let (Some(settings), Some((preview, committed))) =
@@ -3229,9 +3234,11 @@ impl ChattView {
                         self.status = "Command completed".into();
                     }
                     RequestOutcome::Rejected { code, message } => {
-                        log::error!(
-                            "daemon command rejected request_id={} code={code}: {message}",
-                            result.request_id.0,
+                        kvlog::error!(
+                            "daemon command rejected",
+                            request_id = result.request_id,
+                            code,
+                            err = %message
                         );
                         self.append_command_output(lines);
                         self.status = message.into();
@@ -3284,11 +3291,16 @@ impl ChattView {
             if !submission_result && !reference_jump_request {
                 match result.outcome {
                     RequestOutcome::Accepted => {
-                        log::info!(
-                            "daemon result applied request_id={} operation={:?} outcome=accepted",
-                            result.request_id.0,
-                            result.operation,
-                        );
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::rpc_logging_enabled() {
+                            kvlog::info!(
+                                "daemon result applied",
+                                group = "daemon-rpc",
+                                request_id = result.request_id,
+                                operation = result.operation,
+                                outcome = "accepted"
+                            );
+                        }
                         self.status =
                             format!("{} accepted", operation_label(&result.operation)).into();
                         if let Some(pending) = pending.as_ref()
@@ -3301,10 +3313,13 @@ impl ChattView {
                         }
                     }
                     RequestOutcome::Rejected { code, message } => {
-                        log::error!(
-                            "daemon result applied request_id={} operation={:?} outcome=rejected code={code}: {message}",
-                            result.request_id.0,
-                            result.operation,
+                        kvlog::error!(
+                            "daemon result applied",
+                            request_id = result.request_id,
+                            operation = result.operation,
+                            outcome = "rejected",
+                            code,
+                            err = %message
                         );
                         if let Some(transfer_id) = pending.as_ref().and_then(|pending| {
                             (pending.operation == Operation::BeginAttachmentRead)
@@ -3950,7 +3965,7 @@ impl ChattView {
         }) {
             hover.request_id = None;
             hover.missing = true;
-            log::error!("could not resolve message reference: {error}");
+            kvlog::error!("could not resolve message reference", err = %error);
         }
         cx.notify();
     }
@@ -4421,11 +4436,15 @@ impl ChattView {
             available_slots,
             &timestamp,
         );
-        log::info!(
-            "clipboard image paste prepared accepted={} rejected={}",
-            result.accepted.len(),
-            result.rejected.len(),
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            kvlog::info!(
+                "clipboard image paste prepared",
+                group = "media",
+                accepted = result.accepted.len(),
+                rejected = result.rejected.len()
+            );
+        }
         self.accept_file_inspection(result, cx);
     }
 
@@ -4434,7 +4453,7 @@ impl ChattView {
         self.queued_files.extend(result.accepted);
         let first_error = result.rejected.first().cloned();
         for error in result.rejected {
-            log::error!("file was not queued: {error}");
+            kvlog::error!("file was not queued", err = %error);
         }
         self.composer_error = first_error.clone().map(Into::into);
         self.status = match (accepted, first_error) {
@@ -6224,16 +6243,20 @@ impl ChattView {
         let Some(room_id) = self.model.selected_room else {
             return;
         };
-        log::info!(
-            "attachment fetch requested room={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} media_kind={:?} content_type={:?} bytes={}",
-            room_id.0,
-            descriptor.id.timestamp_ms,
-            descriptor.id.transfer_id.0,
-            descriptor.file_name,
-            descriptor.media_kind,
-            descriptor.content_type,
-            descriptor.byte_len,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            kvlog::info!(
+                "attachment fetch requested",
+                group = "media",
+                room_id,
+                attachment_timestamp_ms = descriptor.id.timestamp_ms,
+                attachment_transfer_id = descriptor.id.transfer_id,
+                path = %descriptor.file_name,
+                media_kind = descriptor.media_kind,
+                content_type = %descriptor.content_type,
+                size = descriptor.byte_len
+            );
+        }
         if let Err(error) = self.begin_attachment_read(room_id, descriptor, cx) {
             self.status = error.into();
             self.pump_eager_image_fetches(cx);
@@ -6276,10 +6299,11 @@ impl ChattView {
             .daemon
             .send(ClientFrame::BeginAttachmentRead { request_id, read })
         {
-            log::error!(
-                "attachment request enqueue failed request_id={} transfer_id={}: {error}",
-                request_id.0,
-                transfer_id.0,
+            kvlog::error!(
+                "attachment request enqueue failed",
+                request_id,
+                transfer_id,
+                err = %error
             );
             self.model.pending.remove(&request_id);
             self.media_cache
@@ -6288,16 +6312,20 @@ impl ChattView {
                 .cancel(transfer_id);
             return Err(error);
         } else {
-            log::info!(
-                "attachment request queued request_id={} bulk_transfer_id={} room={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} bytes={}",
-                request_id.0,
-                transfer_id.0,
-                room_id.0,
-                descriptor.id.timestamp_ms,
-                descriptor.id.transfer_id.0,
-                descriptor.file_name,
-                descriptor.byte_len,
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::rpc_logging_enabled() {
+                kvlog::info!(
+                    "attachment request queued",
+                    group = "daemon-rpc",
+                    request_id,
+                    bulk_transfer_id = transfer_id,
+                    room_id,
+                    attachment_timestamp_ms = descriptor.id.timestamp_ms,
+                    attachment_transfer_id = descriptor.id.transfer_id,
+                    path = %descriptor.file_name,
+                    size = descriptor.byte_len
+                );
+            }
             self.status = format!("Fetching {}…", descriptor.file_name).into();
         }
         cx.notify();
@@ -6932,14 +6960,28 @@ impl ChattView {
                 match self.audios.play(key, Some(source)) {
                     Ok(()) => self.status = "Starting audio playback…".into(),
                     Err(error) => {
-                        log::error!("embedded audio play failed key={key:?}: {error:#}");
+                        kvlog::error!(
+                            "embedded audio play failed",
+                            room_id = key.room_id,
+                            message_id = key.message_id,
+                            attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                            attachment_transfer_id = key.attachment_id.transfer_id,
+                            err = %error
+                        );
                         self.status = format!("Audio playback failed: {error}").into();
                     }
                 }
             }
             VideoSourceView::Absent | VideoSourceView::Loading | VideoSourceView::Failed { .. } => {
                 if let Err(error) = self.audios.play(key, None) {
-                    log::error!("embedded audio preparation failed key={key:?}: {error:#}");
+                    kvlog::error!(
+                        "embedded audio preparation failed",
+                        room_id = key.room_id,
+                        message_id = key.message_id,
+                        attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                        attachment_transfer_id = key.attachment_id.transfer_id,
+                        err = %error
+                    );
                     self.status = format!("Audio playback failed: {error}").into();
                 } else if let Some(descriptor) = self.audio_descriptor(key) {
                     self.pending_audio_plays.insert(key);
@@ -6961,7 +7003,15 @@ impl ChattView {
     fn seek_audio(&mut self, key: AudioKey, seconds: f64, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Audio(key));
         if let Err(error) = self.audios.seek(key, seconds) {
-            log::error!("embedded audio seek failed key={key:?} seconds={seconds}: {error:#}");
+            kvlog::error!(
+                "embedded audio seek failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                seconds,
+                err = %error
+            );
             self.status = format!("Audio seek failed: {error}").into();
         }
         cx.notify();
@@ -6987,7 +7037,15 @@ impl ChattView {
             last_seek: Instant::now(),
         });
         if let Err(error) = self.audios.scrub(key, fraction, duration) {
-            log::error!("embedded audio initial scrub failed key={key:?}: {error:#}");
+            kvlog::error!(
+                "embedded audio initial scrub failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                fraction,
+                err = %error
+            );
             self.status = format!("Audio seek failed: {error}").into();
         }
         cx.stop_propagation();
@@ -7012,9 +7070,14 @@ impl ChattView {
             let dispatch = scrub.should_dispatch_seek(Instant::now());
             self.audio_scrub = Some(scrub);
             if dispatch && let Err(error) = self.audios.scrub(scrub.key, fraction, scrub.duration) {
-                log::error!(
-                    "embedded audio drag scrub failed key={:?}: {error:#}",
-                    scrub.key
+                kvlog::error!(
+                    "embedded audio drag scrub failed",
+                    room_id = scrub.key.room_id,
+                    message_id = scrub.key.message_id,
+                    attachment_timestamp_ms = scrub.key.attachment_id.timestamp_ms,
+                    attachment_transfer_id = scrub.key.attachment_id.transfer_id,
+                    fraction,
+                    err = %error
                 );
                 self.status = format!("Audio seek failed: {error}").into();
             }
@@ -7032,9 +7095,14 @@ impl ChattView {
             .audios
             .scrub(scrub.key, scrub.last_fraction, scrub.duration)
         {
-            log::error!(
-                "embedded audio final scrub failed key={:?}: {error:#}",
-                scrub.key
+            kvlog::error!(
+                "embedded audio final scrub failed",
+                room_id = scrub.key.room_id,
+                message_id = scrub.key.message_id,
+                attachment_timestamp_ms = scrub.key.attachment_id.timestamp_ms,
+                attachment_transfer_id = scrub.key.attachment_id.transfer_id,
+                fraction = scrub.last_fraction,
+                err = %error
             );
             self.status = format!("Audio seek failed: {error}").into();
         }
@@ -7044,7 +7112,15 @@ impl ChattView {
     fn set_audio_volume(&mut self, key: AudioKey, volume: f64, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Audio(key));
         if let Err(error) = self.audios.set_volume_for(key, volume) {
-            log::error!("embedded audio volume failed key={key:?}: {error:#}");
+            kvlog::error!(
+                "embedded audio volume failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                volume,
+                err = %error
+            );
             self.status = format!("Audio volume failed: {error}").into();
         }
         cx.notify();
@@ -7053,7 +7129,14 @@ impl ChattView {
     fn toggle_audio_mute(&mut self, key: AudioKey, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Audio(key));
         if let Err(error) = self.audios.toggle_mute(key) {
-            log::error!("embedded audio mute failed key={key:?}: {error:#}");
+            kvlog::error!(
+                "embedded audio mute failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                err = %error
+            );
             self.status = format!("Audio volume failed: {error}").into();
         }
         cx.notify();
@@ -7062,7 +7145,14 @@ impl ChattView {
     fn cycle_audio_speed(&mut self, key: AudioKey, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Audio(key));
         if let Err(error) = self.audios.cycle_playback_speed(key) {
-            log::error!("embedded audio speed change failed key={key:?}: {error:#}");
+            kvlog::error!(
+                "embedded audio speed change failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                err = %error
+            );
             self.status = format!("Audio speed change failed: {error}").into();
         }
         cx.notify();
@@ -7244,7 +7334,14 @@ impl ChattView {
                 match self.videos.play(key) {
                     Ok(()) => self.status = "Starting attachment playback…".into(),
                     Err(error) => {
-                        log::error!("embedded video play failed key={key:?}: {error:#}");
+                        kvlog::error!(
+                            "embedded video play failed",
+                            room_id = key.room_id,
+                            message_id = key.message_id,
+                            attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                            attachment_transfer_id = key.attachment_id.transfer_id,
+                            err = %error
+                        );
                         self.status = format!("Playback failed: {error}").into();
                     }
                 }
@@ -7271,7 +7368,15 @@ impl ChattView {
     fn seek_video(&mut self, key: VideoKey, seconds: f64, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.seek(key, seconds) {
-            log::error!("embedded video seek failed key={key:?} seconds={seconds}: {error:#}");
+            kvlog::error!(
+                "embedded video seek failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                seconds,
+                err = %error
+            );
             self.status = format!("Seek failed: {error}").into();
         }
         self.show_video_controls(key, cx);
@@ -7492,8 +7597,14 @@ impl ChattView {
             last_seek: Instant::now(),
         });
         if let Err(error) = self.videos.scrub(key, fraction, duration, SeekMode::Exact) {
-            log::error!(
-                "embedded video initial scrub failed key={key:?} fraction={fraction}: {error:#}"
+            kvlog::error!(
+                "embedded video initial scrub failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                fraction,
+                err = %error
             );
             self.status = format!("Seek failed: {error}").into();
         }
@@ -7524,9 +7635,14 @@ impl ChattView {
                     self.videos
                         .scrub(scrub.key, fraction, scrub.duration, SeekMode::Exact)
             {
-                log::error!(
-                    "embedded video drag scrub failed key={:?} fraction={fraction}: {error:#}",
-                    scrub.key,
+                kvlog::error!(
+                    "embedded video drag scrub failed",
+                    room_id = scrub.key.room_id,
+                    message_id = scrub.key.message_id,
+                    attachment_timestamp_ms = scrub.key.attachment_id.timestamp_ms,
+                    attachment_transfer_id = scrub.key.attachment_id.transfer_id,
+                    fraction,
+                    err = %error
                 );
                 self.status = format!("Seek failed: {error}").into();
             }
@@ -7593,8 +7709,14 @@ impl ChattView {
     fn set_video_volume(&mut self, key: VideoKey, volume: f64, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.set_volume_for(key, volume) {
-            log::error!(
-                "embedded video volume change failed key={key:?} volume={volume}: {error:#}"
+            kvlog::error!(
+                "embedded video volume change failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                volume,
+                err = %error
             );
             self.status = format!("Volume failed: {error}").into();
         }
@@ -7605,7 +7727,14 @@ impl ChattView {
     fn toggle_video_mute(&mut self, key: VideoKey, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.toggle_mute(key) {
-            log::error!("embedded video mute toggle failed key={key:?}: {error:#}");
+            kvlog::error!(
+                "embedded video mute toggle failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                err = %error
+            );
             self.status = format!("Volume failed: {error}").into();
         }
         self.show_video_controls(key, cx);
@@ -7682,7 +7811,15 @@ impl ChattView {
     fn adjust_video_volume(&mut self, key: VideoKey, delta: f64, cx: &mut Context<Self>) {
         self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.adjust_volume(key, delta) {
-            log::error!("embedded video volume change failed key={key:?} delta={delta}: {error:#}");
+            kvlog::error!(
+                "embedded video volume change failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                delta,
+                err = %error
+            );
             self.status = format!("Volume failed: {error}").into();
         }
         self.show_video_controls(key, cx);

@@ -41,7 +41,7 @@ use gpui_platform::application;
 use crate::app::ChattView;
 
 fn main() {
-    logger::init();
+    let logger_guard = logger::init();
     ensure_graphical_backend();
     let mut loaded = config::io::load();
     let binding_diagnostics = key_bindings::validate(&loaded.config);
@@ -50,9 +50,7 @@ fn main() {
         loaded.config = config::schema::GuiConfig::default();
         loaded.status = config::io::SourceStatus::Invalid;
     }
-    log::info!(
-        "logging initialized (set RUST_LOG for Rust diagnostics and CHATT_MPV_LOG for native mpv diagnostics)"
-    );
+    kvlog::info!("logging initialized");
     application()
         .with_assets(icons::IconAssets)
         .run(move |cx: &mut App| {
@@ -72,10 +70,20 @@ fn main() {
                     .unwrap_or_default();
                 match diagnostic.severity {
                     config::validation::DiagnosticSeverity::Warning => {
-                        log::warn!("{}{}: {}", diagnostic.path, location, diagnostic.message)
+                        kvlog::warn!(
+                            "configuration warning",
+                            path = %diagnostic.path,
+                            location = %location,
+                            detail = %diagnostic.message
+                        )
                     }
                     config::validation::DiagnosticSeverity::Error => {
-                        log::error!("{}{}: {}", diagnostic.path, location, diagnostic.message)
+                        kvlog::error!(
+                            "configuration error",
+                            path = %diagnostic.path,
+                            location = %location,
+                            detail = %diagnostic.message
+                        )
                     }
                 }
             }
@@ -108,6 +116,7 @@ fn main() {
 
             cx.activate(true);
         });
+    logger_guard.flush();
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -118,10 +127,14 @@ fn ensure_graphical_backend() {
     let headless_override = std::env::var_os("ZED_HEADLESS").is_some();
     let selected = gpui::guess_compositor();
 
-    log::info!(
-        "GPUI backend selection: selected={selected}, compiled={{wayland: {}, x11: {}}}, environment={{WAYLAND_DISPLAY: {wayland_display}, DISPLAY: {x11_display}, ZED_HEADLESS: {headless_override}}}",
-        cfg!(feature = "wayland"),
-        cfg!(feature = "x11"),
+    kvlog::info!(
+        "graphical backend selected",
+        selected = %selected,
+        wayland_compiled = cfg!(feature = "wayland"),
+        x11_compiled = cfg!(feature = "x11"),
+        wayland_display,
+        x11_display,
+        headless_override
     );
 
     if selected == "Headless" {
@@ -132,7 +145,7 @@ fn ensure_graphical_backend() {
             x11_display,
             headless_override,
         );
-        log::error!("{error}");
+        kvlog::error!("graphical backend unavailable", err = %error);
         std::process::exit(1);
     }
 }

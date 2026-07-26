@@ -23,9 +23,6 @@ members = [
     "crates/theme",
     "crates/ui",
     "crates/ui_macros",
-    "crates/zlog",
-    "crates/ztracing",
-    "crates/ztracing_macro",
 ]
 
 [workspace.package]
@@ -54,9 +51,6 @@ syntax_theme = { path = "crates/syntax_theme" }
 theme = { path = "crates/theme" }
 ui = { path = "crates/ui" }
 ui_macros = { path = "crates/ui_macros" }
-zlog = { path = "crates/zlog" }
-ztracing = { path = "crates/ztracing" }
-ztracing_macro = { path = "crates/ztracing_macro" }
 
 accesskit_macos = "0.26.0"
 accesskit_unix = "0.21.0"
@@ -104,7 +98,6 @@ slotmap = "1.0.6"
 smol = "2.0"
 stacksafe = "0.1"
 thiserror = "2.0.12"
-tracing = "0.1.40"
 unicode-segmentation = "1.10"
 web-time = "1.1.0"
 wgpu = "29.0.4"

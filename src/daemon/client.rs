@@ -139,9 +139,10 @@ impl DaemonClient {
                     TrySendError::Full(_) => "daemon command queue is full".into(),
                     TrySendError::Disconnected(_) => "daemon connector stopped".into(),
                 };
-                log::error!(
-                    "could not enqueue daemon request request_id={:?}: {reason}",
-                    request_id.map(|id| id.0),
+                kvlog::error!(
+                    "could not enqueue daemon request",
+                    request_id,
+                    err = %reason
                 );
                 reason
             })
@@ -271,7 +272,7 @@ impl DaemonClient {
 
     pub fn disconnect_protocol(&self, reason: impl Into<String>) {
         let reason = reason.into();
-        log::error!("disconnecting daemon RPC after protocol error: {reason}");
+        kvlog::error!("disconnecting daemon RPC after protocol error", err = %reason);
         let _ = self.commands.try_send(ConnectorCommand::SessionEnded);
     }
 }
@@ -295,7 +296,7 @@ fn connection_loop(
                 let reader_stream = match stream.try_clone() {
                     Ok(stream) => stream,
                     Err(error) => {
-                        log::error!("could not clone daemon RPC stream: {error}");
+                        kvlog::error!("could not clone daemon RPC stream", err = %error);
                         if events
                             .send_blocking(DaemonEvent::Disconnected(error.to_string()))
                             .is_err()
@@ -313,7 +314,7 @@ fn connection_loop(
                 {
                     Ok(thread) => thread,
                     Err(error) => {
-                        log::error!("could not start daemon RPC writer: {error}");
+                        kvlog::error!("could not start daemon RPC writer", err = %error);
                         let _ = events.send_blocking(DaemonEvent::Disconnected(error.to_string()));
                         return;
                     }
@@ -419,15 +420,23 @@ fn connection_loop(
                                             .into();
                                 }
                                 match &result.outcome {
-                                    RequestOutcome::Accepted => log::info!(
-                                        "daemon request accepted request_id={} operation={:?}",
-                                        result.request_id.0,
-                                        result.operation,
-                                    ),
-                                    RequestOutcome::Rejected { code, message } => log::error!(
-                                        "daemon request rejected request_id={} operation={:?} code={code}: {message}",
-                                        result.request_id.0,
-                                        result.operation,
+                                    RequestOutcome::Accepted => {
+                                        #[cfg(feature = "diagnostic-logs")]
+                                        if crate::logger::rpc_logging_enabled() {
+                                            kvlog::info!(
+                                                "daemon request accepted",
+                                                group = "daemon-rpc",
+                                                request_id = result.request_id,
+                                                operation = result.operation
+                                            );
+                                        }
+                                    }
+                                    RequestOutcome::Rejected { code, message } => kvlog::error!(
+                                        "daemon request rejected",
+                                        request_id = result.request_id,
+                                        operation = result.operation,
+                                        code,
+                                        err = %message
                                     ),
                                 }
                             }
@@ -467,7 +476,7 @@ fn connection_loop(
                     .lock()
                     .expect("media cache lock poisoned")
                     .cancel_all();
-                log::error!("daemon RPC connection ended: {reason}");
+                kvlog::error!("daemon RPC connection ended", err = %reason);
                 if events
                     .send_blocking(DaemonEvent::Disconnected(reason))
                     .is_err()
@@ -480,7 +489,7 @@ fn connection_loop(
                 | ConnectError::Permission(details)
                 | ConnectError::Rejected(details),
             ) => {
-                log::error!("daemon RPC connection rejected: {details}");
+                kvlog::error!("daemon RPC connection rejected", err = %details);
                 if events
                     .send_blocking(DaemonEvent::Incompatible(details))
                     .is_err()
@@ -490,7 +499,7 @@ fn connection_loop(
                 wait_for_retry(&commands, Duration::from_secs(5));
             }
             Err(error) => {
-                log::error!("daemon RPC connection failed: {error}");
+                kvlog::error!("daemon RPC connection failed", err = %error);
                 if events
                     .send_blocking(DaemonEvent::Disconnected(error.to_string()))
                     .is_err()
@@ -523,7 +532,14 @@ fn handle_bulk_frame(
         }
         DaemonFrame::BulkFinished(finished) => {
             let transfer_id = finished.transfer_id;
-            log::info!("attachment transfer finished transfer_id={}", transfer_id.0);
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::rpc_logging_enabled() {
+                kvlog::info!(
+                    "attachment transfer finished",
+                    group = "daemon-rpc",
+                    transfer_id
+                );
+            }
             match media_cache
                 .lock()
                 .expect("media cache lock poisoned")
@@ -534,9 +550,9 @@ fn handle_bulk_frame(
                         .send_blocking(DaemonEvent::MediaCached(descriptor))
                         .is_err()
                     {
-                        log::error!(
-                            "could not deliver attachment-cached event transfer_id={}",
-                            transfer_id.0,
+                        kvlog::error!(
+                            "could not deliver attachment-cached event",
+                            transfer_id
                         );
                     }
                 }
@@ -548,9 +564,10 @@ fn handle_bulk_frame(
             transfer_id,
             reason,
         } => {
-            log::error!(
-                "attachment transfer canceled transfer_id={}: {reason}",
-                transfer_id.0,
+            kvlog::error!(
+                "attachment transfer canceled",
+                transfer_id,
+                err = %reason
             );
             media_cache
                 .lock()
@@ -588,18 +605,12 @@ fn cancel_failed_download(
     commands: &SyncSender<ConnectorCommand>,
     events: &EventSender<DaemonEvent>,
 ) {
-    log::error!(
-        "attachment transfer failed transfer_id={}: {reason}",
-        transfer_id.0,
-    );
+    kvlog::error!("attachment transfer failed", transfer_id, err = %reason);
     if commands
         .send(ConnectorCommand::CancelBulk(transfer_id))
         .is_err()
     {
-        log::error!(
-            "could not enqueue attachment cancellation transfer_id={}",
-            transfer_id.0,
-        );
+        kvlog::error!("could not enqueue attachment cancellation", transfer_id);
     }
     if events
         .send_blocking(DaemonEvent::MediaTransferFailed {
@@ -608,10 +619,7 @@ fn cancel_failed_download(
         })
         .is_err()
     {
-        log::error!(
-            "could not deliver attachment-failure event transfer_id={}",
-            transfer_id.0,
-        );
+        kvlog::error!("could not deliver attachment-failure event", transfer_id);
     }
 }
 
@@ -642,24 +650,33 @@ fn writer_loop(
                         prepared.retain(|_, upload| upload.upload.transfer_id != *transfer_id);
                         active.retain(|upload| upload.prepared.upload.transfer_id != *transfer_id);
                     }
+                    #[cfg(feature = "diagnostic-logs")]
                     let attachment_request = match &frame {
                         ClientFrame::BeginAttachmentRead { request_id, read } => {
-                            Some((request_id.0, read.transfer_id.0, read.room_id.0))
+                            Some((*request_id, read.transfer_id, read.room_id))
                         }
                         _ => None,
                     };
                     if let Err(error) = writer.send_client(&frame) {
-                        log::error!(
-                            "could not write daemon request request_id={:?}: {error}",
-                            frame.request_id().map(|id| id.0),
+                        kvlog::error!(
+                            "could not write daemon request",
+                            request_id = frame.request_id(),
+                            err = %error
                         );
                         let _ = writer.shutdown();
                         break;
                     }
+                    #[cfg(feature = "diagnostic-logs")]
                     if let Some((request_id, transfer_id, room_id)) = attachment_request {
-                        log::info!(
-                            "attachment request sent request_id={request_id} transfer_id={transfer_id} room={room_id}"
-                        );
+                        if crate::logger::rpc_logging_enabled() {
+                            kvlog::info!(
+                                "attachment request sent",
+                                group = "daemon-rpc",
+                                request_id,
+                                transfer_id,
+                                room_id
+                            );
+                        }
                     }
                 }
                 ConnectorCommand::PreparedUpload(upload) => {
@@ -668,10 +685,11 @@ fn writer_loop(
                         upload: upload.upload.clone(),
                     };
                     if let Err(error) = writer.send_client(&frame) {
-                        log::error!(
-                            "could not write begin-upload request request_id={} transfer_id={}: {error}",
-                            upload.begin_request.0,
-                            upload.upload.transfer_id.0,
+                        kvlog::error!(
+                            "could not write begin-upload request",
+                            request_id = upload.begin_request,
+                            transfer_id = upload.upload.transfer_id,
+                            err = %error
                         );
                         let _ = writer.shutdown();
                         break;
@@ -708,9 +726,10 @@ fn writer_loop(
                     };
                     internal_request_id = internal_request_id.wrapping_add(1).max(1 << 63);
                     if let Err(error) = writer.send_client(&frame) {
-                        log::error!(
-                            "could not write attachment cancellation transfer_id={}: {error}",
-                            transfer_id.0,
+                        kvlog::error!(
+                            "could not write attachment cancellation",
+                            transfer_id,
+                            err = %error
                         );
                         let _ = writer.shutdown();
                         break;
@@ -742,10 +761,11 @@ fn writer_loop(
                     transfer_id: upload.prepared.upload.transfer_id,
                 };
                 if let Err(error) = writer.send_client(&cancel) {
-                    log::error!(
-                        "could not write failed-upload cancellation request_id={} transfer_id={}: {error}",
-                        cancel_request.0,
-                        upload.prepared.upload.transfer_id.0,
+                    kvlog::error!(
+                        "could not write failed-upload cancellation",
+                        request_id = cancel_request,
+                        transfer_id = upload.prepared.upload.transfer_id,
+                        err = %error
                     );
                     let _ = writer.shutdown();
                     break;
@@ -818,10 +838,11 @@ fn report_upload_error(
     finish_request: RequestId,
     reason: String,
 ) {
-    log::error!(
-        "upload failed begin_request={} finish_request={}: {reason}",
-        begin_request.0,
-        finish_request.0,
+    kvlog::error!(
+        "upload failed",
+        begin_request,
+        finish_request,
+        err = %reason
     );
     if events
         .send_blocking(DaemonEvent::UploadFailed {
@@ -831,10 +852,10 @@ fn report_upload_error(
         })
         .is_err()
     {
-        log::error!(
-            "could not deliver upload-failure event begin_request={} finish_request={}",
-            begin_request.0,
-            finish_request.0,
+        kvlog::error!(
+            "could not deliver upload-failure event",
+            begin_request,
+            finish_request
         );
     }
 }

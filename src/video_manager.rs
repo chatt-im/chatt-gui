@@ -126,7 +126,7 @@ impl AttachmentVideoManager {
                 }
             })
         {
-            log::error!("could not start mpv cleanup worker: {error}");
+            kvlog::error!("could not start mpv cleanup worker", err = %error);
         }
         Self {
             sessions: HashMap::new(),
@@ -170,7 +170,7 @@ impl AttachmentVideoManager {
         let mut drain = VideoDrain::default();
         self.pump_builds(&mut drain);
         for error in drain.errors {
-            log::warn!("{error}");
+            kvlog::warn!("video manager operation failed", err = %error);
         }
     }
 
@@ -409,8 +409,10 @@ impl AttachmentVideoManager {
                         drain.errors.push(format!("Video unavailable: {error}"));
                     } else {
                         self.warm_build_suppressed = true;
-                        log::warn!(
-                            "could not replenish warm video player pool; retrying on demand: {error}"
+                        kvlog::warn!(
+                            "could not replenish warm video player pool",
+                            retry = "on-demand",
+                            err = %error
                         );
                     }
                 }
@@ -503,7 +505,7 @@ impl AttachmentVideoManager {
         let mut drain = VideoDrain::default();
         self.pump_builds(&mut drain);
         for error in drain.errors {
-            log::error!("{error}");
+            kvlog::error!("video manager operation failed", err = %error);
         }
     }
 
@@ -560,22 +562,23 @@ impl AttachmentVideoManager {
             .name("mpv-builder".into())
             .spawn(move || {
                 let started_at = std::time::Instant::now();
-                log::info!(
-                    "asynchronous video player build started cached_backend={}",
-                    preferred_backend.is_some()
+                kvlog::info!(
+                    "asynchronous video player build started",
+                    cached_backend = preferred_backend.is_some()
                 );
                 let result =
                     MpvPlayer::new_attachment(wakeup.clone(), preferred_backend, source_registry)
                         .map_err(|error| format!("{error:#}"));
                 match &result {
-                    Ok(_) => log::info!(
-                        "asynchronous video player build completed elapsed_ms={:.3}",
-                        started_at.elapsed().as_secs_f64() * 1_000.0,
+                    Ok(_) => kvlog::info!(
+                        "asynchronous video player build completed",
+                        elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0
                     ),
                     Err(error) => {
-                        log::error!(
-                            "asynchronous video player build failed elapsed_ms={:.3}: {error}",
-                            started_at.elapsed().as_secs_f64() * 1_000.0,
+                        kvlog::error!(
+                            "asynchronous video player build failed",
+                            elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0,
+                            err = %error
                         )
                     }
                 }
@@ -674,7 +677,7 @@ impl AttachmentVideoManager {
 
     fn recycle(&mut self, mut player: MpvPlayer) {
         if let Err(error) = player.stop() {
-            log::warn!("could not stop retained video player: {error}");
+            kvlog::warn!("could not stop retained video player", err = %error);
             let _ = self.reaper.send(player);
         } else if self.standby.len() < WARM_PLAYER_TARGET {
             self.standby.push(player);

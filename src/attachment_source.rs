@@ -995,32 +995,36 @@ impl AttachmentCursor {
         self.bytes_read = self.bytes_read.saturating_add(read as u64);
         let elapsed = started_at.elapsed();
         if self.read_count == 1 {
-            log::info!(
-                "attachment protocol first read key={:?} backend={} offset={} requested={} read={} elapsed_ms={:.3}",
-                source.key(),
-                if source.is_remote() {
-                    "remote"
-                } else {
-                    "direct"
-                },
-                offset,
-                output.len(),
-                read,
-                elapsed.as_secs_f64() * 1_000.0,
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                let key = source.key();
+                kvlog::info!(
+                    "attachment protocol first read",
+                    group = "media",
+                    namespace = key.namespace,
+                    room_id = key.room_id,
+                    attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                    attachment_transfer_id = key.attachment_id.transfer_id,
+                    backend = if source.is_remote() { "remote" } else { "direct" },
+                    offset,
+                    requested = output.len(),
+                    read,
+                    elapsed_ms = elapsed.as_secs_f64() * 1_000.0
+                );
+            }
         } else if elapsed >= Duration::from_millis(10) {
-            log::warn!(
-                "slow attachment protocol read key={:?} backend={} offset={} requested={} read={} elapsed_ms={:.3}",
-                source.key(),
-                if source.is_remote() {
-                    "remote"
-                } else {
-                    "direct"
-                },
+            let key = source.key();
+            kvlog::warn!(
+                "slow attachment protocol read",
+                namespace = key.namespace,
+                room_id = key.room_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                backend = if source.is_remote() { "remote" } else { "direct" },
                 offset,
-                output.len(),
+                requested = output.len(),
                 read,
-                elapsed.as_secs_f64() * 1_000.0,
+                elapsed_ms = elapsed.as_secs_f64() * 1_000.0
             );
         }
         Ok(read)
@@ -1036,17 +1040,31 @@ impl AttachmentCursor {
             AttachmentSeekMode::Current => i128::from(self.position),
             AttachmentSeekMode::End => i128::from(source.byte_len()),
         };
-        let previous = self.position;
+        let _previous = self.position;
         let position = (base + i128::from(offset)).clamp(0, i128::from(source.byte_len()));
         self.position = position as u64;
         self.seek_count = self.seek_count.saturating_add(1);
-        log::info!(
-            "attachment protocol seek key={:?} mode={mode:?} offset={} from={} to={}",
-            source.key(),
-            offset,
-            previous,
-            self.position,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            let key = source.key();
+            let mode = match mode {
+                AttachmentSeekMode::Set => "set",
+                AttachmentSeekMode::Current => "current",
+                AttachmentSeekMode::End => "end",
+            };
+            kvlog::info!(
+                "attachment protocol seek",
+                group = "media",
+                namespace = key.namespace,
+                room_id = key.room_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                mode,
+                offset,
+                previous = _previous,
+                position = self.position
+            );
+        }
         Ok(self.position)
     }
 
@@ -1061,27 +1079,31 @@ impl AttachmentCursor {
 
 impl Drop for AttachmentCursor {
     fn drop(&mut self) {
-        let Some(source) = self.source.as_ref() else {
-            log::warn!(
-                "unresolved attachment protocol cursor closed elapsed_ms={:.3}",
-                self.opened_at.elapsed().as_secs_f64() * 1_000.0,
+        let Some(_source) = self.source.as_ref() else {
+            kvlog::warn!(
+                "unresolved attachment protocol cursor closed",
+                elapsed_ms = self.opened_at.elapsed().as_secs_f64() * 1_000.0
             );
             return;
         };
-        log::info!(
-            "attachment protocol cursor closed key={:?} backend={} reads={} bytes={} seeks={} final_offset={} elapsed_ms={:.3}",
-            source.key(),
-            if source.is_remote() {
-                "remote"
-            } else {
-                "direct"
-            },
-            self.read_count,
-            self.bytes_read,
-            self.seek_count,
-            self.position,
-            self.opened_at.elapsed().as_secs_f64() * 1_000.0,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            let key = _source.key();
+            kvlog::info!(
+                "attachment protocol cursor closed",
+                group = "media",
+                namespace = key.namespace,
+                room_id = key.room_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                backend = if _source.is_remote() { "remote" } else { "direct" },
+                reads = self.read_count,
+                size = self.bytes_read,
+                seeks = self.seek_count,
+                final_offset = self.position,
+                elapsed_ms = self.opened_at.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
     }
 }
 
@@ -1107,22 +1129,26 @@ pub(crate) fn register_mpv_attachment_protocol(
 fn protocol_open(registry: &mut AttachmentSourceRegistry, uri: &str) -> AttachmentCursor {
     let started_at = Instant::now();
     let source = registry.resolve_url(uri);
-    if let Some(source) = source.as_ref() {
-        log::info!(
-            "attachment protocol opened key={:?} backend={} byte_len={} elapsed_ms={:.3}",
-            source.key(),
-            if source.is_remote() {
-                "remote"
-            } else {
-                "direct"
-            },
-            source.byte_len(),
-            started_at.elapsed().as_secs_f64() * 1_000.0,
-        );
+    if let Some(_source) = source.as_ref() {
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            let key = _source.key();
+            kvlog::info!(
+                "attachment protocol opened",
+                group = "media",
+                namespace = key.namespace,
+                room_id = key.room_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                backend = if _source.is_remote() { "remote" } else { "direct" },
+                size = _source.byte_len(),
+                elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
     } else {
-        log::warn!(
-            "attachment protocol could not resolve source token elapsed_ms={:.3}",
-            started_at.elapsed().as_secs_f64() * 1_000.0,
+        kvlog::warn!(
+            "attachment protocol could not resolve source token",
+            elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0
         );
     }
     AttachmentCursor::new(source)
@@ -1141,7 +1167,7 @@ fn protocol_read(cursor: &mut AttachmentCursor, output: &mut [c_char]) -> i64 {
     match cursor.read(output) {
         Ok(read) => i64::try_from(read).unwrap_or(-1),
         Err(error) => {
-            log::warn!("libmpv attachment read failed: {error:#}");
+            kvlog::warn!("libmpv attachment read failed", err = %error);
             -1
         }
     }
@@ -1151,7 +1177,7 @@ fn protocol_seek(cursor: &mut AttachmentCursor, offset: i64) -> i64 {
     match cursor.seek(offset, AttachmentSeekMode::Set) {
         Ok(position) => i64::try_from(position).unwrap_or(-1),
         Err(error) => {
-            log::warn!("libmpv attachment seek failed: {error:#}");
+            kvlog::warn!("libmpv attachment seek failed", err = %error);
             -1
         }
     }

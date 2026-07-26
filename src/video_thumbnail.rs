@@ -217,7 +217,7 @@ impl VideoThumbnailCache {
                     };
                 }
                 Err(error) => {
-                    log::warn!("video thumbnail extraction failed: {error}");
+                    kvlog::warn!("video thumbnail extraction failed", err = %error);
                     if result.source_failed {
                         self.transport_failures
                             .push((result.key.source_key, error.clone()));
@@ -238,7 +238,7 @@ impl VideoThumbnailCache {
 
     pub(crate) fn warm(&mut self) {
         if let Err(error) = self.start_worker() {
-            log::warn!("video thumbnail warmup failed: {error}");
+            kvlog::warn!("video thumbnail warmup failed", err = %error);
             return;
         }
         let (jobs, ready) = &*self.jobs;
@@ -288,7 +288,7 @@ impl VideoThumbnailCache {
     }
 
     fn record_failure(&mut self, key: ThumbnailKey, error: String) {
-        log::warn!("video thumbnail extraction failed: {error}");
+        kvlog::warn!("video thumbnail extraction failed", err = %error);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.failures = entry.failures.saturating_add(1);
             entry.state = CacheState::Failed {
@@ -377,7 +377,7 @@ fn thumbnail_worker(
     results: mpsc::Sender<ThumbnailResult>,
     wakeup: AsyncSender<()>,
 ) {
-    log::info!("lazy video thumbnail worker started");
+    kvlog::info!("video thumbnail worker started");
     let mut extractor = ThumbnailExtractor;
     loop {
         let job = {
@@ -405,27 +405,43 @@ fn thumbnail_worker(
         let Some(job) = job else {
             continue;
         };
-        let started_at = Instant::now();
-        log::info!(
-            "video thumbnail extraction started key={:?} backend={} byte_len={}",
-            job.key.source_key,
-            if job.source.source().is_remote() {
-                "remote"
-            } else {
-                "direct"
-            },
-            job.source.source().byte_len(),
-        );
+        let _started_at = Instant::now();
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            let key = job.key.source_key;
+            kvlog::info!(
+                "video thumbnail extraction started",
+                group = "media",
+                namespace = key.namespace,
+                room_id = key.room_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                backend = if job.source.source().is_remote() {
+                    "remote"
+                } else {
+                    "direct"
+                },
+                size = job.source.source().byte_len()
+            );
+        }
         let result = extractor
             .extract(job.source.source().clone())
             .map_err(|error| format!("{error:#}"));
-        log::info!(
-            "video thumbnail extraction completed key={:?} success={} source_failed={} elapsed_ms={:.3}",
-            job.key.source_key,
-            result.is_ok(),
-            job.source.source().has_failed(),
-            started_at.elapsed().as_secs_f64() * 1_000.0,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            let key = job.key.source_key;
+            kvlog::info!(
+                "video thumbnail extraction completed",
+                group = "media",
+                namespace = key.namespace,
+                room_id = key.room_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                success = result.is_ok(),
+                source_failed = job.source.source().has_failed(),
+                elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         if results
             .send(ThumbnailResult {
                 key: job.key,
@@ -439,7 +455,7 @@ fn thumbnail_worker(
         }
         let _ = wakeup.try_send(());
     }
-    log::info!("video thumbnail worker stopped");
+    kvlog::info!("video thumbnail worker stopped");
 }
 
 struct ThumbnailExtractor;

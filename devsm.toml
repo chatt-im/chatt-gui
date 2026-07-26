@@ -21,15 +21,16 @@ cargo run
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
 
 [action.alice-release]
-profiles = ["default", "pop"]
+profiles = ["default", "logged"]
 managed = false
 allow_multiple = true
 cli.forward_arguments = true
 env.RUST_BACKTRACE = "1"
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
-env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
-env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
-env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_GUI_MEDIA_LOG = { if.profile = "logged", then = "1", or_else = "" }
+env.CHATT_GUI_RENDER_LOG = { if.profile = "logged", then = "1", or_else = "" }
+env.CHATT_GUI_RPC_LOG = { if.profile = "logged", then = "1", or_else = "" }
+env.CHATT_GUI_KVLOG_FILE = { if.profile = "logged", then = "/tmp/chatt-gui.kvlog", or_else = "" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
 RUNTIME_CONFIG=/tmp/chatt-dev/config/alice.toml
@@ -37,7 +38,7 @@ if [ ! -e "$RUNTIME_CONFIG" ]; then
   mkdir -p "$(dirname "$RUNTIME_CONFIG")"
   cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
 fi
-cargo run --release
+cargo run --release --features diagnostic-logs
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
 

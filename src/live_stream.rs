@@ -48,6 +48,7 @@ const MAX_RECYCLED_BYTES: usize = MAX_PENDING_BYTES;
 const MAX_BOOTSTRAP_FRAMES: usize = 90;
 const LIVE_RECORDING_MAGIC: &[u8] = b"chatt-live-rpc\0";
 const LIVE_RECORDING_VERSION: u32 = 1;
+#[cfg(feature = "diagnostic-logs")]
 const LIVE_DIAGNOSTIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LIVE_DIAGNOSTIC_HISTORY: usize = 512;
 
@@ -62,6 +63,7 @@ struct LiveDiagnosticState {
     latest_render: Option<(u64, u64, u64)>,
     rendered_outputs: u64,
     input_queue_depth: usize,
+    #[cfg(feature = "diagnostic-logs")]
     last_report: Option<Instant>,
     latency_window_us: Vec<u64>,
     total_latency_us: u128,
@@ -113,10 +115,14 @@ impl LiveDiagnostics {
         state.latency_window_us.push(latency_us);
         state.total_latency_us += u128::from(latency_us);
         state.max_latency_us = state.max_latency_us.max(latency_us);
-        let first_render = state.rendered_outputs == 1;
-        Self::maybe_report(&mut state, first_render);
+        #[cfg(feature = "diagnostic-logs")]
+        {
+            let first_render = state.rendered_outputs == 1;
+            Self::maybe_report(&mut state, first_render);
+        }
     }
 
+    #[cfg(feature = "diagnostic-logs")]
     fn maybe_report(state: &mut LiveDiagnosticState, force: bool) {
         let (Some((input_sequence, input_pts)), Some((render_sequence, render_pts, latency_us))) =
             (state.latest_input, state.latest_render)
@@ -136,42 +142,53 @@ impl LiveDiagnostics {
         let latency_p50_us = percentile(&state.latency_window_us, 50);
         let latency_p95_us = percentile(&state.latency_window_us, 95);
         let latency_max_us = state.latency_window_us.last().copied().unwrap_or(0);
-        log::info!(
-            "live latency input_frame={} input_pts_ms={} rendered_input_frame={} rendered_pts_ms={} pending_frames={} pending_pts_delta_ms={} receive_to_render_ms={:.3} receive_to_render_p50_ms={:.3} receive_to_render_p95_ms={:.3} receive_to_render_max_ms={:.3} render_outputs={} input_queue={}",
-            input_sequence,
-            input_pts,
-            render_sequence,
-            render_pts,
-            input_sequence.saturating_sub(render_sequence),
-            input_pts.saturating_sub(render_pts),
-            latency_us as f64 / 1_000.0,
-            latency_p50_us as f64 / 1_000.0,
-            latency_p95_us as f64 / 1_000.0,
-            latency_max_us as f64 / 1_000.0,
-            state.rendered_outputs,
-            state.input_queue_depth,
-        );
+        if crate::logger::render_logging_enabled() {
+            kvlog::info!(
+                "live video latency",
+                group = "render",
+                input_sequence,
+                input_pts_ms = input_pts,
+                render_sequence,
+                render_pts_ms = render_pts,
+                pending_frames = input_sequence.saturating_sub(render_sequence),
+                pending_pts_delta_ms = input_pts.saturating_sub(render_pts),
+                receive_to_render_ms = latency_us as f64 / 1_000.0,
+                receive_to_render_p50_ms = latency_p50_us as f64 / 1_000.0,
+                receive_to_render_p95_ms = latency_p95_us as f64 / 1_000.0,
+                receive_to_render_max_ms = latency_max_us as f64 / 1_000.0,
+                render_outputs = state.rendered_outputs,
+                input_queue = state.input_queue_depth
+            );
+        }
         state.latency_window_us.clear();
     }
 }
 
 impl Drop for LiveDiagnostics {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostic-logs")]
+        {
         let state = self.state.lock().unwrap();
         let average_ms = if state.rendered_outputs == 0 {
             0.0
         } else {
             state.total_latency_us as f64 / state.rendered_outputs as f64 / 1_000.0
         };
-        log::info!(
-            "live latency summary input_frames={} render_outputs={} receive_to_render_avg_ms={average_ms:.3} receive_to_render_max_ms={:.3}",
-            state.latest_input.map_or(0, |(sequence, _)| sequence),
-            state.rendered_outputs,
-            state.max_latency_us as f64 / 1_000.0,
-        );
+        if crate::logger::render_logging_enabled() {
+            kvlog::info!(
+                "live video latency summary",
+                group = "render",
+                input_frames = state.latest_input.map_or(0, |(sequence, _)| sequence),
+                render_outputs = state.rendered_outputs,
+                receive_to_render_avg_ms = average_ms,
+                receive_to_render_max_ms = state.max_latency_us as f64 / 1_000.0
+            );
+        }
+        }
     }
 }
 
+#[cfg(feature = "diagnostic-logs")]
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -199,18 +216,19 @@ impl LiveRecordingWriter {
         let path = std::env::var_os("CHATT_LIVE_RECORD").map(PathBuf::from)?;
         match Self::create(&path, share) {
             Ok(recorder) => {
-                log::info!(
-                    "recording decrypted live video RPC stream path={:?} stream_id={} format_version={}",
-                    path,
-                    share.stream_id.0,
-                    LIVE_RECORDING_VERSION
+                kvlog::info!(
+                    "live video recording started",
+                    path = %path.display(),
+                    stream_id = share.stream_id,
+                    format_version = LIVE_RECORDING_VERSION
                 );
                 Some(recorder)
             }
             Err(error) => {
-                log::error!(
-                    "could not start live video recording path={:?}: {error:#}",
-                    path
+                kvlog::error!(
+                    "could not start live video recording",
+                    path = %path.display(),
+                    err = %error
                 );
                 None
             }
@@ -279,16 +297,17 @@ impl LiveRecordingWriter {
 impl Drop for LiveRecordingWriter {
     fn drop(&mut self) {
         if let Err(error) = self.output.flush() {
-            log::error!(
-                "could not finish live video recording path={:?}: {error}",
-                self.path
+            kvlog::error!(
+                "could not finish live video recording",
+                path = %self.path.display(),
+                err = %error
             );
         } else {
-            log::info!(
-                "live video recording finished path={:?} frames={} frame_bytes={}",
-                self.path,
-                self.frames,
-                self.bytes
+            kvlog::info!(
+                "live video recording finished",
+                path = %self.path.display(),
+                frames = self.frames,
+                size = self.bytes
             );
         }
     }
@@ -396,14 +415,14 @@ impl LiveStreamSource {
         let extradata = bitstream::configuration_to_annex_b(codec, &share.extradata)
             .map_err(|error| anyhow!(error))?;
         let header = nut_header(codec, share.coded_width, share.coded_height, &extradata);
-        log::info!(
-            "live video bridge initialized codec={:?} stream_id={} size={}x{} descriptor_bytes={} nut_header_bytes={}",
-            codec,
-            share.stream_id.0,
-            share.coded_width,
-            share.coded_height,
-            share.extradata.len(),
-            header.len()
+        kvlog::info!(
+            "live video bridge initialized",
+            codec = %share.codec,
+            stream_id = share.stream_id,
+            width = share.coded_width,
+            height = share.coded_height,
+            descriptor_bytes = share.extradata.len(),
+            nut_header_bytes = header.len()
         );
         let queue = Arc::new(NutQueue {
             stream_id: share.stream_id.0,
@@ -496,11 +515,11 @@ fn read_frames(
         if !read_frame_header(&mut stream, &mut wire_header)
             .context("read live video frame header")?
         {
-            log::info!(
-                "live video socket closed stream_id={} frames={} bytes={} saw_keyframe={}",
-                expected_stream_id,
-                received_frames,
-                received_bytes,
+            kvlog::info!(
+                "live video socket closed",
+                stream_id = expected_stream_id,
+                frames = received_frames,
+                size = received_bytes,
                 saw_keyframe
             );
             return Ok(());
@@ -516,11 +535,15 @@ fn read_frames(
         }
         if header.bootstrap_end {
             queue.finish_bootstrap();
-            log::info!(
-                "live video cached GOP complete stream_id={} cached_frames={}",
-                header.stream_id,
-                received_frames
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!(
+                    "live video cached GOP complete",
+                    group = "media",
+                    stream_id = header.stream_id,
+                    cached_frames = received_frames
+                );
+            }
             continue;
         }
         let payload_len = header.size - local_rpc::video::VIDEO_FRAME_HEADER_LEN;
@@ -544,9 +567,10 @@ fn read_frames(
             && let Err(error) =
                 active.write_frame_parts(received_at, &wire_header, &nut_bytes[payload_offset..])
         {
-            log::error!(
-                "live video recording failed; disabling recording path={:?}: {error:#}",
-                active.path
+            kvlog::error!(
+                "live video recording failed; disabling recording",
+                path = %active.path.display(),
+                err = %error
             );
             recorder = None;
         }
@@ -559,24 +583,32 @@ fn read_frames(
         received_frames += 1;
         received_bytes += header.size as u64;
         if received_frames == 1 {
-            log::info!(
-                "live video first socket frame stream_id={} keyframe={} timestamp_ms={} frame_bytes={} bitstream_bytes={}",
-                header.stream_id,
-                header.is_key,
-                header.ts_ms,
-                header.size,
-                payload_len
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!(
+                    "live video first socket frame",
+                    group = "media",
+                    stream_id = header.stream_id,
+                    keyframe = header.is_key,
+                    timestamp_ms = header.ts_ms,
+                    frame_bytes = header.size,
+                    bitstream_bytes = payload_len
+                );
+            }
         }
         if header.is_key && !saw_keyframe {
             saw_keyframe = true;
-            log::info!(
-                "live video first keyframe received stream_id={} frame_number={} timestamp_ms={} bitstream_bytes={}",
-                header.stream_id,
-                received_frames,
-                header.ts_ms,
-                payload_len
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!(
+                    "live video first keyframe received",
+                    group = "media",
+                    stream_id = header.stream_id,
+                    frame_number = received_frames,
+                    timestamp_ms = header.ts_ms,
+                    bitstream_bytes = payload_len
+                );
+            }
         }
         let caught_up = queue.push(NutFrame { bytes: nut_bytes }, header.is_key);
         diagnostics.record_input(received_frames, pts, received_at, queue.pending_len());
@@ -691,9 +723,9 @@ impl NutQueue {
             if !is_key {
                 state.dropped_before_key += 1;
                 if state.dropped_before_key == 1 {
-                    log::warn!(
-                        "live video waiting for keyframe stream_id={}",
-                        self.stream_id
+                    kvlog::warn!(
+                        "live video waiting for keyframe",
+                        stream_id = self.stream_id
                     );
                 }
                 state.recycle_frame(frame);
@@ -710,10 +742,10 @@ impl NutQueue {
             state.clear_frames();
             state.awaiting_keyframe = false;
             caught_up = true;
-            log::info!(
-                "live video resumed at fresh keyframe stream_id={} overflow_count={}",
-                self.stream_id,
-                state.overflow_count
+            kvlog::info!(
+                "live video resumed at fresh keyframe",
+                stream_id = self.stream_id,
+                overflow_count = state.overflow_count
             );
         } else {
             let frame_limit = if state.bootstrapping {
@@ -731,12 +763,12 @@ impl NutQueue {
                     state.awaiting_keyframe = true;
                     state.bootstrapping = false;
                     state.overflow_count += 1;
-                    log::warn!(
-                        "live video decoder input queue full; waiting for keyframe stream_id={} pending_frames={} pending_bytes={} overflow_count={}",
-                        self.stream_id,
-                        state.frames.len(),
-                        state.pending_bytes,
-                        state.overflow_count
+                    kvlog::warn!(
+                        "live video decoder input queue full; waiting for keyframe",
+                        stream_id = self.stream_id,
+                        pending_frames = state.frames.len(),
+                        pending_bytes = state.pending_bytes,
+                        overflow_count = state.overflow_count
                     );
                     state.recycle_frame(frame);
                     return false;
@@ -838,10 +870,10 @@ impl QueueState {
 }
 
 fn open_stream(queue: &mut Arc<NutQueue>, _uri: &str) -> NutCursor {
-    log::info!(
-        "mpv opened live NUT stream stream_id={} header_bytes={}",
-        queue.stream_id,
-        queue.header.len()
+    kvlog::info!(
+        "mpv opened live NUT stream",
+        stream_id = queue.stream_id,
+        header_bytes = queue.header.len()
     );
     NutCursor {
         queue: queue.clone(),
@@ -859,11 +891,11 @@ fn close_stream(mut cursor: Box<NutCursor>) {
     if let Some(frame) = cursor.current.take() {
         cursor.queue.recycle_buffer(frame.bytes);
     }
-    log::info!(
-        "mpv closed live NUT stream stream_id={} header_bytes_read={} had_frame={}",
-        cursor.queue.stream_id,
-        cursor.header_offset,
-        cursor.logged_first_frame
+    kvlog::info!(
+        "mpv closed live NUT stream",
+        stream_id = cursor.queue.stream_id,
+        header_bytes_read = cursor.header_offset,
+        had_frame = cursor.logged_first_frame
     );
 }
 
@@ -872,11 +904,15 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
         unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), output.len()) };
     if !cursor.logged_first_read {
         cursor.logged_first_read = true;
-        log::info!(
-            "mpv requested first live NUT bytes stream_id={} requested_bytes={}",
-            cursor.queue.stream_id,
-            output.len()
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            kvlog::info!(
+                "mpv requested first live NUT bytes",
+                group = "media",
+                stream_id = cursor.queue.stream_id,
+                requested_bytes = output.len()
+            );
+        }
     }
     let mut written = 0usize;
     while written < output.len() {
@@ -900,16 +936,24 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
                 }
                 if !cursor.logged_input_gate {
                     cursor.logged_input_gate = true;
-                    log::info!(
-                        "holding live decoder input after first frame until video output is ready stream_id={}",
-                        cursor.queue.stream_id
-                    );
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "holding live decoder input until video output is ready",
+                            group = "media",
+                            stream_id = cursor.queue.stream_id
+                        );
+                    }
                 }
                 gate.wait();
-                log::info!(
-                    "released remaining live decoder input stream_id={}",
-                    cursor.queue.stream_id
-                );
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::media_logging_enabled() {
+                    kvlog::info!(
+                        "released remaining live decoder input",
+                        group = "media",
+                        stream_id = cursor.queue.stream_id
+                    );
+                }
             }
             let frame = if written == 0 {
                 cursor.queue.pop()
@@ -921,11 +965,15 @@ fn read_stream(cursor: &mut NutCursor, output: &mut [std::os::raw::c_char]) -> i
             };
             if !cursor.logged_first_frame {
                 cursor.logged_first_frame = true;
-                log::info!(
-                    "mpv received first live NUT frame stream_id={} nut_frame_bytes={}",
-                    cursor.queue.stream_id,
-                    frame.bytes.len()
-                );
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::media_logging_enabled() {
+                    kvlog::info!(
+                        "mpv received first live NUT frame",
+                        group = "media",
+                        stream_id = cursor.queue.stream_id,
+                        nut_frame_bytes = frame.bytes.len()
+                    );
+                }
             }
             cursor.current = Some(frame);
             cursor.current_offset = 0;

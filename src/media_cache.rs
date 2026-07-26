@@ -18,6 +18,7 @@ pub struct CachedAttachment {
 }
 
 impl CachedAttachment {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn id(&self) -> AttachmentId {
         self.id
     }
@@ -26,6 +27,7 @@ impl CachedAttachment {
         self.bytes.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -141,14 +143,18 @@ impl MediaCache {
             },
         );
         self.partial_bytes = self.partial_bytes.saturating_add(descriptor.byte_len);
-        log::info!(
-            "attachment cache reserved bulk_transfer_id={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} bytes={}",
-            transfer_id.0,
-            descriptor.id.timestamp_ms,
-            descriptor.id.transfer_id.0,
-            descriptor.file_name,
-            descriptor.byte_len,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            kvlog::info!(
+                "attachment cache reserved",
+                group = "media",
+                bulk_transfer_id = transfer_id,
+                attachment_timestamp_ms = descriptor.id.timestamp_ms,
+                attachment_transfer_id = descriptor.id.transfer_id,
+                path = %descriptor.file_name,
+                size = descriptor.byte_len
+            );
+        }
         Ok(())
     }
 
@@ -215,15 +221,19 @@ impl MediaCache {
                 touched: self.clock,
             },
         );
-        log::info!(
-            "attachment cache finalized bulk_transfer_id={} attachment_timestamp_ms={} attachment_transfer_id={} file={:?} bytes={} revision={}",
-            finished.transfer_id.0,
-            partial.descriptor.id.timestamp_ms,
-            partial.descriptor.id.transfer_id.0,
-            partial.descriptor.file_name,
-            actual_len,
-            revision,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            kvlog::info!(
+                "attachment cache finalized",
+                group = "media",
+                bulk_transfer_id = finished.transfer_id,
+                attachment_timestamp_ms = partial.descriptor.id.timestamp_ms,
+                attachment_transfer_id = partial.descriptor.id.transfer_id,
+                path = %partial.descriptor.file_name,
+                size = actual_len,
+                revision
+            );
+        }
         self.evict();
         Ok(partial.descriptor)
     }

@@ -182,8 +182,10 @@ impl MpvPlayer {
             Some(AttachmentRenderBackend::Software) => "software",
             None => "probe",
         };
-        log::info!(
-            "video player construction started live={live} preferred_backend={preferred_backend_name}"
+        kvlog::info!(
+            "video player construction started",
+            live,
+            preferred_backend = preferred_backend_name
         );
         let live_diagnostics = live.then(|| Arc::new(crate::live_stream::LiveDiagnostics::new()));
         let live_input_gate = live.then(|| Arc::new(crate::live_stream::LiveInputGate::default()));
@@ -245,19 +247,23 @@ impl MpvPlayer {
             default_hwdec.to_owned()
         };
         let require_direct_vulkan = supports_vulkan_decode && hwdec == "vulkan";
-        log::info!(
-            "initializing embedded libmpv live={live} hwdec={hwdec} codec={} vaapi_device={} forced_software_render={force_live_software} direct_vulkan_required={require_direct_vulkan}",
-            live_codec.unwrap_or("probe-at-load"),
-            vaapi_device.as_deref().unwrap_or("none")
+        kvlog::info!(
+            "initializing embedded libmpv",
+            live,
+            hwdec = %hwdec,
+            codec = live_codec.unwrap_or("probe-at-load"),
+            vaapi_device = vaapi_device.as_deref().unwrap_or("none"),
+            forced_software_render = force_live_software,
+            direct_vulkan_required = require_direct_vulkan
         );
         let mpv = Mpv::with_initializer(|initializer| {
             macro_rules! set_option {
                 ($name:literal, $value:expr) => {
                     if let Err(error) = initializer.set_option($name, $value) {
-                        log::error!(
-                            "libmpv option rejected name={} value={:?}: {error}",
-                            $name,
-                            $value
+                        kvlog::error!(
+                            "libmpv option rejected",
+                            name = $name,
+                            err = %error
                         );
                         return Err(error);
                     }
@@ -315,10 +321,10 @@ impl MpvPlayer {
             Ok(())
         })
         .map_err(|error| {
-            log::error!("embedded libmpv initialization failed live={live}: {error}");
+            kvlog::error!("embedded libmpv initialization failed", live, err = %error);
             error
         })?;
-        log::info!("embedded libmpv initialized live={live}");
+        kvlog::info!("embedded libmpv initialized", live);
         let mpv = Arc::new(mpv);
         if let Some(registry) = source_registry {
             crate::attachment_source::register_mpv_attachment_protocol(&mpv, registry)?;
@@ -333,15 +339,19 @@ impl MpvPlayer {
             .context("observe mpv property current-vo")?;
         mpv.observe_property("hwdec-interop", Format::String, 9)
             .context("observe mpv property hwdec-interop")?;
-        log::info!("libmpv playback properties registered live={live}");
+        kvlog::info!("libmpv playback properties registered", live);
 
-        let mpv_log_level = std::env::var("CHATT_MPV_LOG").unwrap_or_else(|_| "warn".into());
-        mpv.request_log_messages(&mpv_log_level)
-            .with_context(|| format!("request native mpv log level {mpv_log_level:?}"))?;
-        log::info!("native mpv logging enabled min_level={mpv_log_level:?}");
+        let mpv_log_level = crate::logger::native_mpv_log_level();
+        mpv.request_log_messages(mpv_log_level)
+            .with_context(|| format!("request native mpv log level {mpv_log_level}"))?;
+        kvlog::info!("native mpv logging enabled", min_level = %mpv_log_level);
         if live {
-            log::info!(
-                "live playback latency mode enabled cache=false demux_readahead_secs=0 hwdec_copy_delay_frames=0 latest_frame=true"
+            kvlog::info!(
+                "live playback latency mode enabled",
+                cache = false,
+                demux_readahead_seconds = 0u32,
+                hwdec_copy_delay_frames = 0u32,
+                latest_frame = true
             );
         }
 
@@ -352,8 +362,12 @@ impl MpvPlayer {
                 let context = mpv
                     .create_software_render_context(live)
                     .context("create preferred libmpv software render context")?;
-                log::info!(
-                    "video render backend selected backend=software upload=wgpu latest_frame={live} cached_decision=true"
+                kvlog::info!(
+                    "video render backend selected",
+                    backend = "software",
+                    upload = "wgpu",
+                    latest_frame = live,
+                    cached_decision = true
                 );
                 (
                     RenderBackend::Software {
@@ -370,15 +384,21 @@ impl MpvPlayer {
                 let cached_decision = preferred.is_some();
                 let native = native_candidate
                     .expect("non-software render preference must have a Vulkan probe result");
-                log::info!(
-                    "creating libmpv Vulkan render context live={live} cached_decision={cached_decision}"
+                kvlog::info!(
+                    "creating libmpv Vulkan render context",
+                    live,
+                    cached_decision
                 );
                 match native.and_then(|native| {
                     create_vulkan_context(&mpv, &native, live).map(|context| (context, native))
                 }) {
                     Ok((context, native)) => {
-                        log::info!(
-                            "video render backend selected backend=vulkan sharing=wgpu-device latest_frame={live} cached_decision={cached_decision}"
+                        kvlog::info!(
+                            "video render backend selected",
+                            backend = "vulkan",
+                            sharing = "wgpu-device",
+                            latest_frame = live,
+                            cached_decision
                         );
                         (
                             RenderBackend::Vulkan {
@@ -390,14 +410,18 @@ impl MpvPlayer {
                         )
                     }
                     Err(error) => {
-                        log::warn!(
-                            "Vulkan libmpv interop unavailable, using software fallback: {error:#}"
+                        kvlog::warn!(
+                            "Vulkan libmpv interop unavailable; using software fallback",
+                            err = %error
                         );
                         let context = mpv.create_software_render_context(live).context(
                             "create libmpv software render context after Vulkan fallback",
                         )?;
-                        log::info!(
-                            "video render backend selected backend=software upload=wgpu latest_frame={live}"
+                        kvlog::info!(
+                            "video render backend selected",
+                            backend = "software",
+                            upload = "wgpu",
+                            latest_frame = live
                         );
                         (
                             RenderBackend::Software {
@@ -501,9 +525,10 @@ impl MpvPlayer {
                 }
             };
 
-        log::info!(
-            "video player construction completed live={live} backend={}",
-            selected_backend.name()
+        kvlog::info!(
+            "video player construction completed",
+            live,
+            backend = selected_backend.name()
         );
 
         Ok((
@@ -644,15 +669,15 @@ impl MpvAudioPlayer {
         source_registry: crate::attachment_source::AttachmentSourceRegistry,
         audio_output: Option<&str>,
     ) -> Result<Self> {
-        log::info!("audio player construction started");
+        kvlog::info!("audio player construction started");
         let mpv = Mpv::with_initializer(|initializer| {
             macro_rules! set_option {
                 ($name:literal, $value:expr) => {
                     if let Err(error) = initializer.set_option($name, $value) {
-                        log::error!(
-                            "libmpv audio option rejected name={} value={:?}: {error}",
-                            $name,
-                            $value
+                        kvlog::error!(
+                            "libmpv audio option rejected",
+                            name = $name,
+                            err = %error
                         );
                         return Err(error);
                     }
@@ -677,9 +702,9 @@ impl MpvAudioPlayer {
         let mpv = Arc::new(mpv);
         crate::attachment_source::register_mpv_attachment_protocol(&mpv, source_registry)?;
         observe_playback_properties(&mpv)?;
-        let mpv_log_level = std::env::var("CHATT_MPV_LOG").unwrap_or_else(|_| "warn".into());
-        mpv.request_log_messages(&mpv_log_level)
-            .with_context(|| format!("request native mpv log level {mpv_log_level:?}"))?;
+        let mpv_log_level = crate::logger::native_mpv_log_level();
+        mpv.request_log_messages(mpv_log_level)
+            .with_context(|| format!("request native mpv log level {mpv_log_level}"))?;
 
         let (control_sender, control_commands) = mpsc::channel();
         let playback = Arc::new(SharedPlaybackState::default());
@@ -699,7 +724,7 @@ impl MpvAudioPlayer {
                 );
             })
             .context("spawn mpv audio control thread")?;
-        log::info!("audio player construction completed");
+        kvlog::info!("audio player construction completed");
         Ok(Self {
             control_sender,
             control_thread: Some(control_thread),
@@ -782,15 +807,15 @@ impl MpvAudioPlayer {
 
 impl Drop for MpvAudioPlayer {
     fn drop(&mut self) {
-        log::debug!("stopping mpv audio control thread");
+        kvlog::info!("stopping mpv audio control thread");
         shutdown_owned_mpv_control(&self.control_sender, &mut self.control_thread, &self.mpv);
-        log::debug!("mpv audio control thread stopped");
+        kvlog::info!("mpv audio control thread stopped");
     }
 }
 
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
-        log::debug!("stopping mpv player threads");
+        kvlog::info!("stopping mpv player threads");
         self.live_source.take();
         self.render_stopping.store(true, Ordering::Release);
         let _ = self.render_sender.send(RenderMessage::Shutdown);
@@ -799,7 +824,7 @@ impl Drop for MpvPlayer {
         }
 
         shutdown_owned_mpv_control(&self.control_sender, &mut self.control_thread, &self.mpv);
-        log::debug!("mpv player threads stopped");
+        kvlog::info!("mpv player threads stopped");
     }
 }
 
@@ -892,6 +917,7 @@ fn supports_vulkan_video_decode(
 
 fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevice>> {
     let native = Arc::new(surface.vulkan_device()?);
+    #[cfg(feature = "diagnostic-logs")]
     let queue_family_properties = unsafe {
         native
             .instance
@@ -909,6 +935,7 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_EXT_image_drm_format_modifier");
+    #[cfg(feature = "diagnostic-logs")]
     let has_vulkan_video_core = [c"VK_KHR_video_queue", c"VK_KHR_video_decode_queue"]
         .iter()
         .all(|required| {
@@ -917,21 +944,26 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
                 .iter()
                 .any(|extension| extension == required)
         });
+    #[cfg(feature = "diagnostic-logs")]
     let has_vulkan_video_h264 = native
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_KHR_video_decode_h264");
+    #[cfg(feature = "diagnostic-logs")]
     let has_vulkan_video_h265 = native
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_KHR_video_decode_h265");
+    #[cfg(feature = "diagnostic-logs")]
     let has_vulkan_video_av1 = native
         .device_extensions
         .iter()
         .any(|extension| *extension == c"VK_KHR_video_decode_av1");
+    #[cfg(feature = "diagnostic-logs")]
     let render_queue_has_video_decode = native
         .queue_flags
         .contains(vk::QueueFlags::VIDEO_DECODE_KHR);
+    #[cfg(feature = "diagnostic-logs")]
     let enabled_video_decode_queue_families = native
         .enabled_queue_families
         .iter()
@@ -948,37 +980,43 @@ fn probe_vulkan_device(surface: &WgpuVideoSurface) -> Result<Arc<VulkanVideoDevi
         })
         .collect::<Vec<_>>()
         .join(",");
+    #[cfg(feature = "diagnostic-logs")]
     let enabled_video_decode_queue_families = if enabled_video_decode_queue_families.is_empty() {
         "none".to_owned()
     } else {
         enabled_video_decode_queue_families
     };
+    #[cfg(feature = "diagnostic-logs")]
     let drm_render_node = native
         .drm_render_node
         .as_deref()
         .map_or_else(|| "none".into(), |path| path.display().to_string());
-    log::info!(
-        "importing GPUI Vulkan device into libmpv queue_family={} queue_index={} render_queue_video_decode={} enabled_queue_families={} enabled_video_decode_queue_families={} synchronization2={} video_maintenance1={} instance_extensions={} device_extensions={} external_memory_fd={} dma_buf={} drm_modifiers={} drm_render_node={} vulkan_video_core={} vulkan_video_h264={} vulkan_video_h265={} vulkan_video_av1={}",
-        native.queue_family,
-        native.queue_index,
-        render_queue_has_video_decode,
-        native.enabled_queue_families.len(),
-        enabled_video_decode_queue_families,
-        native.synchronization2,
-        native.video_maintenance1,
-        native.instance_extensions.len(),
-        native.device_extensions.len(),
-        has_external_memory_fd,
-        has_dma_buf,
-        has_drm_modifiers,
-        drm_render_node,
-        has_vulkan_video_core,
-        has_vulkan_video_h264,
-        has_vulkan_video_h265,
-        has_vulkan_video_av1,
-    );
+    #[cfg(feature = "diagnostic-logs")]
+    if crate::logger::render_logging_enabled() {
+        kvlog::info!(
+            "importing GPUI Vulkan device into libmpv",
+            group = "render",
+            queue_family = native.queue_family,
+            queue_index = native.queue_index,
+            render_queue_video_decode = render_queue_has_video_decode,
+            enabled_queue_families = native.enabled_queue_families.len(),
+            enabled_video_decode_queue_families = %enabled_video_decode_queue_families,
+            synchronization2 = native.synchronization2,
+            video_maintenance1 = native.video_maintenance1,
+            instance_extensions = native.instance_extensions.len(),
+            device_extensions = native.device_extensions.len(),
+            external_memory_fd = has_external_memory_fd,
+            dma_buf = has_dma_buf,
+            drm_modifiers = has_drm_modifiers,
+            drm_render_node = %drm_render_node,
+            vulkan_video_core = has_vulkan_video_core,
+            vulkan_video_h264 = has_vulkan_video_h264,
+            vulkan_video_h265 = has_vulkan_video_h265,
+            vulkan_video_av1 = has_vulkan_video_av1
+        );
+    }
     if cfg!(target_os = "linux") && !(has_external_memory_fd && has_dma_buf && has_drm_modifiers) {
-        log::warn!(
+        kvlog::warn!(
             "Vulkan device lacks full Linux dma-buf import support; DRM/VAAPI hardware-frame interop may be unavailable, but native Vulkan Video remains device-local"
         );
     }
@@ -1021,9 +1059,10 @@ fn create_vulkan_context(
         {
             Ok(file) => Some(file.into()),
             Err(error) => {
-                log::warn!(
-                    "Could not open matching DRM render node {} for VAAPI interop; continuing without it: {error}",
-                    path.display()
+                kvlog::warn!(
+                    "could not open matching DRM render node for VAAPI interop",
+                    path = %path.display(),
+                    err = %error
                 );
                 None
             }
@@ -1064,6 +1103,14 @@ pub(crate) enum SeekMode {
 }
 
 impl SeekMode {
+    #[cfg(feature = "diagnostic-logs")]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Keyframes => "keyframes",
+        }
+    }
+
     fn absolute_flag(self) -> &'static str {
         match self {
             Self::Exact => "absolute+exact",
@@ -1184,11 +1231,16 @@ impl RenderBackend {
                     return Ok(false);
                 }
                 if let Some(old) = generation.take() {
-                    log::debug!(
-                        "retiring video texture generation backend=vulkan generation={} textures={}",
-                        old.id,
-                        old.textures.len(),
-                    );
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::render_logging_enabled() {
+                        kvlog::info!(
+                            "retiring video texture generation",
+                            group = "render",
+                            backend = "vulkan",
+                            generation = old.id,
+                            textures = old.textures.len()
+                        );
+                    }
                     for texture in &old.textures {
                         let image = texture
                             .image()
@@ -1202,13 +1254,18 @@ impl RenderBackend {
                         .context("wait before retiring Vulkan video textures")?;
                 }
                 let new_generation = surface.allocate_generation(width, height)?;
-                log::info!(
-                    "video texture generation ready backend=vulkan generation={} size={}x{} textures={}",
-                    new_generation.id,
-                    width,
-                    height,
-                    new_generation.textures.len(),
-                );
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::render_logging_enabled() {
+                    kvlog::info!(
+                        "video texture generation ready",
+                        group = "render",
+                        backend = "vulkan",
+                        generation = new_generation.id,
+                        width,
+                        height,
+                        textures = new_generation.textures.len()
+                    );
+                }
                 *generation = Some(new_generation);
                 *next_texture = 0;
             }
@@ -1230,13 +1287,18 @@ impl RenderBackend {
                         .context("wait before retiring software-upload video textures")?;
                 }
                 let new_generation = surface.allocate_software_generation(width, height)?;
-                log::info!(
-                    "video texture generation ready backend=software generation={} size={}x{} textures={}",
-                    new_generation.id,
-                    width,
-                    height,
-                    new_generation.textures.len(),
-                );
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::render_logging_enabled() {
+                    kvlog::info!(
+                        "video texture generation ready",
+                        group = "render",
+                        backend = "software",
+                        generation = new_generation.id,
+                        width,
+                        height,
+                        textures = new_generation.textures.len()
+                    );
+                }
                 *generation = Some(new_generation);
                 *next_texture = 0;
             }
@@ -1448,7 +1510,13 @@ impl RenderDiagnostics {
 
     fn note_unconfigured(&mut self) {
         self.unconfigured += 1;
-        log::trace!("video frame arrived before the surface had a texture generation");
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::render_logging_enabled() {
+            kvlog::info!(
+                "video frame arrived before texture generation",
+                group = "render"
+            );
+        }
     }
 
     fn note_ring_busy(&mut self, backend: &str, generation: u64) {
@@ -1459,45 +1527,53 @@ impl RenderDiagnostics {
             .is_none_or(|last| now.duration_since(last) >= RENDER_PRESSURE_LOG_INTERVAL)
         {
             self.last_pressure_log = Some(now);
-            log::warn!(
-                "all video textures are still in use; deferring render request backend={backend} generation={generation} busy_total={}",
-                self.ring_busy,
+            kvlog::warn!(
+                "all video textures are in use; deferring render request",
+                backend,
+                generation,
+                busy_total = self.ring_busy
             );
         }
     }
 
-    fn maybe_log_summary(&mut self, backend: &str) {
+    fn maybe_log_summary(&mut self, _backend: &str) {
         let now = Instant::now();
         if now.duration_since(self.last_summary) < RENDER_SUMMARY_INTERVAL {
             return;
         }
         self.last_summary = now;
-        log::debug!(
-            "video render summary backend={backend} uptime_ms={} callbacks={} rendered={} repeats={} no_frame={} unconfigured={} ring_busy={} resizes={} errors={}",
-            now.duration_since(self.started_at).as_millis(),
-            self.callbacks,
-            self.rendered,
-            self.repeats,
-            self.callbacks_without_frames,
-            self.unconfigured,
-            self.ring_busy,
-            self.resizes,
-            self.errors,
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::render_logging_enabled() {
+            kvlog::info!(
+                "video render summary",
+                group = "render",
+                backend = _backend,
+                uptime_ms = now.duration_since(self.started_at).as_secs_f64() * 1_000.0,
+                callbacks = self.callbacks,
+                rendered = self.rendered,
+                repeats = self.repeats,
+                no_frame = self.callbacks_without_frames,
+                unconfigured = self.unconfigured,
+                ring_busy = self.ring_busy,
+                resizes = self.resizes,
+                errors = self.errors
+            );
+        }
     }
 
     fn log_final(&self, backend: &str) {
-        log::info!(
-            "video render worker stopped backend={backend} uptime_ms={} callbacks={} rendered={} repeats={} no_frame={} unconfigured={} ring_busy={} resizes={} errors={}",
-            self.started_at.elapsed().as_millis(),
-            self.callbacks,
-            self.rendered,
-            self.repeats,
-            self.callbacks_without_frames,
-            self.unconfigured,
-            self.ring_busy,
-            self.resizes,
-            self.errors,
+        kvlog::info!(
+            "video render worker stopped",
+            backend,
+            uptime_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0,
+            callbacks = self.callbacks,
+            rendered = self.rendered,
+            repeats = self.repeats,
+            no_frame = self.callbacks_without_frames,
+            unconfigured = self.unconfigured,
+            ring_busy = self.ring_busy,
+            resizes = self.resizes,
+            errors = self.errors
         );
     }
 }
@@ -1517,7 +1593,7 @@ fn control_worker(
     render: Option<RenderControl>,
 ) {
     let rendered = render.is_some();
-    log::info!("mpv control worker started rendered={rendered}");
+    kvlog::info!("mpv control worker started", rendered);
     let mut state = PlaybackState::default();
     let initial_render_size = render.as_ref().and_then(|render| render.initial_size);
     let mut configured_size = initial_render_size;
@@ -1544,7 +1620,14 @@ fn control_worker(
                     }
                 }
                 if coalesced != 0 {
-                    log::info!("coalesced {coalesced} stale media seek commands");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "coalesced stale media seek commands",
+                            group = "media",
+                            count = coalesced
+                        );
+                    }
                 }
             }
             let result = match command {
@@ -1555,7 +1638,10 @@ fn control_worker(
                     speed,
                     position,
                 } => {
-                    log::info!("loading media path={path:?}");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!("loading media", group = "media", path = %path);
+                    }
                     load_started_at = Some(Instant::now());
                     seek_started_at = None;
                     state = PlaybackState {
@@ -1578,18 +1664,37 @@ fn control_worker(
                         .and_then(|()| mpv.set_property("speed", speed))
                         .and_then(|()| mpv.command("loadfile", &[&path, "replace"]));
                     if result.is_ok() {
-                        log::info!(
-                            "mpv accepted loadfile paused={paused} volume={volume:.1} speed={speed:.2} start_position={position:.3}"
-                        );
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::media_logging_enabled() {
+                            kvlog::info!(
+                                "mpv accepted loadfile",
+                                group = "media",
+                                paused,
+                                volume,
+                                speed,
+                                start_position = position
+                            );
+                        }
                     }
                     result
                 }
                 ControlCommand::SetPause(paused) => {
-                    log::debug!("setting mpv pause={paused}");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!("setting mpv pause", group = "media", paused);
+                    }
                     mpv.set_property("pause", paused)
                 }
                 ControlCommand::SeekAbsolute { seconds, mode } => {
-                    log::info!("seeking mpv absolute_seconds={seconds} mode={mode:?}");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "seeking mpv",
+                            group = "media",
+                            seconds,
+                            mode = mode.as_str()
+                        );
+                    }
                     seek_started_at = Some((Instant::now(), seconds, mode));
                     state.position = seconds;
                     state.finished = false;
@@ -1604,9 +1709,16 @@ fn control_worker(
                     position,
                     mode,
                 } => {
-                    log::info!(
-                        "seeking mpv absolute_percent={percent} expected_seconds={position} mode={mode:?}"
-                    );
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "seeking mpv by percentage",
+                            group = "media",
+                            percent,
+                            expected_seconds = position,
+                            mode = mode.as_str()
+                        );
+                    }
                     seek_started_at = Some((Instant::now(), position, mode));
                     state.position = position;
                     state.finished = false;
@@ -1620,15 +1732,27 @@ fn control_worker(
                     )
                 }
                 ControlCommand::SetVolume(volume) => {
-                    log::debug!("setting mpv volume={volume}");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!("setting mpv volume", group = "media", volume);
+                    }
                     mpv.set_property("volume", volume)
                 }
                 ControlCommand::SetSpeed(speed) => {
-                    log::debug!("setting mpv speed={speed}");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!("setting mpv speed", group = "media", speed);
+                    }
                     mpv.set_property("speed", speed)
                 }
                 ControlCommand::Stop => {
-                    log::debug!("stopping media while retaining mpv core");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "stopping media while retaining mpv core",
+                            group = "media"
+                        );
+                    }
                     load_started_at = None;
                     seek_started_at = None;
                     state = PlaybackState {
@@ -1641,16 +1765,22 @@ fn control_worker(
                     mpv.command("stop", &[])
                 }
                 ControlCommand::DropBuffers => {
-                    log::debug!("dropping buffered live video at fresh keyframe");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "dropping buffered live video at fresh keyframe",
+                            group = "media"
+                        );
+                    }
                     mpv.command("drop-buffers", &[])
                 }
                 ControlCommand::Shutdown => {
-                    log::info!("mpv control worker stopped");
+                    kvlog::info!("mpv control worker stopped");
                     return;
                 }
             };
             if let Err(error) = result {
-                log::error!("mpv control command failed: {error}");
+                kvlog::error!("mpv control command failed", err = %error);
                 let _ = errors.send(error.to_string());
                 let _ = gpui_wakeup.try_send(());
             }
@@ -1661,7 +1791,7 @@ fn control_worker(
                 && let Some(position) = pending_start.take()
                 && let Err(error) = mpv.command("seek", &[&position.to_string(), "absolute+exact"])
             {
-                log::warn!("failed to restore retained playback position: {error}");
+                kvlog::warn!("failed to restore retained playback position", err = %error);
             }
             let file_loaded = matches!(event.as_ref(), Ok(Event::FileLoaded));
             let video_reconfigured = matches!(event.as_ref(), Ok(Event::VideoReconfig));
@@ -1674,23 +1804,37 @@ fn control_worker(
                     ..
                 })
             );
-            if file_loaded && let Some(started_at) = load_started_at {
-                log::info!(
-                    "mpv media demux ready elapsed_ms={:.3}",
-                    started_at.elapsed().as_secs_f64() * 1_000.0,
-                );
+            if file_loaded && let Some(_started_at) = load_started_at {
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::media_logging_enabled() {
+                    kvlog::info!(
+                        "mpv media demux ready",
+                        group = "media",
+                        elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
+                    );
+                }
             }
             if playback_restarted {
-                if let Some((started_at, target, mode)) = seek_started_at.take() {
-                    log::info!(
-                        "mpv seek completed target_seconds={target:.3} mode={mode:?} elapsed_ms={:.3}",
-                        started_at.elapsed().as_secs_f64() * 1_000.0,
-                    );
-                } else if let Some(started_at) = load_started_at.take() {
-                    log::info!(
-                        "mpv initial playback ready elapsed_ms={:.3}",
-                        started_at.elapsed().as_secs_f64() * 1_000.0,
-                    );
+                if let Some((_started_at, _target, _mode)) = seek_started_at.take() {
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "mpv seek completed",
+                            group = "media",
+                            target_seconds = _target,
+                            mode = _mode.as_str(),
+                            elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
+                        );
+                    }
+                } else if let Some(_started_at) = load_started_at.take() {
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "mpv initial playback ready",
+                            group = "media",
+                            elapsed_ms = _started_at.elapsed().as_secs_f64() * 1_000.0
+                        );
+                    }
                 }
             }
             let mut display_size_changed = false;
@@ -1699,11 +1843,15 @@ fn control_worker(
                     Ok(size) => {
                         let resized = configured_size != Some(size);
                         if resized {
-                            log::info!(
-                                "video texture configured at decoded display size={}x{}",
-                                size.0,
-                                size.1,
-                            );
+                            #[cfg(feature = "diagnostic-logs")]
+                            if crate::logger::render_logging_enabled() {
+                                kvlog::info!(
+                                    "video texture configured at decoded display size",
+                                    group = "render",
+                                    width = size.0,
+                                    height = size.1
+                                );
+                            }
                         }
                         configured_size = Some(size);
                         display_size_changed = state.display_size != Some(size);
@@ -1721,12 +1869,19 @@ fn control_worker(
                                 .is_err()
                         {
                             let message = "mpv render thread stopped during video configuration";
-                            log::error!("{message}");
+                            kvlog::error!("video configuration failed", err = message);
                             let _ = errors.send(message.into());
                         }
                     }
-                    Err(error) => {
-                        log::debug!("decoded video size is not ready: {error:#}");
+                    Err(_error) => {
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::render_logging_enabled() {
+                            kvlog::info!(
+                                "decoded video size is not ready",
+                                group = "render",
+                                err = %_error
+                            );
+                        }
                     }
                 }
             }
@@ -1735,13 +1890,14 @@ fn control_worker(
                 && ((!delay_render_until_reconfiguration && file_loaded)
                     || (delay_render_until_reconfiguration && video_reconfigured));
             if should_enable_render {
-                log::info!(
-                    "enabling video rendering trigger={} preserved_frame=true",
-                    if video_reconfigured {
+                kvlog::info!(
+                    "enabling video rendering",
+                    trigger = if video_reconfigured {
                         "video-reconfiguration"
                     } else {
                         "file-loaded"
-                    }
+                    },
+                    preserved_frame = true
                 );
                 let render_sender = &render
                     .as_ref()
@@ -1753,14 +1909,14 @@ fn control_worker(
                     render_enabled = true;
                 } else {
                     let message = "mpv render thread stopped while enabling the new media";
-                    log::error!("{message}");
+                    kvlog::error!("could not enable video rendering", err = message);
                     let _ = errors.send(message.into());
                 }
             }
             let mut notify_gpui = match apply_event(event, &mut state) {
                 Ok(notify_gpui) => notify_gpui,
                 Err(error) => {
-                    log::error!("mpv event handling failed: {error:#}");
+                    kvlog::error!("mpv event handling failed", err = %error);
                     let _ = errors.send(format!("{error:#}"));
                     true
                 }
@@ -1830,28 +1986,33 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             }
             ("hwdec-current", PropertyData::Str(value)) => {
                 if value.ends_with("-copy") {
-                    log::info!(
-                        "mpv decoder selected hardware_decoder={value:?} transfer=gpu-to-cpu-before-render"
+                    kvlog::info!(
+                        "mpv decoder selected",
+                        hardware_decoder = %value,
+                        transfer = "gpu-to-cpu-before-render"
                     );
                 } else if value == "vulkan" {
-                    log::info!(
-                        "mpv decoder selected hardware_decoder={value:?} transfer=vulkan-hardware-frames-direct no_system_memory_round_trip=true"
+                    kvlog::info!(
+                        "mpv decoder selected",
+                        hardware_decoder = %value,
+                        transfer = "vulkan-hardware-frames-direct",
+                        no_system_memory_round_trip = true
                     );
                 } else {
-                    log::info!("mpv decoder selected hardware_decoder={value:?}");
+                    kvlog::info!("mpv decoder selected", hardware_decoder = %value);
                 }
                 false
             }
             ("video-codec", PropertyData::Str(value)) => {
-                log::info!("mpv video stream selected codec={value:?}");
+                kvlog::info!("mpv video stream selected", codec = %value);
                 false
             }
             ("current-vo", PropertyData::Str(value)) => {
-                log::info!("mpv video output selected vo={value:?}");
+                kvlog::info!("mpv video output selected", output = %value);
                 false
             }
             ("hwdec-interop", PropertyData::Str(value)) => {
-                log::info!("mpv hardware frame interop available interop={value:?}");
+                kvlog::info!("mpv hardware frame interop available", interop = %value);
                 false
             }
             _ => false,
@@ -1866,7 +2027,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             false
         }
         Event::StartFile => {
-            log::info!("mpv started opening media");
+            kvlog::info!("mpv started opening media");
             let was_finished = state.finished;
             let was_ready = state.ready;
             state.ready = false;
@@ -1874,29 +2035,44 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             was_finished || was_ready
         }
         Event::FileLoaded => {
-            log::info!("mpv media loaded");
+            kvlog::info!("mpv media loaded");
             let changed = !state.ready;
             state.ready = true;
             changed
         }
         Event::VideoReconfig => {
-            log::info!("mpv video output reconfigured");
+            kvlog::info!("mpv video output reconfigured");
             false
         }
         Event::AudioReconfig => {
-            log::debug!("mpv audio output reconfigured");
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!("mpv audio output reconfigured", group = "media");
+            }
             false
         }
         Event::Seek => {
-            log::debug!("mpv seek started");
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!("mpv seek started", group = "media");
+            }
             false
         }
         Event::PlaybackRestart => {
-            log::debug!("mpv playback resumed after load, seek, or discontinuity");
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!(
+                    "mpv playback resumed after discontinuity",
+                    group = "media"
+                );
+            }
             false
         }
         Event::EndFile(reason) => {
-            log::info!("mpv media ended reason={reason:?}");
+            kvlog::info!(
+                "mpv media ended",
+                failed = reason == libmpv2::mpv_end_file_reason::Error
+            );
             if reason == libmpv2::mpv_end_file_reason::Error {
                 bail!("mpv could not decode or play the media");
             }
@@ -1904,7 +2080,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             true
         }
         Event::Shutdown => {
-            log::warn!("mpv core requested shutdown");
+            kvlog::warn!("mpv core requested shutdown");
             state.finished = true;
             true
         }
@@ -1916,24 +2092,19 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
 
 fn relay_mpv_log(level: libmpv2::LogLevel, prefix: &str, text: &str) {
     let text = text.trim_end_matches(['\r', '\n']);
-    match level {
+    let level = match level {
         libmpv2::mpv_log_level::Fatal | libmpv2::mpv_log_level::Error => {
-            log::error!(target: "chatt_mpv", "mpv[{prefix}] {text}")
+            log::Level::Error
         }
-        libmpv2::mpv_log_level::Warn => {
-            log::warn!(target: "chatt_mpv", "mpv[{prefix}] {text}")
-        }
-        libmpv2::mpv_log_level::Info => {
-            log::info!(target: "chatt_mpv", "mpv[{prefix}] {text}")
-        }
+        libmpv2::mpv_log_level::Warn => log::Level::Warn,
+        libmpv2::mpv_log_level::Info => log::Level::Info,
         libmpv2::mpv_log_level::V | libmpv2::mpv_log_level::Debug => {
-            log::debug!(target: "chatt_mpv", "mpv[{prefix}] {text}")
+            log::Level::Debug
         }
-        libmpv2::mpv_log_level::Trace => {
-            log::trace!(target: "chatt_mpv", "mpv[{prefix}] {text}")
-        }
-        _ => {}
-    }
+        libmpv2::mpv_log_level::Trace => log::Level::Trace,
+        _ => return,
+    };
+    log::log!(target: "chatt_mpv", level, "mpv[{prefix}] {text}");
 }
 
 fn render_worker(
@@ -1949,7 +2120,7 @@ fn render_worker(
     frame_invalidated: Arc<SeekFrameInvalidation>,
 ) {
     let backend_name = backend.name();
-    log::info!("video render worker started backend={backend_name}");
+    kvlog::info!("video render worker started", backend = backend_name);
     let mut diagnostics = RenderDiagnostics::new();
     let mut has_frame = false;
     let mut enabled = false;
@@ -1977,15 +2148,21 @@ fn render_worker(
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                     if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
-                        log::info!(
-                            "released live decoder input after first rendered output backend={backend_name}"
+                        kvlog::info!(
+                            "released live decoder input after first rendered output",
+                            backend = backend_name
                         );
                     }
                     if diagnostics.rendered <= INITIAL_RENDER_TRACE_LIMIT {
-                        log::info!(
-                            "video render output published ordinal={} operation=deferred-redraw",
-                            diagnostics.rendered
-                        );
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::render_logging_enabled() {
+                            kvlog::info!(
+                                "video render output published",
+                                group = "render",
+                                ordinal = diagnostics.rendered,
+                                operation = "deferred-redraw"
+                            );
+                        }
                     }
                 }
                 Ok(false) => {
@@ -1994,8 +2171,11 @@ fn render_worker(
                 Err(error) => {
                     diagnostics.errors += 1;
                     redraw_pending = false;
-                    log::error!(
-                        "video render worker operation failed backend={backend_name} operation=deferred redraw: {error:#}"
+                    kvlog::error!(
+                        "video render worker operation failed",
+                        backend = backend_name,
+                        operation = "deferred-redraw",
+                        err = %error
                     );
                     let _ = errors.send(format!("{error:#}"));
                     let _ = gpui_wakeup.try_send(());
@@ -2013,7 +2193,13 @@ fn render_worker(
                 if frame_invalidated.take_for_update(updates) {
                     has_frame = false;
                     redraw_pending = false;
-                    log::debug!("invalidated displayed video frame after seek");
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::render_logging_enabled() {
+                        kvlog::info!(
+                            "invalidated displayed video frame after seek",
+                            group = "render"
+                        );
+                    }
                 }
                 if !enabled {
                     // A live stream can expose its first decoded frame before
@@ -2026,20 +2212,24 @@ fn render_worker(
                     let frame_pts = backend.context().next_frame_video_pts().ok();
                     let action = render_action(updates, frame_info, has_frame);
                     if diagnostics.callbacks <= INITIAL_RENDER_TRACE_LIMIT {
-                        log::info!(
-                            "video render callback ordinal={} updates=0x{:x} action={:?} frame_info_available={} frame_flags=0x{:x} present={} repeat={} redraw={} target_time_ns={:?} pts={:?} has_frame={}",
-                            diagnostics.callbacks,
-                            updates,
-                            action,
-                            frame_info.is_some(),
-                            frame_info.map_or(0, |info| info.flags),
-                            frame_info.is_some_and(|info| info.is_present()),
-                            frame_info.is_some_and(|info| info.is_repeat()),
-                            frame_info.is_some_and(|info| info.is_redraw()),
-                            frame_info.map(|info| info.target_time),
-                            frame_pts,
-                            has_frame,
-                        );
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::render_logging_enabled() {
+                            kvlog::info!(
+                                "video render callback",
+                                group = "render",
+                                ordinal = diagnostics.callbacks,
+                                updates,
+                                action = action.as_str(),
+                                frame_info_available = frame_info.is_some(),
+                                frame_flags = frame_info.map_or(0, |info| info.flags),
+                                present = frame_info.is_some_and(|info| info.is_present()),
+                                repeat = frame_info.is_some_and(|info| info.is_repeat()),
+                                redraw = frame_info.is_some_and(|info| info.is_redraw()),
+                                target_time_ns = frame_info.map(|info| info.target_time),
+                                pts = frame_pts,
+                                has_frame
+                            );
+                        }
                     }
                     let result = match action {
                         RenderAction::None => {
@@ -2086,7 +2276,14 @@ fn render_worker(
                 ("resize", result)
             }
             RenderMessage::Reset => {
-                log::debug!("resetting published video frame backend={backend_name}");
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::render_logging_enabled() {
+                    kvlog::info!(
+                        "resetting published video frame",
+                        group = "render",
+                        backend = backend_name
+                    );
+                }
                 enabled = false;
                 has_frame = false;
                 redraw_pending = false;
@@ -2095,7 +2292,14 @@ fn render_worker(
                 ("reset", Ok(false))
             }
             RenderMessage::ReleaseResources => {
-                log::debug!("releasing pooled video frame resources backend={backend_name}");
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::render_logging_enabled() {
+                    kvlog::info!(
+                        "releasing pooled video frame resources",
+                        group = "render",
+                        backend = backend_name
+                    );
+                }
                 enabled = false;
                 has_frame = false;
                 redraw_pending = false;
@@ -2117,22 +2321,31 @@ fn render_worker(
                     playback.frame_ready.store(true, Ordering::Release);
                     let _ = gpui_wakeup.try_send(());
                     if live_input_gate.as_ref().is_some_and(|gate| gate.release()) {
-                        log::info!(
-                            "released live decoder input after first rendered output backend={backend_name}"
+                        kvlog::info!(
+                            "released live decoder input after first rendered output",
+                            backend = backend_name
                         );
                     }
                     if diagnostics.rendered <= INITIAL_RENDER_TRACE_LIMIT {
-                        log::info!(
-                            "video render output published ordinal={} operation={operation}",
-                            diagnostics.rendered
-                        );
+                        #[cfg(feature = "diagnostic-logs")]
+                        if crate::logger::render_logging_enabled() {
+                            kvlog::info!(
+                                "video render output published",
+                                group = "render",
+                                ordinal = diagnostics.rendered,
+                                operation
+                            );
+                        }
                     }
                 }
             }
             Err(error) => {
                 diagnostics.errors += 1;
-                log::error!(
-                    "video render worker operation failed backend={backend_name} operation={operation}: {error:#}"
+                kvlog::error!(
+                    "video render worker operation failed",
+                    backend = backend_name,
+                    operation,
+                    err = %error
                 );
                 let _ = errors.send(format!("{error:#}"));
                 let _ = gpui_wakeup.try_send(());
@@ -2148,6 +2361,17 @@ enum RenderAction {
     None,
     Render,
     Skip,
+}
+
+impl RenderAction {
+    #[cfg(feature = "diagnostic-logs")]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Render => "render",
+            Self::Skip => "skip",
+        }
+    }
 }
 
 fn render_action(

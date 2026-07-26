@@ -122,7 +122,7 @@ impl AttachmentAudioManager {
                 }
             })
         {
-            log::error!("could not start mpv audio cleanup worker: {error}");
+            kvlog::error!("could not start mpv audio cleanup worker", err = %error);
         }
         Self {
             sessions: HashMap::new(),

@@ -395,7 +395,10 @@ impl TextEditor {
     }
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
-            log::info!("clipboard paste returned no clipboard item");
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!("clipboard paste returned no item", group = "media");
+            }
             return;
         };
         let metadata = item.metadata().cloned();
@@ -404,7 +407,10 @@ impl TextEditor {
             Err(item) => item,
         };
         let Some(text) = item.text() else {
-            log::info!("clipboard paste contained no usable text or image data");
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                kvlog::info!("clipboard paste contained no usable data", group = "media");
+            }
             return;
         };
         if self.vim_enabled && self.editor.mode() != Mode::Insert {
@@ -662,7 +668,10 @@ impl TextEditor {
         if matches!(key, VimKey::Char('p' | 'P')) {
             let item = cx.read_from_clipboard();
             if item.is_none() {
-                log::info!("Vim clipboard paste returned no clipboard item");
+                #[cfg(feature = "diagnostic-logs")]
+                if crate::logger::media_logging_enabled() {
+                    kvlog::info!("Vim clipboard paste returned no item", group = "media");
+                }
             }
             let item = if let Some(item) = item {
                 let metadata = item.metadata().cloned();
@@ -720,11 +729,16 @@ impl TextEditor {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let byte_len = images.iter().map(|image| image.bytes.len()).sum::<usize>();
-        log::info!(
-            "clipboard image paste detected images={} bytes={byte_len}",
-            images.len(),
-        );
+        #[cfg(feature = "diagnostic-logs")]
+        if crate::logger::media_logging_enabled() {
+            let byte_len = images.iter().map(|image| image.bytes.len()).sum::<usize>();
+            kvlog::info!(
+                "clipboard image paste detected",
+                group = "media",
+                count = images.len(),
+                size = byte_len
+            );
+        }
         cx.emit(ComposerImagePaste {
             images: images.into(),
         });
@@ -1386,7 +1400,7 @@ impl Element for ComposerElement {
                 window,
                 cx,
             ) {
-                log::error!("failed to paint composer text: {error:#}");
+                kvlog::error!("failed to paint composer text", err = %error);
             }
             origin.y += line_height;
         }

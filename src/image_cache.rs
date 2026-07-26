@@ -27,21 +27,35 @@ impl Asset for TimelineImageLoader {
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         let svg_renderer = cx.svg_renderer();
         async move {
-            log::info!(
-                "timeline image decode started attachment={:?} source_bytes={} empty={}",
-                source.id(),
-                source.len(),
-                source.is_empty(),
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                let attachment_id = source.id();
+                kvlog::info!(
+                    "timeline image decode started",
+                    group = "media",
+                    attachment_timestamp_ms = attachment_id.timestamp_ms,
+                    attachment_transfer_id = attachment_id.transfer_id,
+                    source_bytes = source.len(),
+                    empty = source.is_empty()
+                );
+            }
             let image = decode_timeline_attachment(&source, &svg_renderer)?;
 
-            log::info!(
-                "timeline image decode finished attachment={:?} source_bytes={} render_image_id={} size={:?}",
-                source.id(),
-                source.len(),
-                image.id.0,
-                image.size(0),
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                let attachment_id = source.id();
+                let size = image.size(0);
+                kvlog::info!(
+                    "timeline image decode finished",
+                    group = "media",
+                    attachment_timestamp_ms = attachment_id.timestamp_ms,
+                    attachment_transfer_id = attachment_id.transfer_id,
+                    source_bytes = source.len(),
+                    render_image_id = image.id.0,
+                    width = size.width.0,
+                    height = size.height.0
+                );
+            }
             Ok(image)
         }
     }
@@ -58,13 +72,21 @@ impl Asset for PreviewImageLoader {
         let svg_renderer = cx.svg_renderer();
         async move {
             let image = decode_preview_attachment(&source, &svg_renderer)?;
-            log::info!(
-                "preview image decode finished attachment={:?} source_bytes={} render_image_id={} size={:?}",
-                source.id(),
-                source.len(),
-                image.id.0,
-                image.size(0),
-            );
+            #[cfg(feature = "diagnostic-logs")]
+            if crate::logger::media_logging_enabled() {
+                let attachment_id = source.id();
+                let size = image.size(0);
+                kvlog::info!(
+                    "preview image decode finished",
+                    group = "media",
+                    attachment_timestamp_ms = attachment_id.timestamp_ms,
+                    attachment_transfer_id = attachment_id.transfer_id,
+                    source_bytes = source.len(),
+                    render_image_id = image.id.0,
+                    width = size.width.0,
+                    height = size.height.0
+                );
+            }
             Ok(image)
         }
     }

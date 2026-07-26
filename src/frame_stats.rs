@@ -1,29 +1,45 @@
 use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::{Duration, Instant},
 };
+#[cfg(any(feature = "diagnostic-logs", test))]
+use std::time::Duration;
+#[cfg(feature = "diagnostic-logs")]
+use std::time::Instant;
 
-use gpui::{App, Window, profiler};
+use gpui::{App, Window};
+#[cfg(feature = "diagnostic-logs")]
+use gpui::profiler;
 
+#[cfg(feature = "diagnostic-logs")]
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
-static ENABLED: AtomicBool = AtomicBool::new(true);
+static ENABLED: AtomicBool = AtomicBool::new(false);
 static DISPLAY_FRAMES: AtomicU64 = AtomicU64::new(0);
 static SCROLL_INPUTS: AtomicU64 = AtomicU64::new(0);
 static SCROLL_UPDATES: AtomicU64 = AtomicU64::new(0);
 static SCROLL_TRACES: AtomicU64 = AtomicU64::new(0);
 
 pub fn start(cx: &mut App) {
-    if std::env::var_os("CHATT_FRAME_STATS").is_some_and(|value| value == "0") {
+    #[cfg(feature = "diagnostic-logs")]
+    start_diagnostics(cx);
+    #[cfg(not(feature = "diagnostic-logs"))]
+    let _ = cx;
+}
+
+#[cfg(feature = "diagnostic-logs")]
+fn start_diagnostics(cx: &mut App) {
+    if !crate::logger::render_logging_enabled() {
         ENABLED.store(false, Ordering::Relaxed);
         return;
     }
 
+    ENABLED.store(true, Ordering::Relaxed);
     profiler::set_frame_trace_enabled(true);
     let mut collector = profiler::FrameTimingCollector::new();
 
-    eprintln!(
-        "[chatt frame] reporting GPUI draw statistics every {:.0}s (set CHATT_FRAME_STATS=0 to disable)",
-        REPORT_INTERVAL.as_secs_f64()
+    kvlog::info!(
+        "frame timing diagnostics started",
+        group = "render",
+        interval_seconds = REPORT_INTERVAL.as_secs_f64()
     );
 
     cx.spawn(async move |cx| {
@@ -44,8 +60,14 @@ pub fn start(cx: &mut App) {
             let scroll_update_hz = scroll_updates as f64 / elapsed_seconds;
 
             if frames.is_empty() {
-                eprintln!(
-                    "[chatt frame] {display_hz:.1} display hz | idle: 0 draws in {elapsed_seconds:.2}s | scroll {scroll_input_hz:.1} input/s {scroll_update_hz:.1} update/s",
+                kvlog::info!(
+                    "frame timing summary",
+                    group = "render",
+                    display_hz,
+                    draw_count = 0u64,
+                    elapsed_seconds,
+                    scroll_input_hz,
+                    scroll_update_hz
                 );
                 continue;
             }
@@ -70,19 +92,35 @@ pub fn start(cx: &mut App) {
             let draw_max = draw_times.last().copied().unwrap_or_default();
 
             if let Some(dirty_p95) = percentile(&dirty_to_draw_times, 95) {
-                eprintln!(
-                    "[chatt frame] {display_hz:.1} display hz | {fps:.1} draw fps ({frame_count} in {elapsed_seconds:.2}s) | draw p50 {} p95 {} max {} | dirty-to-draw p95 {} | invalidations/frame {invalidations_per_frame:.1} | scroll {scroll_input_hz:.1} input/s {scroll_update_hz:.1} update/s",
-                    format_duration(draw_p50.unwrap_or_default()),
-                    format_duration(draw_p95.unwrap_or_default()),
-                    format_duration(draw_max),
-                    format_duration(dirty_p95),
+                kvlog::info!(
+                    "frame timing summary",
+                    group = "render",
+                    display_hz,
+                    fps,
+                    frame_count,
+                    elapsed_seconds,
+                    draw_p50_ms = draw_p50.unwrap_or_default().as_secs_f64() * 1_000.0,
+                    draw_p95_ms = draw_p95.unwrap_or_default().as_secs_f64() * 1_000.0,
+                    draw_max_ms = draw_max.as_secs_f64() * 1_000.0,
+                    dirty_to_draw_p95_ms = dirty_p95.as_secs_f64() * 1_000.0,
+                    invalidations_per_frame,
+                    scroll_input_hz,
+                    scroll_update_hz
                 );
             } else {
-                eprintln!(
-                    "[chatt frame] {display_hz:.1} display hz | {fps:.1} draw fps ({frame_count} in {elapsed_seconds:.2}s) | draw p50 {} p95 {} max {} | invalidations/frame {invalidations_per_frame:.1} | scroll {scroll_input_hz:.1} input/s {scroll_update_hz:.1} update/s",
-                    format_duration(draw_p50.unwrap_or_default()),
-                    format_duration(draw_p95.unwrap_or_default()),
-                    format_duration(draw_max),
+                kvlog::info!(
+                    "frame timing summary",
+                    group = "render",
+                    display_hz,
+                    fps,
+                    frame_count,
+                    elapsed_seconds,
+                    draw_p50_ms = draw_p50.unwrap_or_default().as_secs_f64() * 1_000.0,
+                    draw_p95_ms = draw_p95.unwrap_or_default().as_secs_f64() * 1_000.0,
+                    draw_max_ms = draw_max.as_secs_f64() * 1_000.0,
+                    invalidations_per_frame,
+                    scroll_input_hz,
+                    scroll_update_hz
                 );
             }
         }
@@ -115,10 +153,11 @@ pub fn record_scroll_update() {
 
 pub fn trace_scroll(message: impl FnOnce() -> String) {
     if ENABLED.load(Ordering::Relaxed) && SCROLL_TRACES.fetch_add(1, Ordering::Relaxed) < 24 {
-        eprintln!("[chatt scroll] {}", message());
+        kvlog::info!("scroll trace", group = "render", detail = %message());
     }
 }
 
+#[cfg(any(feature = "diagnostic-logs", test))]
 fn percentile(samples: &[Duration], percentile: usize) -> Option<Duration> {
     if samples.is_empty() {
         return None;
@@ -126,10 +165,6 @@ fn percentile(samples: &[Duration], percentile: usize) -> Option<Duration> {
 
     let index = (samples.len() * percentile).div_ceil(100).saturating_sub(1);
     samples.get(index).copied()
-}
-
-fn format_duration(duration: Duration) -> String {
-    format!("{:.2}ms", duration.as_secs_f64() * 1_000.)
 }
 
 #[cfg(test)]
