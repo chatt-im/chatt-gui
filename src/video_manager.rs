@@ -341,10 +341,6 @@ impl AttachmentVideoManager {
         first_error.map_or(Ok(()), Err)
     }
 
-    pub(crate) fn last_visible_key(&self) -> Option<VideoKey> {
-        self.last_visible_interaction()
-    }
-
     pub(crate) fn retained_source_keys(
         &self,
     ) -> HashSet<crate::attachment_source::AttachmentSourceKey> {
@@ -692,14 +688,6 @@ impl AttachmentVideoManager {
         if let Some(session) = self.sessions.get_mut(&key) {
             session.touched = self.clock;
         }
-    }
-
-    fn last_visible_interaction(&self) -> Option<VideoKey> {
-        self.last_interacted.filter(|key| {
-            self.sessions
-                .get(key)
-                .is_some_and(|session| session.visible)
-        })
     }
 }
 

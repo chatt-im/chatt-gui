@@ -32,6 +32,7 @@ const FORMAT_RGBA: &CStr = c"rgba";
 const RENDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
 const RENDER_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const RENDER_RETRY_INTERVAL: Duration = Duration::from_millis(16);
+const AUDIO_POSITION_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const INITIAL_RENDER_TRACE_LIMIT: u64 = 8;
 // The update callback coalesces notifications while one render update is
 // pending, so at most one pre-seek frame update can still reach the render
@@ -95,6 +96,19 @@ pub struct MpvPlayer {
     live_diagnostics: Option<Arc<crate::live_stream::LiveDiagnostics>>,
     live_input_gate: Option<Arc<crate::live_stream::LiveInputGate>>,
     live_source: Option<crate::live_stream::LiveStreamSource>,
+}
+
+/// A headless libmpv client for streamed audio attachments.
+///
+/// Audio shares the attachment protocol and playback state machine with video,
+/// but deliberately owns no GPUI surface or render thread.
+pub(crate) struct MpvAudioPlayer {
+    control_sender: mpsc::Sender<ControlCommand>,
+    control_thread: Option<thread::JoinHandle<()>>,
+    playback: Arc<SharedPlaybackState>,
+    errors: mpsc::Receiver<String>,
+    requested_paused: bool,
+    mpv: Arc<Mpv>,
 }
 
 impl MpvPlayer {
@@ -310,16 +324,7 @@ impl MpvPlayer {
             crate::attachment_source::register_mpv_attachment_protocol(&mpv, registry)?;
         }
 
-        mpv.observe_property("time-pos", Format::Double, 1)
-            .context("observe mpv property time-pos")?;
-        mpv.observe_property("duration", Format::Double, 2)
-            .context("observe mpv property duration")?;
-        mpv.observe_property("pause", Format::Flag, 3)
-            .context("observe mpv property pause")?;
-        mpv.observe_property("eof-reached", Format::Flag, 4)
-            .context("observe mpv property eof-reached")?;
-        mpv.observe_property("idle-active", Format::Flag, 5)
-            .context("observe mpv property idle-active")?;
+        observe_playback_properties(&mpv)?;
         mpv.observe_property("hwdec-current", Format::String, 6)
             .context("observe mpv property hwdec-current")?;
         mpv.observe_property("video-codec", Format::String, 7)
@@ -480,9 +485,11 @@ impl MpvPlayer {
                         control_playback,
                         gpui_wakeup,
                         control_error_sender,
-                        control_render_sender,
-                        fixed_render_size,
-                        control_frame_invalidated,
+                        Some(RenderControl {
+                            sender: control_render_sender,
+                            initial_size: fixed_render_size,
+                            frame_invalidated: control_frame_invalidated,
+                        }),
                     );
                 }) {
                 Ok(thread) => thread,
@@ -544,6 +551,7 @@ impl MpvPlayer {
             path: path.to_owned(),
             paused,
             volume: volume.clamp(0.0, 100.0),
+            speed: 1.0,
             position: position.max(0.0),
         })
     }
@@ -609,6 +617,177 @@ impl MpvPlayer {
     }
 }
 
+fn observe_playback_properties(mpv: &Mpv) -> Result<()> {
+    mpv.observe_property("time-pos", Format::Double, 1)
+        .context("observe mpv property time-pos")?;
+    mpv.observe_property("duration", Format::Double, 2)
+        .context("observe mpv property duration")?;
+    mpv.observe_property("pause", Format::Flag, 3)
+        .context("observe mpv property pause")?;
+    mpv.observe_property("eof-reached", Format::Flag, 4)
+        .context("observe mpv property eof-reached")?;
+    mpv.observe_property("idle-active", Format::Flag, 5)
+        .context("observe mpv property idle-active")?;
+    Ok(())
+}
+
+impl MpvAudioPlayer {
+    pub(crate) fn new_attachment(
+        gpui_wakeup: AsyncSender<()>,
+        source_registry: crate::attachment_source::AttachmentSourceRegistry,
+    ) -> Result<Self> {
+        Self::new_attachment_with_audio_output(gpui_wakeup, source_registry, None)
+    }
+
+    fn new_attachment_with_audio_output(
+        gpui_wakeup: AsyncSender<()>,
+        source_registry: crate::attachment_source::AttachmentSourceRegistry,
+        audio_output: Option<&str>,
+    ) -> Result<Self> {
+        log::info!("audio player construction started");
+        let mpv = Mpv::with_initializer(|initializer| {
+            macro_rules! set_option {
+                ($name:literal, $value:expr) => {
+                    if let Err(error) = initializer.set_option($name, $value) {
+                        log::error!(
+                            "libmpv audio option rejected name={} value={:?}: {error}",
+                            $name,
+                            $value
+                        );
+                        return Err(error);
+                    }
+                };
+            }
+            set_option!("vo", "null");
+            set_option!("video", "no");
+            // A scrub can briefly reach EOF before the pointer moves back.
+            // Retain the loaded file so that backward seek still has a target.
+            set_option!("keep-open", "yes");
+            set_option!("idle", "yes");
+            set_option!("sub", "no");
+            set_option!("sub-auto", "no");
+            set_option!("osd-level", "0");
+            set_option!("profile", "fast");
+            if let Some(audio_output) = audio_output {
+                set_option!("ao", audio_output);
+            }
+            Ok(())
+        })
+        .context("initialize headless libmpv audio player")?;
+        let mpv = Arc::new(mpv);
+        crate::attachment_source::register_mpv_attachment_protocol(&mpv, source_registry)?;
+        observe_playback_properties(&mpv)?;
+        let mpv_log_level = std::env::var("CHATT_MPV_LOG").unwrap_or_else(|_| "warn".into());
+        mpv.request_log_messages(&mpv_log_level)
+            .with_context(|| format!("request native mpv log level {mpv_log_level:?}"))?;
+
+        let (control_sender, control_commands) = mpsc::channel();
+        let playback = Arc::new(SharedPlaybackState::default());
+        let control_playback = playback.clone();
+        let control_mpv = mpv.clone();
+        let (error_sender, errors) = mpsc::channel();
+        let control_thread = thread::Builder::new()
+            .name("mpv-audio-control".into())
+            .spawn(move || {
+                control_worker(
+                    control_mpv,
+                    control_commands,
+                    control_playback,
+                    gpui_wakeup,
+                    error_sender,
+                    None,
+                );
+            })
+            .context("spawn mpv audio control thread")?;
+        log::info!("audio player construction completed");
+        Ok(Self {
+            control_sender,
+            control_thread: Some(control_thread),
+            playback,
+            errors,
+            requested_paused: false,
+            mpv,
+        })
+    }
+
+    pub(crate) fn load_at(
+        &mut self,
+        path: &str,
+        paused: bool,
+        volume: f64,
+        speed: f64,
+        position: f64,
+    ) -> Result<()> {
+        self.playback.reset();
+        self.requested_paused = paused;
+        self.send_control(ControlCommand::Load {
+            path: path.to_owned(),
+            paused,
+            volume: volume.clamp(0.0, 100.0),
+            speed: speed.clamp(0.25, 4.0),
+            position: position.max(0.0),
+        })
+    }
+
+    pub(crate) fn toggle_pause(&mut self) -> Result<bool> {
+        let paused = !self.requested_paused;
+        self.set_paused(paused)?;
+        Ok(paused)
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<()> {
+        self.requested_paused = paused;
+        self.playback.paused.store(paused, Ordering::Release);
+        self.send_control(ControlCommand::SetPause(paused))
+    }
+
+    pub(crate) fn seek_absolute(&self, seconds: f64) -> Result<()> {
+        let seconds = seconds.max(0.0);
+        self.playback.seek_to(seconds);
+        self.send_control(ControlCommand::SeekAbsolute {
+            seconds,
+            mode: SeekMode::Exact,
+        })
+    }
+
+    pub(crate) fn set_volume(&self, volume: f64) -> Result<()> {
+        self.send_control(ControlCommand::SetVolume(volume.clamp(0.0, 100.0)))
+    }
+
+    pub(crate) fn set_speed(&self, speed: f64) -> Result<()> {
+        self.send_control(ControlCommand::SetSpeed(speed.clamp(0.25, 4.0)))
+    }
+
+    pub(crate) fn stop(&mut self) -> Result<()> {
+        self.requested_paused = true;
+        self.playback.reset();
+        self.send_control(ControlCommand::Stop)
+    }
+
+    pub(crate) fn drain_events(&mut self) -> Result<PlaybackState> {
+        if let Ok(error) = self.errors.try_recv() {
+            bail!(error);
+        }
+        Ok(self.playback.snapshot())
+    }
+
+    fn send_control(&self, command: ControlCommand) -> Result<()> {
+        self.control_sender
+            .send(command)
+            .map_err(|_| anyhow!("mpv audio control thread stopped"))?;
+        self.mpv.wakeup();
+        Ok(())
+    }
+}
+
+impl Drop for MpvAudioPlayer {
+    fn drop(&mut self) {
+        log::debug!("stopping mpv audio control thread");
+        shutdown_owned_mpv_control(&self.control_sender, &mut self.control_thread, &self.mpv);
+        log::debug!("mpv audio control thread stopped");
+    }
+}
+
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
         log::debug!("stopping mpv player threads");
@@ -619,18 +798,26 @@ impl Drop for MpvPlayer {
             let _ = thread.join();
         }
 
-        let _ = self.control_sender.send(ControlCommand::Shutdown);
-        self.mpv.wakeup();
-        if let Some(thread) = self.control_thread.take() {
-            let _ = thread.join();
-        }
-        // `mpv_destroy` only detaches this client handle and permits the core,
-        // its internal clients, and registered stream callbacks to outlive it.
-        // All application workers are joined now, so synchronously terminate
-        // the core when the final Arc is released below.
-        self.mpv.terminate_on_drop();
+        shutdown_owned_mpv_control(&self.control_sender, &mut self.control_thread, &self.mpv);
         log::debug!("mpv player threads stopped");
     }
+}
+
+fn shutdown_owned_mpv_control(
+    control_sender: &mpsc::Sender<ControlCommand>,
+    control_thread: &mut Option<thread::JoinHandle<()>>,
+    mpv: &Mpv,
+) {
+    let _ = control_sender.send(ControlCommand::Shutdown);
+    mpv.wakeup();
+    if let Some(thread) = control_thread.take() {
+        let _ = thread.join();
+    }
+    // `mpv_destroy` only detaches this client handle and permits the core,
+    // its internal clients, and registered stream callbacks to outlive it.
+    // All application workers are joined now, so synchronously terminate the
+    // owned core when the final Arc is released.
+    mpv.terminate_on_drop();
 }
 
 struct WgpuQueueLock {
@@ -899,6 +1086,7 @@ pub(crate) enum ControlCommand {
         path: String,
         paused: bool,
         volume: f64,
+        speed: f64,
         position: f64,
     },
     SetPause(bool),
@@ -912,6 +1100,7 @@ pub(crate) enum ControlCommand {
         mode: SeekMode,
     },
     SetVolume(f64),
+    SetSpeed(f64),
     Stop,
     DropBuffers,
     Shutdown,
@@ -1313,24 +1502,33 @@ impl RenderDiagnostics {
     }
 }
 
+struct RenderControl {
+    sender: mpsc::Sender<RenderMessage>,
+    initial_size: Option<(u32, u32)>,
+    frame_invalidated: Arc<SeekFrameInvalidation>,
+}
+
 fn control_worker(
     mpv: Arc<Mpv>,
     commands: mpsc::Receiver<ControlCommand>,
     playback: Arc<SharedPlaybackState>,
     gpui_wakeup: AsyncSender<()>,
     errors: mpsc::Sender<String>,
-    render_sender: mpsc::Sender<RenderMessage>,
-    initial_render_size: Option<(u32, u32)>,
-    frame_invalidated: Arc<SeekFrameInvalidation>,
+    render: Option<RenderControl>,
 ) {
-    log::info!("mpv control worker started");
+    let rendered = render.is_some();
+    log::info!("mpv control worker started rendered={rendered}");
     let mut state = PlaybackState::default();
+    let initial_render_size = render.as_ref().and_then(|render| render.initial_size);
     let mut configured_size = initial_render_size;
     let mut pending_start = None;
     let delay_render_until_reconfiguration = initial_render_size.is_some();
     let mut render_enabled = false;
     let mut load_started_at = None;
     let mut seek_started_at = None;
+    let mut last_audio_position_wakeup = Instant::now()
+        .checked_sub(AUDIO_POSITION_WAKE_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut deferred_command = None;
     loop {
         while let Some(mut command) = deferred_command.take().or_else(|| commands.try_recv().ok()) {
@@ -1346,7 +1544,7 @@ fn control_worker(
                     }
                 }
                 if coalesced != 0 {
-                    log::info!("coalesced {coalesced} stale video seek commands");
+                    log::info!("coalesced {coalesced} stale media seek commands");
                 }
             }
             let result = match command {
@@ -1354,6 +1552,7 @@ fn control_worker(
                     path,
                     paused,
                     volume,
+                    speed,
                     position,
                 } => {
                     log::info!("loading media path={path:?}");
@@ -1376,10 +1575,11 @@ fn control_worker(
                         .map(|()| while mpv.wait_event(0.0).is_some() {})
                         .and_then(|()| mpv.set_property("pause", paused))
                         .and_then(|()| mpv.set_property("volume", volume))
+                        .and_then(|()| mpv.set_property("speed", speed))
                         .and_then(|()| mpv.command("loadfile", &[&path, "replace"]));
                     if result.is_ok() {
                         log::info!(
-                            "mpv accepted loadfile paused={paused} volume={volume:.1} start_position={position:.3}"
+                            "mpv accepted loadfile paused={paused} volume={volume:.1} speed={speed:.2} start_position={position:.3}"
                         );
                     }
                     result
@@ -1394,7 +1594,9 @@ fn control_worker(
                     state.position = seconds;
                     state.finished = false;
                     playback.publish(state);
-                    frame_invalidated.invalidate();
+                    if let Some(render) = render.as_ref() {
+                        render.frame_invalidated.invalidate();
+                    }
                     mpv.command("seek", &[&seconds.to_string(), mode.absolute_flag()])
                 }
                 ControlCommand::SeekPercent {
@@ -1409,7 +1611,9 @@ fn control_worker(
                     state.position = position;
                     state.finished = false;
                     playback.publish(state);
-                    frame_invalidated.invalidate();
+                    if let Some(render) = render.as_ref() {
+                        render.frame_invalidated.invalidate();
+                    }
                     mpv.command(
                         "seek",
                         &[&percent.to_string(), mode.absolute_percent_flag()],
@@ -1418,6 +1622,10 @@ fn control_worker(
                 ControlCommand::SetVolume(volume) => {
                     log::debug!("setting mpv volume={volume}");
                     mpv.set_property("volume", volume)
+                }
+                ControlCommand::SetSpeed(speed) => {
+                    log::debug!("setting mpv speed={speed}");
+                    mpv.set_property("speed", speed)
                 }
                 ControlCommand::Stop => {
                     log::debug!("stopping media while retaining mpv core");
@@ -1458,6 +1666,14 @@ fn control_worker(
             let file_loaded = matches!(event.as_ref(), Ok(Event::FileLoaded));
             let video_reconfigured = matches!(event.as_ref(), Ok(Event::VideoReconfig));
             let playback_restarted = matches!(event.as_ref(), Ok(Event::PlaybackRestart));
+            let position_changed = matches!(
+                event.as_ref(),
+                Ok(Event::PropertyChange {
+                    name: "time-pos",
+                    change: PropertyData::Double(_),
+                    ..
+                })
+            );
             if file_loaded && let Some(started_at) = load_started_at {
                 log::info!(
                     "mpv media demux ready elapsed_ms={:.3}",
@@ -1478,7 +1694,7 @@ fn control_worker(
                 }
             }
             let mut display_size_changed = false;
-            if file_loaded || video_reconfigured {
+            if rendered && (file_loaded || video_reconfigured) {
                 match video_display_size(&mpv) {
                     Ok(size) => {
                         let resized = configured_size != Some(size);
@@ -1493,7 +1709,10 @@ fn control_worker(
                         display_size_changed = state.display_size != Some(size);
                         state.display_size = Some(size);
                         if resized
-                            && render_sender
+                            && render
+                                .as_ref()
+                                .expect("rendered control worker has render state")
+                                .sender
                                 .send(RenderMessage::Resize {
                                     width: size.0,
                                     height: size.1,
@@ -1511,7 +1730,8 @@ fn control_worker(
                     }
                 }
             }
-            let should_enable_render = !render_enabled
+            let should_enable_render = rendered
+                && !render_enabled
                 && ((!delay_render_until_reconfiguration && file_loaded)
                     || (delay_render_until_reconfiguration && video_reconfigured));
             if should_enable_render {
@@ -1523,6 +1743,10 @@ fn control_worker(
                         "file-loaded"
                     }
                 );
+                let render_sender = &render
+                    .as_ref()
+                    .expect("rendered control worker has render state")
+                    .sender;
                 let enabled = render_sender.send(RenderMessage::Enable).is_ok()
                     && render_sender.send(RenderMessage::Update).is_ok();
                 if enabled {
@@ -1533,7 +1757,7 @@ fn control_worker(
                     let _ = errors.send(message.into());
                 }
             }
-            let notify_gpui = match apply_event(event, &mut state) {
+            let mut notify_gpui = match apply_event(event, &mut state) {
                 Ok(notify_gpui) => notify_gpui,
                 Err(error) => {
                     log::error!("mpv event handling failed: {error:#}");
@@ -1541,6 +1765,13 @@ fn control_worker(
                     true
                 }
             } || display_size_changed;
+            if !rendered
+                && position_changed
+                && last_audio_position_wakeup.elapsed() >= AUDIO_POSITION_WAKE_INTERVAL
+            {
+                last_audio_position_wakeup = Instant::now();
+                notify_gpui = true;
+            }
             playback.publish(state);
             if notify_gpui {
                 let _ = gpui_wakeup.try_send(());
@@ -1637,12 +1868,16 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
         Event::StartFile => {
             log::info!("mpv started opening media");
             let was_finished = state.finished;
+            let was_ready = state.ready;
+            state.ready = false;
             state.finished = false;
-            was_finished
+            was_finished || was_ready
         }
         Event::FileLoaded => {
             log::info!("mpv media loaded");
-            false
+            let changed = !state.ready;
+            state.ready = true;
+            changed
         }
         Event::VideoReconfig => {
             log::info!("mpv video output reconfigured");
@@ -1662,6 +1897,9 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
         }
         Event::EndFile(reason) => {
             log::info!("mpv media ended reason={reason:?}");
+            if reason == libmpv2::mpv_end_file_reason::Error {
+                bail!("mpv could not decode or play the media");
+            }
             state.finished = true;
             true
         }
@@ -1939,6 +2177,7 @@ pub struct PlaybackState {
     pub duration: f64,
     pub paused: bool,
     pub finished: bool,
+    pub ready: bool,
     pub frame_ready: bool,
     pub display_size: Option<(u32, u32)>,
 }
@@ -1949,6 +2188,7 @@ struct SharedPlaybackState {
     duration: AtomicU64,
     paused: AtomicBool,
     finished: AtomicBool,
+    ready: AtomicBool,
     frame_ready: AtomicBool,
     display_size: AtomicU64,
 }
@@ -1960,6 +2200,7 @@ impl SharedPlaybackState {
         self.duration
             .store(state.duration.to_bits(), Ordering::Relaxed);
         self.paused.store(state.paused, Ordering::Relaxed);
+        self.ready.store(state.ready, Ordering::Relaxed);
         self.finished.store(state.finished, Ordering::Release);
         let display_size = state.display_size.map_or(0, |(width, height)| {
             (u64::from(width) << 32) | u64::from(height)
@@ -1975,6 +2216,7 @@ impl SharedPlaybackState {
             duration: f64::from_bits(self.duration.load(Ordering::Relaxed)),
             paused: self.paused.load(Ordering::Relaxed),
             finished,
+            ready: self.ready.load(Ordering::Relaxed),
             frame_ready: self.frame_ready.load(Ordering::Acquire),
             display_size: (packed_size != 0)
                 .then_some(((packed_size >> 32) as u32, packed_size as u32)),
@@ -2105,6 +2347,113 @@ mod tests {
         }
 
         assert_eq!(display_size, Some((320, 180)));
+    }
+
+    #[test]
+    fn headless_attachment_player_decodes_common_audio_formats_without_video_frames() {
+        use local_rpc::{
+            ids::{FileTransferId, RoomId},
+            model::AttachmentId,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let formats = [
+            ("sample.wav", "pcm_s16le"),
+            ("sample.mp3", "libmp3lame"),
+            ("sample.opus", "libopus"),
+            ("sample.ogg", "libvorbis"),
+            ("sample.m4a", "aac"),
+            ("sample.flac", "flac"),
+        ];
+        let registry = crate::attachment_source::AttachmentSourceRegistry::new(1);
+        let (wakeup, _) = async_channel::bounded(1);
+        let mut player = MpvAudioPlayer::new_attachment_with_audio_output(
+            wakeup,
+            registry.clone(),
+            Some("null"),
+        )
+        .unwrap();
+
+        for (index, (file_name, codec)) in formats.into_iter().enumerate() {
+            let path = directory.path().join(file_name);
+            let output = std::process::Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=0.6",
+                    "-vn",
+                    "-c:a",
+                    codec,
+                    "-y",
+                ])
+                .arg(&path)
+                .output()
+                .expect("ffmpeg is available with the required libmpv dependency");
+            assert!(
+                output.status.success(),
+                "ffmpeg could not create {file_name}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let byte_len = std::fs::metadata(&path).unwrap().len();
+            let source = crate::attachment_source::AttachmentSource::direct(
+                crate::attachment_source::AttachmentSourceKey {
+                    namespace: 1,
+                    room_id: RoomId(1),
+                    attachment_id: AttachmentId {
+                        timestamp_ms: index as u64 + 1,
+                        transfer_id: FileTransferId(index as u64 + 1),
+                    },
+                },
+                std::fs::File::open(&path).unwrap(),
+                byte_len,
+            );
+            let source = registry.register(source);
+            player.load_at(source.url(), true, 100.0, 1.0, 0.0).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let playback = loop {
+                assert!(Instant::now() < deadline, "timed out decoding {file_name}");
+                let playback = player.drain_events().unwrap();
+                if playback.ready && playback.duration > 0.0 {
+                    break playback;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(!playback.frame_ready);
+            if index == 0 {
+                let duration = playback.duration;
+                player.seek_absolute(duration).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out seeking {file_name} to its end"
+                    );
+                    let playback = player.drain_events().unwrap();
+                    if playback.position >= duration - 0.1 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                let target = playback.duration * 0.5;
+                player.seek_absolute(target).unwrap();
+                player.set_speed(1.5).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    assert!(Instant::now() < deadline, "timed out seeking {file_name}");
+                    let playback = player.drain_events().unwrap();
+                    if (playback.position - target).abs() <= 0.1 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            player.stop().unwrap();
+        }
     }
 
     #[test]

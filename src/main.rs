@@ -1,6 +1,8 @@
 mod app;
 mod appearance;
 mod attachment_source;
+mod audio_manager;
+mod audio_player;
 mod code_viewer;
 mod composer;
 mod config;
@@ -16,6 +18,7 @@ mod libplacebo_numeric;
 mod live_stream;
 mod logger;
 mod media_cache;
+mod media_controls;
 mod model;
 mod mpv_player;
 mod naga_bridge;

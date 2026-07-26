@@ -28,6 +28,14 @@ pub struct Attachment {
     pub descriptor: AttachmentDescriptor,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentRenderKind {
+    Image,
+    Audio,
+    Video,
+    Other,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalCommandRow {
     pub local_id: u64,
@@ -89,22 +97,58 @@ impl MessageListItem {
 }
 
 impl Attachment {
+    pub fn render_kind(&self) -> AttachmentRenderKind {
+        match self.descriptor.media_kind {
+            MediaKind::Image => AttachmentRenderKind::Image,
+            MediaKind::Audio => AttachmentRenderKind::Audio,
+            MediaKind::Video => AttachmentRenderKind::Video,
+            MediaKind::File => {
+                if self.descriptor.content_type.starts_with("audio/") {
+                    AttachmentRenderKind::Audio
+                } else if self.descriptor.content_type.starts_with("video/") {
+                    AttachmentRenderKind::Video
+                } else if has_extension(
+                    &self.descriptor.file_name,
+                    &[
+                        "aac", "ac3", "aif", "aifc", "aiff", "eac3", "ec3", "flac", "m4a", "mka",
+                        "mp3", "oga", "ogg", "opus", "wav", "weba",
+                    ],
+                ) {
+                    AttachmentRenderKind::Audio
+                } else if has_extension(
+                    &self.descriptor.file_name,
+                    &["avi", "m4v", "mkv", "mov", "mp4", "ogv", "webm"],
+                ) {
+                    AttachmentRenderKind::Video
+                } else {
+                    AttachmentRenderKind::Other
+                }
+            }
+        }
+    }
+
     pub fn is_image(&self) -> bool {
-        self.descriptor.media_kind == MediaKind::Image
+        self.render_kind() == AttachmentRenderKind::Image
     }
+
+    pub fn is_audio(&self) -> bool {
+        self.render_kind() == AttachmentRenderKind::Audio
+    }
+
     pub fn is_video(&self) -> bool {
-        self.descriptor.media_kind == MediaKind::Video
-            || self.descriptor.content_type.starts_with("video/")
-            || Path::new(&self.descriptor.file_name)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    matches!(
-                        extension.to_ascii_lowercase().as_str(),
-                        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "ogv" | "webm"
-                    )
-                })
+        self.render_kind() == AttachmentRenderKind::Video
     }
+}
+
+fn has_extension(file_name: &str, candidates: &[&str]) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            candidates
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
 }
 
 pub fn from_daemon(message: local_rpc::model::Message) -> Message {
@@ -710,6 +754,53 @@ mod tests {
         assert!(attachment("clip.MKV", MediaKind::File, "application/octet-stream").is_video());
         assert!(attachment("clip.bin", MediaKind::File, "video/mp4").is_video());
         assert!(!attachment("notes.txt", MediaKind::File, "text/plain").is_video());
+    }
+
+    #[test]
+    fn recognizes_common_audio_when_protocol_metadata_is_generic() {
+        for extension in [
+            "aac", "ac3", "aif", "aifc", "aiff", "eac3", "ec3", "flac", "m4a", "mka", "mp3", "oga",
+            "ogg", "opus", "wav", "weba",
+        ] {
+            assert!(
+                attachment(
+                    &format!("recording.{extension}"),
+                    MediaKind::File,
+                    "application/octet-stream",
+                )
+                .is_audio(),
+                "extension {extension} should route to audio playback",
+            );
+        }
+        assert!(
+            attachment("recording.MP3", MediaKind::File, "application/octet-stream").is_audio()
+        );
+        assert!(attachment("recording.bin", MediaKind::File, "audio/mpeg").is_audio());
+        assert!(
+            attachment(
+                "recording.bin",
+                MediaKind::Audio,
+                "application/octet-stream"
+            )
+            .is_audio()
+        );
+        assert!(!attachment("notes.txt", MediaKind::File, "text/plain").is_audio());
+    }
+
+    #[test]
+    fn authoritative_media_metadata_keeps_audio_and_video_routes_exclusive() {
+        let video = attachment("clip.ogg", MediaKind::Video, "video/ogg");
+        assert_eq!(video.render_kind(), AttachmentRenderKind::Video);
+        assert!(video.is_video());
+        assert!(!video.is_audio());
+
+        let audio = attachment("recording.mp4", MediaKind::Audio, "audio/mp4");
+        assert_eq!(audio.render_kind(), AttachmentRenderKind::Audio);
+        assert!(audio.is_audio());
+        assert!(!audio.is_video());
+
+        let generic_video = attachment("clip.ogg", MediaKind::File, "video/ogg");
+        assert_eq!(generic_video.render_kind(), AttachmentRenderKind::Video);
     }
 
     #[test]

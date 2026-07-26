@@ -15,6 +15,8 @@ use crate::{
         RegisteredAttachmentSource, VideoSourceCache, VideoSourceCandidate, VideoSourcePin,
         VideoSourceView,
     },
+    audio_manager::{AttachmentAudioManager, AudioDrain, AudioKey},
+    audio_player::{AudioPlayerConfig, AudioPlayerEvent, AudioPlayerHandler, render_audio_player},
     code_viewer::{
         CodeDocument, CodeSearchResults, CodeSelection, CodeViewState, MAX_CODE_PREVIEW_BYTES,
         render_code_document,
@@ -50,7 +52,7 @@ use crate::{
     scroll_capture::capture_scroll,
     settings::{ConfigurationState, SettingsView, SettingsViewEvent},
     theme::{AppliedSettings, ThemePalette, ThemeRole},
-    timeline::{self, Attachment},
+    timeline::{self, Attachment, AttachmentRenderKind},
     ui_controls::{
         composer_add_button, icon_button, message_action_button, mini_button,
         preview_action_button, preview_control_button, preview_status, room_button, toolbar_button,
@@ -136,23 +138,6 @@ fn write_cached_attachment_to_user_selected_path(
     Ok(Some(destination))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AttachmentRenderRoute {
-    Image,
-    Video,
-    Other,
-}
-
-fn attachment_render_route(attachment: &Attachment) -> AttachmentRenderRoute {
-    if attachment.is_image() {
-        AttachmentRenderRoute::Image
-    } else if attachment.is_video() {
-        AttachmentRenderRoute::Video
-    } else {
-        AttachmentRenderRoute::Other
-    }
-}
-
 fn code_preview_size_error(byte_len: u64) -> Option<&'static str> {
     (byte_len > MAX_CODE_PREVIEW_BYTES).then_some("file too large to preview")
 }
@@ -236,6 +221,41 @@ struct TheaterVideo {
     key: VideoKey,
     descriptor: AttachmentDescriptor,
     source: Option<RegisteredAttachmentSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MediaPlaybackTarget {
+    Audio(AudioKey),
+    Video(VideoKey),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AudioScrub {
+    key: AudioKey,
+    bounds: Bounds<Pixels>,
+    duration: f64,
+    last_fraction: f64,
+    last_seek: Instant,
+}
+
+impl AudioScrub {
+    fn position(self) -> f64 {
+        self.duration * self.last_fraction
+    }
+
+    fn should_dispatch_seek(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last_seek) < Duration::from_millis(16) {
+            return false;
+        }
+        self.last_seek = now;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AudioVolumeDrag {
+    key: AudioKey,
+    bounds: Bounds<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -685,13 +705,20 @@ pub struct ChattView {
     next_message_reference_flash_id: u64,
     message_reference_flash_task: Option<Task<()>>,
     timeline_selection: MessageSelectionGroup,
+    audios: AttachmentAudioManager,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
     attachment_source_registry: AttachmentSourceRegistry,
     video_sources: VideoSourceCache,
     media_namespace_generation: u64,
     pending_video_plays: HashSet<VideoKey>,
+    pending_audio_plays: HashSet<AudioKey>,
+    visible_video_keys: HashSet<VideoKey>,
+    visible_audio_keys: HashSet<AudioKey>,
+    media_interactions: VecDeque<MediaPlaybackTarget>,
     video_source_retry_task: Option<Task<()>>,
+    audio_scrub: Option<AudioScrub>,
+    audio_volume_drag: Option<AudioVolumeDrag>,
     video_scrub: Option<VideoScrub>,
     video_volume_drag: Option<VideoVolumeDrag>,
     video_controls: VideoControlsState,
@@ -838,6 +865,8 @@ impl ChattView {
         );
         let videos =
             AttachmentVideoManager::new(video_wakeup.clone(), attachment_source_registry.clone());
+        let audios =
+            AttachmentAudioManager::new(video_wakeup.clone(), attachment_source_registry.clone());
         let video_thumbnails =
             VideoThumbnailCache::new(VIDEO_THUMBNAIL_CACHE_BYTES, video_wakeup.clone());
         Self {
@@ -908,13 +937,20 @@ impl ChattView {
             next_message_reference_flash_id: 1,
             message_reference_flash_task: None,
             timeline_selection,
+            audios,
             videos,
             video_thumbnails,
             attachment_source_registry,
             video_sources,
             media_namespace_generation,
             pending_video_plays: HashSet::new(),
+            pending_audio_plays: HashSet::new(),
+            visible_video_keys: HashSet::new(),
+            visible_audio_keys: HashSet::new(),
+            media_interactions: VecDeque::new(),
             video_source_retry_task: None,
+            audio_scrub: None,
+            audio_volume_drag: None,
             video_scrub: None,
             video_volume_drag: None,
             video_controls: VideoControlsState::default(),
@@ -1734,6 +1770,10 @@ impl ChattView {
     fn advance_video(&mut self, cx: &mut Context<Self>) {
         let drain = self.videos.drain();
         let playback_changed = drain.changed || !drain.errors.is_empty();
+        let audio_drain = self.audios.drain();
+        let audio_view_changed = audio_drain.view_changed || !audio_drain.errors.is_empty();
+        let audio_source_changed =
+            audio_drain.source_changed || !audio_drain.transport_failures.is_empty();
         let thumbnails_changed = self.video_thumbnails.drain_results();
         let finished_sources = self.video_thumbnails.take_finished_sources();
         let transport_failures = self.video_thumbnails.take_transport_failures();
@@ -1755,11 +1795,14 @@ impl ChattView {
             self.video_sources.source_failed(key, error, Instant::now());
         }
         self.apply_video_drain(drain);
-        self.sync_video_source_pins();
-        if source_work_changed || playback_changed {
+        self.apply_audio_drain(audio_drain);
+        let media_source_work_changed =
+            source_work_changed || playback_changed || audio_source_changed;
+        if media_source_work_changed {
+            self.sync_video_source_pins();
             self.pump_video_sources(cx);
         }
-        if thumbnails_changed {
+        if thumbnails_changed || audio_view_changed {
             cx.notify();
         }
     }
@@ -1788,11 +1831,28 @@ impl ChattView {
             })
     }
 
+    fn audio_descriptor(&self, key: AudioKey) -> Option<AttachmentDescriptor> {
+        self.model
+            .messages
+            .iter()
+            .find(|message| message.room_id == key.room_id && message.id == key.message_id)
+            .and_then(|message| message.attachment.as_ref())
+            .filter(|attachment| attachment.is_audio())
+            .map(|attachment| attachment.descriptor.clone())
+    }
+
     fn reset_attachment_source_state(&mut self) {
+        self.audios.clear_sessions();
         self.videos.clear_sessions();
         self.video_thumbnails.clear();
         self.clear_video_interactions();
         self.pending_video_plays.clear();
+        self.pending_audio_plays.clear();
+        self.visible_video_keys.clear();
+        self.visible_audio_keys.clear();
+        self.media_interactions.clear();
+        self.audio_scrub = None;
+        self.audio_volume_drag = None;
         self.video_source_retry_task.take();
         self.media_namespace_generation = self.media_namespace_generation.wrapping_add(1).max(1);
         let canceled = self.video_sources.reset(
@@ -1810,7 +1870,7 @@ impl ChattView {
         log::error!("daemon attachment source protocol error: {reason}");
         self.reset_attachment_source_state();
         self.daemon.disconnect_protocol(reason);
-        self.status = format!("Video source protocol error · {reason}").into();
+        self.status = format!("Attachment source protocol error · {reason}").into();
         cx.notify();
     }
 
@@ -1843,7 +1903,7 @@ impl ChattView {
                 self.model.pending.remove(&request_id);
                 self.video_sources
                     .failed_to_send(request_id, error.clone(), Instant::now());
-                self.status = format!("Could not request video source · {error}").into();
+                self.status = format!("Could not request attachment source · {error}").into();
             }
         }
         self.schedule_video_source_retry(cx);
@@ -1866,7 +1926,8 @@ impl ChattView {
     }
 
     fn sync_video_source_pins(&mut self) {
-        let playing = self.videos.retained_source_keys();
+        let mut playing = self.videos.retained_source_keys();
+        playing.extend(self.audios.retained_source_keys());
         self.video_sources
             .sync_pins(VideoSourcePin::Playing, &playing);
         let theater = self
@@ -1877,11 +1938,16 @@ impl ChattView {
             .collect::<HashSet<_>>();
         self.video_sources
             .sync_pins(VideoSourcePin::Theater, &theater);
-        let pending = self
+        let mut pending = self
             .pending_video_plays
             .iter()
             .map(|video| self.source_key(video.room_id, video.attachment_id))
             .collect::<HashSet<_>>();
+        pending.extend(
+            self.pending_audio_plays
+                .iter()
+                .map(|audio| self.source_key(audio.room_id, audio.attachment_id)),
+        );
         self.video_sources
             .sync_pins(VideoSourcePin::PendingPlay, &pending);
     }
@@ -1889,6 +1955,18 @@ impl ChattView {
     fn apply_video_drain(&mut self, drain: VideoDrain) {
         for error in &drain.errors {
             log::error!("embedded video failed: {error}");
+        }
+        if let Some(error) = drain.errors.last() {
+            self.status = error.clone().into();
+        }
+    }
+
+    fn apply_audio_drain(&mut self, drain: AudioDrain) {
+        for (key, error) in drain.transport_failures {
+            self.video_sources.source_failed(key, error, Instant::now());
+        }
+        for error in &drain.errors {
+            log::error!("embedded audio failed: {error}");
         }
         if let Some(error) = drain.errors.last() {
             self.status = error.clone().into();
@@ -1919,9 +1997,18 @@ impl ChattView {
             .filter_map(|index| self.model.messages.get(index))
             .filter_map(message_video_key)
             .collect::<HashSet<_>>();
+        let visible_audio = (visible_start..visible_end)
+            .filter_map(|index| self.message_list.get(index))
+            .filter(|item| !item.is_collapsed())
+            .filter_map(|item| item.message_index())
+            .filter_map(|index| self.model.messages.get(index))
+            .filter_map(message_audio_key)
+            .collect::<HashSet<_>>();
         if let Some(theater) = self.theater_video.as_ref() {
             visible.insert(theater.key);
         }
+        self.visible_video_keys = visible.clone();
+        self.visible_audio_keys = visible_audio.clone();
 
         let mut ordered_rows = (visible_start..visible_end)
             .rev()
@@ -1982,7 +2069,8 @@ impl ChattView {
             self.model.pending.remove(&request_id);
         }
         let drain = self.videos.update_visibility(&visible);
-        let changed = drain.changed || !drain.errors.is_empty();
+        let audio_changed = self.audios.update_visibility(&visible_audio);
+        let changed = drain.changed || !drain.errors.is_empty() || audio_changed;
         self.apply_video_drain(drain);
         self.sync_video_source_pins();
         self.pump_video_sources(cx);
@@ -2513,9 +2601,9 @@ impl ChattView {
                     cx.notify();
                     return;
                 };
-                let expected_len = self
-                    .video_sources
-                    .pending_descriptor(request_id)
+                let pending_descriptor = self.video_sources.pending_descriptor(request_id).cloned();
+                let expected_len = pending_descriptor
+                    .as_ref()
                     .map(|descriptor| descriptor.byte_len);
                 if key.room_id != room_id
                     || key.attachment_id != attachment_id
@@ -2558,7 +2646,14 @@ impl ChattView {
                         return;
                     }
                 };
-                self.videos.prepare();
+                if pending_descriptor.as_ref().is_some_and(|descriptor| {
+                    Attachment {
+                        descriptor: descriptor.clone(),
+                    }
+                    .is_video()
+                }) {
+                    self.videos.prepare();
+                }
                 let pending = self
                     .pending_video_plays
                     .iter()
@@ -2572,10 +2667,25 @@ impl ChattView {
                     }
                     self.pending_video_plays.remove(&video);
                 }
+                let pending_audio = self
+                    .pending_audio_plays
+                    .iter()
+                    .copied()
+                    .filter(|audio| self.source_key(audio.room_id, audio.attachment_id) == key)
+                    .collect::<Vec<_>>();
+                for audio in pending_audio {
+                    let drain = self.audios.provide_source(audio, registered.clone());
+                    self.apply_audio_drain(drain);
+                    self.pending_audio_plays.remove(&audio);
+                }
                 if !self
                     .pending_video_plays
                     .iter()
                     .any(|video| self.source_key(video.room_id, video.attachment_id) == key)
+                    && !self
+                        .pending_audio_plays
+                        .iter()
+                        .any(|audio| self.source_key(audio.room_id, audio.attachment_id) == key)
                 {
                     self.video_sources
                         .set_pin(key, VideoSourcePin::PendingPlay, false);
@@ -2967,6 +3077,27 @@ impl ChattView {
                 .collect::<HashSet<_>>();
             let drain = self.videos.retain_sources(&retained);
             self.apply_video_drain(drain);
+            let retained_audio = self
+                .model
+                .messages
+                .iter()
+                .filter_map(message_audio_key)
+                .collect::<HashSet<_>>();
+            let audio_drain = self.audios.retain_sources(&retained_audio);
+            let audio_source_changed =
+                audio_drain.source_changed || !audio_drain.transport_failures.is_empty();
+            self.apply_audio_drain(audio_drain);
+            if audio_source_changed {
+                self.sync_video_source_pins();
+                self.pump_video_sources(cx);
+            }
+            self.visible_video_keys.retain(|key| retained.contains(key));
+            self.visible_audio_keys
+                .retain(|key| retained_audio.contains(key));
+            self.media_interactions.retain(|target| match target {
+                MediaPlaybackTarget::Audio(key) => retained_audio.contains(key),
+                MediaPlaybackTarget::Video(key) => retained.contains(key),
+            });
             if self
                 .theater_video
                 .as_ref()
@@ -3852,7 +3983,8 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         let descriptor = attachment.descriptor.clone();
-        if attachment.is_image() {
+        let render_kind = attachment.render_kind();
+        if render_kind == AttachmentRenderKind::Image {
             let cached = self
                 .media_cache
                 .lock()
@@ -3877,12 +4009,17 @@ impl ChattView {
             }
             return;
         }
-        if descriptor.media_kind == MediaKind::File && !attachment.is_video() {
+        if render_kind == AttachmentRenderKind::Audio {
+            self.pending_reference_media_preview = None;
+            self.jump_to_message_reference(target, cx);
+            return;
+        }
+        if descriptor.media_kind == MediaKind::File && render_kind == AttachmentRenderKind::Other {
             self.pending_reference_media_preview = None;
             self.open_code_preview(target.room_id, descriptor, window, cx);
             return;
         }
-        if attachment.is_video() {
+        if render_kind == AttachmentRenderKind::Video {
             self.pending_reference_media_preview = None;
             let key = video_key(target.room_id, target.message_id.0, &descriptor);
             let source_key = self.source_key(target.room_id, descriptor.id);
@@ -5578,8 +5715,8 @@ impl ChattView {
     ) -> AnyElement {
         let settings = AppliedSettings::get(cx);
         let descriptor = attachment.descriptor.clone();
-        let render_route = attachment_render_route(&attachment);
-        if render_route == AttachmentRenderRoute::Image {
+        let render_kind = attachment.render_kind();
+        if render_kind == AttachmentRenderKind::Image {
             let (cached_attachment, active_transfer) = {
                 let mut cache = self.media_cache.lock().expect("media cache lock poisoned");
                 (cache.get(descriptor.id), cache.active_transfer(&descriptor))
@@ -5654,7 +5791,10 @@ impl ChattView {
                 &settings.theme,
             );
         }
-        if render_route == AttachmentRenderRoute::Video {
+        if render_kind == AttachmentRenderKind::Audio {
+            return self.render_attachment_audio(room_id, message_id, descriptor, cx);
+        }
+        if render_kind == AttachmentRenderKind::Video {
             let key = video_key(room_id, message_id, &descriptor);
             let source_key = self.source_key(room_id, descriptor.id);
             let has_cached_poster = self
@@ -6601,6 +6741,250 @@ impl ChattView {
             .child(body)
     }
 
+    fn render_attachment_audio(
+        &mut self,
+        room_id: RoomId,
+        message_id: u64,
+        descriptor: AttachmentDescriptor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = audio_key(room_id, message_id, &descriptor);
+        let source_key = self.source_key(room_id, descriptor.id);
+        let mut audio = self.audios.view(key);
+        match self.video_sources.view(source_key) {
+            VideoSourceView::Loading if self.pending_audio_plays.contains(&key) => {
+                audio.loading = true;
+            }
+            VideoSourceView::Failed { reason, .. } if audio.error.is_none() => {
+                audio.loading = false;
+                audio.error = Some(format!("Could not open audio · {reason}"));
+            }
+            _ => {}
+        }
+        let duration = audio.duration;
+        let active_scrub = self.audio_scrub.filter(|scrub| scrub.key == key);
+        let display_position = active_scrub.map_or(audio.position, AudioScrub::position);
+        let view = cx.entity().downgrade();
+        let handler: AudioPlayerHandler = Rc::new(move |event, _, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.handle_audio_player_event(key, duration, event, cx)
+            });
+        });
+        render_audio_player(
+            AudioPlayerConfig {
+                key,
+                audio,
+                duration,
+                display_position,
+            },
+            handler,
+            AppliedSettings::get(cx),
+        )
+        .into_any_element()
+    }
+
+    fn handle_audio_player_event(
+        &mut self,
+        key: AudioKey,
+        duration: f64,
+        event: AudioPlayerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            AudioPlayerEvent::Play => self.play_audio(key, cx),
+            AudioPlayerEvent::ScrubPressed { bounds, event } => {
+                self.begin_audio_scrub(key, duration, bounds, &event, cx)
+            }
+            AudioPlayerEvent::CycleSpeed => self.cycle_audio_speed(key, cx),
+            AudioPlayerEvent::ToggleMute => self.toggle_audio_mute(key, cx),
+            AudioPlayerEvent::VolumePressed { bounds, event } => {
+                self.begin_audio_volume_drag(key, bounds, &event, cx)
+            }
+        }
+    }
+
+    fn play_audio(&mut self, key: AudioKey, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Audio(key));
+        self.pending_audio_plays.retain(|pending| *pending == key);
+        let source_key = self.source_key(key.room_id, key.attachment_id);
+        match self.video_sources.view(source_key) {
+            VideoSourceView::Ready(source) => {
+                self.pending_audio_plays.remove(&key);
+                match self.audios.play(key, Some(source)) {
+                    Ok(()) => self.status = "Starting audio playback…".into(),
+                    Err(error) => {
+                        log::error!("embedded audio play failed key={key:?}: {error:#}");
+                        self.status = format!("Audio playback failed: {error}").into();
+                    }
+                }
+            }
+            VideoSourceView::Absent | VideoSourceView::Loading | VideoSourceView::Failed { .. } => {
+                if let Err(error) = self.audios.play(key, None) {
+                    log::error!("embedded audio preparation failed key={key:?}: {error:#}");
+                    self.status = format!("Audio playback failed: {error}").into();
+                } else if let Some(descriptor) = self.audio_descriptor(key) {
+                    self.pending_audio_plays.insert(key);
+                    self.video_sources.promote(source_key, descriptor);
+                    self.video_sources
+                        .set_pin(source_key, VideoSourcePin::PendingPlay, true);
+                    self.video_sources.retry(source_key);
+                    self.pump_video_sources(cx);
+                    self.status = "Preparing audio playback…".into();
+                } else {
+                    self.status = "Audio source is no longer available".into();
+                }
+            }
+        }
+        self.sync_video_source_pins();
+        cx.notify();
+    }
+
+    fn seek_audio(&mut self, key: AudioKey, seconds: f64, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Audio(key));
+        if let Err(error) = self.audios.seek(key, seconds) {
+            log::error!("embedded audio seek failed key={key:?} seconds={seconds}: {error:#}");
+            self.status = format!("Audio seek failed: {error}").into();
+        }
+        cx.notify();
+    }
+
+    fn begin_audio_scrub(
+        &mut self,
+        key: AudioKey,
+        duration: f64,
+        bounds: Bounds<Pixels>,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fraction) = horizontal_fraction(bounds, event.position.x, duration) else {
+            return;
+        };
+        self.note_media_interaction(MediaPlaybackTarget::Audio(key));
+        self.audio_scrub = Some(AudioScrub {
+            key,
+            bounds,
+            duration,
+            last_fraction: fraction,
+            last_seek: Instant::now(),
+        });
+        if let Err(error) = self.audios.scrub(key, fraction, duration) {
+            log::error!("embedded audio initial scrub failed key={key:?}: {error:#}");
+            self.status = format!("Audio seek failed: {error}").into();
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn drag_audio_scrub(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let Some(mut scrub) = self.audio_scrub else {
+            return false;
+        };
+        if !event.dragging() {
+            self.finish_audio_scrub(cx);
+            return true;
+        }
+        let Some(fraction) = horizontal_fraction(scrub.bounds, event.position.x, scrub.duration)
+        else {
+            self.finish_audio_scrub(cx);
+            return true;
+        };
+        if fraction != scrub.last_fraction {
+            scrub.last_fraction = fraction;
+            let dispatch = scrub.should_dispatch_seek(Instant::now());
+            self.audio_scrub = Some(scrub);
+            if dispatch && let Err(error) = self.audios.scrub(scrub.key, fraction, scrub.duration) {
+                log::error!(
+                    "embedded audio drag scrub failed key={:?}: {error:#}",
+                    scrub.key
+                );
+                self.status = format!("Audio seek failed: {error}").into();
+            }
+            cx.notify();
+        }
+        cx.stop_propagation();
+        true
+    }
+
+    fn finish_audio_scrub(&mut self, cx: &mut Context<Self>) {
+        let Some(scrub) = self.audio_scrub.take() else {
+            return;
+        };
+        if let Err(error) = self
+            .audios
+            .scrub(scrub.key, scrub.last_fraction, scrub.duration)
+        {
+            log::error!(
+                "embedded audio final scrub failed key={:?}: {error:#}",
+                scrub.key
+            );
+            self.status = format!("Audio seek failed: {error}").into();
+        }
+        cx.notify();
+    }
+
+    fn set_audio_volume(&mut self, key: AudioKey, volume: f64, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Audio(key));
+        if let Err(error) = self.audios.set_volume_for(key, volume) {
+            log::error!("embedded audio volume failed key={key:?}: {error:#}");
+            self.status = format!("Audio volume failed: {error}").into();
+        }
+        cx.notify();
+    }
+
+    fn toggle_audio_mute(&mut self, key: AudioKey, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Audio(key));
+        if let Err(error) = self.audios.toggle_mute(key) {
+            log::error!("embedded audio mute failed key={key:?}: {error:#}");
+            self.status = format!("Audio volume failed: {error}").into();
+        }
+        cx.notify();
+    }
+
+    fn cycle_audio_speed(&mut self, key: AudioKey, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Audio(key));
+        if let Err(error) = self.audios.cycle_playback_speed(key) {
+            log::error!("embedded audio speed change failed key={key:?}: {error:#}");
+            self.status = format!("Audio speed change failed: {error}").into();
+        }
+        cx.notify();
+    }
+
+    fn begin_audio_volume_drag(
+        &mut self,
+        key: AudioKey,
+        bounds: Bounds<Pixels>,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fraction) = horizontal_fraction(bounds, event.position.x, 1.0) else {
+            return;
+        };
+        self.audio_volume_drag = Some(AudioVolumeDrag { key, bounds });
+        self.set_audio_volume(key, fraction * 100.0, cx);
+        cx.stop_propagation();
+    }
+
+    fn drag_audio_volume(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.audio_volume_drag else {
+            return false;
+        };
+        if !event.dragging() {
+            self.finish_audio_volume_drag(cx);
+            return true;
+        }
+        if let Some(fraction) = horizontal_fraction(drag.bounds, event.position.x, 1.0) {
+            self.set_audio_volume(drag.key, fraction * 100.0, cx);
+        }
+        cx.stop_propagation();
+        true
+    }
+
+    fn finish_audio_volume_drag(&mut self, cx: &mut Context<Self>) {
+        if self.audio_volume_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn render_attachment_video(
         &mut self,
         key: VideoKey,
@@ -6731,6 +7115,7 @@ impl ChattView {
     }
 
     fn play_video(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
         self.show_video_controls(key, cx);
         let source_key = self.source_key(key.room_id, key.attachment_id);
         match self.video_sources.view(source_key) {
@@ -6765,6 +7150,7 @@ impl ChattView {
     }
 
     fn seek_video(&mut self, key: VideoKey, seconds: f64, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.seek(key, seconds) {
             log::error!("embedded video seek failed key={key:?} seconds={seconds}: {error:#}");
             self.status = format!("Seek failed: {error}").into();
@@ -6976,6 +7362,7 @@ impl ChattView {
         let Some(fraction) = horizontal_fraction(bounds, event.position.x, duration) else {
             return;
         };
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
         self.show_video_controls(key, cx);
         self.video_controls_hide_task.take();
         self.video_scrub = Some(VideoScrub {
@@ -7085,6 +7472,7 @@ impl ChattView {
     }
 
     fn set_video_volume(&mut self, key: VideoKey, volume: f64, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.set_volume_for(key, volume) {
             log::error!(
                 "embedded video volume change failed key={key:?} volume={volume}: {error:#}"
@@ -7096,6 +7484,7 @@ impl ChattView {
     }
 
     fn toggle_video_mute(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.toggle_mute(key) {
             log::error!("embedded video mute toggle failed key={key:?}: {error:#}");
             self.status = format!("Volume failed: {error}").into();
@@ -7172,6 +7561,7 @@ impl ChattView {
     }
 
     fn adjust_video_volume(&mut self, key: VideoKey, delta: f64, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.adjust_volume(key, delta) {
             log::error!("embedded video volume change failed key={key:?} delta={delta}: {error:#}");
             self.status = format!("Volume failed: {error}").into();
@@ -7180,14 +7570,30 @@ impl ChattView {
         cx.notify();
     }
 
+    fn note_media_interaction(&mut self, target: MediaPlaybackTarget) {
+        self.media_interactions
+            .retain(|candidate| *candidate != target);
+        self.media_interactions.push_front(target);
+        self.media_interactions.truncate(256);
+    }
+
+    fn last_visible_media_interaction(&self) -> Option<MediaPlaybackTarget> {
+        latest_visible_media(
+            &self.media_interactions,
+            &self.visible_audio_keys,
+            &self.visible_video_keys,
+        )
+    }
+
     fn toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
-        let key = self
-            .theater_video
-            .as_ref()
-            .map(|theater| theater.key)
-            .or_else(|| self.videos.last_visible_key());
-        if let Some(key) = key {
+        if let Some(key) = self.theater_video.as_ref().map(|theater| theater.key) {
             self.play_video(key, cx);
+            return;
+        }
+        match self.last_visible_media_interaction() {
+            Some(MediaPlaybackTarget::Audio(key)) => self.play_audio(key, cx),
+            Some(MediaPlaybackTarget::Video(key)) => self.play_video(key, cx),
+            None => {}
         }
     }
     fn seek_back(&mut self, _: &SeekBack, _: &mut Window, cx: &mut Context<Self>) {
@@ -7195,8 +7601,12 @@ impl ChattView {
             self.pan_live_view(stream_id, 30.0, 0.0, cx);
         } else if let Some(theater) = self.theater_video.as_ref() {
             self.seek_video(theater.key, -10.0, cx);
-        } else if let Some(key) = self.videos.last_visible_key() {
-            self.seek_video(key, -10.0, cx);
+        } else {
+            match self.last_visible_media_interaction() {
+                Some(MediaPlaybackTarget::Audio(key)) => self.seek_audio(key, -10.0, cx),
+                Some(MediaPlaybackTarget::Video(key)) => self.seek_video(key, -10.0, cx),
+                None => {}
+            }
         }
     }
     fn seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
@@ -7204,8 +7614,12 @@ impl ChattView {
             self.pan_live_view(stream_id, -30.0, 0.0, cx);
         } else if let Some(theater) = self.theater_video.as_ref() {
             self.seek_video(theater.key, 10.0, cx);
-        } else if let Some(key) = self.videos.last_visible_key() {
-            self.seek_video(key, 10.0, cx);
+        } else {
+            match self.last_visible_media_interaction() {
+                Some(MediaPlaybackTarget::Audio(key)) => self.seek_audio(key, 10.0, cx),
+                Some(MediaPlaybackTarget::Video(key)) => self.seek_video(key, 10.0, cx),
+                None => {}
+            }
         }
     }
 
@@ -8878,7 +9292,11 @@ impl Render for ChattView {
                 this.queue_files(paths.0.to_vec(), cx)
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if !this.drag_video_volume(event, cx) && !this.drag_video_scrub(event, cx) {
+                if !this.drag_audio_volume(event, cx)
+                    && !this.drag_audio_scrub(event, cx)
+                    && !this.drag_video_volume(event, cx)
+                    && !this.drag_video_scrub(event, cx)
+                {
                     if this.preview_pane_resize.is_some() {
                         this.drag_preview_pane(event, window, cx)
                     } else if this.preview_last_mouse_position.is_some() {
@@ -8891,6 +9309,8 @@ impl Render for ChattView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_audio_scrub(cx);
+                    this.finish_audio_volume_drag(cx);
                     this.finish_video_scrub(cx);
                     this.finish_video_volume_drag(cx);
                     this.finish_live_pane_resize(cx);
@@ -9539,11 +9959,37 @@ fn video_key(room_id: RoomId, message_id: u64, descriptor: &AttachmentDescriptor
     }
 }
 
+fn audio_key(room_id: RoomId, message_id: u64, descriptor: &AttachmentDescriptor) -> AudioKey {
+    AudioKey {
+        room_id,
+        message_id,
+        attachment_id: descriptor.id,
+    }
+}
+
+fn message_audio_key(message: &timeline::Message) -> Option<AudioKey> {
+    let attachment = message.attachment.as_ref()?;
+    attachment
+        .is_audio()
+        .then(|| audio_key(message.room_id, message.id, &attachment.descriptor))
+}
+
 fn message_video_key(message: &timeline::Message) -> Option<VideoKey> {
     let attachment = message.attachment.as_ref()?;
     attachment
         .is_video()
         .then(|| video_key(message.room_id, message.id, &attachment.descriptor))
+}
+
+fn latest_visible_media(
+    interactions: &VecDeque<MediaPlaybackTarget>,
+    visible_audio: &HashSet<AudioKey>,
+    visible_video: &HashSet<VideoKey>,
+) -> Option<MediaPlaybackTarget> {
+    interactions.iter().copied().find(|target| match target {
+        MediaPlaybackTarget::Audio(key) => visible_audio.contains(key),
+        MediaPlaybackTarget::Video(key) => visible_video.contains(key),
+    })
 }
 
 #[cfg(test)]
@@ -9928,14 +10374,73 @@ mod tests {
         };
         let cache = MediaCache::new(1024);
 
-        assert_eq!(
-            attachment_render_route(&attachment),
-            AttachmentRenderRoute::Video
-        );
+        assert_eq!(attachment.render_kind(), AttachmentRenderKind::Video);
         assert!(!cache.contains(descriptor.id));
         assert_eq!(
             cache.available_transfer_slots(),
             local_rpc::MAX_CONCURRENT_TRANSFERS
+        );
+    }
+
+    #[test]
+    fn audio_rendering_route_does_not_consult_or_populate_media_cache() {
+        let descriptor = AttachmentDescriptor {
+            id: AttachmentId {
+                timestamp_ms: 16,
+                transfer_id: local_rpc::ids::FileTransferId(16),
+            },
+            file_name: "voice.opus".into(),
+            media_kind: MediaKind::Audio,
+            content_type: "audio/ogg".into(),
+            byte_len: 10,
+            width: None,
+            height: None,
+        };
+        let attachment = Attachment {
+            descriptor: descriptor.clone(),
+        };
+        let cache = MediaCache::new(1024);
+
+        assert_eq!(attachment.render_kind(), AttachmentRenderKind::Audio);
+        assert!(!cache.contains(descriptor.id));
+        assert_eq!(
+            cache.available_transfer_slots(),
+            local_rpc::MAX_CONCURRENT_TRANSFERS
+        );
+    }
+
+    #[test]
+    fn media_shortcuts_skip_newer_interactions_that_are_not_visible() {
+        let attachment_id = AttachmentId {
+            timestamp_ms: 17,
+            transfer_id: local_rpc::ids::FileTransferId(17),
+        };
+        let audio = AudioKey {
+            room_id: RoomId(1),
+            message_id: 17,
+            attachment_id,
+        };
+        let video = VideoKey {
+            room_id: RoomId(1),
+            message_id: 18,
+            attachment_id,
+        };
+        let interactions = VecDeque::from([
+            MediaPlaybackTarget::Audio(audio),
+            MediaPlaybackTarget::Video(video),
+        ]);
+
+        assert_eq!(
+            latest_visible_media(&interactions, &HashSet::new(), &HashSet::from([video])),
+            Some(MediaPlaybackTarget::Video(video))
+        );
+        assert_eq!(
+            latest_visible_media(
+                &interactions,
+                &HashSet::from([audio]),
+                &HashSet::from([video])
+            ),
+            Some(MediaPlaybackTarget::Audio(audio))
         );
     }
 

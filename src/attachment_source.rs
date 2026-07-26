@@ -124,7 +124,7 @@ impl AttachmentSource {
     }
 
     #[cfg(test)]
-    fn remote(
+    pub(crate) fn remote(
         key: AttachmentSourceKey,
         socket: UnixStream,
         byte_len: u64,
@@ -168,7 +168,7 @@ impl AttachmentSource {
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let output = &mut output[..requested];
         let result = match &self.backend {
-            AttachmentSourceBackend::Direct(file) => {
+            AttachmentSourceBackend::Direct(file) => (|| {
                 let mut total = 0usize;
                 while total < output.len() {
                     let read_offset = offset
@@ -185,7 +185,7 @@ impl AttachmentSource {
                         .ok_or_else(|| anyhow!("attachment read length overflow"))?;
                 }
                 Ok(total)
-            }
+            })(),
             AttachmentSourceBackend::Remote(source) => source.read_at(offset, output),
         };
         if result.is_err() {

@@ -8,6 +8,7 @@ use gpui::{
 
 use crate::{
     icons::{IconName, icon},
+    media_controls::format_time,
     theme::{ResolvedSettings, ThemeRole},
     video_controls::{
         CONTROLS_ANIMATION_DURATION, ControlsPhase, VOLUME_ANIMATION_DURATION, horizontal_fraction,
@@ -621,20 +622,6 @@ fn fit_video_bounds(viewport: Bounds<Pixels>, aspect_ratio: f32) -> Option<Bound
     ))
 }
 
-fn format_time(seconds: f64) -> String {
-    let seconds = seconds.max(0.0).round() as u64;
-    if seconds >= 3_600 {
-        format!(
-            "{}:{:02}:{:02}",
-            seconds / 3_600,
-            seconds / 60 % 60,
-            seconds % 60
-        )
-    } else {
-        format!("{}:{:02}", seconds / 60, seconds % 60)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,11 +646,5 @@ mod tests {
             ..VideoView::default()
         };
         assert_eq!(aspect_ratio(&video, (Some(1_920), Some(1_080))), 9.0 / 16.0);
-    }
-
-    #[test]
-    fn video_time_uses_hour_format_for_long_media() {
-        assert_eq!(format_time(65.0), "1:05");
-        assert_eq!(format_time(3_661.0), "1:01:01");
     }
 }
