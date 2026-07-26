@@ -3,7 +3,6 @@ use crate::{
     SessionId, Task, TestClock, Timer,
 };
 use async_task::Runnable;
-use backtrace::{Backtrace, BacktraceFrame};
 use futures::channel::oneshot;
 use parking_lot::{Mutex, MutexGuard};
 use rand::{
@@ -12,7 +11,7 @@ use rand::{
 };
 use std::any::Any;
 use std::{
-    any::type_name_of_val,
+    backtrace::Backtrace,
     collections::{BTreeMap, HashSet, VecDeque},
     env,
     fmt::Write,
@@ -117,7 +116,7 @@ impl TestScheduler {
                 // miri cannot debug print backtraces with `miri-disable-isolation` enabled
                 panic!("{}", message)
             } else {
-                panic!("{}\n{:?}", message, backtrace)
+                panic!("{}\n{}", message, backtrace)
             }
         }
         state.finished = true;
@@ -476,7 +475,7 @@ impl TestScheduler {
         } else if self.state.lock().capture_pending_traces {
             let mut pending_traces = String::new();
             for (_, trace) in mem::take(&mut self.state.lock().pending_traces) {
-                writeln!(pending_traces, "{:?}", exclude_wakers_from_trace(trace)).unwrap();
+                writeln!(pending_traces, "{trace}").unwrap();
             }
             panic!("Parking forbidden. Pending traces:\n{}", pending_traces);
         } else {
@@ -504,7 +503,7 @@ fn assert_correct_thread(expected: &Thread, state: &Arc<Mutex<SchedulerState>>) 
         expected.name(),
         expected.id(),
     );
-    let backtrace = Backtrace::new();
+    let backtrace = Backtrace::force_capture();
     if state.finished {
         panic!("{}", message);
     } else {
@@ -812,7 +811,9 @@ impl Clone for TracingWaker {
         let id = if state.capture_pending_traces {
             let id = state.next_trace_id;
             state.next_trace_id.0 += 1;
-            state.pending_traces.insert(id, Backtrace::new_unresolved());
+            state
+                .pending_traces
+                .insert(id, Backtrace::force_capture());
             Some(id)
         } else {
             None
@@ -934,22 +935,4 @@ impl Future for Yield {
             Poll::Pending
         }
     }
-}
-
-fn exclude_wakers_from_trace(mut trace: Backtrace) -> Backtrace {
-    trace.resolve();
-    let mut frames: Vec<BacktraceFrame> = trace.into();
-    let waker_clone_frame_ix = frames.iter().position(|frame| {
-        frame.symbols().iter().any(|symbol| {
-            symbol
-                .name()
-                .is_some_and(|name| format!("{name:#?}") == type_name_of_val(&Waker::clone))
-        })
-    });
-
-    if let Some(waker_clone_frame_ix) = waker_clone_frame_ix {
-        frames.drain(..waker_clone_frame_ix + 1);
-    }
-
-    Backtrace::from(frames)
 }
