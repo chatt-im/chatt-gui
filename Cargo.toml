@@ -52,6 +52,9 @@ debug = 0
 debug = 0
 
 [patch.crates-io]
+cosmic-text = { path = "vendor/forks/cosmic-text-0.19.0" }
+fontconfig-parser = { path = "vendor/forks/fontconfig-parser-0.5.8" }
+harfrust = { path = "vendor/forks/harfrust-0.5.2" }
 naga = { path = "vendor/wgpu/naga" }
 wgpu = { path = "vendor/wgpu/wgpu" }
 wgpu-core = { path = "vendor/wgpu/wgpu-core" }
