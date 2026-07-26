@@ -88,7 +88,7 @@ use local_rpc::{
     model::{
         AttachmentDescriptor, AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind,
         CommandOutputLine, MediaKind, RequestId, RoomKind, ServerAvailability,
-        ServerSelectionPrompt, ServerSummary, TrustState,
+        ServerSelectionPrompt, ServerSummary, TrustState, VoiceState,
     },
 };
 
@@ -4454,12 +4454,24 @@ impl ChattView {
         if !self.model.is_ready() {
             return;
         }
+        let state = self.model.voice.state.toggle_mute();
+        self.request_voice_state(state, cx);
+    }
+
+    fn toggle_deafen(&mut self, _: &ToggleDeafen, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.is_ready() {
+            return;
+        }
+        let state = self.model.voice.state.toggle_deafen();
+        self.request_voice_state(state, cx);
+    }
+
+    fn request_voice_state(&mut self, state: VoiceState, cx: &mut Context<Self>) {
         let request_id = self.request_id();
-        let muted = !self.model.voice.muted;
         self.model.pending.insert(
             request_id,
             PendingRequest {
-                operation: Operation::SetMuted,
+                operation: Operation::SetVoiceState,
                 room_id: self.model.selected_room,
                 draft: None,
                 transfer_id: None,
@@ -4467,33 +4479,8 @@ impl ChattView {
         );
         if let Err(error) = self
             .daemon
-            .send(ClientFrame::SetMuted { request_id, muted })
+            .send(ClientFrame::SetVoiceState { request_id, state })
         {
-            self.model.pending.remove(&request_id);
-            self.status = error.into();
-        }
-        cx.notify();
-    }
-
-    fn toggle_deafen(&mut self, _: &ToggleDeafen, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.is_ready() {
-            return;
-        }
-        let request_id = self.request_id();
-        let deafened = !self.model.voice.deafened;
-        self.model.pending.insert(
-            request_id,
-            PendingRequest {
-                operation: Operation::SetDeafened,
-                room_id: self.model.selected_room,
-                draft: None,
-                transfer_id: None,
-            },
-        );
-        if let Err(error) = self.daemon.send(ClientFrame::SetDeafened {
-            request_id,
-            deafened,
-        }) {
             self.model.pending.remove(&request_id);
             self.status = error.into();
         }
@@ -9656,12 +9643,12 @@ impl Render for ChattView {
                             .child(
                                 toolbar_button(
                                     "mute",
-                                    Some(if self.model.voice.muted {
+                                    Some(if self.model.voice.state.is_muted() {
                                         IconName::MicOff
                                     } else {
                                         IconName::Mic
                                     }),
-                                    if self.model.voice.muted {
+                                    if self.model.voice.state.is_muted() {
                                         "Unmute"
                                     } else {
                                         "Mute"
@@ -9675,12 +9662,12 @@ impl Render for ChattView {
                             .child(
                                 toolbar_button(
                                     "deafen",
-                                    Some(if self.model.voice.deafened {
+                                    Some(if self.model.voice.state.is_deafened() {
                                         IconName::AudioOff
                                     } else {
                                         IconName::AudioOn
                                     }),
-                                    if self.model.voice.deafened {
+                                    if self.model.voice.state.is_deafened() {
                                         "Undeafen"
                                     } else {
                                         "Deafen"
@@ -10142,8 +10129,7 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::RunCommand => "Command",
         Operation::EditMessage => "Edit",
         Operation::DeleteMessage => "Delete",
-        Operation::SetMuted => "Mute change",
-        Operation::SetDeafened => "Deafen change",
+        Operation::SetVoiceState => "Voice state change",
         Operation::JoinVoice => "Voice join",
         Operation::LeaveVoice => "Voice leave",
         Operation::SetOutputVolume => "Volume change",
@@ -10273,6 +10259,27 @@ mod tests {
     use super::*;
     use local_rpc::bulk::BulkFinished;
     use local_rpc::model::MediaKind;
+
+    #[test]
+    fn voice_buttons_have_total_three_state_transitions() {
+        let cases = [
+            (
+                VoiceState::Live,
+                VoiceState::Muted,
+                VoiceState::Deafened,
+            ),
+            (VoiceState::Muted, VoiceState::Live, VoiceState::Deafened),
+            (VoiceState::Deafened, VoiceState::Live, VoiceState::Live),
+        ];
+        for (state, mute_target, deafen_target) in cases {
+            assert_eq!(state.toggle_mute(), mute_target, "mute from {state:?}");
+            assert_eq!(
+                state.toggle_deafen(),
+                deafen_target,
+                "deafen from {state:?}"
+            );
+        }
+    }
 
     fn queued_file(id: u64) -> QueuedFile {
         QueuedFile {

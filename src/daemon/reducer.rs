@@ -299,7 +299,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
                 effect.splices.push((index, index + 1, 0));
             }
         }
-        StateDelta::VoiceStateChanged { voice } => model.voice = voice,
+        StateDelta::VoiceSessionChanged { voice } => model.voice = voice,
         StateDelta::LiveShareUpserted { share } => {
             match model
                 .live_shares
@@ -422,7 +422,8 @@ mod tests {
         model::{
             CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
             ConnectionState, DaemonInstanceId, Participant, RequestId, ServerAvailability,
-            ServerSelectionError, ServerSelectionState, ServerSummary, VoiceState,
+            ServerSelectionError, ServerSelectionState, ServerSummary, VoiceSessionState,
+            VoiceState,
         },
     };
 
@@ -448,9 +449,8 @@ mod tests {
             rooms: Vec::new(),
             selected_room: None,
             room: None,
-            voice: VoiceState {
-                muted: false,
-                deafened: false,
+            voice: VoiceSessionState {
+                state: VoiceState::Live,
                 output_volume: 100.0,
                 joined_room: None,
             },
@@ -736,8 +736,7 @@ mod tests {
             name: "alice".into(),
             online: true,
             speaking: false,
-            muted: false,
-            deafened: false,
+            voice_state: VoiceState::Live,
         });
         let live_share = local_rpc::model::LiveShare {
             room_id: RoomId(2),

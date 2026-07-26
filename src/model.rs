@@ -5,7 +5,7 @@ use local_rpc::{
     ids::RoomId,
     model::{
         CommandInfo, ConnectionState, DaemonInstanceId, LiveShare, Participant, RequestId,
-        RoomSummary, ServerSelectionState, TransferSummary, VoiceState,
+        RoomSummary, ServerSelectionState, TransferSummary, VoiceSessionState, VoiceState,
     },
 };
 
@@ -45,7 +45,7 @@ pub struct ChatModel {
     pub participants: Vec<Participant>,
     pub older_cursor: Option<local_rpc::ids::MessageId>,
     pub at_start: bool,
-    pub voice: VoiceState,
+    pub voice: VoiceSessionState,
     pub transfers: Vec<TransferSummary>,
     pub live_shares: Vec<LiveShare>,
     pub commands: Vec<CommandInfo>,
@@ -71,9 +71,8 @@ impl Default for ChatModel {
             participants: Vec::new(),
             older_cursor: None,
             at_start: true,
-            voice: VoiceState {
-                muted: false,
-                deafened: false,
+            voice: VoiceSessionState {
+                state: VoiceState::Live,
                 output_volume: 100.0,
                 joined_room: None,
             },
