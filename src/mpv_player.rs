@@ -2687,6 +2687,29 @@ mod tests {
         );
     }
 
+    fn write_seek_fixture(path: &std::path::Path) {
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x180:d=2:r=10",
+                "-c:v",
+                "mjpeg",
+                "-y",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffmpeg is available with the required libmpv dependency");
+        assert!(
+            output.status.success(),
+            "ffmpeg could not create the seek fixture: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     fn property_display_size(path: &std::path::Path) -> (u32, u32) {
         let mpv = Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "null")?;
@@ -2984,8 +3007,9 @@ mod tests {
 
     #[test]
     fn libmpv_absolute_percent_seek_reaches_requested_attachment_position() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("vendor/libmpv2-rs/test-data/jellyfish.mp4");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("seek-fixture.mkv");
+        write_seek_fixture(&path);
         let mpv = Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "null")?;
             initializer.set_option("audio", "no")?;

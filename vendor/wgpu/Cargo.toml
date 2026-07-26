@@ -1,57 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "cts_runner",
-    "deno_webgpu",
-
-    # default members
-    "benches",
-    "examples/features",
-    "examples/standalone/*",
-    "examples/bug-repro/*",
-    "lock-analyzer",
-    "naga-cli",
-    "naga-test",
     "naga",
-    "naga/fuzz",
-    "naga/hlsl-snapshots",
-    "naga/xtask",
-    "player",
-    "tests",
     "wgpu-core",
     "wgpu-core/platform-deps/*",
     "wgpu-hal",
-    "wgpu-info",
     "wgpu-macros",
     "wgpu-naga-bridge",
     "wgpu-types",
     "wgpu",
-    "xtask",
 ]
 exclude = []
 default-members = [
-    "benches",
-    "examples/features",
-    "examples/standalone/*",
-    "examples/bug-repro/*",
-    "lock-analyzer",
-    "naga-cli",
-    "naga-test",
     "naga",
-    "naga/fuzz",
-    "naga/hlsl-snapshots",
-    "naga/xtask",
-    "player",
-    "tests",
     "wgpu-core",
     "wgpu-core/platform-deps/*",
     "wgpu-hal",
-    "wgpu-info",
     "wgpu-macros",
     "wgpu-naga-bridge",
     "wgpu-types",
     "wgpu",
-    "xtask",
 ]
 
 [workspace.lints.clippy]

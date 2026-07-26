@@ -1,7 +1,9 @@
 # Vendored media and graphics sources
 
 The following source trees were imported without Git metadata or build output,
-except for FFmpeg, which is downloaded during setup:
+except for FFmpeg, which is downloaded during setup. These are build-oriented
+snapshots: upstream examples, tests, documentation, application bundles, and
+developer tooling that are outside this client's dependency graph are omitted.
 
 - `mpv`: <https://github.com/mpv-player/mpv>, commit `94335ab` (GPL-2.0-or-later by default; see its license files).
 - `libmpv2-rs`: <https://github.com/kohsine/libmpv-rs>, commit `d7ccfaf` (LGPL-2.1; see its license file).

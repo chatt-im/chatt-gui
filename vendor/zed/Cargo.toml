@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/collections",
-    "crates/component",
     "crates/gpui",
     "crates/gpui_linux",
     "crates/gpui_macos",
@@ -11,18 +10,11 @@ members = [
     "crates/gpui_shared_string",
     "crates/gpui_util",
     "crates/gpui_wgpu",
-    "crates/icons",
-    "crates/markdown",
     "crates/media",
-    "crates/menu",
     "crates/refineable",
     "crates/refineable/derive_refineable",
     "crates/scheduler",
     "crates/sum_tree",
-    "crates/syntax_theme",
-    "crates/theme",
-    "crates/ui",
-    "crates/ui_macros",
 ]
 
 [workspace.package]
