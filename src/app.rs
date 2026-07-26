@@ -57,7 +57,7 @@ use crate::{
     ui_controls::{
         compact_action_button, composer_add_button, icon_button, message_action_button,
         mini_button, preview_action_button, preview_control_button, preview_status, room_button,
-        sidebar_footer_button, toolbar_button,
+        sidebar_footer_button, toolbar_button, PREVIEW_HEADER_ICON_SIZE,
     },
     ui_scale::rems_from_px,
     video_controls::{
@@ -95,7 +95,12 @@ use local_rpc::{
 const SIDEBAR_WIDTH: f32 = 232.0;
 const TOP_BAR_HEIGHT: f32 = 52.0;
 const MIN_COMPOSER_HEIGHT: f32 = 64.0;
-const TIMELINE_GROUP_GAP: f32 = 5.0;
+const TIMELINE_GROUP_GAP: f32 = 7.0;
+const TIMELINE_MESSAGE_ROW_PADDING_TOP: f32 = 2.0;
+const TIMELINE_CONTINUATION_ROW_PADDING_Y: f32 = 2.0;
+const TIMELINE_ROW_HEADER_HEIGHT: f32 = 24.0;
+const TIMELINE_MESSAGE_ACTIONS_TOP: f32 = 7.0;
+const TIMELINE_CONTINUATION_ACTIONS_TOP: f32 = 1.0;
 const DECODED_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const PREVIEW_IMAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const VIDEO_THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -109,6 +114,22 @@ const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 const PREVIEW_TAB_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
+
+fn timeline_message_row_padding_top(continuation: bool) -> f32 {
+    if continuation {
+        TIMELINE_CONTINUATION_ROW_PADDING_Y
+    } else {
+        TIMELINE_MESSAGE_ROW_PADDING_TOP
+    }
+}
+
+fn timeline_message_actions_top(continuation: bool) -> f32 {
+    if continuation {
+        TIMELINE_CONTINUATION_ACTIONS_TOP
+    } else {
+        TIMELINE_MESSAGE_ACTIONS_TOP
+    }
+}
 
 fn cached_attachment_image_source<A>(
     attachment: CachedAttachment,
@@ -5367,7 +5388,7 @@ impl ChattView {
                     .absolute()
                     .left_0()
                     .top(rems_from_px(9.))
-                    .h(rems_from_px(24.))
+                    .h(rems_from_px(TIMELINE_ROW_HEADER_HEIGHT))
                     .w(rems_from_px(64.))
                     .pr(rems_from_px(8.))
                     .flex()
@@ -5385,7 +5406,8 @@ impl ChattView {
                     .pl(rems_from_px(15.))
                     .child(
                         div()
-                            .min_h(rems_from_px(24.))
+                            .min_h(rems_from_px(TIMELINE_ROW_HEADER_HEIGHT))
+                            .line_height(rems_from_px(TIMELINE_ROW_HEADER_HEIGHT))
                             .flex()
                             .items_center()
                             .gap_2()
@@ -5522,6 +5544,7 @@ impl ChattView {
                 }))
         });
         let attachment = (!collapsed).then(|| message.attachment.clone()).flatten();
+        let row_padding_top = timeline_message_row_padding_top(continuation);
         let message_row = div()
             .id(("message", message_id as usize))
             .group(hover_group.clone())
@@ -5529,8 +5552,8 @@ impl ChattView {
             .w_full()
             .pl(rems_from_px(64.))
             .pr(rems_from_px(28.))
-            .pt(rems_from_px(if continuation { 3. } else { 6. }))
-            .pb(rems_from_px(if continuation { 3. } else { 6. }))
+            .pt(rems_from_px(row_padding_top))
+            .pb(rems_from_px(TIMELINE_CONTINUATION_ROW_PADDING_Y))
             .bg(background)
             .hover(move |row| row.bg(row_hover))
             .when_some(reference_flash_id, |row, flash_id| {
@@ -5565,8 +5588,8 @@ impl ChattView {
                 div()
                     .absolute()
                     .left_0()
-                    .top(rems_from_px(if continuation { 3. } else { 6. }))
-                    .h(rems_from_px(24.))
+                    .top(rems_from_px(row_padding_top))
+                    .h(rems_from_px(TIMELINE_ROW_HEADER_HEIGHT))
                     .w(rems_from_px(64.))
                     .pr(rems_from_px(15.))
                     .flex()
@@ -5593,7 +5616,8 @@ impl ChattView {
                             .when(!continuation, |content| {
                                 content.child(
                                     div()
-                                        .min_h(rems_from_px(24.))
+                                        .min_h(rems_from_px(TIMELINE_ROW_HEADER_HEIGHT))
+                                        .line_height(rems_from_px(TIMELINE_ROW_HEADER_HEIGHT))
                                         .flex()
                                         .items_end()
                                         .gap_2()
@@ -5662,7 +5686,7 @@ impl ChattView {
             .child(
                 div()
                     .absolute()
-                    .top(rems_from_px(if continuation { 1. } else { 7. }))
+                    .top(rems_from_px(timeline_message_actions_top(continuation)))
                     .right(rems_from_px(28.))
                     .flex()
                     .gap_1()
@@ -6301,6 +6325,15 @@ impl ChattView {
         for item in history {
             let key = item.key();
             let selected = key == active_key;
+            let tab_icon = match item.content {
+                PreviewContent::Image { .. } => IconName::Image,
+                PreviewContent::Code(_) => IconName::FileText,
+            };
+            let tab_icon_color = settings.theme.color(if selected {
+                ThemeRole::MediaProgressKnob
+            } else {
+                ThemeRole::TextMuted
+            });
             let select_key = key;
             let close_key = key;
             let select_id: SharedString = format!(
@@ -6345,10 +6378,11 @@ impl ChattView {
                             .pl_3()
                             .pr_1()
                             .cursor_pointer()
-                            .child(div().flex_none().text_xs().child(match item.content {
-                                PreviewContent::Image { .. } => "▧",
-                                PreviewContent::Code(_) => "{}",
-                            }))
+                            .child(icon(
+                                tab_icon,
+                                PREVIEW_HEADER_ICON_SIZE,
+                                tab_icon_color,
+                            ))
                             .child(
                                 div()
                                     .min_w_0()
@@ -6370,9 +6404,12 @@ impl ChattView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .text_sm()
                             .hover(move |button| button.bg(close_hover).text_color(tab_hover_text))
-                            .child("×")
+                            .child(icon(
+                                IconName::Close,
+                                PREVIEW_HEADER_ICON_SIZE,
+                                settings.theme.color(ThemeRole::TextMuted),
+                            ))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.close_preview_tab(close_key, window, cx)
                             })),
@@ -10263,11 +10300,7 @@ mod tests {
     #[test]
     fn voice_buttons_have_total_three_state_transitions() {
         let cases = [
-            (
-                VoiceState::Live,
-                VoiceState::Muted,
-                VoiceState::Deafened,
-            ),
+            (VoiceState::Live, VoiceState::Muted, VoiceState::Deafened),
             (VoiceState::Muted, VoiceState::Live, VoiceState::Deafened),
             (VoiceState::Deafened, VoiceState::Live, VoiceState::Live),
         ];

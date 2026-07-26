@@ -6,6 +6,8 @@ use crate::{
     ui_scale::rems_from_px,
 };
 
+pub(crate) const PREVIEW_HEADER_ICON_SIZE: f32 = 17.0;
+
 pub(crate) fn room_button(
     id: impl Into<gpui::ElementId>,
     sigil: &'static str,
@@ -249,7 +251,7 @@ pub(crate) fn preview_action_button(
         .hover(move |button| button.bg(hover).text_color(hover_text))
         .child(icon(
             icon_name,
-            17.0,
+            PREVIEW_HEADER_ICON_SIZE,
             palette.color(ThemeRole::TextSecondary),
         ))
 }
