@@ -496,6 +496,15 @@ int mpv_render_context_get_info(mpv_render_context *ctx,
         res = 0;
         break;
     }
+    case MPV_RENDER_PARAM_NEXT_FRAME_VIDEO_SIZE: {
+        int *size = param.data;
+        size[0] = size[1] = 0;
+        struct vo_frame *frame = ctx->next_frame;
+        if (frame && frame->current && mp_image_params_valid(&ctx->img_params))
+            mp_image_params_get_dsize(&ctx->img_params, &size[0], &size[1]);
+        res = 0;
+        break;
+    }
     default:;
     }
 

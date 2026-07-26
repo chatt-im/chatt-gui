@@ -422,6 +422,16 @@ typedef enum mpv_render_param_type {
      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
+    /**
+     * Return the display size of the next pending video image. Valid only for
+     * mpv_render_context_get_info(). This reads render-context-owned state and
+     * does not dispatch to the mpv core.
+     *
+     * Type: int[2]. Both values are 0 when no video image is pending.
+     * Otherwise they contain the positive display width and height, including
+     * crop and pixel aspect ratio.
+     */
+    MPV_RENDER_PARAM_NEXT_FRAME_VIDEO_SIZE = 26,
 } mpv_render_param_type;
 
 /**

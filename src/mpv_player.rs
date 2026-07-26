@@ -478,6 +478,10 @@ impl MpvPlayer {
         let render_gpui_wakeup = gpui_wakeup.clone();
         let render_live_diagnostics = live_diagnostics.clone();
         let render_live_input_gate = live_input_gate.clone();
+        let render_sizing = fixed_render_size
+            .map_or(RenderSizing::PendingFrame, |(width, height)| {
+                RenderSizing::Fixed { width, height }
+            });
         let render_thread = thread::Builder::new()
             .name("mpv-render".into())
             .spawn(move || {
@@ -493,6 +497,7 @@ impl MpvPlayer {
                     render_live_input_gate,
                     render_playback,
                     render_frame_invalidated,
+                    render_sizing,
                 );
             })
             .context("spawn mpv render thread")?;
@@ -1202,6 +1207,12 @@ enum RenderMessage {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderSizing {
+    Fixed { width: u32, height: u32 },
+    PendingFrame,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct StartupLogContext {
     player_id: u64,
@@ -1243,6 +1254,15 @@ impl RenderBackend {
             Self::Vulkan { generation, .. } | Self::Software { generation, .. } => {
                 generation.is_some()
             }
+        }
+    }
+
+    fn configured_size(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Vulkan { generation, .. } | Self::Software { generation, .. } => generation
+                .as_ref()
+                .and_then(|generation| generation.textures.first())
+                .map(|texture| (texture.width(), texture.height())),
         }
     }
 
@@ -1355,6 +1375,20 @@ impl RenderBackend {
         Ok(true)
     }
 
+    fn prepare_pending_frame(&mut self, surface: &WgpuVideoSurface) -> Result<Option<(u32, u32)>> {
+        let Some((width, height)) = self.context().next_frame_video_size().with_context(|| {
+            format!(
+                "read pending video size from {} render context",
+                self.name()
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+        self.resize(surface, width, height)?;
+        Ok(Some((width, height)))
+    }
+
     fn release_resources(&mut self, surface: &WgpuVideoSurface) -> Result<()> {
         match self {
             Self::Vulkan {
@@ -1409,13 +1443,9 @@ impl RenderBackend {
                 generation,
                 next_texture,
             } => {
-                let Some(generation) = generation else {
-                    diagnostics.note_unconfigured();
-                    // Keep mpv's pending frame intact until Resize installs the
-                    // first texture generation. Consuming it here skips the
-                    // beginning of a file when dimensions arrive after load.
-                    return Ok(false);
-                };
+                let generation = generation
+                    .as_ref()
+                    .context("Vulkan video render backend has no texture generation")?;
                 let Some((texture, sync)) = next_ring_texture(generation, next_texture) else {
                     diagnostics.note_ring_busy("vulkan", generation.id);
                     if acknowledge_if_busy {
@@ -1459,12 +1489,9 @@ impl RenderBackend {
                 aligned,
                 tight,
             } => {
-                let Some(generation) = generation else {
-                    diagnostics.note_unconfigured();
-                    // The decoded frame remains pending and is rendered by the
-                    // Resize message once a backend-neutral texture exists.
-                    return Ok(false);
-                };
+                let generation = generation
+                    .as_ref()
+                    .context("software video render backend has no texture generation")?;
                 let Some((texture, _sync)) = next_ring_texture(generation, next_texture) else {
                     diagnostics.note_ring_busy("software", generation.id);
                     if acknowledge_if_busy {
@@ -1526,9 +1553,7 @@ fn next_ring_texture(
 }
 
 struct RenderDiagnostics {
-    player_id: u64,
     startup: Option<StartupLogContext>,
-    unconfigured_started_at: Option<Instant>,
     started_at: Instant,
     last_summary: Instant,
     last_pressure_log: Option<Instant>,
@@ -1536,19 +1561,16 @@ struct RenderDiagnostics {
     rendered: u64,
     repeats: u64,
     callbacks_without_frames: u64,
-    unconfigured: u64,
     ring_busy: u64,
     resizes: u64,
     errors: u64,
 }
 
 impl RenderDiagnostics {
-    fn new(player_id: u64) -> Self {
+    fn new() -> Self {
         let now = Instant::now();
         Self {
-            player_id,
             startup: None,
-            unconfigured_started_at: None,
             started_at: now,
             last_summary: now,
             last_pressure_log: None,
@@ -1556,7 +1578,6 @@ impl RenderDiagnostics {
             rendered: 0,
             repeats: 0,
             callbacks_without_frames: 0,
-            unconfigured: 0,
             ring_busy: 0,
             resizes: 0,
             errors: 0,
@@ -1565,43 +1586,9 @@ impl RenderDiagnostics {
 
     fn start_load(&mut self, startup: StartupLogContext) {
         self.startup = Some(startup);
-        self.unconfigured_started_at = None;
-    }
-
-    fn note_unconfigured(&mut self) {
-        self.unconfigured += 1;
-        let now = Instant::now();
-        let first_unconfigured_at = *self.unconfigured_started_at.get_or_insert(now);
-        #[cfg(feature = "diagnostic-logs")]
-        if crate::logger::render_logging_enabled() {
-            if let Some(startup) = self.startup {
-                kvlog::info!(
-                    "video frame left pending before texture generation",
-                    group = "render",
-                    player_id = startup.player_id,
-                    load_id = startup.load_id,
-                    startup_elapsed_ms = startup.elapsed_ms(),
-                    pending_elapsed_ms =
-                        now.duration_since(first_unconfigured_at).as_secs_f64() * 1_000.0,
-                    pending_frame_acknowledged = false,
-                    occurrence = self.unconfigured
-                );
-            } else {
-                kvlog::info!(
-                    "video frame left pending before texture generation",
-                    group = "render",
-                    player_id = self.player_id,
-                    pending_elapsed_ms =
-                        now.duration_since(first_unconfigured_at).as_secs_f64() * 1_000.0,
-                    pending_frame_acknowledged = false,
-                    occurrence = self.unconfigured
-                );
-            }
-        }
     }
 
     fn note_first_render(&mut self, operation: &str, operation_started_at: Instant) {
-        self.unconfigured_started_at = None;
         let Some(startup) = self.startup.take() else {
             return;
         };
@@ -1653,7 +1640,6 @@ impl RenderDiagnostics {
                 rendered = self.rendered,
                 repeats = self.repeats,
                 no_frame = self.callbacks_without_frames,
-                unconfigured = self.unconfigured,
                 ring_busy = self.ring_busy,
                 resizes = self.resizes,
                 errors = self.errors
@@ -1670,7 +1656,6 @@ impl RenderDiagnostics {
             rendered = self.rendered,
             repeats = self.repeats,
             no_frame = self.callbacks_without_frames,
-            unconfigured = self.unconfigured,
             ring_busy = self.ring_busy,
             resizes = self.resizes,
             errors = self.errors
@@ -1697,7 +1682,6 @@ fn control_worker(
     kvlog::info!("mpv control worker started", player_id, rendered);
     let mut state = PlaybackState::default();
     let initial_render_size = render.as_ref().and_then(|render| render.initial_size);
-    let mut configured_size = initial_render_size;
     let mut pending_start = None;
     let delay_render_until_reconfiguration = initial_render_size.is_some();
     let mut render_enabled = false;
@@ -1757,10 +1741,9 @@ fn control_worker(
                         paused,
                         ..PlaybackState::default()
                     };
-                    configured_size = initial_render_size;
                     pending_start = (position > 0.0).then_some(position);
                     render_enabled = false;
-                    playback.publish(state);
+                    playback.publish_control(state);
                     // `stop` is synchronous. Drain the events it enqueued
                     // before opening the replacement so a pooled core cannot
                     // mistake the previous file's FileLoaded/EndFile for the
@@ -1810,7 +1793,7 @@ fn control_worker(
                     seek_started_at = Some((Instant::now(), seconds, mode));
                     state.position = seconds;
                     state.finished = false;
-                    playback.publish(state);
+                    playback.publish_control(state);
                     if let Some(render) = render.as_ref() {
                         render.frame_invalidated.invalidate();
                     }
@@ -1834,7 +1817,7 @@ fn control_worker(
                     seek_started_at = Some((Instant::now(), position, mode));
                     state.position = position;
                     state.finished = false;
-                    playback.publish(state);
+                    playback.publish_control(state);
                     if let Some(render) = render.as_ref() {
                         render.frame_invalidated.invalidate();
                     }
@@ -1869,8 +1852,7 @@ fn control_worker(
                         ..PlaybackState::default()
                     };
                     pending_start = None;
-                    configured_size = initial_render_size;
-                    playback.publish(state);
+                    playback.publish_control(state);
                     mpv.command("stop", &[])
                 }
                 ControlCommand::DropBuffers => {
@@ -1962,55 +1944,6 @@ fn control_worker(
                     );
                 }
             }
-            let mut display_size_changed = false;
-            if rendered && (file_loaded || video_reconfigured) {
-                match video_display_size(&mpv) {
-                    Ok(size) => {
-                        let resized = configured_size != Some(size);
-                        if resized {
-                            #[cfg(feature = "diagnostic-logs")]
-                            if crate::logger::render_logging_enabled() {
-                                kvlog::info!(
-                                    "video texture configured at decoded display size",
-                                    group = "render",
-                                    width = size.0,
-                                    height = size.1
-                                );
-                            }
-                        }
-                        configured_size = Some(size);
-                        display_size_changed = state.display_size != Some(size);
-                        state.display_size = Some(size);
-                        if resized
-                            && render
-                                .as_ref()
-                                .expect("rendered control worker has render state")
-                                .sender
-                                .send(RenderMessage::Resize {
-                                    width: size.0,
-                                    height: size.1,
-                                    redraw: false,
-                                })
-                                .is_err()
-                        {
-                            let message = "mpv render thread stopped during video configuration";
-                            kvlog::error!("video configuration failed", err = message);
-                            let _ = errors.send(message.into());
-                        }
-                    }
-                    Err(_error) =>
-                    {
-                        #[cfg(feature = "diagnostic-logs")]
-                        if crate::logger::render_logging_enabled() {
-                            kvlog::info!(
-                                "decoded video size is not ready",
-                                group = "render",
-                                err = %_error
-                            );
-                        }
-                    }
-                }
-            }
             let should_enable_render = rendered
                 && !render_enabled
                 && ((!delay_render_until_reconfiguration && file_loaded)
@@ -2046,7 +1979,7 @@ fn control_worker(
                     let _ = errors.send(format!("{error:#}"));
                     true
                 }
-            } || display_size_changed;
+            };
             if !rendered
                 && position_changed
                 && last_audio_position_wakeup.elapsed() >= AUDIO_POSITION_WAKE_INTERVAL
@@ -2054,7 +1987,7 @@ fn control_worker(
                 last_audio_position_wakeup = Instant::now();
                 notify_gpui = true;
             }
-            playback.publish(state);
+            playback.publish_control(state);
             if notify_gpui {
                 let _ = gpui_wakeup.try_send(());
             }
@@ -2069,6 +2002,7 @@ fn is_seek_command(command: &ControlCommand) -> bool {
     )
 }
 
+#[cfg(test)]
 fn video_display_size(mpv: &Mpv) -> Result<(u32, u32)> {
     let width = mpv
         .get_property::<i64>("dwidth")
@@ -2080,6 +2014,7 @@ fn video_display_size(mpv: &Mpv) -> Result<(u32, u32)> {
         .ok_or_else(|| anyhow!("invalid decoded video display size {width}x{height}"))
 }
 
+#[cfg(test)]
 fn checked_video_size(width: i64, height: i64) -> Option<(u32, u32)> {
     Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
         .filter(|(width, height)| *width != 0 && *height != 0)
@@ -2238,6 +2173,7 @@ fn render_worker(
     live_input_gate: Option<Arc<crate::live_stream::LiveInputGate>>,
     playback: Arc<SharedPlaybackState>,
     frame_invalidated: Arc<SeekFrameInvalidation>,
+    sizing: RenderSizing,
 ) {
     let backend_name = backend.name();
     kvlog::info!(
@@ -2245,7 +2181,7 @@ fn render_worker(
         player_id,
         backend = backend_name
     );
-    let mut diagnostics = RenderDiagnostics::new(player_id);
+    let mut diagnostics = RenderDiagnostics::new();
     let mut has_frame = false;
     let mut enabled = false;
     let mut redraw_pending = false;
@@ -2263,7 +2199,15 @@ fn render_worker(
             }
         };
         if message.is_none() {
-            let result = backend.render(&surface, false, &mut diagnostics);
+            let result = render_prepared_frame(
+                &mut backend,
+                &surface,
+                sizing,
+                &playback,
+                false,
+                None,
+                &mut diagnostics,
+            );
             match result {
                 Ok(true) => {
                     diagnostics.rendered += 1;
@@ -2366,7 +2310,15 @@ fn render_worker(
                             backend.skip_rendering().map(|()| false).map_err(Into::into)
                         }
                         RenderAction::Render => {
-                            let result = backend.render(&surface, true, &mut diagnostics);
+                            let result = render_prepared_frame(
+                                &mut backend,
+                                &surface,
+                                sizing,
+                                &playback,
+                                true,
+                                frame_info,
+                                &mut diagnostics,
+                            );
                             redraw_pending = result.as_ref().is_ok_and(|rendered| !rendered)
                                 && backend.is_configured();
                             if result.as_ref().is_ok_and(|rendered| *rendered)
@@ -2393,7 +2345,15 @@ fn render_worker(
                 diagnostics.resizes += 1;
                 let result = backend.resize(&surface, width, height).and_then(|resized| {
                     if should_render_after_resize(enabled, resized, redraw) {
-                        backend.render(&surface, false, &mut diagnostics)
+                        render_prepared_frame(
+                            &mut backend,
+                            &surface,
+                            sizing,
+                            &playback,
+                            false,
+                            None,
+                            &mut diagnostics,
+                        )
                     } else {
                         Ok(false)
                     }
@@ -2416,6 +2376,7 @@ fn render_worker(
                 enabled = false;
                 has_frame = false;
                 redraw_pending = false;
+                playback.clear_display_size();
                 playback.frame_ready.store(false, Ordering::Release);
                 surface.clear();
                 ("reset", Ok(false))
@@ -2432,6 +2393,7 @@ fn render_worker(
                 enabled = false;
                 has_frame = false;
                 redraw_pending = false;
+                playback.clear_display_size();
                 playback.frame_ready.store(false, Ordering::Release);
                 surface.clear();
                 (
@@ -2484,6 +2446,52 @@ fn render_worker(
         diagnostics.maybe_log_summary(backend_name);
     }
     diagnostics.log_final(backend_name);
+}
+
+fn render_prepared_frame(
+    backend: &mut RenderBackend,
+    surface: &WgpuVideoSurface,
+    sizing: RenderSizing,
+    playback: &SharedPlaybackState,
+    acknowledge_if_busy: bool,
+    frame_info: Option<libmpv2::render::RenderFrameInfo>,
+    diagnostics: &mut RenderDiagnostics,
+) -> Result<bool> {
+    let selected_size = match sizing {
+        RenderSizing::Fixed { width, height } => Some((width, height)),
+        RenderSizing::PendingFrame => {
+            let frame_info = match frame_info {
+                Some(info) => info,
+                None => backend.context().next_frame_info().with_context(|| {
+                    format!(
+                        "read next-frame flags from {} render context",
+                        backend.name()
+                    )
+                })?,
+            };
+            if !frame_info.is_present() {
+                None
+            } else {
+                let previous_size = backend.configured_size();
+                let size = backend.prepare_pending_frame(surface)?.ok_or_else(|| {
+                    anyhow!(
+                        "attachment {} render backend has a present frame without a valid pending video size (frame_flags={:#x})",
+                        backend.name(),
+                        frame_info.flags
+                    )
+                })?;
+                if previous_size != Some(size) {
+                    diagnostics.resizes += 1;
+                }
+                Some(size)
+            }
+        }
+    };
+    let rendered = backend.render(surface, acknowledge_if_busy, diagnostics)?;
+    if rendered && let Some(size) = selected_size {
+        playback.set_display_size(size);
+    }
+    Ok(rendered)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2548,7 +2556,7 @@ struct SharedPlaybackState {
 }
 
 impl SharedPlaybackState {
-    fn publish(&self, state: PlaybackState) {
+    fn publish_control(&self, state: PlaybackState) {
         self.position
             .store(state.position.to_bits(), Ordering::Relaxed);
         self.duration
@@ -2556,14 +2564,20 @@ impl SharedPlaybackState {
         self.paused.store(state.paused, Ordering::Relaxed);
         self.ready.store(state.ready, Ordering::Relaxed);
         self.finished.store(state.finished, Ordering::Release);
-        let display_size = state.display_size.map_or(0, |(width, height)| {
-            (u64::from(width) << 32) | u64::from(height)
-        });
-        self.display_size.store(display_size, Ordering::Release);
+    }
+
+    fn set_display_size(&self, size: (u32, u32)) -> bool {
+        let packed_size = (u64::from(size.0) << 32) | u64::from(size.1);
+        self.display_size.swap(packed_size, Ordering::Release) != packed_size
+    }
+
+    fn clear_display_size(&self) {
+        self.display_size.store(0, Ordering::Release);
     }
 
     fn snapshot(&self) -> PlaybackState {
         let finished = self.finished.load(Ordering::Acquire);
+        let frame_ready = self.frame_ready.load(Ordering::Acquire);
         let packed_size = self.display_size.load(Ordering::Acquire);
         PlaybackState {
             position: f64::from_bits(self.position.load(Ordering::Relaxed)),
@@ -2571,7 +2585,7 @@ impl SharedPlaybackState {
             paused: self.paused.load(Ordering::Relaxed),
             finished,
             ready: self.ready.load(Ordering::Relaxed),
-            frame_ready: self.frame_ready.load(Ordering::Acquire),
+            frame_ready,
             display_size: (packed_size != 0)
                 .then_some(((packed_size >> 32) as u32, packed_size as u32)),
         }
@@ -2583,7 +2597,8 @@ impl SharedPlaybackState {
     }
 
     fn reset(&self) {
-        self.publish(PlaybackState::default());
+        self.publish_control(PlaybackState::default());
+        self.clear_display_size();
         self.frame_ready.store(false, Ordering::Release);
     }
 }
@@ -2610,10 +2625,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_playback_publishes_decoded_display_size() {
+    fn render_owned_display_size_survives_control_publication_and_resets() {
         let shared = SharedPlaybackState::default();
-        shared.publish(PlaybackState {
-            display_size: Some((1_080, 1_920)),
+        assert!(shared.set_display_size((1_080, 1_920)));
+        assert!(!shared.set_display_size((1_080, 1_920)));
+        shared.publish_control(PlaybackState {
+            ready: true,
             ..PlaybackState::default()
         });
 
@@ -2624,15 +2641,13 @@ mod tests {
 
     #[test]
     fn startup_render_diagnostics_scope_pending_frame_to_current_load() {
-        let mut diagnostics = RenderDiagnostics::new(7);
+        let mut diagnostics = RenderDiagnostics::new();
         let first = StartupLogContext {
             player_id: 7,
             load_id: 11,
             started_at: Instant::now(),
         };
         diagnostics.start_load(first);
-        diagnostics.note_unconfigured();
-        assert!(diagnostics.unconfigured_started_at.is_some());
         assert_eq!(diagnostics.startup.unwrap().load_id, 11);
 
         let second = StartupLogContext {
@@ -2641,7 +2656,6 @@ mod tests {
             started_at: Instant::now(),
         };
         diagnostics.start_load(second);
-        assert!(diagnostics.unconfigured_started_at.is_none());
         diagnostics.note_first_render("resize", Instant::now());
         assert!(diagnostics.startup.is_none());
     }
@@ -2672,10 +2686,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn libmpv_reports_the_decoded_display_size_for_attachments() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("intrinsic-size.mkv");
+    fn write_one_frame_fixture(path: &std::path::Path, sample_aspect_ratio: &str) {
         let output = std::process::Command::new("ffmpeg")
             .args([
                 "-v",
@@ -2684,13 +2695,15 @@ mod tests {
                 "lavfi",
                 "-i",
                 "color=c=black:s=320x180:d=0.04",
+                "-vf",
+                &format!("setsar={sample_aspect_ratio}"),
                 "-frames:v",
                 "1",
                 "-c:v",
                 "mjpeg",
                 "-y",
             ])
-            .arg(&path)
+            .arg(path)
             .output()
             .expect("ffmpeg is available with the required libmpv dependency");
         assert!(
@@ -2698,7 +2711,9 @@ mod tests {
             "ffmpeg could not create the attachment fixture: {}",
             String::from_utf8_lossy(&output.stderr),
         );
+    }
 
+    fn property_display_size(path: &std::path::Path) -> (u32, u32) {
         let mpv = Mpv::with_initializer(|initializer| {
             initializer.set_option("vo", "null")?;
             initializer.set_option("audio", "no")?;
@@ -2710,21 +2725,97 @@ mod tests {
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut display_size = None;
         while Instant::now() < deadline {
             match mpv.wait_event(0.1) {
                 Some(Ok(Event::FileLoaded | Event::VideoReconfig)) => {
                     if let Ok(size) = video_display_size(&mpv) {
-                        display_size = Some(size);
-                        break;
+                        return size;
                     }
                 }
                 Some(Err(error)) => panic!("libmpv event failed: {error}"),
                 _ => {}
             }
         }
+        panic!("libmpv did not publish display-size properties");
+    }
 
-        assert_eq!(display_size, Some((320, 180)));
+    fn pending_render_size(path: &std::path::Path) -> ((u32, u32), f64) {
+        let mpv = Arc::new(
+            Mpv::with_initializer(|initializer| {
+                initializer.set_option("vo", "libmpv")?;
+                initializer.set_option("audio", "no")?;
+                initializer.set_option("pause", "yes")?;
+                initializer.set_option("hwdec", "no")?;
+                Ok(())
+            })
+            .unwrap(),
+        );
+        let mut context = mpv.create_software_render_context(false).unwrap();
+        let (sender, updates) = mpsc::channel();
+        context.set_update_callback(move || {
+            let _ = sender.send(());
+        });
+        mpv.command("loadfile", &[&path.to_string_lossy(), "replace"])
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = updates.recv_timeout(Duration::from_millis(100));
+            let update = context.update();
+            if update & u64::from(mpv_render_update::Frame) == 0 {
+                continue;
+            }
+            let info = context.next_frame_info().unwrap();
+            if !info.is_present() {
+                continue;
+            }
+            let size = context
+                .next_frame_video_size()
+                .unwrap()
+                .expect("a pending video image has a display size");
+            let pts = context.next_frame_video_pts().unwrap();
+            let stride = size.0 as usize * 4;
+            let mut pixels = vec![0; stride * size.1 as usize];
+            context
+                .render_software(SoftwareRenderTarget {
+                    width: size.0,
+                    height: size.1,
+                    format: FORMAT_RGBA,
+                    stride,
+                    pixels: &mut pixels,
+                })
+                .unwrap();
+            context.report_swap();
+            mpv.command("stop", &[]).unwrap();
+            let stop_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let _ = updates.recv_timeout(Duration::from_millis(20));
+                context.update();
+                if context.next_frame_video_size().unwrap().is_none() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < stop_deadline,
+                    "a no-frame update exposed stale dimensions after stop"
+                );
+            }
+            return (size, pts);
+        }
+        panic!("libmpv did not expose a pending frame");
+    }
+
+    #[test]
+    fn pending_frame_size_matches_display_properties_before_first_render() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, sample_aspect_ratio) in [("square-pixels.mkv", "1/1"), ("anamorphic.mkv", "2/1")]
+        {
+            let path = directory.path().join(name);
+            write_one_frame_fixture(&path, sample_aspect_ratio);
+            let expected = property_display_size(&path);
+            let (pending, first_pts) = pending_render_size(&path);
+            assert_eq!(pending, expected);
+            assert!(first_pts.abs() < f64::EPSILON);
+        }
     }
 
     #[test]
@@ -3070,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn first_texture_generation_renders_the_pending_initial_frame() {
+    fn fixed_size_live_generation_renders_after_initial_resize() {
         assert!(should_render_after_resize(true, true, false));
         assert!(!should_render_after_resize(false, true, false));
     }

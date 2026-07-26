@@ -24,6 +24,7 @@ const PARAM_VULKAN_TARGET: u32 = 22;
 const PARAM_VULKAN_TARGET_REMOVE: u32 = 23;
 const PARAM_LATEST_FRAME: u32 = 24;
 const PARAM_NEXT_FRAME_VIDEO_PTS: u32 = 25;
+const PARAM_NEXT_FRAME_VIDEO_SIZE: u32 = 26;
 
 const API_OPENGL: &[u8] = b"opengl\0";
 const API_SOFTWARE: &[u8] = b"sw\0";
@@ -434,6 +435,21 @@ impl RenderContext {
         mpv_err(pts, code)
     }
 
+    /// Display width and height of the next pending video image, including
+    /// crop and pixel aspect ratio. This only reads render-context-owned state.
+    pub fn next_frame_video_size(&self) -> Result<Option<(u32, u32)>> {
+        let mut size = [0_i32; 2];
+        let parameter = raw_param(
+            PARAM_NEXT_FRAME_VIDEO_SIZE,
+            size.as_mut_ptr().cast(),
+        );
+        let code = unsafe {
+            libmpv2_sys::mpv_render_context_get_info(self.ctx.as_ptr(), parameter)
+        };
+        mpv_err((), code)?;
+        checked_pending_frame_video_size(size)
+    }
+
     pub fn skip_rendering(&self) -> Result<()> {
         let mut skip = 1_i32;
         let mut params = [
@@ -526,6 +542,17 @@ impl RenderContext {
     }
 }
 
+fn checked_pending_frame_video_size(size: [i32; 2]) -> Result<Option<(u32, u32)>> {
+    match size {
+        [0, 0] => Ok(None),
+        [width, height] if width > 0 && height > 0 => Ok(Some((
+            u32::try_from(width).map_err(|_| Error::Raw(crate::mpv_error::InvalidParameter))?,
+            u32::try_from(height).map_err(|_| Error::Raw(crate::mpv_error::InvalidParameter))?,
+        ))),
+        _ => Err(Error::Raw(crate::mpv_error::InvalidParameter)),
+    }
+}
+
 impl Drop for RenderContext {
     fn drop(&mut self) {
         unsafe {
@@ -544,4 +571,21 @@ impl Drop for RenderContext {
 
 fn raw_param(type_: u32, data: *mut c_void) -> libmpv2_sys::mpv_render_param {
     libmpv2_sys::mpv_render_param { type_, data }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_frame_video_size_accepts_only_none_or_positive_dimensions() {
+        assert_eq!(checked_pending_frame_video_size([0, 0]), Ok(None));
+        assert_eq!(
+            checked_pending_frame_video_size([320, 180]),
+            Ok(Some((320, 180)))
+        );
+        assert!(checked_pending_frame_video_size([0, 180]).is_err());
+        assert!(checked_pending_frame_video_size([320, 0]).is_err());
+        assert!(checked_pending_frame_video_size([-1, 180]).is_err());
+    }
 }
