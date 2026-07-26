@@ -3692,7 +3692,7 @@ impl ChattView {
         if self.pending_server_prompt.is_some() {
             return;
         }
-        let Some(ServerSelectionPrompt::AllowExternalSecureLink { label, attempt_id }) =
+        let Some(ServerSelectionPrompt::AllowUnencryptedTransport { label, attempt_id }) =
             self.model.server_selection.prompt.clone()
         else {
             return;
@@ -8304,14 +8304,14 @@ impl ChattView {
                             .text_color(applied.theme.color(ThemeRole::StateWarning))
                             .child("Finish pairing in the terminal client"),
                     )
-                } else if !server.require_native_encryption {
+                } else if !server.require_transport_encryption {
                     row.child(
                         div()
                             .max_w(px(190.))
                             .text_right()
                             .text_xs()
                             .text_color(applied.theme.color(ThemeRole::StateWarning))
-                            .child("Native encryption not required"),
+                            .child("Transport encryption not required"),
                     )
                 } else {
                     row
@@ -8468,7 +8468,7 @@ impl ChattView {
                     ),
             );
 
-        if let Some(ServerSelectionPrompt::AllowExternalSecureLink { label, .. }) = prompt {
+        if let Some(ServerSelectionPrompt::AllowUnencryptedTransport { label, .. }) = prompt {
             let resolving = self.pending_server_prompt.is_some();
             root = root.child(
                 div()
@@ -8497,16 +8497,16 @@ impl ChattView {
                                     .text_color(
                                         applied.theme.color(ThemeRole::StateDanger),
                                     )
-                                    .child("No native encryption to server"),
+                                    .child("Transport encryption disabled"),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .child(
-                                        "The server selected plaintext ExternalSecureLink \
-                                         transport. Connect only when another secure link already \
-                                         protects it, such as WireGuard, an SSH tunnel, or a \
-                                         private trusted network.",
+                                        "The server disabled transport encryption. Control, \
+                                         media, video, and file payloads will travel in \
+                                         plaintext. Connect only if this is intentional and you \
+                                         trust the network path.",
                                     ),
                             )
                             .child(
@@ -8516,7 +8516,7 @@ impl ChattView {
                                         applied.theme.color(ThemeRole::TextMuted),
                                     )
                                     .child(format!(
-                                        "Accepting saves require-native-encryption = false for {label}."
+                                        "Accepting saves require-transport-encryption = false for {label}."
                                     )),
                             )
                             .child(
@@ -10226,7 +10226,7 @@ mod tests {
             label: "Work Chat".into(),
             username: "Alice".into(),
             tcp_addr: "chat.example.test:443".into(),
-            require_native_encryption: true,
+            require_transport_encryption: true,
             availability: ServerAvailability::Ready,
         };
 
@@ -10243,14 +10243,14 @@ mod tests {
             label: "Work Chat".into(),
             username: "Alice".into(),
             tcp_addr: "work.example.test:443".into(),
-            require_native_encryption: true,
+            require_transport_encryption: true,
             availability: ServerAvailability::Ready,
         };
         let personal = ServerSummary {
             label: "Personal".into(),
             username: "alice".into(),
             tcp_addr: "home.example.test:443".into(),
-            require_native_encryption: true,
+            require_transport_encryption: true,
             availability: ServerAvailability::Ready,
         };
 

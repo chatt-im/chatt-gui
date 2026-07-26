@@ -485,7 +485,7 @@ mod tests {
                 label: "work".into(),
                 username: "alice".into(),
                 tcp_addr: "127.0.0.1:4000".into(),
-                require_native_encryption: true,
+                require_transport_encryption: true,
                 availability: ServerAvailability::Ready,
             }],
             error: Some(ServerSelectionError {
