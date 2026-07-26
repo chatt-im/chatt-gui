@@ -16,7 +16,7 @@ gpui = { path = "vendor/zed/crates/gpui", default-features = false }
 gpui_platform = { path = "vendor/zed/crates/gpui_platform", default-features = false }
 gpui_wgpu = { path = "vendor/zed/crates/gpui_wgpu", default-features = false }
 chatt_message_format = { package = "chatt-message-format", git = "https://github.com/chatt-im/chatt.git", rev = "63c144c745565e2493a5695191d8809c7c689db9" }
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dbus-message = { path = "crates/dbus-message" }
 fast-float = "0.2"
 image = { version = "0.25", default-features = false }

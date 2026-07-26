@@ -9,8 +9,6 @@ pub use font_features::*;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
@@ -976,8 +974,7 @@ impl DerefMut for LineWrapperHandle {
 
 /// The degree of blackness or stroke thickness of a font. This value ranges from 100.0 to 900.0,
 /// with 400.0 as normal.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize, Add, Sub, FromStr)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Add, Sub, FromStr)]
 pub struct FontWeight(pub f32);
 
 impl Display for FontWeight {
@@ -1041,25 +1038,8 @@ impl FontWeight {
     ];
 }
 
-impl schemars::JsonSchema for FontWeight {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "FontWeight".into()
-    }
-
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        use schemars::json_schema;
-        json_schema!({
-            "type": "number",
-            "minimum": Self::THIN,
-            "maximum": Self::BLACK,
-            "default": Self::default(),
-            "description": "Font weight value between 100 (thin) and 900 (black)"
-        })
-    }
-}
-
 /// Allows italic or oblique faces to be selected.
-#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, )]
 pub enum FontStyle {
     /// A face that is neither italic not obliqued.
     #[default]

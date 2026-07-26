@@ -73,9 +73,6 @@ pub mod _ownership_and_data_flow;
 pub mod private {
     pub use anyhow;
     pub use inventory;
-    pub use schemars;
-    pub use serde;
-    pub use serde_json;
 }
 
 mod seal {
@@ -334,7 +331,7 @@ where
 }
 
 /// Information about the GPU GPUI is running on.
-#[derive(Default, Debug, serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct GpuSpecs {
     /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
     pub is_software_emulated: bool,

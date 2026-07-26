@@ -69,10 +69,7 @@ scheduler.workspace = true
 resvg.workspace = true
 usvg.workspace = true
 ttf-parser = "0.25"
-schemars.workspace = true
 seahash = "4.1"
-serde.workspace = true
-serde_json.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 async-channel.workspace = true
@@ -121,4 +118,3 @@ scap = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 bindgen = "0.71"
-cbindgen = { version = "0.28.0", default-features = false }

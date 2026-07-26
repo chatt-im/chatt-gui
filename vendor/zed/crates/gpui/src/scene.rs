@@ -1,8 +1,6 @@
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
@@ -644,7 +642,7 @@ impl From<Shadow> for Primitive {
 }
 
 /// The style of a border.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, )]
 #[repr(C)]
 pub enum BorderStyle {
     /// A solid border.

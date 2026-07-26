@@ -2190,9 +2190,8 @@ impl App {
     pub fn build_action(
         &self,
         name: &str,
-        data: Option<serde_json::Value>,
     ) -> std::result::Result<Box<dyn Action>, ActionBuildError> {
-        self.actions.build_action(name, data)
+        self.actions.build_action(name)
     }
 
     /// Get all action names that have been registered. Note that registration only allows for
@@ -2206,26 +2205,6 @@ impl App {
     /// binding should take precedence.
     pub fn all_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
         RefCell::borrow(&self.keymap).all_bindings_for_input(input)
-    }
-
-    /// Get all non-internal actions that have been registered, along with their schemas.
-    pub fn action_schemas(
-        &self,
-        generator: &mut schemars::SchemaGenerator,
-    ) -> Vec<(&'static str, Option<schemars::Schema>)> {
-        self.actions.action_schemas(generator)
-    }
-
-    /// Get the schema for a specific action by name.
-    /// Returns `None` if the action is not found.
-    /// Returns `Some(None)` if the action exists but has no schema.
-    /// Returns `Some(Some(schema))` if the action exists and has a schema.
-    pub fn action_schema_by_name(
-        &self,
-        name: &str,
-        generator: &mut schemars::SchemaGenerator,
-    ) -> Option<Option<schemars::Schema>> {
-        self.actions.action_schema_by_name(name, generator)
     }
 
     /// Get a map from a deprecated action name to the canonical name.

@@ -8,8 +8,6 @@ edition.workspace = true
 path = "gpui_shared_string.rs"
 
 [dependencies]
-schemars.workspace = true
-serde.workspace = true
 smol_str = "0.3.6"
 
 [lints]

@@ -386,7 +386,10 @@ mod tests {
 
         let item = ClipboardItem {
             entries: vec![ClipboardEntry::String(
-                ClipboardString::new("2".to_string()).with_json_metadata(vec![3, 4]),
+                ClipboardString {
+                    text: "2".to_string(),
+                    metadata: Some("[3,4]".to_string()),
+                },
             )],
         };
         pasteboard.write(item.clone());

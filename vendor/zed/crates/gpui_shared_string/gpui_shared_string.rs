@@ -3,8 +3,6 @@ use std::{
     sync::Arc,
 };
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
 /// A shared string is an immutable string that can be cheaply cloned in GPUI
@@ -35,20 +33,6 @@ impl SharedString {
     /// Get a &str from the underlying string.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl JsonSchema for SharedString {
-    fn inline_schema() -> bool {
-        String::inline_schema()
-    }
-
-    fn schema_name() -> Cow<'static, str> {
-        String::schema_name()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        String::json_schema(generator)
     }
 }
 
@@ -180,24 +164,5 @@ impl From<SharedString> for String {
     #[inline(always)]
     fn from(text: SharedString) -> Self {
         text.0.into()
-    }
-}
-
-impl Serialize for SharedString {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for SharedString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(SharedString::new(&s))
     }
 }

@@ -13,8 +13,6 @@ use crate::{
 };
 use collections::HashSet;
 use refineable::Refineable;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 /// Use this struct for interfacing with the 'debug_below' styling from your own elements.
 /// If a parent element has this style set on it, then this struct will be set as a global in
@@ -140,8 +138,7 @@ impl ObjectFit {
 
 /// The minimum size of a column or row in a grid layout
 #[derive(
-    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, JsonSchema, Serialize, Deserialize,
-)]
+    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, )]
 pub enum TemplateColumnMinSize {
     /// The column size may be 0
     #[default]
@@ -163,10 +160,7 @@ pub enum TemplateColumnMinSize {
     Ord,
     Debug,
     Default,
-    JsonSchema,
-    Serialize,
-    Deserialize,
-)]
+    )]
 pub struct GridTemplate {
     /// How this template directive should be repeated
     pub repeat: u16,
@@ -176,7 +170,7 @@ pub struct GridTemplate {
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[refineable(Debug, PartialEq, )]
 pub struct Style {
     /// What layout strategy should be used?
     pub display: Display,
@@ -331,7 +325,7 @@ impl StyleRefinement {
 }
 
 /// The value of the visibility property, similar to the CSS property `visibility`
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, )]
 pub enum Visibility {
     /// The element should be drawn as normal.
     #[default]
@@ -341,7 +335,7 @@ pub enum Visibility {
 }
 
 /// The possible values of the box-shadow property
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, )]
 pub struct BoxShadow {
     /// What color should the shadow have?
     pub color: Hsla,
@@ -389,7 +383,7 @@ impl BoxShadow {
 }
 
 /// How to handle whitespace in text
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, )]
 pub enum WhiteSpace {
     /// Normal line wrapping when text overflows the width of the element
     #[default]
@@ -399,7 +393,7 @@ pub enum WhiteSpace {
 }
 
 /// How to truncate text that overflows the width of the element
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, )]
 pub enum TextOverflow {
     /// Truncate the text at the end when it doesn't fit, and represent this truncation by
     /// displaying the provided string (e.g., "very long te…").
@@ -415,7 +409,7 @@ pub enum TextOverflow {
 }
 
 /// How to align text within the element
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, )]
 pub enum TextAlign {
     /// Align the text to the left of the element
     #[default]
@@ -430,7 +424,7 @@ pub enum TextAlign {
 
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[refineable(Debug, PartialEq, )]
 pub struct TextStyle {
     /// The color of the text
     pub color: Hsla,
@@ -819,8 +813,7 @@ impl Default for Style {
 
 /// The properties that can be applied to an underline.
 #[derive(
-    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, )]
 pub struct UnderlineStyle {
     /// The thickness of the underline.
     pub thickness: Pixels,
@@ -834,8 +827,7 @@ pub struct UnderlineStyle {
 
 /// The properties that can be applied to a strikethrough.
 #[derive(
-    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, )]
 pub struct StrikethroughStyle {
     /// The thickness of the strikethrough.
     pub thickness: Pixels,
@@ -845,7 +837,7 @@ pub struct StrikethroughStyle {
 }
 
 /// The kinds of fill that can be applied to a shape.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, )]
 pub enum Fill {
     /// A solid color fill.
     Color(Background),
@@ -1030,7 +1022,7 @@ pub fn combine_highlights(
 /// For Grid it controls alignment in the block axis
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-items)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum AlignItems {
     /// Items are packed toward the start of the axis
@@ -1080,7 +1072,7 @@ pub type JustifySelf = AlignItems;
 /// For Grid it controls alignment in the block axis
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-content)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum AlignContent {
     /// Items are packed toward the start of the axis
@@ -1122,7 +1114,7 @@ pub type JustifyContent = AlignContent;
 /// Sets the layout used for the children of this node
 ///
 /// The default values depends on on which feature flags are enabled. The order of precedence is: Flex, Grid, Block, None.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Display {
     /// The children will follow the block layout algorithm
@@ -1141,7 +1133,7 @@ pub enum Display {
 /// Defaults to [`FlexWrap::NoWrap`]
 ///
 /// [Specification](https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum FlexWrap {
     /// Items will not wrap and stay on a single line
@@ -1164,7 +1156,7 @@ pub enum FlexWrap {
 /// The default behavior is [`FlexDirection::Row`].
 ///
 /// [Specification](https://www.w3.org/TR/css-flexbox-1/#flex-direction-property)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum FlexDirection {
     /// Defines +x as the main axis
@@ -1199,7 +1191,7 @@ pub enum FlexDirection {
 /// a scrollbar is controlled by the `scrollbar_width` property. If this is `0` then `Scroll` behaves identically to `Hidden`.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow>
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Overflow {
     /// The automatic minimum size of this node as a flexbox/grid item should be based on the size of its content.
@@ -1227,7 +1219,7 @@ pub enum Overflow {
 /// which can be unintuitive.
 ///
 /// [`Position::Relative`] is the default value, in contrast to the default behavior in CSS.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, )]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Position {
     /// The offset is computed relative to the final position given by the layout algorithm.

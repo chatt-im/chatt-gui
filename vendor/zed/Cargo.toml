@@ -120,7 +120,6 @@ features = ["async-io", "notification", "open_uri", "file_chooser", "settings", 
 
 [workspace.dependencies.chrono]
 version = "0.4"
-features = ["serde"]
 
 [workspace.dependencies.core-video]
 version = "0.5.2"
@@ -137,11 +136,9 @@ features = ["gif", "jpeg", "png", "webp"]
 
 [workspace.dependencies.indexmap]
 version = "2.7.0"
-features = ["serde"]
 
 [workspace.dependencies.log]
 version = "0.4.16"
-features = ["serde"]
 
 [workspace.dependencies.objc2-app-kit]
 version = "0.3.2"
@@ -178,25 +175,8 @@ default-features = false
 package = "zed-scap"
 version = "0.0.8-zed"
 
-[workspace.dependencies.schemars]
-version = "1.0"
-features = ["indexmap2"]
-
 [workspace.dependencies.semver]
 version = "1.0"
-features = ["serde"]
-
-[workspace.dependencies.serde]
-version = "1.0.221"
-features = ["derive", "rc"]
-
-[workspace.dependencies.serde_json]
-version = "1.0.144"
-features = ["preserve_order", "raw_value"]
-
-[workspace.dependencies.serde_json_lenient]
-version = "0.2"
-features = ["preserve_order", "raw_value"]
 
 [workspace.dependencies.smallvec]
 version = "1.6"
@@ -216,7 +196,7 @@ default-features = false
 
 [workspace.dependencies.uuid]
 version = "1.1.2"
-features = ["v4", "v5", "v7", "serde"]
+features = ["v4", "v5", "v7"]
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }

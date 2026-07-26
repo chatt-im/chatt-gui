@@ -1,10 +1,4 @@
 use anyhow::{Context as _, bail};
-use schemars::{JsonSchema, json_schema};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
-};
-use std::borrow::Cow;
 use std::{
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
@@ -140,54 +134,6 @@ impl From<Rgba> for u32 {
         let b = (rgba.b * 255.0) as u32;
         let a = (rgba.a * 255.0) as u32;
         (r << 24) | (g << 16) | (b << 8) | a
-    }
-}
-
-struct RgbaVisitor;
-
-impl Visitor<'_> for RgbaVisitor {
-    type Value = Rgba;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a string in the format #rrggbb or #rrggbbaa")
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Rgba, E> {
-        Rgba::try_from(value).map_err(E::custom)
-    }
-}
-
-impl JsonSchema for Rgba {
-    fn schema_name() -> Cow<'static, str> {
-        "Rgba".into()
-    }
-
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        json_schema!({
-            "type": "string",
-            "pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$"
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for Rgba {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_str(RgbaVisitor)
-    }
-}
-
-impl Serialize for Rgba {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let r = (self.r * 255.0).round() as u8;
-        let g = (self.g * 255.0).round() as u8;
-        let b = (self.b * 255.0).round() as u8;
-        let a = (self.a * 255.0).round() as u8;
-
-        let s = format!("#{r:02x}{g:02x}{b:02x}{a:02x}");
-        serializer.serialize_str(&s)
     }
 }
 
@@ -712,35 +658,7 @@ impl From<Rgba> for Hsla {
     }
 }
 
-impl JsonSchema for Hsla {
-    fn schema_name() -> Cow<'static, str> {
-        Rgba::schema_name()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        Rgba::json_schema(generator)
-    }
-}
-
-impl Serialize for Hsla {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        Rgba::from(*self).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Hsla {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Ok(Rgba::deserialize(deserializer)?.into())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, )]
 #[repr(C)]
 pub(crate) enum BackgroundTag {
     Solid = 0,
@@ -754,7 +672,7 @@ pub(crate) enum BackgroundTag {
 /// References:
 /// - <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
 /// - <https://www.w3.org/TR/css-color-4/#typedef-color-space>
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, )]
 #[repr(C)]
 pub enum ColorSpace {
     #[default]
@@ -774,7 +692,7 @@ impl Display for ColorSpace {
 }
 
 /// A background color, which can be either a solid color or a linear gradient.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, PartialEq, )]
 #[repr(C)]
 pub struct Background {
     pub(crate) tag: BackgroundTag,
@@ -878,7 +796,7 @@ pub fn linear_gradient(
 /// A color stop in a linear gradient.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient#linear-color-stop>
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, )]
 #[repr(C)]
 pub struct LinearColorStop {
     /// The color of the color stop.
@@ -969,48 +887,46 @@ impl From<Rgba> for Background {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     #[test]
     fn test_deserialize_three_value_hex_to_rgba() {
-        let actual: Rgba = serde_json::from_value(json!("#f09")).unwrap();
+        let actual = Rgba::try_from("#f09").unwrap();
 
         assert_eq!(actual, rgba(0xff0099ff))
     }
 
     #[test]
     fn test_deserialize_four_value_hex_to_rgba() {
-        let actual: Rgba = serde_json::from_value(json!("#f09f")).unwrap();
+        let actual = Rgba::try_from("#f09f").unwrap();
 
         assert_eq!(actual, rgba(0xff0099ff))
     }
 
     #[test]
     fn test_deserialize_six_value_hex_to_rgba() {
-        let actual: Rgba = serde_json::from_value(json!("#ff0099")).unwrap();
+        let actual = Rgba::try_from("#ff0099").unwrap();
 
         assert_eq!(actual, rgba(0xff0099ff))
     }
 
     #[test]
     fn test_deserialize_eight_value_hex_to_rgba() {
-        let actual: Rgba = serde_json::from_value(json!("#ff0099ff")).unwrap();
+        let actual = Rgba::try_from("#ff0099ff").unwrap();
 
         assert_eq!(actual, rgba(0xff0099ff))
     }
 
     #[test]
     fn test_deserialize_eight_value_hex_with_padding_to_rgba() {
-        let actual: Rgba = serde_json::from_value(json!(" #f5f5f5ff   ")).unwrap();
+        let actual = Rgba::try_from(" #f5f5f5ff   ").unwrap();
 
         assert_eq!(actual, rgba(0xf5f5f5ff))
     }
 
     #[test]
     fn test_deserialize_eight_value_hex_with_mixed_case_to_rgba() {
-        let actual: Rgba = serde_json::from_value(json!("#DeAdbEeF")).unwrap();
+        let actual = Rgba::try_from("#DeAdbEeF").unwrap();
 
         assert_eq!(actual, rgba(0xdeadbeef))
     }

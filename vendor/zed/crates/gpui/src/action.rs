@@ -2,7 +2,6 @@ use anyhow::{Context as _, Result};
 use collections::{HashMap, TypeIdHashMap};
 pub use gpui_macros::Action;
 pub use no_action::{NoAction, Unbind, is_no_action, is_unbind};
-use serde_json::json;
 use std::{
     any::{Any, TypeId},
     fmt::Display,
@@ -58,7 +57,7 @@ macro_rules! actions {
 ///
 /// ```
 /// use gpui::Action;
-/// #[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
+/// #[derive(Clone, PartialEq, serde::schemars::Action)]
 /// #[action(namespace = editor)]
 /// pub struct SelectNext {
 ///     pub replace_newest: bool,
@@ -97,7 +96,7 @@ macro_rules! actions {
 ///
 /// ```
 /// use gpui::{SharedString, register_action};
-/// #[derive(Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+/// #[derive(Clone, PartialEq, Eq, serde::schemars::)]
 /// pub struct Paste {
 ///     pub content: SharedString,
 /// }
@@ -129,19 +128,10 @@ pub trait Action: Any + Send {
     where
         Self: Sized;
 
-    /// Build this action from a JSON value. This is used to construct actions from the keymap.
-    /// A value of `{}` will be passed for actions that don't have any parameters.
-    fn build(value: serde_json::Value) -> Result<Box<dyn Action>>
+    /// Build this action by name. Parameterized JSON actions are not supported.
+    fn build() -> Result<Box<dyn Action>>
     where
         Self: Sized;
-
-    /// Optional JSON schema for the action's input data.
-    fn action_json_schema(_: &mut schemars::SchemaGenerator) -> Option<schemars::Schema>
-    where
-        Self: Sized,
-    {
-        None
-    }
 
     /// A list of alternate, deprecated names for this action. These names can still be used to
     /// invoke the action. In Zed, the keymap JSON schema will accept these old names and provide
@@ -228,7 +218,7 @@ impl Display for ActionBuildError {
     }
 }
 
-type ActionBuilder = fn(json: serde_json::Value) -> anyhow::Result<Box<dyn Action>>;
+type ActionBuilder = fn() -> anyhow::Result<Box<dyn Action>>;
 
 pub(crate) struct ActionRegistry {
     by_name: HashMap<&'static str, ActionData>,
@@ -258,7 +248,6 @@ impl Default for ActionRegistry {
 
 struct ActionData {
     pub build: ActionBuilder,
-    pub json_schema: fn(&mut schemars::SchemaGenerator) -> Option<schemars::Schema>,
 }
 
 /// This type must be public so that our macros can build it in other crates.
@@ -273,7 +262,6 @@ pub struct MacroActionData {
     pub name: &'static str,
     pub type_id: TypeId,
     pub build: ActionBuilder,
-    pub json_schema: fn(&mut schemars::SchemaGenerator) -> Option<schemars::Schema>,
     pub deprecated_aliases: &'static [&'static str],
     pub deprecation_message: Option<&'static str>,
     pub documentation: Option<&'static str>,
@@ -300,10 +288,7 @@ impl ActionRegistry {
         }
         self.by_name.insert(
             name,
-            ActionData {
-                build: action.build,
-                json_schema: action.json_schema,
-            },
+            ActionData { build: action.build },
         );
         for &alias in action.deprecated_aliases {
             if self.by_name.contains_key(alias) {
@@ -314,10 +299,7 @@ impl ActionRegistry {
             }
             self.by_name.insert(
                 alias,
-                ActionData {
-                    build: action.build,
-                    json_schema: action.json_schema,
-                },
+                ActionData { build: action.build },
             );
             self.deprecated_aliases.insert(alias, name);
             self.all_names.push(alias);
@@ -339,7 +321,7 @@ impl ActionRegistry {
             .get(type_id)
             .with_context(|| format!("no action type registered for {type_id:?}"))?;
 
-        Ok(self.build_action(name, None)?)
+        Ok(self.build_action(name)?)
     }
 
     #[cfg(feature = "profiler")]
@@ -347,11 +329,10 @@ impl ActionRegistry {
         self.names_by_type_id.get(type_id).copied()
     }
 
-    /// Construct an action based on its name and optional JSON parameters sourced from the keymap.
+    /// Construct an action based on its name.
     pub fn build_action(
         &self,
         name: &str,
-        params: Option<serde_json::Value>,
     ) -> std::result::Result<Box<dyn Action>, ActionBuildError> {
         let build_action = self
             .by_name
@@ -360,7 +341,7 @@ impl ActionRegistry {
                 name: name.to_owned(),
             })?
             .build;
-        (build_action)(params.unwrap_or_else(|| json!({}))).map_err(|e| {
+        (build_action)().map_err(|e| {
             ActionBuildError::BuildError {
                 name: name.to_owned(),
                 error: e,
@@ -370,33 +351,6 @@ impl ActionRegistry {
 
     pub fn all_action_names(&self) -> &[&'static str] {
         self.all_names.as_slice()
-    }
-
-    pub fn action_schemas(
-        &self,
-        generator: &mut schemars::SchemaGenerator,
-    ) -> Vec<(&'static str, Option<schemars::Schema>)> {
-        // Use the order from all_names so that the resulting schema has sensible order.
-        self.all_names
-            .iter()
-            .map(|name| {
-                let action_data = self
-                    .by_name
-                    .get(name)
-                    .expect("All actions in all_names should be registered");
-                (*name, (action_data.json_schema)(generator))
-            })
-            .collect::<Vec<_>>()
-    }
-
-    pub fn action_schema_by_name(
-        &self,
-        name: &str,
-        generator: &mut schemars::SchemaGenerator,
-    ) -> Option<Option<schemars::Schema>> {
-        self.by_name
-            .get(name)
-            .map(|action_data| (action_data.json_schema)(generator))
     }
 
     pub fn deprecated_aliases(&self) -> &HashMap<&'static str, &'static str> {
@@ -424,8 +378,6 @@ pub fn generate_list_of_all_registered_actions() -> impl Iterator<Item = MacroAc
 
 mod no_action {
     use crate as gpui;
-    use schemars::JsonSchema;
-    use serde::Deserialize;
 
     actions!(
         zed,
@@ -442,7 +394,7 @@ mod no_action {
     /// In keymap JSON this is written as:
     ///
     /// `["zed::Unbind", "editor::NewLine"]`
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, gpui::Action)]
+    #[derive(Clone, Debug, PartialEq, gpui::Action)]
     #[action(namespace = zed)]
     pub struct Unbind(pub gpui::SharedString);
 

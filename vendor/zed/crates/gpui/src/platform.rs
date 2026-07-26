@@ -54,9 +54,7 @@ use image::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
-use schemars::JsonSchema;
 use seahash::SeaHasher;
-use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -2130,7 +2128,7 @@ impl From<&str> for PromptButton {
 }
 
 /// The style of the cursor (pointer)
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, )]
 pub enum CursorStyle {
     /// The default cursor
     #[default]
@@ -2250,15 +2248,6 @@ impl ClipboardItem {
                 text,
                 metadata: Some(metadata),
             })],
-        }
-    }
-
-    /// Create a new ClipboardItem::String with the given text and associated metadata
-    pub fn new_string_with_json_metadata<T: Serialize>(text: String, metadata: T) -> Self {
-        Self {
-            entries: vec![ClipboardEntry::String(
-                ClipboardString::new(text).with_json_metadata(metadata),
-            )],
         }
     }
 
@@ -2600,13 +2589,6 @@ impl ClipboardString {
         }
     }
 
-    /// Return a new clipboard item with the metadata replaced by the given metadata,
-    /// after serializing it as JSON.
-    pub fn with_json_metadata<T: Serialize>(mut self, metadata: T) -> Self {
-        self.metadata = Some(serde_json::to_string(&metadata).unwrap());
-        self
-    }
-
     /// Get the text of the clipboard string
     pub fn text(&self) -> &String {
         &self.text
@@ -2615,16 +2597,6 @@ impl ClipboardString {
     /// Get the owned text of the clipboard string
     pub fn into_text(self) -> String {
         self.text
-    }
-
-    /// Get the metadata of the clipboard string, formatted as JSON
-    pub fn metadata_json<T>(&self) -> Option<T>
-    where
-        T: for<'a> Deserialize<'a>,
-    {
-        self.metadata
-            .as_ref()
-            .and_then(|m| serde_json::from_str(m).ok())
     }
 
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]

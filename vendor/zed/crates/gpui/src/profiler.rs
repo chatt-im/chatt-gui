@@ -16,7 +16,6 @@ mod actions;
 pub use actions::{ActionStatistics, ActionTiming, take_action_stats};
 pub(crate) use actions::{save_action_timing, update_running_action};
 
-use serde::{Deserialize, Serialize};
 
 use crate::{SharedString, TasksIncluded, WindowId};
 
@@ -222,7 +221,7 @@ impl ThreadTaskStatistics {
 }
 
 /// Serializable variant of [`core::panic::Location`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, )]
 pub struct SerializedLocation {
     /// Name of the source file
     pub file: SharedString,
@@ -243,7 +242,7 @@ impl From<&core::panic::Location<'static>> for SerializedLocation {
 }
 
 /// Serializable variant of [`TaskTiming`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, )]
 pub struct SerializedTaskTiming {
     /// Location of the timing
     pub location: SerializedLocation,
@@ -289,7 +288,7 @@ impl SerializedTaskTiming {
 }
 
 /// Serializable variant of [`ThreadTaskTimings`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, )]
 pub struct SerializedThreadTaskTimings {
     /// Thread name
     pub thread_name: Option<String>,

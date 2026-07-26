@@ -118,19 +118,11 @@ pub(crate) fn derive_action(input: TokenStream) -> TokenStream {
 
     let is_unit_struct = matches!(&input.data, Data::Struct(data) if data.fields.is_empty());
 
-    let build_fn_body = if no_json {
+    let build_fn_body = if no_json || !is_unit_struct {
         let error_msg = format!("{} cannot be built from JSON", full_name);
         quote! { Err(gpui::private::anyhow::anyhow!(#error_msg)) }
-    } else if is_unit_struct {
+    } else {
         quote! { Ok(Box::new(Self)) }
-    } else {
-        quote! { Ok(Box::new(gpui::private::serde_json::from_value::<Self>(_value)?)) }
-    };
-
-    let json_schema_fn_body = if no_json || is_unit_struct {
-        quote! { None }
-    } else {
-        quote! { Some(<Self as gpui::private::schemars::JsonSchema>::json_schema(_generator)) }
     };
 
     let deprecated_aliases_fn_body = if deprecated_aliases.is_empty() {
@@ -185,14 +177,8 @@ pub(crate) fn derive_action(input: TokenStream) -> TokenStream {
                 Box::new(self.clone())
             }
 
-            fn build(_value: gpui::private::serde_json::Value) -> gpui::Result<Box<dyn gpui::Action>> {
+            fn build() -> gpui::Result<Box<dyn gpui::Action>> {
                 #build_fn_body
-            }
-
-            fn action_json_schema(
-                _generator: &mut gpui::private::schemars::SchemaGenerator,
-            ) -> Option<gpui::private::schemars::Schema> {
-                #json_schema_fn_body
             }
 
             fn deprecated_aliases() -> &'static [&'static str] {

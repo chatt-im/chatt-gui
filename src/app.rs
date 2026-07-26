@@ -55,9 +55,9 @@ use crate::{
     theme::{AppliedSettings, ThemePalette, ThemeRole},
     timeline::{self, Attachment, AttachmentRenderKind},
     ui_controls::{
-        compact_action_button, composer_add_button, icon_button, message_action_button,
-        mini_button, preview_action_button, preview_control_button, preview_status, room_button,
-        sidebar_footer_button, toolbar_button, PREVIEW_HEADER_ICON_SIZE,
+        PREVIEW_HEADER_ICON_SIZE, compact_action_button, composer_add_button, icon_button,
+        message_action_button, mini_button, preview_action_button, preview_control_button,
+        preview_status, room_button, sidebar_footer_button, toolbar_button,
     },
     ui_scale::rems_from_px,
     video_controls::{
@@ -6378,11 +6378,7 @@ impl ChattView {
                             .pl_3()
                             .pr_1()
                             .cursor_pointer()
-                            .child(icon(
-                                tab_icon,
-                                PREVIEW_HEADER_ICON_SIZE,
-                                tab_icon_color,
-                            ))
+                            .child(icon(tab_icon, PREVIEW_HEADER_ICON_SIZE, tab_icon_color))
                             .child(
                                 div()
                                     .min_w_0()
