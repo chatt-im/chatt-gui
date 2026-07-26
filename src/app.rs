@@ -2700,14 +2700,6 @@ impl ChattView {
                         return;
                     }
                 };
-                if pending_descriptor.as_ref().is_some_and(|descriptor| {
-                    Attachment {
-                        descriptor: descriptor.clone(),
-                    }
-                    .is_video()
-                }) {
-                    self.videos.prepare();
-                }
                 let pending = self
                     .pending_video_plays
                     .iter()

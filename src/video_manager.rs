@@ -12,7 +12,6 @@ use local_rpc::{ids::RoomId, model::AttachmentId};
 use crate::attachment_source::{AttachmentSourceRegistry, RegisteredAttachmentSource};
 use crate::mpv_player::{AttachmentRenderBackend, MpvPlayer, SeekMode};
 
-const WARM_PLAYER_TARGET: usize = 2;
 const RETAINED_OFFSCREEN_LIMIT: usize = 4;
 const MAX_SESSION_ENTRIES: usize = 256;
 
@@ -93,16 +92,13 @@ pub(crate) struct VideoDrain {
 }
 
 /// Owns independent attachment sessions while sharing the expensive backend
-/// decision and retaining a small number of initialized libmpv cores.
+/// decision. Players are constructed only in response to playback demand.
 pub(crate) struct AttachmentVideoManager {
     sessions: HashMap<VideoKey, VideoSession>,
-    standby: Vec<MpvPlayer>,
     queued: VecDeque<VideoKey>,
     queued_keys: HashSet<VideoKey>,
     backend: Option<AttachmentRenderBackend>,
     build_in_flight: bool,
-    warm_build_suppressed: bool,
-    prepare_requested: bool,
     build_results: mpsc::Receiver<BuildResult>,
     build_result_sender: mpsc::Sender<BuildResult>,
     reaper: mpsc::Sender<MpvPlayer>,
@@ -130,13 +126,10 @@ impl AttachmentVideoManager {
         }
         Self {
             sessions: HashMap::new(),
-            standby: Vec::new(),
             queued: VecDeque::new(),
             queued_keys: HashSet::new(),
             backend: None,
             build_in_flight: false,
-            warm_build_suppressed: false,
-            prepare_requested: false,
             build_results,
             build_result_sender,
             reaper,
@@ -160,18 +153,6 @@ impl AttachmentVideoManager {
             .or_insert_with(|| VideoSession::new(source.clone(), self.clock));
         session.source = Some(source);
         session.touched = self.clock;
-    }
-
-    pub(crate) fn prepare(&mut self) {
-        if self.prepare_requested || !self.standby.is_empty() {
-            return;
-        }
-        self.prepare_requested = true;
-        let mut drain = VideoDrain::default();
-        self.pump_builds(&mut drain);
-        for error in drain.errors {
-            kvlog::warn!("video manager operation failed", err = %error);
-        }
     }
 
     pub(crate) fn view(&self, key: VideoKey) -> VideoView {
@@ -229,11 +210,7 @@ impl AttachmentVideoManager {
         if self.queued_keys.insert(key) {
             self.queued.push_back(key);
         }
-        let mut drain = VideoDrain::default();
-        self.pump_builds(&mut drain);
-        if let Some(error) = drain.errors.pop() {
-            return Err(anyhow!(error));
-        }
+        self.pump_builds();
         Ok(())
     }
 
@@ -290,11 +267,7 @@ impl AttachmentVideoManager {
                 self.queued.push_back(key);
             }
         }
-        let mut drain = VideoDrain::default();
-        self.pump_builds(&mut drain);
-        if let Some(error) = drain.errors.pop() {
-            return Err(anyhow!(error));
-        }
+        self.pump_builds();
         Ok(())
     }
 
@@ -385,7 +358,7 @@ impl AttachmentVideoManager {
         self.queued.retain(|key| self.queued_keys.contains(key));
         self.enforce_retained_limit(&mut drain);
         self.enforce_session_limit(&mut drain);
-        self.pump_builds(&mut drain);
+        self.pump_builds();
         drain
     }
 
@@ -397,7 +370,6 @@ impl AttachmentVideoManager {
             match result.0 {
                 Ok((player, backend)) => {
                     self.backend = Some(backend);
-                    self.warm_build_suppressed = false;
                     self.assign_player(player, &mut drain);
                 }
                 Err(error) => {
@@ -408,10 +380,8 @@ impl AttachmentVideoManager {
                         }
                         drain.errors.push(format!("Video unavailable: {error}"));
                     } else {
-                        self.warm_build_suppressed = true;
                         kvlog::warn!(
-                            "could not replenish warm video player pool",
-                            retry = "on-demand",
+                            "video player build failed after playback request was canceled",
                             err = %error
                         );
                     }
@@ -457,7 +427,7 @@ impl AttachmentVideoManager {
             drain.changed = true;
         }
         self.enforce_session_limit(&mut drain);
-        self.pump_builds(&mut drain);
+        self.pump_builds();
         drain
     }
 
@@ -486,7 +456,7 @@ impl AttachmentVideoManager {
             }
             drain.changed = true;
         }
-        self.pump_builds(&mut drain);
+        self.pump_builds();
         drain
     }
 
@@ -502,16 +472,11 @@ impl AttachmentVideoManager {
         for player in players {
             self.recycle(player);
         }
-        let mut drain = VideoDrain::default();
-        self.pump_builds(&mut drain);
-        for error in drain.errors {
-            kvlog::error!("video manager operation failed", err = %error);
-        }
     }
 
     fn assign_player(&mut self, player: MpvPlayer, drain: &mut VideoDrain) {
         let Some(key) = self.pop_queued() else {
-            self.standby.push(player);
+            let _ = self.reaper.send(player);
             return;
         };
         self.assign_specific_player(key, player, drain);
@@ -531,26 +496,11 @@ impl AttachmentVideoManager {
         None
     }
 
-    fn pump_builds(&mut self, drain: &mut VideoDrain) {
+    fn pump_builds(&mut self) {
         if self.build_in_flight {
             return;
         }
-        while let Some(player) = self.standby.pop() {
-            let Some(key) = self.pop_queued() else {
-                self.standby.push(player);
-                break;
-            };
-            self.assign_specific_player(key, player, drain);
-        }
-
-        let needs_queued_player = !self.queued_keys.is_empty();
-        let needs_initial_warm_player =
-            self.prepare_requested && self.backend.is_none() && self.standby.is_empty();
-        let needs_warm_player = needs_initial_warm_player
-            || (self.backend.is_some()
-                && !self.warm_build_suppressed
-                && self.standby.len() < WARM_PLAYER_TARGET);
-        if !needs_queued_player && !needs_warm_player {
+        if self.queued_keys.is_empty() {
             return;
         }
         self.build_in_flight = true;
@@ -601,7 +551,7 @@ impl AttachmentVideoManager {
         drain: &mut VideoDrain,
     ) {
         let Some(session) = self.sessions.get_mut(&key) else {
-            self.standby.push(player);
+            let _ = self.reaper.send(player);
             return;
         };
         let Some(source) = session.source.as_ref() else {
@@ -675,15 +625,8 @@ impl AttachmentVideoManager {
         drain.changed |= self.sessions.len() != before;
     }
 
-    fn recycle(&mut self, mut player: MpvPlayer) {
-        if let Err(error) = player.stop() {
-            kvlog::warn!("could not stop retained video player", err = %error);
-            let _ = self.reaper.send(player);
-        } else if self.standby.len() < WARM_PLAYER_TARGET {
-            self.standby.push(player);
-        } else {
-            let _ = self.reaper.send(player);
-        }
+    fn recycle(&self, player: MpvPlayer) {
+        let _ = self.reaper.send(player);
     }
 
     fn touch(&mut self, key: VideoKey) {
@@ -700,9 +643,6 @@ impl Drop for AttachmentVideoManager {
             if let Some(player) = session.player.take() {
                 let _ = self.reaper.send(player);
             }
-        }
-        for player in self.standby.drain(..) {
-            let _ = self.reaper.send(player);
         }
     }
 }
@@ -798,7 +738,6 @@ mod tests {
         ensure_source(&mut videos, key(1));
 
         assert!(videos.backend.is_none());
-        assert!(videos.standby.is_empty());
         assert!(!videos.build_in_flight);
     }
 
@@ -821,9 +760,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_warm_replenishment_waits_for_real_demand() {
+    fn canceled_on_demand_build_failure_does_not_restart_or_surface_an_error() {
         let mut videos = manager();
-        videos.backend = Some(AttachmentRenderBackend::Software);
         videos.build_in_flight = true;
         videos
             .build_result_sender
@@ -833,7 +771,6 @@ mod tests {
         let drain = videos.drain();
 
         assert!(drain.errors.is_empty());
-        assert!(videos.warm_build_suppressed);
         assert!(!videos.build_in_flight);
     }
 

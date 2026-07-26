@@ -40,6 +40,9 @@ use gpui_platform::application;
 
 use crate::app::ChattView;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let logger_guard = logger::init();
     ensure_graphical_backend();
