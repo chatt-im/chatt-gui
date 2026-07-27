@@ -9,6 +9,7 @@ pub(crate) enum IconName {
     AudioOff,
     AudioOn,
     AtSign,
+    Chatt,
     Close,
     CornerUpLeft,
     Copy,
@@ -43,6 +44,7 @@ impl IconName {
             Self::AudioOff => "icons/audio-off.svg",
             Self::AudioOn => "icons/audio-on.svg",
             Self::AtSign => "icons/at-sign.svg",
+            Self::Chatt => "icons/chatt.svg",
             Self::Close => "icons/close.svg",
             Self::CornerUpLeft => "icons/corner-up-left.svg",
             Self::Copy => "icons/copy.svg",
@@ -107,6 +109,7 @@ const ICON_PATHS: &[&str] = &[
     "icons/audio-off.svg",
     "icons/audio-on.svg",
     "icons/at-sign.svg",
+    "icons/chatt.svg",
     "icons/close.svg",
     "icons/corner-up-left.svg",
     "icons/copy.svg",
@@ -136,6 +139,13 @@ const ICON_PATHS: &[&str] = &[
 ];
 
 fn icon_svg(path: &str) -> Option<String> {
+    if path == "icons/chatt.svg" {
+        return Some(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><path d="M0 0v48h8v16l24-16h32V0Zm12 4 20 20-20 20Zm40 0v40L32 24Z" fill="black"/></svg>"#
+                .to_owned(),
+        );
+    }
+
     let body = match path {
         "icons/audio-off.svg" => {
             r#"<path d="M11 5 6 9H2v6h4l5 4z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/>"#

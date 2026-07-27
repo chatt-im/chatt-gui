@@ -40,7 +40,7 @@ impl ChattView {
     /// The tab bar sits above it in every layout, and the live share pane sits
     /// above the tab bar in the layouts that share the body column with it.
     pub(super) fn preview_chrome_top(&self, layout: PreviewLayout, window: &Window) -> Pixels {
-        let tab_bar = crate::ui_scale::scaled_px(PREVIEW_TAB_BAR_HEIGHT, window.rem_size());
+        let tab_bar = crate::ui_scale::scaled_px(TOP_BAR_HEIGHT, window.rem_size());
         if layout == PreviewLayout::Split || self.model.live_shares.is_empty() {
             return tab_bar;
         }
@@ -69,7 +69,7 @@ impl ChattView {
             return px(0.);
         }
         crate::ui_scale::scaled_px(
-            MIN_STACKED_VIEWER_HEIGHT + PREVIEW_TAB_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH,
+            MIN_STACKED_VIEWER_HEIGHT + TOP_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH,
             window.rem_size(),
         )
     }
@@ -849,13 +849,15 @@ impl ChattView {
             .gap_2()
             .px_3()
             .cursor_pointer()
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(settings.theme.color(ThemeRole::TextDim))
-                    .child("#"),
-            )
+            .child(icon(
+                IconName::Chatt,
+                PREVIEW_HEADER_ICON_SIZE,
+                settings.theme.color(if selected {
+                    ThemeRole::MediaProgressKnob
+                } else {
+                    ThemeRole::TextMuted
+                }),
+            ))
             .child(div().min_w_0().truncate().text_xs().child(room_name))
             .on_click(cx.listener(|this, _, window, cx| this.show_chat_tab(window, cx)))
     }
@@ -890,19 +892,19 @@ impl ChattView {
                 actions
                     .child(
                         preview_control_button("preview-fit", "Fit", &settings.theme)
-                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .min_h(rems_from_px(TOP_BAR_HEIGHT))
                             .on_click(cx.listener(|this, _, _, cx| this.fit_preview_image(cx))),
                     )
                     .child(
                         preview_control_button("preview-actual", "1:1", &settings.theme)
-                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .min_h(rems_from_px(TOP_BAR_HEIGHT))
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.actual_size_preview_image(cx)),
                             ),
                     )
                     .child(
                         preview_control_button("preview-zoom-out", "−", &settings.theme)
-                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .min_h(rems_from_px(TOP_BAR_HEIGHT))
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.zoom_preview_image(-0.25, cx)),
                             ),
@@ -917,7 +919,7 @@ impl ChattView {
                     )
                     .child(
                         preview_control_button("preview-zoom-in", "+", &settings.theme)
-                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .min_h(rems_from_px(TOP_BAR_HEIGHT))
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.zoom_preview_image(0.25, cx)),
                             ),
@@ -977,7 +979,7 @@ impl ChattView {
         let tabs = self.render_preview_tabs(active.map(PreviewItem::key), cx);
         let actions = self.render_preview_actions(active, viewport, cx);
         div()
-            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+            .min_h(rems_from_px(TOP_BAR_HEIGHT))
             .flex_none()
             .flex()
             .flex_wrap()

@@ -7,6 +7,8 @@ use crate::{
 };
 
 pub(crate) const PREVIEW_HEADER_ICON_SIZE: f32 = 17.0;
+/// Minimum height of one row in the rooms header, status bar, and preview tab bar.
+pub(crate) const TOP_BAR_HEIGHT: f32 = 42.0;
 
 pub(crate) fn room_button(
     id: impl Into<gpui::ElementId>,
@@ -71,7 +73,7 @@ pub(crate) fn toolbar_button(
     let hover = palette.color(ThemeRole::ControlButtonHover);
     div()
         .id(id)
-        .min_h(rems_from_px(52.))
+        .min_h(rems_from_px(TOP_BAR_HEIGHT))
         .px_3()
         .flex()
         .items_center()
@@ -242,7 +244,7 @@ pub(crate) fn preview_action_button(
     div()
         .id(id)
         .w(rems_from_px(36.0))
-        .min_h(rems_from_px(52.0))
+        .min_h(rems_from_px(TOP_BAR_HEIGHT))
         .flex()
         .items_center()
         .justify_center()

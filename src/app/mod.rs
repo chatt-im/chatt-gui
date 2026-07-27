@@ -66,9 +66,9 @@ use crate::{
     theme::{AppliedSettings, ThemePalette, ThemeRole},
     timeline::{self, Attachment, AttachmentRenderKind},
     ui_controls::{
-        PREVIEW_HEADER_ICON_SIZE, compact_action_button, composer_add_button, icon_button,
-        message_action_button, mini_button, preview_action_button, preview_control_button,
-        preview_status, room_button, sidebar_footer_button, toolbar_button,
+        PREVIEW_HEADER_ICON_SIZE, TOP_BAR_HEIGHT, compact_action_button, composer_add_button,
+        icon_button, message_action_button, mini_button, preview_action_button,
+        preview_control_button, preview_status, room_button, sidebar_footer_button, toolbar_button,
     },
     ui_scale::rems_from_px,
     video_controls::{
@@ -104,7 +104,6 @@ use local_rpc::{
 };
 
 const SIDEBAR_WIDTH: f32 = 232.0;
-const TOP_BAR_HEIGHT: f32 = 52.0;
 const MIN_COMPOSER_HEIGHT: f32 = 64.0;
 const TIMELINE_GROUP_GAP: f32 = 7.0;
 const TIMELINE_MESSAGE_ROW_PADDING_TOP: f32 = 2.0;
@@ -124,7 +123,6 @@ const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const MIN_STACKED_VIEWER_HEIGHT: f32 = 200.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
-const PREVIEW_TAB_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
 const VIDEO_EFFECT_OVERLAY_HOLD: Duration = Duration::from_millis(400);
 
@@ -5227,7 +5225,7 @@ impl Render for ChattView {
                                 .flex()
                                 .flex_wrap()
                                 .items_center()
-                                .gap_3()
+                                .gap_x_3()
                                 .px_4()
                                 .border_b_1()
                                 .border_color(applied.theme.color(ThemeRole::BorderSubtle))
@@ -5986,29 +5984,44 @@ mod tests {
     #[test]
     fn preview_image_viewport_starts_below_the_chrome_above_the_viewer() {
         let window = gpui::size(px(1_920.0), px(1_080.0));
+        let bar_height = px(TOP_BAR_HEIGHT);
 
-        let split = preview_image_viewport_bounds(window, px(900.0), px(52.0), px(1_028.0));
-        assert_eq!(PREVIEW_TAB_BAR_HEIGHT, TOP_BAR_HEIGHT);
-        assert_eq!(split.origin, point(px(1_020.0), px(52.0)));
-        assert_eq!(split.size, gpui::size(px(900.0), px(1_028.0)));
+        let split = preview_image_viewport_bounds(
+            window,
+            px(900.0),
+            bar_height,
+            window.height - bar_height,
+        );
+        assert_eq!(split.origin, point(px(1_020.0), bar_height));
+        assert_eq!(
+            split.size,
+            gpui::size(px(900.0), window.height - bar_height)
+        );
 
         // Tabbed: the viewer spans the body, below a live share pane and the
         // tab bar, so it starts at the sidebar edge and clears both.
-        let tabbed =
-            preview_image_viewport_bounds(window, px(1_688.0), px(240.0) + px(52.0), px(788.0));
-        assert_eq!(tabbed.origin, point(px(232.0), px(292.0)));
-        assert_eq!(tabbed.size, gpui::size(px(1_688.0), px(788.0)));
+        let tabbed = preview_image_viewport_bounds(
+            window,
+            px(1_688.0),
+            px(240.0) + bar_height,
+            window.height - px(240.0) - bar_height,
+        );
+        assert_eq!(tabbed.origin, point(px(232.0), px(240.0) + bar_height));
+        assert_eq!(
+            tabbed.size,
+            gpui::size(px(1_688.0), window.height - px(240.0) - bar_height)
+        );
 
         // Stacked: same top edge as tabbed, but the chat below it keeps the
         // rest of the window instead of the viewer running to the bottom.
         let stacked = preview_image_viewport_bounds(
             window,
             px(1_688.0),
-            px(52.0),
-            stacked_viewer_height(None, px(1_028.0), px(16.0)),
+            bar_height,
+            stacked_viewer_height(None, window.height - bar_height, px(16.0)),
         );
-        assert_eq!(stacked.origin, point(px(232.0), px(52.0)));
-        assert_eq!(stacked.size, gpui::size(px(1_688.0), px(509.5)));
+        assert_eq!(stacked.origin, point(px(232.0), bar_height));
+        assert_eq!(stacked.size, gpui::size(px(1_688.0), px(515.5)));
     }
 
     #[test]
@@ -6530,26 +6543,26 @@ mod tests {
         );
         assert_eq!(
             clamp_live_pane_height(px(900.0), px(900.0), px(0.0), px(16.0)),
-            px(699.0),
+            px(711.0),
         );
         assert_eq!(
             clamp_live_pane_height(px(900.0), px(300.0), px(0.0), px(16.0)),
-            px(99.0),
+            px(111.0),
         );
     }
 
     #[test]
     fn live_pane_height_gives_up_room_reserved_for_the_stacked_viewer() {
         let reserved =
-            px(MIN_STACKED_VIEWER_HEIGHT + PREVIEW_TAB_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH);
+            px(MIN_STACKED_VIEWER_HEIGHT + TOP_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH);
 
         assert_eq!(
             clamp_live_pane_height(px(900.0), px(900.0), reserved, px(16.0)),
-            px(438.0),
+            px(462.0),
         );
         assert_eq!(
-            clamp_live_pane_height(px(900.0), px(1_800.0), reserved * 2.0, px(32.0)),
-            px(876.0),
+            clamp_live_pane_height(px(1_800.0), px(1_800.0), reserved * 2.0, px(32.0)),
+            px(924.0),
         );
     }
 
