@@ -13,15 +13,19 @@ impl ChattView {
         let thumbnail_key = ThumbnailKey {
             source_key: self.source_key(key.room_id, descriptor.id),
         };
-        let thumbnail = if let Some(source) = registered_source.as_ref() {
-            let thumbnail = self.video_thumbnails.request(thumbnail_key, source.clone());
-            if thumbnail.pending {
-                self.video_sources
-                    .set_pin(source.source().key(), VideoSourcePin::Thumbnail, true);
+        let thumbnail = match registered_source.as_ref() {
+            Some(source) if !self.video_sources.has_playback_pin(source.source().key()) => {
+                let thumbnail = self.video_thumbnails.request(thumbnail_key, source.clone());
+                if thumbnail.pending {
+                    self.video_sources.set_pin(
+                        source.source().key(),
+                        VideoSourcePin::Thumbnail,
+                        true,
+                    );
+                }
+                thumbnail
             }
-            thumbnail
-        } else {
-            self.video_thumbnails.view(thumbnail_key)
+            _ => self.video_thumbnails.view(thumbnail_key),
         };
         let duration = if video.duration > 0.0 {
             video.duration

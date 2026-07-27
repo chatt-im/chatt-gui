@@ -37,11 +37,19 @@ pub type ChattFfmpegSeekFn = unsafe extern "C" fn(
 ) -> i64;
 
 #[cfg(feature = "vendored")]
+pub type ChattFfmpegInterruptFn =
+    unsafe extern "C" fn(opaque: *mut ::std::ffi::c_void) -> ::std::ffi::c_int;
+
+#[cfg(feature = "vendored")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChattFfmpegThumbnail {
+    /// Scaled size before `rotate` is applied.
     pub width: ::std::ffi::c_int,
     pub height: ::std::ffi::c_int,
+    /// Clockwise degrees the image must be rotated at display time: 0, 90, 180, or 270.
+    pub rotate: ::std::ffi::c_int,
+    pub reserved: ::std::ffi::c_int,
     pub duration: f64,
 }
 
@@ -52,8 +60,12 @@ unsafe extern "C" {
         byte_len: i64,
         read: ChattFfmpegReadFn,
         seek: ChattFfmpegSeekFn,
+        interrupt: ChattFfmpegInterruptFn,
         maximum_width: ::std::ffi::c_int,
         maximum_height: ::std::ffi::c_int,
+        maximum_pixels: i64,
+        probesize: i64,
+        maximum_analyze_duration: i64,
         bgra: *mut u8,
         bgra_capacity: usize,
         thumbnail: *mut ChattFfmpegThumbnail,

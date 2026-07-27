@@ -1,5 +1,7 @@
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,16 +11,30 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
+#include <libavutil/display.h>
 #include <libavutil/error.h>
+#include <libavutil/frame.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 
+/* FFmpeg only applies log_level_offset to levels at or above AV_LOG_FATAL, so
+ * shifting those past AV_LOG_TRACE keeps thumbnail decode noise out of the
+ * process-global av_log callback that mpv installs, while leaving AV_LOG_PANIC
+ * intact. The diagnostic the caller actually surfaces is captured in `error`.
+ * Only AVCodecContext exposes the field; AVFormatContext has no equivalent, so
+ * demuxer-level messages still reach mpv's callback. */
+#define CHATT_THUMBNAIL_LOG_OFFSET (AV_LOG_TRACE + 8 - AV_LOG_FATAL)
+
 typedef int (*chatt_ffmpeg_read_fn)(void *opaque, uint8_t *buffer, int length);
 typedef int64_t (*chatt_ffmpeg_seek_fn)(void *opaque, int64_t offset, int whence);
+typedef int (*chatt_ffmpeg_interrupt_fn)(void *opaque);
 
 struct chatt_ffmpeg_thumbnail {
     int width;
     int height;
+    int rotate;
+    int reserved;
     double duration;
 };
 
@@ -27,6 +43,7 @@ struct chatt_ffmpeg_io {
     int64_t byte_len;
     chatt_ffmpeg_read_fn read;
     chatt_ffmpeg_seek_fn seek;
+    chatt_ffmpeg_interrupt_fn interrupt;
 };
 
 static int set_error(char *output, size_t capacity, const char *format, ...)
@@ -72,37 +89,115 @@ static int64_t seek(void *opaque, int64_t offset, int whence)
     return position < 0 ? AVERROR(EIO) : position;
 }
 
-static void bounded_size(int source_width, int source_height, int maximum_width,
-                         int maximum_height, int *width, int *height)
+static int check_interrupt(void *opaque)
 {
-    *width = source_width;
-    *height = source_height;
-    if (source_width <= maximum_width && source_height <= maximum_height)
-        return;
+    struct chatt_ffmpeg_io *io = opaque;
+    return io->interrupt ? io->interrupt(io->opaque) : 0;
+}
 
-    if ((int64_t)maximum_width * source_height <=
-        (int64_t)maximum_height * source_width) {
-        *width = maximum_width;
-        *height = (int)(((int64_t)source_height * maximum_width +
-                         source_width / 2) /
-                        source_width);
-    } else {
-        *height = maximum_height;
-        *width = (int)(((int64_t)source_width * maximum_height +
-                        source_height / 2) /
-                       source_height);
+static void bounded_size(int64_t source_width, int64_t source_height,
+                         int maximum_width, int maximum_height, int *width,
+                         int *height)
+{
+    if (source_width < 1)
+        source_width = 1;
+    if (source_height < 1)
+        source_height = 1;
+
+    int64_t scaled_width = source_width;
+    int64_t scaled_height = source_height;
+    if (source_width > maximum_width || source_height > maximum_height) {
+        if ((int64_t)maximum_width * source_height <=
+            (int64_t)maximum_height * source_width) {
+            scaled_width = maximum_width;
+            scaled_height = (source_height * maximum_width +
+                             source_width / 2) /
+                            source_width;
+        } else {
+            scaled_height = maximum_height;
+            scaled_width = (source_width * maximum_height +
+                            source_height / 2) /
+                           source_height;
+        }
     }
-    if (*width < 1)
-        *width = 1;
-    if (*height < 1)
-        *height = 1;
+
+    if (scaled_width < 1)
+        scaled_width = 1;
+    if (scaled_height < 1)
+        scaled_height = 1;
+    if (scaled_width > maximum_width)
+        scaled_width = maximum_width;
+    if (scaled_height > maximum_height)
+        scaled_height = maximum_height;
+    *width = (int)scaled_width;
+    *height = (int)scaled_height;
+}
+
+/* Clockwise degrees the image must be rotated at display time, matching mpv's
+ * demux_lavf.c so thumbnails agree with playback. The frame matrix wins over the
+ * container one, as it does in mpv's mp_image_copy_attributes. */
+static int display_rotation(const AVFrame *frame, const AVStream *stream)
+{
+    const int32_t *matrix = NULL;
+    const AVFrameSideData *frame_side_data =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+    if (frame_side_data && frame_side_data->size >= 9 * sizeof(int32_t)) {
+        matrix = (const int32_t *)frame_side_data->data;
+    } else {
+        const AVPacketSideData *stream_side_data = av_packet_side_data_get(
+            stream->codecpar->coded_side_data,
+            stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        if (stream_side_data &&
+            stream_side_data->size >= 9 * sizeof(int32_t))
+            matrix = (const int32_t *)stream_side_data->data;
+    }
+    if (!matrix)
+        return 0;
+
+    double rotation = av_display_rotation_get(matrix);
+    if (isnan(rotation))
+        return 0;
+    int rotate = (((int)(-rotation) % 360) + 360) % 360;
+    return (((rotate + 45) / 90) * 90) % 360;
+}
+
+static void display_size(AVFormatContext *format, AVStream *stream,
+                         AVFrame *frame, int64_t *width, int64_t *height)
+{
+    int64_t display_width = frame->width;
+    int64_t display_height = frame->height;
+    AVRational aspect = av_guess_sample_aspect_ratio(format, stream, frame);
+    if (aspect.num > 0 && aspect.den > 0 && aspect.num != aspect.den) {
+        if (aspect.num > aspect.den)
+            display_width = av_rescale(display_width, aspect.num, aspect.den);
+        else
+            display_height = av_rescale(display_height, aspect.den, aspect.num);
+    }
+    *width = display_width < 1 ? 1
+                               : (display_width > INT_MAX ? INT_MAX
+                                                          : display_width);
+    *height = display_height < 1 ? 1
+                                 : (display_height > INT_MAX ? INT_MAX
+                                                             : display_height);
+}
+
+/* SWS_CS_* deliberately share the AVCOL_SPC_* numbering, so the frame's
+ * colorspace can be handed to sws_getCoefficients directly. The fallback for
+ * unspecified content mirrors mpv's mp_csp_guess_colorspace. */
+static int source_colorspace(const AVFrame *frame)
+{
+    if (frame->colorspace != AVCOL_SPC_UNSPECIFIED)
+        return frame->colorspace;
+    return (frame->width >= 1280 || frame->height > 576) ? SWS_CS_ITU709
+                                                         : SWS_CS_ITU601;
 }
 
 int chatt_ffmpeg_extract_first_frame(
     void *opaque, int64_t byte_len, chatt_ffmpeg_read_fn read,
-    chatt_ffmpeg_seek_fn seek_callback, int maximum_width, int maximum_height,
-    uint8_t *bgra, size_t bgra_capacity,
-    struct chatt_ffmpeg_thumbnail *thumbnail, char *error,
+    chatt_ffmpeg_seek_fn seek_callback, chatt_ffmpeg_interrupt_fn interrupt,
+    int maximum_width, int maximum_height, int64_t maximum_pixels,
+    int64_t probesize, int64_t maximum_analyze_duration, uint8_t *bgra,
+    size_t bgra_capacity, struct chatt_ffmpeg_thumbnail *thumbnail, char *error,
     size_t error_capacity)
 {
     const int io_buffer_size = 64 * 1024;
@@ -111,6 +206,7 @@ int chatt_ffmpeg_extract_first_frame(
         .byte_len = byte_len,
         .read = read,
         .seek = seek_callback,
+        .interrupt = interrupt,
     };
     AVFormatContext *format = NULL;
     AVIOContext *avio = NULL;
@@ -121,7 +217,8 @@ int chatt_ffmpeg_extract_first_frame(
     int result = -1;
 
     if (!opaque || byte_len <= 0 || !read || !seek_callback ||
-        maximum_width <= 0 || maximum_height <= 0 || !bgra || !thumbnail)
+        maximum_width <= 0 || maximum_height <= 0 || maximum_pixels <= 0 ||
+        probesize <= 0 || maximum_analyze_duration <= 0 || !bgra || !thumbnail)
         return set_error(error, error_capacity,
                          "invalid FFmpeg thumbnail arguments");
     memset(thumbnail, 0, sizeof(*thumbnail));
@@ -147,6 +244,11 @@ int chatt_ffmpeg_extract_first_frame(
     }
     format->pb = avio;
     format->flags |= AVFMT_FLAG_CUSTOM_IO;
+    format->probesize = probesize;
+    format->max_analyze_duration = maximum_analyze_duration;
+    format->fps_probe_size = 0;
+    format->interrupt_callback.callback = check_interrupt;
+    format->interrupt_callback.opaque = &io;
 
     int status = avformat_open_input(&format, NULL, NULL, NULL);
     if (status < 0) {
@@ -182,6 +284,8 @@ int chatt_ffmpeg_extract_first_frame(
     }
     decoder_context->pkt_timebase = stream->time_base;
     decoder_context->thread_count = 1;
+    decoder_context->max_pixels = maximum_pixels;
+    decoder_context->log_level_offset = CHATT_THUMBNAIL_LOG_OFFSET;
     status = avcodec_open2(decoder_context, decoder, NULL);
     if (status < 0) {
         set_av_error(error, error_capacity, "open thumbnail decoder", status);
@@ -239,10 +343,20 @@ int chatt_ffmpeg_extract_first_frame(
                   "thumbnail decoder returned invalid dimensions");
         goto cleanup;
     }
+
+    /* Scaling happens before rotation, so the maxima are swapped for quarter
+     * turns to keep the rotated result inside the caller's bounds. */
+    int rotate = display_rotation(frame, stream);
+    int quarter_turn = rotate == 90 || rotate == 270;
+    int64_t display_width;
+    int64_t display_height;
+    display_size(format, stream, frame, &display_width, &display_height);
     int width;
     int height;
-    bounded_size(frame->width, frame->height, maximum_width, maximum_height,
-                 &width, &height);
+    bounded_size(display_width, display_height,
+                 quarter_turn ? maximum_height : maximum_width,
+                 quarter_turn ? maximum_width : maximum_height, &width,
+                 &height);
     size_t stride = (size_t)width * 4;
     if ((size_t)height > SIZE_MAX / stride ||
         stride * (size_t)height > bgra_capacity) {
@@ -281,9 +395,10 @@ int chatt_ffmpeg_extract_first_frame(
                   "create thumbnail scaler: unsupported pixel format");
         goto cleanup;
     }
-    const int *coefficients = sws_getCoefficients(SWS_CS_DEFAULT);
-    status = sws_setColorspaceDetails(scaler, coefficients, source_full_range,
-                                      coefficients, 1, 0, 1 << 16, 1 << 16);
+    status = sws_setColorspaceDetails(
+        scaler, sws_getCoefficients(source_colorspace(frame)),
+        source_full_range, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16,
+        1 << 16);
     if (status < 0) {
         set_av_error(error, error_capacity,
                      "configure thumbnail color conversion", status);
@@ -303,6 +418,7 @@ int chatt_ffmpeg_extract_first_frame(
 
     thumbnail->width = width;
     thumbnail->height = height;
+    thumbnail->rotate = rotate;
     if (format->duration != AV_NOPTS_VALUE)
         thumbnail->duration = (double)format->duration / AV_TIME_BASE;
     else if (stream->duration != AV_NOPTS_VALUE)

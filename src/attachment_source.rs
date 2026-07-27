@@ -465,7 +465,7 @@ pub(crate) enum VideoSourcePin {
 }
 
 impl VideoSourcePin {
-    fn bit(self) -> u8 {
+    const fn bit(self) -> u8 {
         match self {
             Self::Playing => 1 << 0,
             Self::Theater => 1 << 1,
@@ -474,6 +474,10 @@ impl VideoSourcePin {
         }
     }
 }
+
+const PLAYBACK_PINS: u8 = VideoSourcePin::Playing.bit()
+    | VideoSourcePin::Theater.bit()
+    | VideoSourcePin::PendingPlay.bit();
 
 pub(crate) struct VideoSourceCache {
     entries: HashMap<AttachmentSourceKey, VideoSourceEntry>,
@@ -654,6 +658,15 @@ impl VideoSourceCache {
             entry.desired = true;
         }
         self.evict_over_limits();
+    }
+
+    /// Whether playback holds this source. Thumbnail extraction shares the
+    /// source's socket, block cache, and lock with mpv, so it stays out of the
+    /// way while playback needs them.
+    pub(crate) fn has_playback_pin(&self, key: AttachmentSourceKey) -> bool {
+        self.entries
+            .get(&key)
+            .is_some_and(|entry| entry.pins & PLAYBACK_PINS != 0)
     }
 
     pub(crate) fn thumbnail_finished(&mut self, key: AttachmentSourceKey) {
