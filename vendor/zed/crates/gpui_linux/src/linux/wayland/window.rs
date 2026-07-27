@@ -567,7 +567,10 @@ impl WaylandWindowState {
                     width: DevicePixels(f32::from(options.bounds.size.width) as i32),
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
-                transparent: true,
+                // Match the transparency the window will settle on once `Window::new`
+                // requests decorations, so the first `update_transparency` is a no-op.
+                // Flipping the alpha mode rebuilds every pipeline, which costs ~10ms.
+                transparent: surface_state.decoration().is_none(),
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
