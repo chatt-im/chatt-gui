@@ -276,14 +276,28 @@ impl<'a> FontFallbackIter<'a> {
             .is_some_and(|face| face.families.iter().any(|(name, _)| name == family_name))
     }
 
-    fn default_font_match_key(&self) -> Option<&FontMatchKey> {
+    // The family check runs first so the variable-weight probe, which parses the
+    // font file, is only reached for the few faces of the requested family.
+    fn default_font_match_key(&mut self) -> Option<FontMatchKey> {
         let default_family = self.default_families[self.default_i - 1];
-        let default_family_name = self.font_system.db().family_name(default_family);
-
-        self.font_match_keys
-            .iter()
-            .filter(|m_key| m_key.font_weight_diff == 0 || m_key.variable_weight_match)
-            .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
+        let keys = self.font_match_keys;
+        for m_key in keys {
+            let contains_family = {
+                let family_name = self.font_system.db().family_name(default_family);
+                self.face_contains_family(m_key.id, family_name)
+            };
+            if !contains_family {
+                continue;
+            }
+            if m_key.font_weight_diff == 0
+                || self
+                    .font_system
+                    .variable_weight_match(m_key.id, self.ideal_weight)
+            {
+                return Some(*m_key);
+            }
+        }
+        None
     }
 
     fn next_item(&mut self, fallbacks: &Fallbacks) -> Option<<Self as Iterator>::Item> {
@@ -296,16 +310,12 @@ impl<'a> FontFallbackIter<'a> {
             }
         }
 
-        let font_match_keys_iter = |is_mono| {
-            self.font_match_keys.iter().filter(move |m_key| {
-                m_key.font_weight_diff == 0 || m_key.variable_weight_match || is_mono
-            })
-        };
+        let keys = self.font_match_keys;
 
         'DEF_FAM: while self.default_i < self.default_families.len() {
             self.default_i += 1;
             let is_mono = self.default_families[self.default_i - 1] == &Family::Monospace;
-            let default_font_match_key = self.default_font_match_key().copied();
+            let default_font_match_key = self.default_font_match_key();
             let word_chars_count = self.word.chars().count();
 
             macro_rules! mk_mono_fallback_info {
@@ -379,37 +389,42 @@ impl<'a> FontFallbackIter<'a> {
                 Vec::new()
             };
 
-            for m_key in font_match_keys_iter(is_mono) {
-                if Some(m_key.id) != default_font_match_key.as_ref().map(|m_key| m_key.id) {
-                    let is_mono_id = if mono_ids_for_scripts.is_empty() {
-                        self.font_system.is_monospace(m_key.id)
-                    } else {
-                        mono_ids_for_scripts.binary_search(&m_key.id).is_ok()
+            for m_key in keys {
+                if Some(m_key.id) == default_font_match_key.as_ref().map(|m_key| m_key.id) {
+                    continue;
+                }
+                let is_mono_id = if mono_ids_for_scripts.is_empty() {
+                    self.font_system.is_monospace(m_key.id)
+                } else {
+                    mono_ids_for_scripts.binary_search(&m_key.id).is_ok()
+                };
+                if !is_mono_id {
+                    continue;
+                }
+                if !is_mono
+                    && m_key.font_weight_diff != 0
+                    && !self
+                        .font_system
+                        .variable_weight_match(m_key.id, self.ideal_weight)
+                {
+                    continue;
+                }
+                let supported_cp_count_opt = self
+                    .font_system
+                    .get_font_supported_codepoints_in_word(m_key.id, self.ideal_weight, self.word);
+                if let Some(supported_cp_count) = supported_cp_count_opt {
+                    let codepoint_non_matches = self.word.chars().count() - supported_cp_count;
+
+                    let fallback_info = MonospaceFallbackInfo {
+                        font_weight_diff: Some(m_key.font_weight_diff),
+                        codepoint_non_matches: Some(codepoint_non_matches),
+                        font_weight: m_key.font_weight,
+                        id: m_key.id,
                     };
-
-                    if is_mono_id {
-                        let supported_cp_count_opt =
-                            self.font_system.get_font_supported_codepoints_in_word(
-                                m_key.id,
-                                self.ideal_weight,
-                                self.word,
-                            );
-                        if let Some(supported_cp_count) = supported_cp_count_opt {
-                            let codepoint_non_matches =
-                                self.word.chars().count() - supported_cp_count;
-
-                            let fallback_info = MonospaceFallbackInfo {
-                                font_weight_diff: Some(m_key.font_weight_diff),
-                                codepoint_non_matches: Some(codepoint_non_matches),
-                                font_weight: m_key.font_weight,
-                                id: m_key.id,
-                            };
-                            assert!(self
-                                .font_system
-                                .monospace_fallbacks_buffer
-                                .insert(fallback_info));
-                        }
-                    }
+                    assert!(self
+                        .font_system
+                        .monospace_fallbacks_buffer
+                        .insert(fallback_info));
                 }
             }
             // If default family is Monospace fallback to first monospaced font
@@ -431,11 +446,19 @@ impl<'a> FontFallbackIter<'a> {
             while self.script_i.1 < script_families.len() {
                 let script_family = script_families[self.script_i.1];
                 self.script_i.1 += 1;
-                for m_key in font_match_keys_iter(false) {
-                    if self.face_contains_family(m_key.id, script_family) {
-                        if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
-                            return Some(font);
-                        }
+                for m_key in keys {
+                    if !self.face_contains_family(m_key.id, script_family) {
+                        continue;
+                    }
+                    if m_key.font_weight_diff != 0
+                        && !self
+                            .font_system
+                            .variable_weight_match(m_key.id, self.ideal_weight)
+                    {
+                        continue;
+                    }
+                    if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
+                        return Some(font);
                     }
                 }
                 log::debug!(
@@ -454,11 +477,19 @@ impl<'a> FontFallbackIter<'a> {
         while self.common_i < common_families.len() {
             let common_family = common_families[self.common_i];
             self.common_i += 1;
-            for m_key in font_match_keys_iter(false) {
-                if self.face_contains_family(m_key.id, common_family) {
-                    if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
-                        return Some(font);
-                    }
+            for m_key in keys {
+                if !self.face_contains_family(m_key.id, common_family) {
+                    continue;
+                }
+                if m_key.font_weight_diff != 0
+                    && !self
+                        .font_system
+                        .variable_weight_match(m_key.id, self.ideal_weight)
+                {
+                    continue;
+                }
+                if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
+                    return Some(font);
                 }
             }
             log::debug!("failed to find family '{common_family}'");
