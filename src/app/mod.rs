@@ -122,7 +122,6 @@ const MIN_LIVE_PANE_HEIGHT: f32 = 160.0;
 const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const MIN_STACKED_VIEWER_HEIGHT: f32 = 200.0;
-const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
 const VIDEO_EFFECT_OVERLAY_HOLD: Duration = Duration::from_millis(400);
 
@@ -516,7 +515,7 @@ fn clamp_live_pane_height(
         - reserved
         - crate::ui_scale::scaled_px(TOP_BAR_HEIGHT, rem_size)
         - crate::ui_scale::scaled_px(MIN_CHAT_PANE_HEIGHT, rem_size)
-        - crate::ui_scale::scaled_px(LIVE_PANE_DIVIDER_SIZE, rem_size);
+        - crate::ui_scale::scaled_px(PREVIEW_DIVIDER_WIDTH, rem_size);
     let min_height = crate::ui_scale::scaled_px(MIN_LIVE_PANE_HEIGHT, rem_size).min(available.max(
         crate::ui_scale::scaled_px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT, rem_size),
     ));
@@ -838,6 +837,7 @@ pub struct ChattView {
     video_wakeup: async_channel::Sender<()>,
     live_players: HashMap<StreamId, LivePlayerView>,
     fullscreen_share: Option<StreamId>,
+    fullscreen_live_controls_hovered: bool,
     live_pane_height: Option<Pixels>,
     live_pane_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     live_pane_resize: Option<LivePaneResize>,
@@ -1092,6 +1092,7 @@ impl ChattView {
             video_wakeup,
             live_players: HashMap::new(),
             fullscreen_share: None,
+            fullscreen_live_controls_hovered: false,
             live_pane_height: None,
             live_pane_bounds: Rc::new(Cell::new(None)),
             live_pane_resize: None,
@@ -1941,6 +1942,7 @@ impl ChattView {
             .is_some_and(|stream_id| !available.contains(&stream_id))
         {
             self.fullscreen_share = None;
+            self.fullscreen_live_controls_hovered = false;
             if window.is_fullscreen() {
                 window.toggle_fullscreen();
             }
@@ -5628,6 +5630,7 @@ fn live_share_title(share: &local_rpc::model::LiveShare, palette: &ThemePalette)
         .items_center()
         .gap_2()
         .text_sm()
+        .text_color(palette.color(ThemeRole::TextPrimary))
         .child(
             div()
                 .min_w_0()
@@ -6553,8 +6556,7 @@ mod tests {
 
     #[test]
     fn live_pane_height_gives_up_room_reserved_for_the_stacked_viewer() {
-        let reserved =
-            px(MIN_STACKED_VIEWER_HEIGHT + TOP_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH);
+        let reserved = px(MIN_STACKED_VIEWER_HEIGHT + TOP_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH);
 
         assert_eq!(
             clamp_live_pane_height(px(900.0), px(900.0), reserved, px(16.0)),

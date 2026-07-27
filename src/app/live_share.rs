@@ -67,6 +67,7 @@ impl ChattView {
         }
         if self.fullscreen_share == Some(stream_id) {
             self.fullscreen_share = None;
+            self.fullscreen_live_controls_hovered = false;
         }
         self.send_stop_live_share(stream_id);
         self.status = "Stopped screen share".into();
@@ -350,6 +351,7 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.fullscreen_live_controls_hovered = false;
         self.fullscreen_share = if self.fullscreen_share == Some(stream_id) {
             None
         } else {
@@ -362,6 +364,7 @@ impl ChattView {
     pub(super) fn release_live_players(&mut self, window: &mut Window) {
         self.live_players.clear();
         self.live_pane_resize = None;
+        self.fullscreen_live_controls_hovered = false;
         if self.fullscreen_share.take().is_some() && window.is_fullscreen() {
             window.toggle_fullscreen();
         }
@@ -391,6 +394,7 @@ impl ChattView {
             self.live_pane_height = pane_height;
         }
         let constrained = pane_height.is_some();
+        let resizing = self.live_pane_resize.is_some();
         let pane_bounds = self.live_pane_bounds.clone();
         let mut panel = div()
             .relative()
@@ -400,9 +404,12 @@ impl ChattView {
             .min_h_0()
             .overflow_hidden()
             .gap_0()
-            .border_b_1()
-            .border_color(settings.theme.color(ThemeRole::BorderSubtle))
             .bg(settings.theme.color(ThemeRole::Raised))
+            .when(!resizable, |panel| {
+                panel
+                    .border_b_1()
+                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+            })
             .when_some(pane_height, |panel, height| panel.h(height))
             .child(
                 canvas(
@@ -415,41 +422,53 @@ impl ChattView {
         for share in shares {
             panel = panel.child(self.render_live_share_card(share, false, constrained, cx));
         }
-        if resizable {
-            panel = panel.child(
-                div()
-                    .id("live-pane-resize")
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(rems_from_px(LIVE_PANE_DIVIDER_SIZE))
-                    .cursor_row_resize()
-                    .hover({
-                        let hover = settings.theme.color(ThemeRole::StateSelection);
-                        move |handle| handle.bg(hover)
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.begin_live_pane_resize(event, window, cx)
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            this.finish_live_pane_resize(cx)
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            this.finish_live_pane_resize(cx)
-                        }),
-                    ),
-            );
+        if !resizable {
+            return panel;
         }
-        panel
+        let divider = div()
+            .id("live-pane-resize")
+            .h(rems_from_px(PREVIEW_DIVIDER_WIDTH))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .cursor_row_resize()
+            .hover({
+                let hover = settings.theme.color(ThemeRole::StateSelection);
+                move |handle| handle.bg(hover)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.begin_live_pane_resize(event, window, cx)
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_live_pane_resize(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_live_pane_resize(cx)),
+            )
+            .child(
+                div()
+                    .h(rems_from_px(3.0))
+                    .w_full()
+                    .bg(settings.theme.color(if resizing {
+                        ThemeRole::BorderFocus
+                    } else {
+                        ThemeRole::BorderSubtle
+                    })),
+            );
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(panel)
+            .child(divider)
     }
 
     pub(super) fn render_live_share_card(
@@ -478,7 +497,7 @@ impl ChattView {
             .flex()
             .flex_col()
             .bg(settings.theme.color(ThemeRole::MediaViewport))
-            .when(fullscreen, |card| card.size_full())
+            .when(fullscreen, |card| card.relative().size_full())
             .when(constrained && active_share, |card| card.flex_1().min_h_0())
             .when(constrained && !active_share, |card| card.flex_none());
         if let Some((video_surface, zoom, pan, dragging, viewport_bounds, coded_size)) = active {
@@ -487,154 +506,160 @@ impl ChattView {
             let zoom_out_id = stream_id;
             let zoom_in_id = stream_id;
             let fullscreen_id = stream_id;
-            card = card
+            let controls_hover_id = stream_id;
+            let controls_visible = dragging || self.fullscreen_live_controls_hovered;
+            let header = div()
+                .id(("live-share-controls", stream_id.0 as usize))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .bg(settings.theme.color(ThemeRole::Window))
+                .when(fullscreen, |header| {
+                    header
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .opacity(if controls_visible { 1.0 } else { 0.0 })
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if this.fullscreen_share == Some(controls_hover_id)
+                                && this.fullscreen_live_controls_hovered != *hovered
+                            {
+                                this.fullscreen_live_controls_hovered = *hovered;
+                                cx.notify();
+                            }
+                        }))
+                })
+                .child(live_share_title(&share, &settings.theme))
+                .child(
+                    icon_button(
+                        ("live-stop", stream_id.0 as usize),
+                        IconName::Stop,
+                        &settings.theme,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.fullscreen_share == Some(stop_id) && window.is_fullscreen() {
+                            window.toggle_fullscreen();
+                        }
+                        this.stop_live_share(stop_id, cx)
+                    })),
+                )
+                .child(
+                    icon_button(
+                        ("live-reset", stream_id.0 as usize),
+                        IconName::RotateCcw,
+                        &settings.theme,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.reset_live_view(reset_id, cx)),
+                    ),
+                )
+                .child(
+                    icon_button(
+                        ("live-zoom-out", stream_id.0 as usize),
+                        IconName::ZoomOut,
+                        &settings.theme,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.zoom_live_view(zoom_out_id, 1.0 / 1.25, cx)
+                    })),
+                )
                 .child(
                     div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_1()
-                        .px_3()
-                        .py_2()
-                        .bg(settings.theme.color(ThemeRole::Window))
-                        .child(live_share_title(&share, &settings.theme))
-                        .child(
-                            icon_button(
-                                ("live-stop", stream_id.0 as usize),
-                                IconName::Stop,
-                                &settings.theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    if this.fullscreen_share == Some(stop_id)
-                                        && window.is_fullscreen()
-                                    {
-                                        window.toggle_fullscreen();
-                                    }
-                                    this.stop_live_share(stop_id, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            icon_button(
-                                ("live-reset", stream_id.0 as usize),
-                                IconName::RotateCcw,
-                                &settings.theme,
-                            )
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.reset_live_view(reset_id, cx)
-                                }),
-                            ),
-                        )
-                        .child(
-                            icon_button(
-                                ("live-zoom-out", stream_id.0 as usize),
-                                IconName::ZoomOut,
-                                &settings.theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.zoom_live_view(zoom_out_id, 1.0 / 1.25, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(settings.theme.color(ThemeRole::TextMuted))
-                                .child(format!("{:.0}%", zoom * 100.0)),
-                        )
-                        .child(
-                            icon_button(
-                                ("live-zoom-in", stream_id.0 as usize),
-                                IconName::ZoomIn,
-                                &settings.theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.zoom_live_view(zoom_in_id, 1.25, cx),
-                            )),
-                        )
-                        .child(
-                            icon_button(
-                                ("live-fullscreen", stream_id.0 as usize),
-                                if fullscreen {
-                                    IconName::Minimize
-                                } else {
-                                    IconName::Maximize
-                                },
-                                &settings.theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.toggle_live_fullscreen(fullscreen_id, window, cx)
-                                },
-                            )),
-                        ),
+                        .text_xs()
+                        .text_color(settings.theme.color(ThemeRole::TextMuted))
+                        .child(format!("{:.0}%", zoom * 100.0)),
                 )
-                .child({
-                    let scroll_id = stream_id;
-                    let down_id = stream_id;
-                    let move_id = stream_id;
-                    let up_id = stream_id;
-                    let pinch_id = stream_id;
-                    div()
-                        .relative()
-                        .overflow_hidden()
-                        .w_full()
-                        .when(fullscreen || constrained, |viewport| {
-                            viewport.flex_1().min_h_0()
-                        })
-                        .when(!fullscreen && !constrained, |viewport| {
-                            viewport.h(rems_from_px(320.))
-                        })
-                        .bg(settings.theme.color(ThemeRole::MediaViewport))
-                        .cursor(if dragging {
-                            gpui::CursorStyle::ClosedHand
+                .child(
+                    icon_button(
+                        ("live-zoom-in", stream_id.0 as usize),
+                        IconName::ZoomIn,
+                        &settings.theme,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.zoom_live_view(zoom_in_id, 1.25, cx)
+                        }),
+                    ),
+                )
+                .child(
+                    icon_button(
+                        ("live-fullscreen", stream_id.0 as usize),
+                        if fullscreen {
+                            IconName::Minimize
                         } else {
-                            gpui::CursorStyle::OpenHand
-                        })
-                        .on_scroll_wheel(cx.listener(
-                            move |this, event: &ScrollWheelEvent, _, cx| {
-                                this.scroll_live_view(scroll_id, event, cx)
-                            },
-                        ))
-                        .on_pinch(cx.listener(move |this, event: &PinchEvent, _, cx| {
-                            this.pinch_live_view(pinch_id, event, cx)
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                this.live_mouse_down(down_id, event, cx)
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                            this.live_mouse_move(move_id, event, cx)
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                                this.live_mouse_up(up_id, cx)
-                            }),
-                        )
-                        .child(
-                            canvas(
-                                move |bounds, _, _| {
-                                    viewport_bounds.set(Some(bounds));
-                                    let pan = clamp_live_pan(pan, coded_size, bounds, zoom);
-                                    LiveVideoGeometry::new(coded_size, bounds, zoom, pan)
-                                },
-                                move |_, geometry, window, _| {
-                                    if let Some(geometry) = geometry {
-                                        window
-                                            .paint_platform_surface(geometry.bounds, video_surface);
-                                    }
-                                },
-                            )
-                            .absolute()
-                            .size_full(),
-                        )
-                });
+                            IconName::Maximize
+                        },
+                        &settings.theme,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_live_fullscreen(fullscreen_id, window, cx)
+                    })),
+                );
+            let scroll_id = stream_id;
+            let down_id = stream_id;
+            let move_id = stream_id;
+            let up_id = stream_id;
+            let pinch_id = stream_id;
+            let viewport = div()
+                .relative()
+                .overflow_hidden()
+                .w_full()
+                .when(fullscreen || constrained, |viewport| {
+                    viewport.flex_1().min_h_0()
+                })
+                .when(!fullscreen && !constrained, |viewport| {
+                    viewport.h(rems_from_px(320.))
+                })
+                .bg(settings.theme.color(ThemeRole::MediaViewport))
+                .cursor(if dragging {
+                    gpui::CursorStyle::ClosedHand
+                } else {
+                    gpui::CursorStyle::OpenHand
+                })
+                .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                    this.scroll_live_view(scroll_id, event, cx)
+                }))
+                .on_pinch(cx.listener(move |this, event: &PinchEvent, _, cx| {
+                    this.pinch_live_view(pinch_id, event, cx)
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.live_mouse_down(down_id, event, cx)
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    this.live_mouse_move(move_id, event, cx)
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseUpEvent, _, cx| this.live_mouse_up(up_id, cx)),
+                )
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            viewport_bounds.set(Some(bounds));
+                            let pan = clamp_live_pan(pan, coded_size, bounds, zoom);
+                            LiveVideoGeometry::new(coded_size, bounds, zoom, pan)
+                        },
+                        move |_, geometry, window, _| {
+                            if let Some(geometry) = geometry {
+                                window.paint_platform_surface(geometry.bounds, video_surface);
+                            }
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                );
+            card = if fullscreen {
+                card.child(viewport).child(header)
+            } else {
+                card.child(header).child(viewport)
+            };
         } else {
             card = card.child(
                 div()

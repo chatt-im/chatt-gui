@@ -50,7 +50,12 @@ impl ChattView {
             .live_pane_bounds
             .get()
             .map_or(px(0.), |bounds| bounds.bottom());
-        tab_bar + live_pane_bottom
+        let live_divider = if self.live_players.is_empty() {
+            px(0.)
+        } else {
+            crate::ui_scale::scaled_px(PREVIEW_DIVIDER_WIDTH, window.rem_size())
+        };
+        tab_bar + live_pane_bottom + live_divider
     }
 
     /// What the stacked viewer and the chat below it share, once the live pane
