@@ -196,8 +196,9 @@ fn take_startup_activation_token_from_environment() -> Option<String> {
         .filter(|token| !token.is_empty());
     // The token must be removed from the environment so it isn't inherited by child
     // processes we spawn, per the xdg-activation spec: https://wayland.app/protocols/xdg-activation-v1
-    // SAFETY: This runs during Wayland platform initialization before GPUI starts
-    // concurrent environment access or spawning child processes.
+    // SAFETY: This runs at the top of `WaylandClient::new`, before `LinuxCommon::new`
+    // spawns the system font database thread (which reads the environment) and before
+    // GPUI spawns any child process.
     unsafe { std::env::remove_var(XDG_ACTIVATION_TOKEN_ENV_VAR) };
     startup_activation_token
 }

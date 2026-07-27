@@ -14,7 +14,7 @@ use gpui::{
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, thread::JoinHandle};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     tag_from_bytes,
@@ -43,7 +43,11 @@ impl FontKey {
 }
 
 struct CosmicTextSystemState {
+    /// Holds an empty placeholder database until
+    /// [`CosmicTextSystemState::ensure_system_fonts`] swaps in the one being built on the
+    /// background thread.
     font_system: FontSystem,
+    pending_system_fonts: Option<PendingSystemFonts>,
     scratch: ShapeBuffer,
     swash_scale_context: ScaleContext,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
@@ -54,6 +58,14 @@ struct CosmicTextSystemState {
     system_font_fallback: String,
     emoji_fallback: Option<(FontId, SharedString)>,
     emoji_fallback_scanned: bool,
+}
+
+/// The in-flight system font build, plus the faces added while it was still running.
+struct PendingSystemFonts {
+    handle: JoinHandle<FontSystem>,
+    /// Replayed into the real database at the join, so bundled faces still land after the
+    /// system faces exactly as they did when the database was built eagerly.
+    deferred: Vec<Cow<'static, [u8]>>,
 }
 
 struct LoadedFont {
@@ -67,10 +79,29 @@ struct LoadedFont {
 
 impl CosmicTextSystem {
     pub fn new(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new();
+        // `FontSystem::new` walks every system font directory and merges fontconfig, which
+        // dominates platform initialization. Nothing reads the database before the first
+        // text layout, by which point the display stack has been built alongside it.
+        let (font_system, pending_system_fonts) = match std::thread::Builder::new()
+            .name("font-database".to_string())
+            .spawn(FontSystem::new)
+        {
+            std::result::Result::Ok(handle) => (
+                empty_font_system(),
+                Some(PendingSystemFonts {
+                    handle,
+                    deferred: Vec::new(),
+                }),
+            ),
+            Err(error) => {
+                log::warn!("failed to spawn the system font database thread: {error}");
+                (FontSystem::new(), None)
+            }
+        };
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
+            pending_system_fonts,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
@@ -82,13 +113,9 @@ impl CosmicTextSystem {
     }
 
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new_with_locale_and_db(
-            "en-US".to_string(),
-            cosmic_text::fontdb::Database::new(),
-        );
-
         Self(RwLock::new(CosmicTextSystemState {
-            font_system,
+            font_system: empty_font_system(),
+            pending_system_fonts: None,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
@@ -100,15 +127,28 @@ impl CosmicTextSystem {
     }
 }
 
+fn empty_font_system() -> FontSystem {
+    FontSystem::new_with_locale_and_db("en-US".to_string(), cosmic_text::fontdb::Database::new())
+}
+
+fn load_font_data(db: &mut cosmic_text::fontdb::Database, fonts: Vec<Cow<'static, [u8]>>) {
+    for bytes in fonts {
+        match bytes {
+            Cow::Borrowed(embedded_font) => db.load_font_data(embedded_font.to_vec()),
+            Cow::Owned(bytes) => db.load_font_data(bytes),
+        }
+    }
+}
+
 impl PlatformTextSystem for CosmicTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        let mut result = self
-            .0
-            .read()
+        let mut state = self.0.write();
+        state.ensure_system_fonts();
+        let mut result = state
             .font_system
             .db()
             .faces()
@@ -121,6 +161,7 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let mut state = self.0.write();
+        state.ensure_system_fonts();
         let key = FontKey::new(
             font.family.clone(),
             font.features.clone(),
@@ -216,18 +257,34 @@ impl CosmicTextSystemState {
         &self.loaded_fonts[font_id.0]
     }
 
+    /// Joins the background system font build, replaying any fonts added while it ran.
+    ///
+    /// Every database read that is not keyed off an already loaded [`FontId`] must call
+    /// this first. The reads that are keyed off one imply it transitively, because
+    /// `loaded_fonts` is only ever populated after a join.
+    fn ensure_system_fonts(&mut self) {
+        let Some(pending) = self.pending_system_fonts.take() else {
+            return;
+        };
+        // No `LoadedFont` may outlive the placeholder database: its `fontdb::ID`s would
+        // alias unrelated faces once the real database takes over.
+        debug_assert!(self.loaded_fonts.is_empty());
+
+        let mut font_system = match pending.handle.join() {
+            std::result::Result::Ok(font_system) => font_system,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        load_font_data(font_system.db_mut(), pending.deferred);
+        self.font_system = font_system;
+    }
+
     #[profiling::function]
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        let db = self.font_system.db_mut();
-        for bytes in fonts {
-            match bytes {
-                Cow::Borrowed(embedded_font) => {
-                    db.load_font_data(embedded_font.to_vec());
-                }
-                Cow::Owned(bytes) => {
-                    db.load_font_data(bytes);
-                }
-            }
+        // Deliberately does not join: bundled fonts are registered during startup, long
+        // before anything reads the database.
+        match &mut self.pending_system_fonts {
+            Some(pending) => pending.deferred.extend(fonts),
+            None => load_font_data(self.font_system.db_mut(), fonts),
         }
         self.emoji_fallback = None;
         self.emoji_fallback_scanned = false;
@@ -241,6 +298,7 @@ impl CosmicTextSystemState {
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
     ) -> Result<SmallVec<[FontId; 4]>> {
+        self.ensure_system_fonts();
         // recurse with `fallbacks = None` so a fallback family cannot pull in
         // another chain. missing fallback families are dropped so a typo in
         // settings still lets the primary family load.
@@ -435,6 +493,7 @@ impl CosmicTextSystemState {
     /// current use of this field is for the *input* of `layout_line`, and so it's fine to use
     /// `font_id_for_cosmic_id` when computing the *output* of `layout_line`.
     fn font_id_for_cosmic_id(&mut self, id: cosmic_text::fontdb::ID) -> Result<FontId> {
+        self.ensure_system_fonts();
         if let Some(ix) = self
             .loaded_fonts
             .iter()
@@ -470,6 +529,7 @@ impl CosmicTextSystemState {
         if self.emoji_fallback_scanned {
             return self.emoji_fallback.clone();
         }
+        self.ensure_system_fonts();
         self.emoji_fallback_scanned = true;
 
         let mut candidates = self
@@ -506,6 +566,7 @@ impl CosmicTextSystemState {
 
     #[profiling::function]
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        self.ensure_system_fonts();
         let mut attrs_list = AttrsList::new(&Attrs::new());
         let emoji_fallback = self.emoji_fallback();
         let mut offs = 0;
@@ -703,6 +764,7 @@ fn find_best_match(
     candidates: &[FontId],
     state: &CosmicTextSystemState,
 ) -> Result<usize> {
+    debug_assert!(state.pending_system_fonts.is_none());
     let candidate_properties = candidates
         .iter()
         .map(|font_id| {
@@ -729,6 +791,7 @@ fn find_best_match(
     candidates: &[FontId],
     state: &CosmicTextSystemState,
 ) -> Result<usize> {
+    debug_assert!(state.pending_system_fonts.is_none());
     if candidates.is_empty() {
         anyhow::bail!("requested font family contains no font matching the other parameters");
     }

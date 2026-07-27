@@ -1118,8 +1118,7 @@ impl ChattView {
         let mut live_layout = cx.global::<ConfigurationState>().0.config.layout;
         live_layout.status_bar_visible = self.show_top_status_bar;
         live_layout.room_menu_visible = self.show_rooms_sidebar;
-        let settings =
-            cx.new(move |cx| SettingsView::new(appearance_session, live_layout, cx));
+        let settings = cx.new(move |cx| SettingsView::new(appearance_session, live_layout, cx));
         let subscription =
             cx.subscribe(
                 &settings,

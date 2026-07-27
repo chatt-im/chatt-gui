@@ -58,49 +58,9 @@ fn main() {
         .with_assets(icons::IconAssets)
         .run(move |cx: &mut App| {
             fonts::init(cx);
-            let available_families = cx.text_system().all_font_names();
-            loaded
-                .diagnostics
-                .extend(theme::font_warnings(&loaded.config, &available_families));
-            let source = loaded
-                .source
-                .as_deref()
-                .and_then(|source| std::str::from_utf8(source).ok());
-            for diagnostic in &loaded.diagnostics {
-                let location = source
-                    .and_then(|source| diagnostic.source_excerpt(source))
-                    .map(|excerpt| format!(":{}:{}", excerpt.line, excerpt.column))
-                    .unwrap_or_default();
-                match diagnostic.severity {
-                    config::validation::DiagnosticSeverity::Warning => {
-                        kvlog::warn!(
-                            "configuration warning",
-                            path = %diagnostic.path,
-                            location = %location,
-                            detail = %diagnostic.message
-                        )
-                    }
-                    config::validation::DiagnosticSeverity::Error => {
-                        kvlog::error!(
-                            "configuration error",
-                            path = %diagnostic.path,
-                            location = %location,
-                            detail = %diagnostic.message
-                        )
-                    }
-                }
-            }
-            theme::apply_appearance(
-                &loaded.config,
-                loaded.status,
-                &loaded.diagnostics,
-                &available_families,
-                cx,
-            );
             ui_scale::install(cx);
             key_bindings::install(&loaded.config, cx)
                 .expect("built-in GUI key bindings must compile");
-            settings::install_loaded(loaded.clone(), cx);
             appearance::install(cx);
             frame_stats::start(cx);
 
@@ -112,6 +72,50 @@ fn main() {
                 },
                 move |window, cx| {
                     frame_stats::start_window(window);
+                    // Enumerating font families waits on the system font database, which
+                    // `CosmicTextSystem` builds on a background thread. Asking here rather
+                    // than before `open_window` overlaps that build with the whole display
+                    // stack, while still resolving before the first frame is drawn.
+                    let available_families = cx.text_system().all_font_names();
+                    loaded
+                        .diagnostics
+                        .extend(theme::font_warnings(&loaded.config, &available_families));
+                    let source = loaded
+                        .source
+                        .as_deref()
+                        .and_then(|source| std::str::from_utf8(source).ok());
+                    for diagnostic in &loaded.diagnostics {
+                        let location = source
+                            .and_then(|source| diagnostic.source_excerpt(source))
+                            .map(|excerpt| format!(":{}:{}", excerpt.line, excerpt.column))
+                            .unwrap_or_default();
+                        match diagnostic.severity {
+                            config::validation::DiagnosticSeverity::Warning => {
+                                kvlog::warn!(
+                                    "configuration warning",
+                                    path = %diagnostic.path,
+                                    location = %location,
+                                    detail = %diagnostic.message
+                                )
+                            }
+                            config::validation::DiagnosticSeverity::Error => {
+                                kvlog::error!(
+                                    "configuration error",
+                                    path = %diagnostic.path,
+                                    location = %location,
+                                    detail = %diagnostic.message
+                                )
+                            }
+                        }
+                    }
+                    theme::apply_appearance(
+                        &loaded.config,
+                        loaded.status,
+                        &loaded.diagnostics,
+                        &available_families,
+                        cx,
+                    );
+                    settings::install_loaded(loaded, cx);
                     cx.new(|cx| ChattView::new(window, cx))
                 },
             )

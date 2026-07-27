@@ -24,8 +24,8 @@ use crate::{
     ui_scale::rems_from_px,
 };
 use catalog::{
-    RowRef, SETTINGS_SECTIONS, ScalarSetting, SettingsSection, help, label, matches_search, path,
-    rows, ToggleSetting,
+    RowRef, SETTINGS_SECTIONS, ScalarSetting, SettingsSection, ToggleSetting, help, label,
+    matches_search, path, rows,
 };
 use color_picker::{ColorPicker, DragTarget, Hsva};
 use local_rpc::settings as wire_settings;
@@ -2377,8 +2377,8 @@ impl SettingsView {
                 self.layout_previewed.status_bar_visible = true;
                 self.draft.layout.status_bar_visible
             });
-        let room_menu_visible =
-            (before.room_menu_visible != self.draft.layout.room_menu_visible).then(|| {
+        let room_menu_visible = (before.room_menu_visible != self.draft.layout.room_menu_visible)
+            .then(|| {
                 self.layout_previewed.room_menu_visible = true;
                 self.draft.layout.room_menu_visible
             });
@@ -3467,16 +3467,11 @@ fn render_row(
                     } else {
                         palette.color(ThemeRole::ControlSurface)
                     })
-                    .child(
-                        div()
-                            .size(rems_from_px(18.))
-                            .rounded_full()
-                            .bg(if enabled {
-                                palette.color(ThemeRole::ControlActiveText)
-                            } else {
-                                palette.color(ThemeRole::TextMuted)
-                            }),
-                    ),
+                    .child(div().size(rems_from_px(18.)).rounded_full().bg(if enabled {
+                        palette.color(ThemeRole::ControlActiveText)
+                    } else {
+                        palette.color(ThemeRole::TextMuted)
+                    })),
             )
             .child(
                 div()
@@ -4518,14 +4513,8 @@ mod tests {
                 assert!(!settings.draft.layout.room_menu_visible);
                 assert!(settings.local_dirty());
 
-                settings.reset_row(
-                    RowRef::Toggle(ToggleSetting::StatusBarVisible),
-                    cx,
-                );
-                settings.reset_row(
-                    RowRef::Toggle(ToggleSetting::RoomMenuVisible),
-                    cx,
-                );
+                settings.reset_row(RowRef::Toggle(ToggleSetting::StatusBarVisible), cx);
+                settings.reset_row(RowRef::Toggle(ToggleSetting::RoomMenuVisible), cx);
                 assert!(settings.draft.layout.status_bar_visible);
                 assert!(settings.draft.layout.room_menu_visible);
                 assert!(!settings.local_dirty());

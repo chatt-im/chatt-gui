@@ -47,7 +47,16 @@ mod tests {
     };
     use gpui_wgpu::CosmicTextSystem;
 
-    use super::embedded_fonts;
+    use super::{CODE_FONT_FAMILY, UI_FONT_FAMILY, embedded_fonts};
+
+    #[test]
+    fn resolves_bundled_faces_registered_before_the_system_database_finishes() {
+        let text = CosmicTextSystem::new(UI_FONT_FAMILY);
+        text.add_fonts(embedded_fonts()).unwrap();
+
+        assert!(text.font_id(&font(UI_FONT_FAMILY)).is_ok());
+        assert!(text.font_id(&font(CODE_FONT_FAMILY)).is_ok());
+    }
 
     #[test]
     fn selects_embedded_weight_and_style_faces_without_font_kit() {
