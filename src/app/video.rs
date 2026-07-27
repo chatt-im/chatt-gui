@@ -72,6 +72,13 @@ impl ChattView {
             }
         });
         let aspect_ratio = aspect_ratio(&video, (descriptor.width, descriptor.height));
+        let effect_overlay = self
+            .video_effect_overlay
+            .filter(|overlay| overlay.key == key)
+            .map(|overlay| VideoEffectDisplay {
+                label: overlay.effect.label(),
+                value: overlay.value,
+            });
         render_video_player(
             VideoPlayerConfig {
                 key,
@@ -85,6 +92,7 @@ impl ChattView {
                 controls_phase,
                 controls_pinned,
                 scrub_hover_fraction,
+                effect_overlay,
                 volume_open: active_controls && self.video_controls.volume_open,
                 measure_volume_bounds: active_controls,
             },
@@ -192,6 +200,297 @@ impl ChattView {
         }
         self.show_video_controls(key, cx);
         self.schedule_video_controls_hide(key, cx);
+        cx.notify();
+    }
+
+    pub(super) fn decrease_video_contrast(
+        &mut self,
+        _: &DecreaseContrast,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Contrast(-1.0), cx);
+    }
+
+    pub(super) fn increase_video_contrast(
+        &mut self,
+        _: &IncreaseContrast,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Contrast(1.0), cx);
+    }
+
+    pub(super) fn decrease_video_brightness(
+        &mut self,
+        _: &DecreaseBrightness,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Brightness(-1.0), cx);
+    }
+
+    pub(super) fn increase_video_brightness(
+        &mut self,
+        _: &IncreaseBrightness,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Brightness(1.0), cx);
+    }
+
+    pub(super) fn decrease_video_gamma(
+        &mut self,
+        _: &DecreaseGamma,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Gamma(-1.0), cx);
+    }
+
+    pub(super) fn increase_video_gamma(
+        &mut self,
+        _: &IncreaseGamma,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Gamma(1.0), cx);
+    }
+
+    pub(super) fn decrease_video_saturation(
+        &mut self,
+        _: &DecreaseSaturation,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Saturation(-1.0), cx);
+    }
+
+    pub(super) fn increase_video_saturation(
+        &mut self,
+        _: &IncreaseSaturation,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::Saturation(1.0), cx);
+    }
+
+    pub(super) fn decrease_video_volume(
+        &mut self,
+        _: &DecreaseVolume,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(key) = self.active_video_target() {
+            self.adjust_video_volume(key, -2.0, cx);
+        }
+    }
+
+    pub(super) fn increase_video_volume(
+        &mut self,
+        _: &IncreaseVolume,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(key) = self.active_video_target() {
+            self.adjust_video_volume(key, 2.0, cx);
+        }
+    }
+
+    pub(super) fn decrease_video_playback_speed(
+        &mut self,
+        _: &DecreasePlaybackSpeed,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::PlaybackSpeed(1.0 / 1.1), cx);
+    }
+
+    pub(super) fn increase_video_playback_speed(
+        &mut self,
+        _: &IncreasePlaybackSpeed,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adjust_active_video(VideoAdjustment::PlaybackSpeed(1.1), cx);
+    }
+
+    pub(super) fn previous_video_frame(
+        &mut self,
+        _: &PreviousFrame,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.active_video_target() else {
+            return;
+        };
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
+        match self.videos.step_frame(key, true) {
+            Ok(true) => {
+                self.show_video_controls(key, cx);
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => self.report_video_keyboard_control_error(key, error, cx),
+        }
+    }
+
+    pub(super) fn next_video_frame(
+        &mut self,
+        _: &NextFrame,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.active_video_target() else {
+            return;
+        };
+        let repeated = matches!(
+            self.next_frame_hold,
+            Some(NextFrameHold::Active { target, .. }) if target == key
+        );
+        if !repeated {
+            self.finish_active_frame_hold();
+        }
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
+        let result = if repeated {
+            self.videos.set_frame_hold_playing(key, true)
+        } else {
+            self.videos.step_frame(key, false)
+        };
+        match result {
+            Ok(true) => {
+                if !repeated {
+                    self.next_frame_hold = Some(NextFrameHold::AwaitingKey { target: key });
+                }
+                self.show_video_controls(key, cx);
+                // Let the low-level key-down listener record the physical key
+                // that dispatched this configurable action.
+                cx.propagate();
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => self.report_video_keyboard_control_error(key, error, cx),
+        }
+    }
+
+    pub(super) fn capture_next_frame_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.next_frame_hold.take() {
+            Some(NextFrameHold::AwaitingKey { target })
+            | Some(NextFrameHold::Active { target, .. }) => {
+                self.next_frame_hold = Some(NextFrameHold::Active {
+                    target,
+                    key: event.keystroke.key.clone(),
+                });
+                cx.stop_propagation();
+            }
+            None => {}
+        }
+    }
+
+    pub(super) fn release_next_frame_key(
+        &mut self,
+        event: &KeyUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(NextFrameHold::Active { target, key }) = self.next_frame_hold.as_ref() else {
+            return;
+        };
+        if event.keystroke.key != *key {
+            return;
+        }
+        let target = *target;
+        self.next_frame_hold = None;
+        if let Err(error) = self.videos.set_frame_hold_playing(target, false) {
+            self.report_video_keyboard_control_error(target, error, cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn finish_active_frame_hold(&mut self) {
+        let Some(NextFrameHold::Active { target, .. }) = self.next_frame_hold.take() else {
+            self.next_frame_hold = None;
+            return;
+        };
+        if let Err(error) = self.videos.set_frame_hold_playing(target, false) {
+            kvlog::error!(
+                "embedded video frame hold release failed",
+                room_id = target.room_id,
+                message_id = target.message_id,
+                attachment_timestamp_ms = target.attachment_id.timestamp_ms,
+                attachment_transfer_id = target.attachment_id.transfer_id,
+                err = %error
+            );
+        }
+    }
+
+    fn adjust_active_video(&mut self, adjustment: VideoAdjustment, cx: &mut Context<Self>) {
+        let Some(key) = self.active_video_target() else {
+            return;
+        };
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
+        match self.videos.adjust_video(key, adjustment) {
+            Ok(Some(change)) => self.show_video_effect_overlay(key, change, cx),
+            Ok(None) => cx.notify(),
+            Err(error) => self.report_video_keyboard_control_error(key, error, cx),
+        }
+    }
+
+    fn show_video_effect_overlay(
+        &mut self,
+        key: VideoKey,
+        change: VideoEffectChange,
+        cx: &mut Context<Self>,
+    ) {
+        self.video_effect_overlay_hide_task.take();
+        let serial = self.next_video_effect_overlay_serial;
+        self.next_video_effect_overlay_serial =
+            self.next_video_effect_overlay_serial.wrapping_add(1).max(1);
+        self.video_effect_overlay = Some(VideoEffectOverlay {
+            key,
+            effect: change.effect,
+            value: change.value,
+            serial,
+        });
+        self.video_effect_overlay_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(VIDEO_EFFECT_OVERLAY_HOLD)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.video_effect_overlay_hide_task.take();
+                if this
+                    .video_effect_overlay
+                    .is_some_and(|overlay| overlay.serial == serial)
+                {
+                    this.video_effect_overlay = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn report_video_keyboard_control_error(
+        &mut self,
+        key: VideoKey,
+        error: anyhow::Error,
+        cx: &mut Context<Self>,
+    ) {
+        kvlog::error!(
+            "embedded video keyboard control failed",
+            room_id = key.room_id,
+            message_id = key.message_id,
+            attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+            attachment_transfer_id = key.attachment_id.transfer_id,
+            err = %error
+        );
+        self.status = format!("Video control failed: {error}").into();
         cx.notify();
     }
 

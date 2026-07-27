@@ -55,7 +55,7 @@ use crate::{
     image_cache::{PreviewImageLoader, TimelineImageLoader},
     media_cache::{CachedAttachment, MediaCache},
     model::{ChatModel, ConnectionPhase, PendingRequest},
-    mpv_player::{MpvPlayer, SeekMode},
+    mpv_player::{MpvPlayer, SeekMode, VideoAdjustment, VideoEffect},
     preview::{
         CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, PreviewContent,
         PreviewHistory, PreviewItem, clamp_chat_width, default_chat_width,
@@ -75,10 +75,10 @@ use crate::{
         CONTROLS_ANIMATION_DURATION, CONTROLS_HIDE_DELAY, VideoControlsState, VideoScrub,
         VideoVolumeDrag, horizontal_fraction, vertical_fraction, volume_scroll_delta,
     },
-    video_manager::{AttachmentVideoManager, VideoDrain, VideoKey},
+    video_manager::{AttachmentVideoManager, VideoDrain, VideoEffectChange, VideoKey},
     video_player::{
-        INLINE_VIDEO_ASPECT_RATIO, VideoPlayerConfig, VideoPlayerEvent, VideoPlayerHandler,
-        aspect_ratio, render_video_player,
+        INLINE_VIDEO_ASPECT_RATIO, VideoEffectDisplay, VideoPlayerConfig, VideoPlayerEvent,
+        VideoPlayerHandler, aspect_ratio, render_video_player,
     },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
 };
@@ -87,11 +87,11 @@ use dbus_message::{FileChooserResponse, OpenFileOptions, open_files};
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, Asset, Bounds, ClipboardItem, Context, Div,
     ExternalPaths, FocusHandle, Focusable, FollowMode, FontWeight, ImageCacheError, ImageSource,
-    ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful, Subscription, Task,
-    UniformListScrollHandle, WeakFocusHandle, Window, actions, anchored, canvas, deferred, div,
-    img, list, point, prelude::*, px, relative,
+    KeyDownEvent, KeyUpEvent, ListAlignment, ListState, LruImageCache, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Render, RenderImage,
+    ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
+    Subscription, Task, UniformListScrollHandle, WeakFocusHandle, Window, actions, anchored,
+    canvas, deferred, div, img, list, point, prelude::*, px, relative,
 };
 use local_rpc::{
     frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome, StateDelta},
@@ -125,6 +125,7 @@ const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 const PREVIEW_TAB_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
+const VIDEO_EFFECT_OVERLAY_HOLD: Duration = Duration::from_millis(400);
 
 fn timeline_message_row_padding_top(continuation: bool) -> f32 {
     if continuation {
@@ -262,6 +263,19 @@ struct TheaterVideo {
 enum MediaPlaybackTarget {
     Audio(AudioKey),
     Video(VideoKey),
+}
+
+enum NextFrameHold {
+    AwaitingKey { target: VideoKey },
+    Active { target: VideoKey, key: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoEffectOverlay {
+    key: VideoKey,
+    effect: VideoEffect,
+    value: f64,
+    serial: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -585,6 +599,20 @@ actions!(
         TogglePlayback,
         SeekBack,
         SeekForward,
+        DecreaseContrast,
+        IncreaseContrast,
+        DecreaseBrightness,
+        IncreaseBrightness,
+        DecreaseGamma,
+        IncreaseGamma,
+        DecreaseSaturation,
+        IncreaseSaturation,
+        DecreaseVolume,
+        IncreaseVolume,
+        DecreasePlaybackSpeed,
+        IncreasePlaybackSpeed,
+        PreviousFrame,
+        NextFrame,
         LiveZoomIn,
         LiveZoomOut,
         LiveReset,
@@ -768,6 +796,10 @@ pub struct ChattView {
     video_volume_popup_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     video_volume_button_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     theater_video: Option<TheaterVideo>,
+    next_frame_hold: Option<NextFrameHold>,
+    video_effect_overlay: Option<VideoEffectOverlay>,
+    video_effect_overlay_hide_task: Option<Task<()>>,
+    next_video_effect_overlay_serial: u64,
     video_controls_animation_task: Option<Task<()>>,
     video_controls_hide_task: Option<Task<()>>,
     video_volume_hide_task: Option<Task<()>>,
@@ -1015,6 +1047,10 @@ impl ChattView {
             video_volume_popup_bounds: Rc::new(Cell::new(None)),
             video_volume_button_bounds: Rc::new(Cell::new(None)),
             theater_video: None,
+            next_frame_hold: None,
+            video_effect_overlay: None,
+            video_effect_overlay_hide_task: None,
+            next_video_effect_overlay_serial: 1,
             video_controls_animation_task: None,
             video_controls_hide_task: None,
             video_volume_hide_task: None,
@@ -3835,6 +3871,13 @@ impl ChattView {
         )
     }
 
+    fn active_video_target(&self) -> Option<VideoKey> {
+        self.theater_video
+            .as_ref()
+            .map(|theater| theater.key)
+            .or_else(|| latest_visible_video(&self.media_interactions, &self.visible_video_keys))
+    }
+
     fn toggle_playback(&mut self, _: &TogglePlayback, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(key) = self.theater_video.as_ref().map(|theater| theater.key) {
             self.play_video(key, cx);
@@ -4805,6 +4848,22 @@ impl Render for ChattView {
                 .on_action(cx.listener(Self::toggle_playback))
                 .on_action(cx.listener(Self::seek_back))
                 .on_action(cx.listener(Self::seek_forward))
+                .on_action(cx.listener(Self::decrease_video_contrast))
+                .on_action(cx.listener(Self::increase_video_contrast))
+                .on_action(cx.listener(Self::decrease_video_brightness))
+                .on_action(cx.listener(Self::increase_video_brightness))
+                .on_action(cx.listener(Self::decrease_video_gamma))
+                .on_action(cx.listener(Self::increase_video_gamma))
+                .on_action(cx.listener(Self::decrease_video_saturation))
+                .on_action(cx.listener(Self::increase_video_saturation))
+                .on_action(cx.listener(Self::decrease_video_volume))
+                .on_action(cx.listener(Self::increase_video_volume))
+                .on_action(cx.listener(Self::decrease_video_playback_speed))
+                .on_action(cx.listener(Self::increase_video_playback_speed))
+                .on_action(cx.listener(Self::previous_video_frame))
+                .on_action(cx.listener(Self::next_video_frame))
+                .on_key_down(cx.listener(Self::capture_next_frame_key_down))
+                .on_key_up(cx.listener(Self::release_next_frame_key))
                 .on_action(cx.listener(Self::close_preview_action))
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                     if this.scroll_video_volume(event, cx) {
@@ -4952,6 +5011,22 @@ impl Render for ChattView {
             .on_action(cx.listener(Self::toggle_playback))
             .on_action(cx.listener(Self::seek_back))
             .on_action(cx.listener(Self::seek_forward))
+            .on_action(cx.listener(Self::decrease_video_contrast))
+            .on_action(cx.listener(Self::increase_video_contrast))
+            .on_action(cx.listener(Self::decrease_video_brightness))
+            .on_action(cx.listener(Self::increase_video_brightness))
+            .on_action(cx.listener(Self::decrease_video_gamma))
+            .on_action(cx.listener(Self::increase_video_gamma))
+            .on_action(cx.listener(Self::decrease_video_saturation))
+            .on_action(cx.listener(Self::increase_video_saturation))
+            .on_action(cx.listener(Self::decrease_video_volume))
+            .on_action(cx.listener(Self::increase_video_volume))
+            .on_action(cx.listener(Self::decrease_video_playback_speed))
+            .on_action(cx.listener(Self::increase_video_playback_speed))
+            .on_action(cx.listener(Self::previous_video_frame))
+            .on_action(cx.listener(Self::next_video_frame))
+            .on_key_down(cx.listener(Self::capture_next_frame_key_down))
+            .on_key_up(cx.listener(Self::release_next_frame_key))
             .on_action(cx.listener(Self::live_zoom_in_action))
             .on_action(cx.listener(Self::live_zoom_out_action))
             .on_action(cx.listener(Self::live_reset_action))
@@ -5722,6 +5797,16 @@ fn latest_visible_media(
     })
 }
 
+fn latest_visible_video(
+    interactions: &VecDeque<MediaPlaybackTarget>,
+    visible_video: &HashSet<VideoKey>,
+) -> Option<VideoKey> {
+    interactions.iter().find_map(|target| match target {
+        MediaPlaybackTarget::Video(key) if visible_video.contains(key) => Some(*key),
+        MediaPlaybackTarget::Audio(_) | MediaPlaybackTarget::Video(_) => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6192,6 +6277,10 @@ mod tests {
                 &HashSet::from([video])
             ),
             Some(MediaPlaybackTarget::Audio(audio))
+        );
+        assert_eq!(
+            latest_visible_video(&interactions, &HashSet::from([video])),
+            Some(video)
         );
     }
 

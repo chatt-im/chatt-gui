@@ -8,10 +8,14 @@ use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate};
 use crate::{
     app::{
         CloseCodeSearch, ClosePreview, CloseServerSelector, CompletionAccept,
-        CompletionAcceptEngaged, CompletionDismiss, CompletionNext, CompletionPrevious, FindInCode,
-        LivePanDown, LivePanUp, LiveReset, LiveZoomIn, LiveZoomOut, NextCodeMatch, OpenMedia,
-        OpenSettings, PreviousCodeMatch, SeekBack, SeekForward, SendMessage, ServerActivate,
-        ServerNext, ServerPrevious, ToggleDeafen, ToggleMute, TogglePlayback, ToggleVoice,
+        CompletionAcceptEngaged, CompletionDismiss, CompletionNext, CompletionPrevious,
+        DecreaseBrightness, DecreaseContrast, DecreaseGamma, DecreasePlaybackSpeed,
+        DecreaseSaturation, DecreaseVolume, FindInCode, IncreaseBrightness, IncreaseContrast,
+        IncreaseGamma, IncreasePlaybackSpeed, IncreaseSaturation, IncreaseVolume, LivePanDown,
+        LivePanUp, LiveReset, LiveZoomIn, LiveZoomOut, NextCodeMatch, NextFrame, OpenMedia,
+        OpenSettings, PreviousCodeMatch, PreviousFrame, SeekBack, SeekForward, SendMessage,
+        ServerActivate, ServerNext, ServerPrevious, ToggleDeafen, ToggleMute, TogglePlayback,
+        ToggleVoice,
     },
     code_viewer, composer,
     config::{
@@ -488,6 +492,118 @@ pub(crate) static BINDINGS: &[BindingSpec] = &[
     },
     BindingSpec {
         scope: BindingScope::NonInput,
+        command: BindCommand::DecreaseContrast,
+        label: "Decrease video contrast",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["1"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::IncreaseContrast,
+        label: "Increase video contrast",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["2"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::DecreaseBrightness,
+        label: "Decrease video brightness",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["3"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::IncreaseBrightness,
+        label: "Increase video brightness",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["4"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::DecreaseGamma,
+        label: "Decrease video gamma",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["5"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::IncreaseGamma,
+        label: "Increase video gamma",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["6"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::DecreaseSaturation,
+        label: "Decrease video saturation",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["7"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::IncreaseSaturation,
+        label: "Increase video saturation",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &["8"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::DecreaseVolume,
+        label: "Decrease video volume",
+        help: Some("Changes volume by mpv's default two-point step."),
+        contexts: &[NON_INPUT],
+        defaults: &["9"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::IncreaseVolume,
+        label: "Increase video volume",
+        help: Some("Changes volume by mpv's default two-point step."),
+        contexts: &[NON_INPUT],
+        defaults: &["0"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::DecreasePlaybackSpeed,
+        label: "Decrease video playback speed",
+        help: Some("Divides the current speed by 1.1, matching mpv."),
+        contexts: &[NON_INPUT],
+        defaults: &["["],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::IncreasePlaybackSpeed,
+        label: "Increase video playback speed",
+        help: Some("Multiplies the current speed by 1.1, matching mpv."),
+        contexts: &[NON_INPUT],
+        defaults: &["]"],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::PreviousFrame,
+        label: "Previous video frame",
+        help: None,
+        contexts: &[NON_INPUT],
+        defaults: &[","],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
+        command: BindCommand::NextFrame,
+        label: "Next video frame",
+        help: Some("Hold to play; releasing the shortcut pauses."),
+        contexts: &[NON_INPUT],
+        defaults: &["."],
+    },
+    BindingSpec {
+        scope: BindingScope::NonInput,
         command: BindCommand::LiveZoomIn,
         label: "Zoom in",
         help: None,
@@ -834,6 +950,24 @@ fn make_action(scope: BindingScope, command: BindCommand) -> Box<dyn Action> {
         (BindingScope::NonInput, BindCommand::TogglePlayback) => Box::new(TogglePlayback),
         (BindingScope::NonInput, BindCommand::SeekBack) => Box::new(SeekBack),
         (BindingScope::NonInput, BindCommand::SeekForward) => Box::new(SeekForward),
+        (BindingScope::NonInput, BindCommand::DecreaseContrast) => Box::new(DecreaseContrast),
+        (BindingScope::NonInput, BindCommand::IncreaseContrast) => Box::new(IncreaseContrast),
+        (BindingScope::NonInput, BindCommand::DecreaseBrightness) => Box::new(DecreaseBrightness),
+        (BindingScope::NonInput, BindCommand::IncreaseBrightness) => Box::new(IncreaseBrightness),
+        (BindingScope::NonInput, BindCommand::DecreaseGamma) => Box::new(DecreaseGamma),
+        (BindingScope::NonInput, BindCommand::IncreaseGamma) => Box::new(IncreaseGamma),
+        (BindingScope::NonInput, BindCommand::DecreaseSaturation) => Box::new(DecreaseSaturation),
+        (BindingScope::NonInput, BindCommand::IncreaseSaturation) => Box::new(IncreaseSaturation),
+        (BindingScope::NonInput, BindCommand::DecreaseVolume) => Box::new(DecreaseVolume),
+        (BindingScope::NonInput, BindCommand::IncreaseVolume) => Box::new(IncreaseVolume),
+        (BindingScope::NonInput, BindCommand::DecreasePlaybackSpeed) => {
+            Box::new(DecreasePlaybackSpeed)
+        }
+        (BindingScope::NonInput, BindCommand::IncreasePlaybackSpeed) => {
+            Box::new(IncreasePlaybackSpeed)
+        }
+        (BindingScope::NonInput, BindCommand::PreviousFrame) => Box::new(PreviousFrame),
+        (BindingScope::NonInput, BindCommand::NextFrame) => Box::new(NextFrame),
         (BindingScope::NonInput, BindCommand::LiveZoomIn) => Box::new(LiveZoomIn),
         (BindingScope::NonInput, BindCommand::LiveZoomOut) => Box::new(LiveZoomOut),
         (BindingScope::NonInput, BindCommand::LiveReset) => Box::new(LiveReset),
@@ -861,7 +995,7 @@ mod tests {
             .iter()
             .map(|binding| binding.defaults.len() * binding.contexts.len())
             .sum::<usize>();
-        assert_eq!(expanded_default_count, 52);
+        assert_eq!(expanded_default_count, 66);
         assert_eq!(
             effective_scope(&GuiConfig::default().bindings, BindingScope::Composer)
                 .iter()

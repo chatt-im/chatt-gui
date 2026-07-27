@@ -530,6 +530,20 @@ pub(crate) enum BindCommand {
     TogglePlayback,
     SeekBack,
     SeekForward,
+    DecreaseContrast,
+    IncreaseContrast,
+    DecreaseBrightness,
+    IncreaseBrightness,
+    DecreaseGamma,
+    IncreaseGamma,
+    DecreaseSaturation,
+    IncreaseSaturation,
+    DecreaseVolume,
+    IncreaseVolume,
+    DecreasePlaybackSpeed,
+    IncreasePlaybackSpeed,
+    PreviousFrame,
+    NextFrame,
     LiveZoomIn,
     LiveZoomOut,
     LiveReset,
@@ -686,6 +700,8 @@ enter = "CompletionAcceptEngaged"
 
 [bindings.non-input]
 space = "TogglePlayback"
+"[" = "DecreasePlaybackSpeed"
+"." = "NextFrame"
 "#,
         )
         .unwrap();
@@ -717,6 +733,14 @@ space = "TogglePlayback"
         assert_eq!(
             config.bindings.non_input.get("space"),
             Some(&BindCommand::TogglePlayback)
+        );
+        assert_eq!(
+            config.bindings.non_input.get("["),
+            Some(&BindCommand::DecreasePlaybackSpeed)
+        );
+        assert_eq!(
+            config.bindings.non_input.get("."),
+            Some(&BindCommand::NextFrame)
         );
         assert!(config.bindings.composer.is_empty());
     }

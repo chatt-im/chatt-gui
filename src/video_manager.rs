@@ -10,10 +10,38 @@ use gpui::PlatformSurface;
 use local_rpc::{ids::RoomId, model::AttachmentId};
 
 use crate::attachment_source::{AttachmentSourceRegistry, RegisteredAttachmentSource};
-use crate::mpv_player::{AttachmentRenderBackend, MpvPlayer, SeekMode};
+use crate::mpv_player::{
+    AttachmentRenderBackend, MpvPlayer, SeekMode, VideoAdjustment, VideoEffect,
+};
 
 const RETAINED_OFFSCREEN_LIMIT: usize = 4;
 const MAX_SESSION_ENTRIES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VideoEffectChange {
+    pub(crate) effect: VideoEffect,
+    pub(crate) value: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct VideoEffectValues([f64; 4]);
+
+impl VideoEffectValues {
+    fn adjusted(self, effect: VideoEffect, delta: f64) -> VideoEffectChange {
+        VideoEffectChange {
+            effect,
+            value: (self.0[effect.index()] + delta).clamp(-100.0, 100.0),
+        }
+    }
+
+    fn set(&mut self, change: VideoEffectChange) {
+        self.0[change.effect.index()] = change.value;
+    }
+
+    fn get(self, effect: VideoEffect) -> f64 {
+        self.0[effect.index()]
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct VideoKey {
@@ -63,6 +91,7 @@ struct VideoSession {
     touched: u64,
     error: Option<String>,
     display_size: Option<(u32, u32)>,
+    effects: VideoEffectValues,
 }
 
 impl VideoSession {
@@ -79,6 +108,7 @@ impl VideoSession {
             touched,
             error: None,
             display_size: None,
+            effects: VideoEffectValues::default(),
         }
     }
 }
@@ -194,6 +224,7 @@ impl AttachmentVideoManager {
         if let Some(player) = session.player.as_mut() {
             if session.finished {
                 player.load_at(source.url(), false, volume, 0.0)?;
+                apply_video_effects(player, session.effects)?;
                 session.position = 0.0;
                 session.duration = 0.0;
                 session.paused = false;
@@ -275,6 +306,58 @@ impl AttachmentVideoManager {
         self.touch(key);
         self.last_interacted = Some(key);
         self.set_volume(self.volume + delta)
+    }
+
+    pub(crate) fn adjust_video(
+        &mut self,
+        key: VideoKey,
+        adjustment: VideoAdjustment,
+    ) -> Result<Option<VideoEffectChange>> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return Ok(None);
+        };
+        let Some(player) = session.player.as_ref() else {
+            return Ok(None);
+        };
+        let change = adjustment
+            .effect_delta()
+            .map(|(effect, delta)| session.effects.adjusted(effect, delta));
+        player.adjust_video(adjustment)?;
+        if let Some(change) = change {
+            session.effects.set(change);
+        }
+        Ok(change)
+    }
+
+    pub(crate) fn step_frame(&mut self, key: VideoKey, backwards: bool) -> Result<bool> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return Ok(false);
+        };
+        let Some(player) = session.player.as_mut() else {
+            return Ok(false);
+        };
+        player.step_frame(backwards)?;
+        session.paused = true;
+        session.finished = false;
+        Ok(true)
+    }
+
+    pub(crate) fn set_frame_hold_playing(&mut self, key: VideoKey, playing: bool) -> Result<bool> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return Ok(false);
+        };
+        let Some(player) = session.player.as_mut() else {
+            return Ok(false);
+        };
+        player.set_paused(!playing)?;
+        session.paused = !playing;
+        Ok(true)
     }
 
     pub(crate) fn set_volume_for(&mut self, key: VideoKey, volume: f64) -> Result<()> {
@@ -560,8 +643,9 @@ impl AttachmentVideoManager {
             let _ = self.reaper.send(player);
             return;
         };
-        if let Err(error) =
-            player.load_at(source.url(), session.paused, self.volume, session.position)
+        if let Err(error) = player
+            .load_at(source.url(), session.paused, self.volume, session.position)
+            .and_then(|()| apply_video_effects(&player, session.effects))
         {
             let error = format!("Could not open video: {error}");
             session.paused = true;
@@ -637,6 +721,13 @@ impl AttachmentVideoManager {
     }
 }
 
+fn apply_video_effects(player: &MpvPlayer, effects: VideoEffectValues) -> Result<()> {
+    for effect in VideoEffect::ALL {
+        player.set_video_effect(effect, effects.get(effect))?;
+    }
+    Ok(())
+}
+
 impl Drop for AttachmentVideoManager {
     fn drop(&mut self) {
         for (_, mut session) in self.sessions.drain() {
@@ -690,6 +781,19 @@ mod tests {
         assert!(view.paused);
         assert_eq!(view.volume, 100.0);
         assert!(!view.loading);
+    }
+
+    #[test]
+    fn video_effect_values_are_independent_and_clamped_to_mpv_limits() {
+        let mut effects = VideoEffectValues::default();
+        effects.set(effects.adjusted(VideoEffect::Contrast, 12.0));
+        effects.set(effects.adjusted(VideoEffect::Brightness, -7.0));
+        effects.set(effects.adjusted(VideoEffect::Contrast, 500.0));
+
+        assert_eq!(effects.get(VideoEffect::Contrast), 100.0);
+        assert_eq!(effects.get(VideoEffect::Brightness), -7.0);
+        assert_eq!(effects.get(VideoEffect::Gamma), 0.0);
+        assert_eq!(effects.get(VideoEffect::Saturation), 0.0);
     }
 
     #[test]

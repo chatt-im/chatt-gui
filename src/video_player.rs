@@ -47,6 +47,12 @@ pub(crate) type VideoPlayerHandler = Rc<dyn Fn(VideoPlayerEvent, &mut Window, &m
 
 pub(crate) const INLINE_VIDEO_ASPECT_RATIO: f32 = 16.0 / 9.0;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VideoEffectDisplay {
+    pub(crate) label: &'static str,
+    pub(crate) value: f64,
+}
+
 pub(crate) struct VideoPlayerConfig {
     pub key: VideoKey,
     pub theater: bool,
@@ -59,6 +65,7 @@ pub(crate) struct VideoPlayerConfig {
     pub controls_phase: ControlsPhase,
     pub controls_pinned: bool,
     pub scrub_hover_fraction: Option<f64>,
+    pub effect_overlay: Option<VideoEffectDisplay>,
     pub volume_open: bool,
     pub measure_volume_bounds: bool,
 }
@@ -82,6 +89,7 @@ pub(crate) fn render_video_player(
         controls_phase,
         controls_pinned,
         scrub_hover_fraction,
+        effect_overlay,
         volume_open,
         measure_volume_bounds,
     } = config;
@@ -208,6 +216,85 @@ pub(crate) fn render_video_player(
                     22.0,
                     settings.theme.color(ThemeRole::ControlActiveText),
                 )),
+        );
+    }
+
+    if let Some(effect) = effect_overlay {
+        let effect_fraction = effect_progress(effect.value);
+        viewport = viewport.child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .pt(rems_from_px(if theater { 18.0 } else { 8.0 }))
+                .px(rems_from_px(10.0))
+                .child(
+                    div()
+                        .w(rems_from_px(if theater { 320.0 } else { 220.0 }))
+                        .max_w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(settings.theme.color(ThemeRole::MediaBorder))
+                        .bg(settings.theme.color(ThemeRole::MediaOverlayStrong))
+                        .shadow_sm()
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .text_xs()
+                                .text_color(settings.theme.color(ThemeRole::MediaText))
+                                .child(effect.label)
+                                .child(format!("{:+.0}", effect.value)),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .w_full()
+                                .h(rems_from_px(5.0))
+                                .rounded_full()
+                                .bg(settings.theme.color(ThemeRole::MediaProgressTrack))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .top_0()
+                                        .h_full()
+                                        .w(relative(effect_fraction))
+                                        .rounded_full()
+                                        .bg(settings.theme.color(ThemeRole::MediaProgressFill)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(relative(0.5))
+                                        .top(rems_from_px(-2.0))
+                                        .ml(rems_from_px(-0.5))
+                                        .w(rems_from_px(1.0))
+                                        .h(rems_from_px(9.0))
+                                        .bg(settings.theme.color(ThemeRole::MediaText)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(relative(effect_fraction))
+                                        .top(rems_from_px(-2.0))
+                                        .ml(rems_from_px(-4.5))
+                                        .size(rems_from_px(9.0))
+                                        .rounded_full()
+                                        .bg(settings.theme.color(ThemeRole::MediaProgressKnob)),
+                                ),
+                        ),
+                ),
         );
     }
 
@@ -573,6 +660,10 @@ pub(crate) fn render_video_player(
         .into_any_element()
 }
 
+fn effect_progress(value: f64) -> f32 {
+    ((value.clamp(-100.0, 100.0) + 100.0) / 200.0) as f32
+}
+
 fn video_control_button(
     id: impl Into<gpui::ElementId>,
     icon_name: IconName,
@@ -660,5 +751,14 @@ mod tests {
             ..VideoView::default()
         };
         assert_eq!(aspect_ratio(&video, (Some(1_920), Some(1_080))), 9.0 / 16.0);
+    }
+
+    #[test]
+    fn video_effect_progress_centers_the_neutral_value_and_clamps_edges() {
+        assert_eq!(effect_progress(-200.0), 0.0);
+        assert_eq!(effect_progress(-100.0), 0.0);
+        assert_eq!(effect_progress(0.0), 0.5);
+        assert_eq!(effect_progress(100.0), 1.0);
+        assert_eq!(effect_progress(200.0), 1.0);
     }
 }

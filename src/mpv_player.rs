@@ -653,6 +653,23 @@ impl MpvPlayer {
         self.send_control(ControlCommand::SetVolume(volume.clamp(0.0, 100.0)))
     }
 
+    pub(crate) fn adjust_video(&self, adjustment: VideoAdjustment) -> Result<()> {
+        self.send_control(ControlCommand::AdjustVideo(adjustment))
+    }
+
+    pub(crate) fn set_video_effect(&self, effect: VideoEffect, value: f64) -> Result<()> {
+        self.send_control(ControlCommand::SetVideoEffect {
+            effect,
+            value: value.clamp(-100.0, 100.0),
+        })
+    }
+
+    pub(crate) fn step_frame(&mut self, backwards: bool) -> Result<()> {
+        self.requested_paused = true;
+        self.playback.paused.store(true, Ordering::Release);
+        self.send_control(ControlCommand::StepFrame { backwards })
+    }
+
     pub fn drain_events(&mut self) -> Result<PlaybackState> {
         if let Ok(error) = self.errors.try_recv() {
             bail!(error);
@@ -1173,6 +1190,81 @@ impl SeekMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VideoAdjustment {
+    Contrast(f64),
+    Brightness(f64),
+    Gamma(f64),
+    Saturation(f64),
+    PlaybackSpeed(f64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoEffect {
+    Contrast,
+    Brightness,
+    Gamma,
+    Saturation,
+}
+
+impl VideoEffect {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Contrast,
+        Self::Brightness,
+        Self::Gamma,
+        Self::Saturation,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Contrast => "Contrast",
+            Self::Brightness => "Brightness",
+            Self::Gamma => "Gamma",
+            Self::Saturation => "Saturation",
+        }
+    }
+
+    const fn property(self) -> &'static str {
+        match self {
+            Self::Contrast => "contrast",
+            Self::Brightness => "brightness",
+            Self::Gamma => "gamma",
+            Self::Saturation => "saturation",
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Contrast => 0,
+            Self::Brightness => 1,
+            Self::Gamma => 2,
+            Self::Saturation => 3,
+        }
+    }
+}
+
+impl VideoAdjustment {
+    fn mpv_command(self) -> (&'static str, &'static str, f64) {
+        match self {
+            Self::Contrast(delta) => ("add", "contrast", delta),
+            Self::Brightness(delta) => ("add", "brightness", delta),
+            Self::Gamma(delta) => ("add", "gamma", delta),
+            Self::Saturation(delta) => ("add", "saturation", delta),
+            Self::PlaybackSpeed(factor) => ("multiply", "speed", factor),
+        }
+    }
+
+    pub(crate) const fn effect_delta(self) -> Option<(VideoEffect, f64)> {
+        match self {
+            Self::Contrast(delta) => Some((VideoEffect::Contrast, delta)),
+            Self::Brightness(delta) => Some((VideoEffect::Brightness, delta)),
+            Self::Gamma(delta) => Some((VideoEffect::Gamma, delta)),
+            Self::Saturation(delta) => Some((VideoEffect::Saturation, delta)),
+            Self::PlaybackSpeed(_) => None,
+        }
+    }
+}
+
 pub(crate) enum ControlCommand {
     Load {
         startup: StartupLogContext,
@@ -1194,6 +1286,14 @@ pub(crate) enum ControlCommand {
     },
     SetVolume(f64),
     SetSpeed(f64),
+    AdjustVideo(VideoAdjustment),
+    SetVideoEffect {
+        effect: VideoEffect,
+        value: f64,
+    },
+    StepFrame {
+        backwards: bool,
+    },
     Stop,
     DropBuffers,
     Shutdown,
@@ -1841,6 +1941,48 @@ fn control_worker(
                         kvlog::info!("setting mpv speed", group = "media", speed);
                     }
                     mpv.set_property("speed", speed)
+                }
+                ControlCommand::AdjustVideo(adjustment) => {
+                    let (command, property, amount) = adjustment.mpv_command();
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "adjusting mpv video property",
+                            group = "media",
+                            property,
+                            amount
+                        );
+                    }
+                    mpv.command(command, &[property, &amount.to_string()])
+                }
+                ControlCommand::SetVideoEffect { effect, value } => {
+                    let property = effect.property();
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!(
+                            "setting mpv video property",
+                            group = "media",
+                            property,
+                            value
+                        );
+                    }
+                    mpv.set_property(property, value)
+                }
+                ControlCommand::StepFrame { backwards } => {
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!("stepping mpv video frame", group = "media", backwards);
+                    }
+                    state.paused = true;
+                    playback.publish_control(state);
+                    mpv.command(
+                        if backwards {
+                            "frame-back-step"
+                        } else {
+                            "frame-step"
+                        },
+                        &[],
+                    )
                 }
                 ControlCommand::Stop => {
                     #[cfg(feature = "diagnostic-logs")]
@@ -2604,6 +2746,40 @@ mod tests {
         assert_eq!(checked_video_size(0, 240), None);
         assert_eq!(checked_video_size(320, -1), None);
         assert_eq!(checked_video_size(i64::from(u32::MAX) + 1, 240), None);
+    }
+
+    #[test]
+    fn video_adjustments_use_native_mpv_property_operations() {
+        assert_eq!(
+            VideoAdjustment::Contrast(-1.0).mpv_command(),
+            ("add", "contrast", -1.0)
+        );
+        assert_eq!(
+            VideoAdjustment::Brightness(1.0).mpv_command(),
+            ("add", "brightness", 1.0)
+        );
+        assert_eq!(
+            VideoAdjustment::Gamma(-1.0).mpv_command(),
+            ("add", "gamma", -1.0)
+        );
+        assert_eq!(
+            VideoAdjustment::Saturation(1.0).mpv_command(),
+            ("add", "saturation", 1.0)
+        );
+        assert_eq!(
+            VideoAdjustment::PlaybackSpeed(1.0 / 1.1).mpv_command(),
+            ("multiply", "speed", 1.0 / 1.1)
+        );
+        assert_eq!(
+            VideoAdjustment::PlaybackSpeed(1.1).mpv_command(),
+            ("multiply", "speed", 1.1)
+        );
+        assert_eq!(
+            VideoAdjustment::Gamma(-1.0).effect_delta(),
+            Some((VideoEffect::Gamma, -1.0))
+        );
+        assert_eq!(VideoAdjustment::PlaybackSpeed(1.1).effect_delta(), None);
+        assert_eq!(VideoEffect::Saturation.property(), "saturation");
     }
 
     #[test]

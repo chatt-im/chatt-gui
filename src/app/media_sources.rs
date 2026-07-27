@@ -226,6 +226,9 @@ impl ChattView {
         self.video_surface_click_task.take();
         self.video_volume_popup_bounds.set(None);
         self.video_volume_button_bounds.set(None);
+        self.next_frame_hold = None;
+        self.video_effect_overlay = None;
+        self.video_effect_overlay_hide_task.take();
     }
 
     pub(super) fn update_video_visibility(
