@@ -952,6 +952,7 @@ impl ChattView {
             AttachmentAudioManager::new(video_wakeup.clone(), attachment_source_registry.clone());
         let video_thumbnails =
             VideoThumbnailCache::new(VIDEO_THUMBNAIL_CACHE_BYTES, video_wakeup.clone());
+        let layout = &cx.global::<ConfigurationState>().0.config.layout;
         Self {
             model,
             daemon,
@@ -973,8 +974,8 @@ impl ChattView {
             composer_menu_open: false,
             composer_menu_action_taken: false,
             composer_menu_trigger_bounds: Rc::new(Cell::new(None)),
-            show_rooms_sidebar: true,
-            show_top_status_bar: true,
+            show_rooms_sidebar: layout.room_menu_visible,
+            show_top_status_bar: layout.status_bar_visible,
             selected_server_label: None,
             server_list_scroll: ScrollHandle::new(),
             pending_server_selection: None,
@@ -1114,7 +1115,11 @@ impl ChattView {
         }
         self.settings_close_when_opened = false;
         let appearance_session = self.appearance_session_id();
-        let settings = cx.new(move |cx| SettingsView::new(appearance_session, cx));
+        let mut live_layout = cx.global::<ConfigurationState>().0.config.layout;
+        live_layout.status_bar_visible = self.show_top_status_bar;
+        live_layout.room_menu_visible = self.show_rooms_sidebar;
+        let settings =
+            cx.new(move |cx| SettingsView::new(appearance_session, live_layout, cx));
         let subscription =
             cx.subscribe(
                 &settings,
@@ -1146,6 +1151,18 @@ impl ChattView {
                             &loaded,
                             cx,
                         );
+                    }
+                    SettingsViewEvent::LocalLayoutPreview {
+                        status_bar_visible,
+                        room_menu_visible,
+                    } => {
+                        if let Some(visible) = status_bar_visible {
+                            this.show_top_status_bar = *visible;
+                        }
+                        if let Some(visible) = room_menu_visible {
+                            this.show_rooms_sidebar = *visible;
+                        }
+                        cx.notify();
                     }
                     SettingsViewEvent::AppearanceCommand(command) => {
                         this.send_appearance_command(command.clone(), cx);

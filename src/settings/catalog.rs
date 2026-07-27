@@ -11,11 +11,18 @@ pub(crate) enum ScalarSetting {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToggleSetting {
+    StatusBarVisible,
+    RoomMenuVisible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RowRef {
     Theme(ThemeRole),
     FontFamily(FontRole),
     FontSize(FontRole),
     Choice(ScalarSetting),
+    Toggle(ToggleSetting),
     Binding(BindingScope, BindCommand),
     Diagnostic(usize),
 }
@@ -25,6 +32,7 @@ pub(crate) enum CatalogItem {
     ThemeGroup(ThemeGroup),
     Font(FontRole),
     Choice(ScalarSetting),
+    Toggle(ToggleSetting),
     Keymap,
     Diagnostics,
 }
@@ -54,6 +62,10 @@ const TYPOGRAPHY: &[CatalogItem] = &[
 ];
 const SYNTAX: &[CatalogItem] = &[CatalogItem::ThemeGroup(ThemeGroup::Syntax)];
 const MEDIA: &[CatalogItem] = &[CatalogItem::ThemeGroup(ThemeGroup::Media)];
+const LAYOUT: &[CatalogItem] = &[
+    CatalogItem::Toggle(ToggleSetting::StatusBarVisible),
+    CatalogItem::Toggle(ToggleSetting::RoomMenuVisible),
+];
 const INPUT: &[CatalogItem] = &[
     CatalogItem::Choice(ScalarSetting::BindingMode),
     CatalogItem::Keymap,
@@ -86,6 +98,12 @@ pub(crate) static SETTINGS_SECTIONS: &[SettingsSection] = &[
         items: MEDIA,
     },
     SettingsSection {
+        id: "layout",
+        title: "Layout",
+        help: "Default visibility of the main room interface.",
+        items: LAYOUT,
+    },
+    SettingsSection {
         id: "input",
         title: "Input & keymap",
         help: "Composer behavior and renderer-owned action bindings.",
@@ -114,6 +132,7 @@ pub(crate) fn rows(section: &SettingsSection, diagnostic_count: usize) -> Vec<Ro
                 rows.push(RowRef::FontSize(role));
             }
             CatalogItem::Choice(choice) => rows.push(RowRef::Choice(choice)),
+            CatalogItem::Toggle(toggle) => rows.push(RowRef::Toggle(toggle)),
             CatalogItem::Keymap => rows.extend(
                 BINDINGS
                     .iter()
@@ -142,6 +161,8 @@ pub(crate) fn path(row: RowRef) -> String {
         RowRef::FontSize(role) => format!("fonts.{}-size", font_spec(role).key_stem),
         RowRef::Choice(ScalarSetting::FontRendering) => "fonts.rendering".into(),
         RowRef::Choice(ScalarSetting::BindingMode) => "input.default-binding-mode".into(),
+        RowRef::Toggle(ToggleSetting::StatusBarVisible) => "layout.status-bar-visible".into(),
+        RowRef::Toggle(ToggleSetting::RoomMenuVisible) => "layout.room-menu-visible".into(),
         RowRef::Binding(scope, command) => {
             format!("bindings.{}.{}", scope.key(), format!("{command:?}"))
         }
@@ -166,6 +187,8 @@ pub(crate) fn label(row: RowRef) -> &'static str {
         },
         RowRef::Choice(ScalarSetting::FontRendering) => "Text rendering",
         RowRef::Choice(ScalarSetting::BindingMode) => "Default composer mode",
+        RowRef::Toggle(ToggleSetting::StatusBarVisible) => "Show status bar by default",
+        RowRef::Toggle(ToggleSetting::RoomMenuVisible) => "Show room menu by default",
         RowRef::Binding(scope, command) => {
             crate::key_bindings::spec(scope, command)
                 .expect("binding row belongs to registry")
@@ -195,6 +218,12 @@ pub(crate) fn help(row: RowRef) -> Option<&'static str> {
         ),
         RowRef::Choice(ScalarSetting::BindingMode) => {
             Some("Standard starts in Insert; Vim starts in Normal mode.")
+        }
+        RowRef::Toggle(ToggleSetting::StatusBarVisible) => {
+            Some("Controls whether the status bar above a room is shown when the GUI starts.")
+        }
+        RowRef::Toggle(ToggleSetting::RoomMenuVisible) => {
+            Some("Controls whether the room menu sidebar is shown when the GUI starts.")
         }
         RowRef::Binding(scope, command) => {
             crate::key_bindings::spec(scope, command)
@@ -259,5 +288,21 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn layout_section_contains_both_visibility_toggles() {
+        let layout = SETTINGS_SECTIONS
+            .iter()
+            .find(|section| section.id == "layout")
+            .expect("layout section is registered");
+
+        assert_eq!(
+            rows(layout, 0),
+            vec![
+                RowRef::Toggle(ToggleSetting::StatusBarVisible),
+                RowRef::Toggle(ToggleSetting::RoomMenuVisible),
+            ]
+        );
     }
 }

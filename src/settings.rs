@@ -16,7 +16,7 @@ use crate::{
     composer::{ComposerChanged, Mode, TextEditor},
     config::{
         io::{self, LoadedConfig, SaveError, SourceStatus},
-        schema::{BindCommand, BindingMode, FontRendering, GuiConfig, Rgba8},
+        schema::{BindCommand, BindingMode, FontRendering, GuiConfig, LayoutConfig, Rgba8},
         validation::{ConfigDiagnostic, DiagnosticSeverity, has_errors, validate},
     },
     key_bindings::{self, BindingScope},
@@ -25,7 +25,7 @@ use crate::{
 };
 use catalog::{
     RowRef, SETTINGS_SECTIONS, ScalarSetting, SettingsSection, help, label, matches_search, path,
-    rows,
+    rows, ToggleSetting,
 };
 use color_picker::{ColorPicker, DragTarget, Hsva};
 use local_rpc::settings as wire_settings;
@@ -75,12 +75,22 @@ pub(crate) enum SettingsViewEvent {
         session_id: local_rpc::appearance::AppearanceSessionId,
         appearance: AppearanceConfig,
     },
+    LocalLayoutPreview {
+        status_bar_visible: Option<bool>,
+        room_menu_visible: Option<bool>,
+    },
     AppearanceCommand(local_rpc::appearance::AppearanceCommand),
 }
 
 struct PendingSave {
     config: GuiConfig,
     bindings: Vec<KeyBinding>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LayoutPreviewed {
+    status_bar_visible: bool,
+    room_menu_visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +163,8 @@ pub(crate) struct SettingsView {
     query: String,
     draft: GuiConfig,
     baseline: GuiConfig,
+    layout_preview_baseline: LayoutConfig,
+    layout_previewed: LayoutPreviewed,
     source: Option<Vec<u8>>,
     source_status: SourceStatus,
     diagnostics: Vec<ConfigDiagnostic>,
@@ -197,6 +209,7 @@ impl EventEmitter<SettingsViewEvent> for SettingsView {}
 impl SettingsView {
     pub(crate) fn new(
         appearance_session: local_rpc::appearance::AppearanceSessionId,
+        live_layout: LayoutConfig,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut loaded = cx.global::<ConfigurationState>().0.clone();
@@ -241,6 +254,8 @@ impl SettingsView {
             query: String::new(),
             draft: loaded.config.clone(),
             baseline: loaded.config,
+            layout_preview_baseline: live_layout,
+            layout_previewed: LayoutPreviewed::default(),
             source: loaded.source,
             source_status: loaded.status,
             diagnostics: loaded.diagnostics,
@@ -969,7 +984,7 @@ impl SettingsView {
             RowRef::Binding(scope, command) => {
                 key_bindings::effective_sequences(&self.draft, scope, command).join(", ")
             }
-            RowRef::Choice(_) | RowRef::Diagnostic(_) => String::new(),
+            RowRef::Choice(_) | RowRef::Toggle(_) | RowRef::Diagnostic(_) => String::new(),
         }
     }
 
@@ -1051,7 +1066,7 @@ impl SettingsView {
                     }
                 }
             }
-            RowRef::Choice(_) | RowRef::Diagnostic(_) => Ok(false),
+            RowRef::Choice(_) | RowRef::Toggle(_) | RowRef::Diagnostic(_) => Ok(false),
         };
         match result {
             Ok(changed) => {
@@ -1758,6 +1773,7 @@ impl SettingsView {
             return Ok(false);
         }
         let loaded = install_external_loaded(loaded, cx)?;
+        let layout = loaded.config.layout;
         self.draft = loaded.config.clone();
         self.baseline = loaded.config.clone();
         self.source = loaded.source;
@@ -1769,6 +1785,7 @@ impl SettingsView {
         if let SettingsFocus::Row(row) = self.focused {
             self.sync_row_editor(row, cx);
         }
+        self.install_live_layout(layout, cx);
         self.status_message = Some("Loaded appearance saved by another GUI.".into());
         cx.notify();
         Ok(true)
@@ -1839,6 +1856,7 @@ impl SettingsView {
             return;
         }
         let defaults = GuiConfig::default();
+        let previous_layout = self.draft.layout;
         let appearance_changed = self.reset_row_value(row, &defaults);
         if row == RowRef::Choice(ScalarSetting::BindingMode) {
             self.sync_editor_binding_mode(cx);
@@ -1849,6 +1867,7 @@ impl SettingsView {
         if appearance_changed {
             self.preview(cx);
         }
+        self.preview_layout_changes(previous_layout, cx);
         cx.notify();
     }
 
@@ -1874,6 +1893,14 @@ impl SettingsView {
             }
             RowRef::Choice(ScalarSetting::BindingMode) => {
                 self.draft.input.default_binding_mode = defaults.input.default_binding_mode;
+                false
+            }
+            RowRef::Toggle(ToggleSetting::StatusBarVisible) => {
+                self.draft.layout.status_bar_visible = defaults.layout.status_bar_visible;
+                false
+            }
+            RowRef::Toggle(ToggleSetting::RoomMenuVisible) => {
+                self.draft.layout.room_menu_visible = defaults.layout.room_menu_visible;
                 false
             }
             RowRef::Binding(scope, command) => {
@@ -1916,6 +1943,7 @@ impl SettingsView {
         }
         let section_rows = rows(self.section(), self.diagnostics.len());
         let defaults = GuiConfig::default();
+        let previous_layout = self.draft.layout;
         let mut appearance_changed = false;
         for row in section_rows {
             appearance_changed |= self.reset_row_value(row, &defaults);
@@ -1929,6 +1957,7 @@ impl SettingsView {
         if appearance_changed {
             self.preview(cx);
         }
+        self.preview_layout_changes(previous_layout, cx);
         cx.notify();
     }
 
@@ -1936,6 +1965,7 @@ impl SettingsView {
         if self.saving {
             return;
         }
+        let previous_layout = self.draft.layout;
         self.draft = GuiConfig::default();
         self.invalid_edits.clear();
         if let Some(defaults) = self.remote_defaults.clone() {
@@ -1949,6 +1979,7 @@ impl SettingsView {
         }
         self.action_menu = None;
         self.preview(cx);
+        self.preview_layout_changes(previous_layout, cx);
         cx.notify();
     }
 
@@ -1956,6 +1987,7 @@ impl SettingsView {
         if self.saving {
             return;
         }
+        self.restore_layout_preview(cx);
         cx.emit(SettingsViewEvent::AppearanceCommand(
             local_rpc::appearance::AppearanceCommand::End {
                 session_id: self.appearance_session,
@@ -2075,6 +2107,7 @@ impl SettingsView {
         }
 
         if !self.local_dirty() {
+            self.commit_layout_preview(self.draft.layout);
             self.saving = self.remote_saving;
             self.status_message = Some(if self.remote_saving {
                 "Saving daemon settings…".into()
@@ -2128,6 +2161,7 @@ impl SettingsView {
                     .expect("successful save retains its exact configuration snapshot");
                 let saved_config = saved.config.clone();
                 self.confirm_replace = false;
+                self.commit_layout_preview(saved_config.layout);
                 key_bindings::apply_compiled(saved.bindings, cx);
                 self.source = Some(source.clone());
                 self.source_status = SourceStatus::Loaded;
@@ -2265,10 +2299,12 @@ impl SettingsView {
                         &self.available_families,
                         cx,
                     );
+                    let layout = self.draft.layout;
                     cx.set_global(ConfigurationState(LoadedConfig {
                         diagnostics: self.diagnostics.clone(),
                         ..loaded
                     }));
+                    self.install_live_layout(layout, cx);
                     self.status_message = Some("Reloaded from disk.".into());
                 }
                 Ok(_) => {
@@ -2309,6 +2345,86 @@ impl SettingsView {
         };
         let next = (self.choice_value(setting) as isize + delta).rem_euclid(count) as usize;
         self.choose(setting, next, cx);
+    }
+
+    fn toggle_value(&self, setting: ToggleSetting) -> bool {
+        match setting {
+            ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible,
+            ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible,
+        }
+    }
+
+    fn set_toggle(&mut self, setting: ToggleSetting, value: bool, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        let before = self.draft.layout;
+        match setting {
+            ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible = value,
+            ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible = value,
+        }
+        self.preview_layout_changes(before, cx);
+        cx.notify();
+    }
+
+    fn toggle(&mut self, setting: ToggleSetting, cx: &mut Context<Self>) {
+        self.set_toggle(setting, !self.toggle_value(setting), cx);
+    }
+
+    fn preview_layout_changes(&mut self, before: LayoutConfig, cx: &mut Context<Self>) {
+        let status_bar_visible =
+            (before.status_bar_visible != self.draft.layout.status_bar_visible).then(|| {
+                self.layout_previewed.status_bar_visible = true;
+                self.draft.layout.status_bar_visible
+            });
+        let room_menu_visible =
+            (before.room_menu_visible != self.draft.layout.room_menu_visible).then(|| {
+                self.layout_previewed.room_menu_visible = true;
+                self.draft.layout.room_menu_visible
+            });
+        if status_bar_visible.is_some() || room_menu_visible.is_some() {
+            cx.emit(SettingsViewEvent::LocalLayoutPreview {
+                status_bar_visible,
+                room_menu_visible,
+            });
+        }
+    }
+
+    fn restore_layout_preview(&mut self, cx: &mut Context<Self>) {
+        let status_bar_visible = self
+            .layout_previewed
+            .status_bar_visible
+            .then_some(self.layout_preview_baseline.status_bar_visible);
+        let room_menu_visible = self
+            .layout_previewed
+            .room_menu_visible
+            .then_some(self.layout_preview_baseline.room_menu_visible);
+        if status_bar_visible.is_some() || room_menu_visible.is_some() {
+            cx.emit(SettingsViewEvent::LocalLayoutPreview {
+                status_bar_visible,
+                room_menu_visible,
+            });
+        }
+        self.layout_previewed = LayoutPreviewed::default();
+    }
+
+    fn commit_layout_preview(&mut self, layout: LayoutConfig) {
+        if self.layout_previewed.status_bar_visible {
+            self.layout_preview_baseline.status_bar_visible = layout.status_bar_visible;
+        }
+        if self.layout_previewed.room_menu_visible {
+            self.layout_preview_baseline.room_menu_visible = layout.room_menu_visible;
+        }
+        self.layout_previewed = LayoutPreviewed::default();
+    }
+
+    fn install_live_layout(&mut self, layout: LayoutConfig, cx: &mut Context<Self>) {
+        self.layout_preview_baseline = layout;
+        self.layout_previewed = LayoutPreviewed::default();
+        cx.emit(SettingsViewEvent::LocalLayoutPreview {
+            status_bar_visible: Some(layout.status_bar_visible),
+            room_menu_visible: Some(layout.room_menu_visible),
+        });
     }
 
     fn row_actions(&self, row: RowRef) -> Vec<(SharedString, RowAction)> {
@@ -2376,6 +2492,7 @@ impl SettingsView {
         match self.focused {
             SettingsFocus::Search => self.focus_target(SettingsFocus::Search, true, window, cx),
             SettingsFocus::Row(RowRef::Choice(setting)) => self.cycle_choice(setting, 1, cx),
+            SettingsFocus::Row(RowRef::Toggle(setting)) => self.toggle(setting, cx),
             SettingsFocus::Row(row) if Self::row_has_editor(row) => {
                 self.focus_target(SettingsFocus::Row(row), true, window, cx)
             }
@@ -2526,6 +2643,8 @@ impl SettingsView {
                 "h" if binding_mode == BindingMode::Vim => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, -1, cx);
+                    } else if let SettingsFocus::Row(RowRef::Toggle(setting)) = self.focused {
+                        self.set_toggle(setting, false, cx);
                     } else if let SettingsFocus::RemoteRow(field) = self.focused
                         && !self.remote_field_is_text(field)
                     {
@@ -2537,6 +2656,8 @@ impl SettingsView {
                 "left" => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, -1, cx);
+                    } else if let SettingsFocus::Row(RowRef::Toggle(setting)) = self.focused {
+                        self.set_toggle(setting, false, cx);
                     } else if let SettingsFocus::RemoteRow(field) = self.focused
                         && !self.remote_field_is_text(field)
                     {
@@ -2548,6 +2669,8 @@ impl SettingsView {
                 "l" if binding_mode == BindingMode::Vim => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, 1, cx);
+                    } else if let SettingsFocus::Row(RowRef::Toggle(setting)) = self.focused {
+                        self.set_toggle(setting, true, cx);
                     } else if let SettingsFocus::RemoteRow(field) = self.focused
                         && !self.remote_field_is_text(field)
                     {
@@ -2559,6 +2682,8 @@ impl SettingsView {
                 "right" => {
                     if let SettingsFocus::Row(RowRef::Choice(setting)) = self.focused {
                         self.cycle_choice(setting, 1, cx);
+                    } else if let SettingsFocus::Row(RowRef::Toggle(setting)) = self.focused {
+                        self.set_toggle(setting, true, cx);
                     } else if let SettingsFocus::RemoteRow(field) = self.focused
                         && !self.remote_field_is_text(field)
                     {
@@ -3237,6 +3362,20 @@ fn render_row(
         RowRef::Choice(ScalarSetting::BindingMode) => {
             format!("{:?}", draft.input.default_binding_mode)
         }
+        RowRef::Toggle(ToggleSetting::StatusBarVisible) => {
+            if draft.layout.status_bar_visible {
+                "On".into()
+            } else {
+                "Off".into()
+            }
+        }
+        RowRef::Toggle(ToggleSetting::RoomMenuVisible) => {
+            if draft.layout.room_menu_visible {
+                "On".into()
+            } else {
+                "Off".into()
+            }
+        }
         RowRef::Binding(scope, command) => {
             let values = key_bindings::effective_sequences(draft, scope, command);
             if values.is_empty() {
@@ -3299,6 +3438,56 @@ fn render_row(
                 let _ = choice_view.update(cx, |this, cx| {
                     this.focus_target(SettingsFocus::Row(row), false, window, cx);
                     this.cycle_choice(setting, 1, cx);
+                });
+            })
+            .into_any_element()
+    } else if let RowRef::Toggle(setting) = row {
+        let enabled = match setting {
+            ToggleSetting::StatusBarVisible => draft.layout.status_bar_visible,
+            ToggleSetting::RoomMenuVisible => draft.layout.room_menu_visible,
+        };
+        div()
+            .id(("settings-toggle", setting as usize))
+            .max_w(rems_from_px(330.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .child(
+                div()
+                    .w(rems_from_px(42.))
+                    .h(rems_from_px(24.))
+                    .p(rems_from_px(3.))
+                    .flex()
+                    .items_center()
+                    .when(enabled, |track| track.justify_end())
+                    .rounded_full()
+                    .bg(if enabled {
+                        palette.color(ThemeRole::ControlActive)
+                    } else {
+                        palette.color(ThemeRole::ControlSurface)
+                    })
+                    .child(
+                        div()
+                            .size(rems_from_px(18.))
+                            .rounded_full()
+                            .bg(if enabled {
+                                palette.color(ThemeRole::ControlActiveText)
+                            } else {
+                                palette.color(ThemeRole::TextMuted)
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(palette.color(ThemeRole::TextSecondary))
+                    .child(row_value),
+            )
+            .on_click(move |_, window, cx| {
+                let _ = choice_view.update(cx, |this, cx| {
+                    this.focus_target(SettingsFocus::Row(row), false, window, cx);
+                    this.toggle(setting, cx);
                 });
             })
             .into_any_element()
@@ -4232,6 +4421,7 @@ fn row_id(row: RowRef) -> usize {
         RowRef::FontFamily(role) => 100 + role as usize,
         RowRef::FontSize(role) => 110 + role as usize,
         RowRef::Choice(setting) => 120 + setting as usize,
+        RowRef::Toggle(setting) => 130 + setting as usize,
         RowRef::Binding(scope, command) => {
             200 + key_bindings::BINDINGS
                 .iter()
@@ -4281,6 +4471,13 @@ mod tests {
     use super::*;
 
     fn create_settings(cx: &gpui::TestAppContext) -> Entity<SettingsView> {
+        create_settings_with_live_layout(cx, LayoutConfig::default())
+    }
+
+    fn create_settings_with_live_layout(
+        cx: &gpui::TestAppContext,
+        live_layout: LayoutConfig,
+    ) -> Entity<SettingsView> {
         cx.update(|cx| {
             crate::fonts::init(cx);
             let config = GuiConfig::default();
@@ -4296,8 +4493,113 @@ mod tests {
                 },
                 cx,
             );
-            cx.new(|cx| SettingsView::new(local_rpc::appearance::AppearanceSessionId(1), cx))
+            cx.new(move |cx| {
+                SettingsView::new(
+                    local_rpc::appearance::AppearanceSessionId(1),
+                    live_layout,
+                    cx,
+                )
+            })
         })
+    }
+
+    #[gpui::test]
+    fn layout_toggles_update_the_draft_and_reset_to_visible(cx: &mut gpui::TestAppContext) {
+        let settings = create_settings(cx);
+
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                assert!(settings.draft.layout.status_bar_visible);
+                assert!(settings.draft.layout.room_menu_visible);
+
+                settings.toggle(ToggleSetting::StatusBarVisible, cx);
+                settings.toggle(ToggleSetting::RoomMenuVisible, cx);
+                assert!(!settings.draft.layout.status_bar_visible);
+                assert!(!settings.draft.layout.room_menu_visible);
+                assert!(settings.local_dirty());
+
+                settings.reset_row(
+                    RowRef::Toggle(ToggleSetting::StatusBarVisible),
+                    cx,
+                );
+                settings.reset_row(
+                    RowRef::Toggle(ToggleSetting::RoomMenuVisible),
+                    cx,
+                );
+                assert!(settings.draft.layout.status_bar_visible);
+                assert!(settings.draft.layout.room_menu_visible);
+                assert!(!settings.local_dirty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn layout_changes_emit_live_deltas_and_cancel_restores_the_open_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings_with_live_layout(
+            cx,
+            LayoutConfig {
+                status_bar_visible: false,
+                room_menu_visible: false,
+            },
+        );
+        let previews = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update({
+            let settings = settings.clone();
+            let previews = previews.clone();
+            move |cx| {
+                cx.subscribe(&settings, move |_, event: &SettingsViewEvent, _| {
+                    if let SettingsViewEvent::LocalLayoutPreview {
+                        status_bar_visible,
+                        room_menu_visible,
+                    } = event
+                    {
+                        previews
+                            .borrow_mut()
+                            .push((*status_bar_visible, *room_menu_visible));
+                    }
+                })
+            }
+        });
+
+        settings.update(cx, |settings, cx| {
+            settings.toggle(ToggleSetting::StatusBarVisible, cx);
+            settings.toggle(ToggleSetting::RoomMenuVisible, cx);
+            settings.cancel(cx);
+        });
+
+        assert_eq!(
+            previews.borrow().as_slice(),
+            &[
+                (Some(false), None),
+                (None, Some(false)),
+                (Some(false), Some(false)),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn save_commits_a_live_layout_preview_even_when_the_draft_matches_disk(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings_with_live_layout(
+            cx,
+            LayoutConfig {
+                status_bar_visible: false,
+                room_menu_visible: true,
+            },
+        );
+
+        settings.update(cx, |settings, cx| {
+            settings.toggle(ToggleSetting::StatusBarVisible, cx);
+            settings.toggle(ToggleSetting::StatusBarVisible, cx);
+            assert!(!settings.local_dirty());
+
+            settings.save(false, cx);
+            assert!(settings.layout_preview_baseline.status_bar_visible);
+            assert!(!settings.layout_previewed.status_bar_visible);
+        });
     }
 
     const OUTPUT_VOLUME: RemoteField = wire_settings::SettingsFieldId(1);
@@ -4412,7 +4714,11 @@ mod tests {
             );
         });
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let mut settings = SettingsView::new(local_rpc::appearance::AppearanceSessionId(1), cx);
+            let mut settings = SettingsView::new(
+                local_rpc::appearance::AppearanceSessionId(1),
+                LayoutConfig::default(),
+                cx,
+            );
             settings.install_remote_document(searchable_choice_document(), false);
             window.focus(&settings.focus, cx);
             settings
@@ -4591,7 +4897,11 @@ mod tests {
             );
         });
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let settings = SettingsView::new(local_rpc::appearance::AppearanceSessionId(1), cx);
+            let settings = SettingsView::new(
+                local_rpc::appearance::AppearanceSessionId(1),
+                LayoutConfig::default(),
+                cx,
+            );
             let focus = settings.focus_handle(cx);
             window.focus(&focus, cx);
             settings
@@ -4903,7 +5213,11 @@ mod tests {
     fn color_picker_cancel_restores_and_apply_keeps_the_draft(cx: &mut gpui::TestAppContext) {
         let _ = create_settings(cx);
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let settings = SettingsView::new(local_rpc::appearance::AppearanceSessionId(2), cx);
+            let settings = SettingsView::new(
+                local_rpc::appearance::AppearanceSessionId(2),
+                LayoutConfig::default(),
+                cx,
+            );
             window.focus(&settings.focus, cx);
             settings
         });

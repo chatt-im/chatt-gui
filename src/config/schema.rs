@@ -27,6 +27,8 @@ pub(crate) struct GuiConfig {
     #[toml(default, style = Header)]
     pub(crate) fonts: FontConfig,
     #[toml(default, style = Header)]
+    pub(crate) layout: LayoutConfig,
+    #[toml(default, style = Header)]
     pub(crate) input: InputConfig,
     #[toml(default, style = Header)]
     pub(crate) bindings: BindingsConfig,
@@ -38,6 +40,7 @@ impl Default for GuiConfig {
             schema_version: GUI_SCHEMA_VERSION,
             theme: ThemeConfig::default(),
             fonts: FontConfig::default(),
+            layout: LayoutConfig::default(),
             input: InputConfig::default(),
             bindings: BindingsConfig::default(),
         }
@@ -463,6 +466,24 @@ pub(crate) enum BindingMode {
     Vim,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
+pub(crate) struct LayoutConfig {
+    #[toml(default = true)]
+    pub(crate) status_bar_visible: bool,
+    #[toml(default = true)]
+    pub(crate) room_menu_visible: bool,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            status_bar_visible: true,
+            room_menu_visible: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, recoverable, rename_all = "kebab-case")]
 pub(crate) struct InputConfig {
@@ -666,6 +687,8 @@ code-size = 15.5
             config.fonts.message_family,
             DEFAULT_MESSAGE_FAMILY.to_string()
         );
+        assert!(config.layout.status_bar_visible);
+        assert!(config.layout.room_menu_visible);
     }
 
     #[test]
@@ -754,8 +777,29 @@ space = "TogglePlayback"
         assert!(rendered.contains("window = "));
         assert!(rendered.contains("[fonts]"));
         assert!(rendered.contains("message-family = \"IBM Plex Sans\""));
+        assert!(rendered.contains("[layout]"));
+        assert!(rendered.contains("status-bar-visible = true"));
+        assert!(rendered.contains("room-menu-visible = true"));
         assert!(rendered.contains("[input]"));
         assert!(rendered.contains("default-binding-mode = \"vim\""));
+    }
+
+    #[test]
+    fn layout_visibility_round_trips_and_partial_layout_uses_defaults() {
+        let config: GuiConfig = toml_spanner::from_str(
+            r#"
+[layout]
+status-bar-visible = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.layout.status_bar_visible);
+        assert!(config.layout.room_menu_visible);
+
+        let rendered = toml_spanner::to_string(&config).unwrap();
+        let reparsed: GuiConfig = toml_spanner::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.layout, config.layout);
     }
 
     #[test]
