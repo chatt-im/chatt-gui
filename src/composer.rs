@@ -698,10 +698,12 @@ impl TextEditor {
                 .set_paste_text_with_metadata(&text, metadata.as_deref());
         }
         let version = self.editor.text_version();
-        if !self.editor.send_key(key) {
-            return;
+        if self.editor.send_key(key) {
+            self.finish_vim_action(version, cx);
         }
-        self.finish_vim_action(version, cx);
+        // Reaching here means the keystroke began outside Insert mode (or was
+        // Escape while in Insert mode). Even keys this Vim implementation does
+        // not handle must not fall through to the platform text input.
         window.prevent_default();
         cx.stop_propagation();
     }
@@ -1661,6 +1663,27 @@ mod tests {
         assert_eq!(
             composer.read_with(cx, |composer, _| composer.text()),
             "first second"
+        );
+    }
+
+    #[gpui::test]
+    fn vim_normal_mode_does_not_insert_unhandled_printable_keys(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let mut composer = Composer::new(cx);
+            composer.set_value("message", cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.simulate_keystrokes(". ,");
+
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "message"
         );
     }
 

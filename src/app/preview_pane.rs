@@ -443,6 +443,34 @@ impl ChattView {
         self.close_preview(window, cx);
     }
 
+    pub(super) fn close_preview_tab_action(
+        &mut self,
+        _: &ClosePreviewTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.preview_history.active_key() else {
+            return;
+        };
+        self.close_preview_tab(key, window, cx);
+    }
+
+    pub(super) fn cycle_preview_tabs_action(
+        &mut self,
+        _: &CyclePreviewTabs,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .preview_history
+            .next_tab(self.preview_layout(window) == PreviewLayout::Tabbed)
+        {
+            Some(PreviewTab::Chat) => self.show_chat_tab(window, cx),
+            Some(PreviewTab::Preview(key)) => self.select_preview(key, window, cx),
+            None => {}
+        }
+    }
+
     fn close_preview_tab(
         &mut self,
         key: AttachmentId,

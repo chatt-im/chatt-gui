@@ -522,6 +522,8 @@ pub(crate) enum BindCommand {
     IncreaseUiScale,
     DecreaseUiScale,
     ResetUiScale,
+    ClosePreviewTab,
+    CyclePreviewTabs,
     ToggleMute,
     ToggleDeafen,
     ToggleVoice,
@@ -713,6 +715,8 @@ code-size = 15.5
 "cmd-o" = "OpenMedia"
 "secondary-," = "OpenSettings"
 "cmd-shift-m" = "Unbind"
+"ctrl-w" = "ClosePreviewTab"
+"ctrl-tab" = "CyclePreviewTabs"
 
 [bindings.formatted-message]
 "secondary-c" = "Copy"
@@ -740,6 +744,14 @@ space = "TogglePlayback"
         assert_eq!(
             config.bindings.application.get("cmd-shift-m"),
             Some(&BindCommand::Unbind)
+        );
+        assert_eq!(
+            config.bindings.application.get("ctrl-w"),
+            Some(&BindCommand::ClosePreviewTab)
+        );
+        assert_eq!(
+            config.bindings.application.get("ctrl-tab"),
+            Some(&BindCommand::CyclePreviewTabs)
         );
         assert_eq!(
             config.bindings.formatted_message.get("secondary-c"),

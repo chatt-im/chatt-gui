@@ -58,7 +58,7 @@ use crate::{
     mpv_player::{MpvPlayer, SeekMode, VideoAdjustment, VideoEffect},
     preview::{
         CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, LiveVideo,
-        PreviewContent, PreviewHistory, PreviewItem, PreviewLayout, clamp_chat_width,
+        PreviewContent, PreviewHistory, PreviewItem, PreviewLayout, PreviewTab, clamp_chat_width,
         default_chat_width, panel_width_for_chat_width, preview_layout,
     },
     scroll_capture::capture_scroll,
@@ -651,6 +651,8 @@ actions!(
         ToggleDeafen,
         ToggleVoice,
         ClosePreview,
+        ClosePreviewTab,
+        CyclePreviewTabs,
         FindInCode,
         NextCodeMatch,
         PreviousCodeMatch,
@@ -5128,6 +5130,8 @@ impl Render for ChattView {
             .on_action(cx.listener(Self::toggle_deafen))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::close_preview_action))
+            .on_action(cx.listener(Self::close_preview_tab_action))
+            .on_action(cx.listener(Self::cycle_preview_tabs_action))
             .on_action(cx.listener(Self::find_in_code_action))
             .on_action(cx.listener(Self::next_code_match_action))
             .on_action(cx.listener(Self::previous_code_match_action))

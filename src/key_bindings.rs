@@ -7,15 +7,15 @@ use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate};
 
 use crate::{
     app::{
-        CloseCodeSearch, ClosePreview, CloseServerSelector, CompletionAccept,
+        CloseCodeSearch, ClosePreview, ClosePreviewTab, CloseServerSelector, CompletionAccept,
         CompletionAcceptEngaged, CompletionDismiss, CompletionNext, CompletionPrevious,
-        DecreaseBrightness, DecreaseContrast, DecreaseGamma, DecreasePlaybackSpeed,
-        DecreaseSaturation, DecreaseVolume, FindInCode, IncreaseBrightness, IncreaseContrast,
-        IncreaseGamma, IncreasePlaybackSpeed, IncreaseSaturation, IncreaseVolume, LivePanDown,
-        LivePanUp, LiveReset, LiveZoomIn, LiveZoomOut, NextCodeMatch, NextFrame, OpenMedia,
-        OpenSettings, PreviousCodeMatch, PreviousFrame, SeekBack, SeekForward, SendMessage,
-        ServerActivate, ServerNext, ServerPrevious, ToggleDeafen, ToggleMute, TogglePlayback,
-        ToggleVoice,
+        CyclePreviewTabs, DecreaseBrightness, DecreaseContrast, DecreaseGamma,
+        DecreasePlaybackSpeed, DecreaseSaturation, DecreaseVolume, FindInCode, IncreaseBrightness,
+        IncreaseContrast, IncreaseGamma, IncreasePlaybackSpeed, IncreaseSaturation, IncreaseVolume,
+        LivePanDown, LivePanUp, LiveReset, LiveZoomIn, LiveZoomOut, NextCodeMatch, NextFrame,
+        OpenMedia, OpenSettings, PreviousCodeMatch, PreviousFrame, SeekBack, SeekForward,
+        SendMessage, ServerActivate, ServerNext, ServerPrevious, ToggleDeafen, ToggleMute,
+        TogglePlayback, ToggleVoice,
     },
     code_viewer, composer,
     config::{
@@ -145,6 +145,22 @@ pub(crate) static BINDINGS: &[BindingSpec] = &[
         help: Some("Restores the interface scale configured in GUI settings."),
         contexts: &[UI_SCALE_CONTEXT],
         defaults: &["ctrl-0"],
+    },
+    BindingSpec {
+        scope: BindingScope::Application,
+        command: BindCommand::ClosePreviewTab,
+        label: "Close preview tab",
+        help: Some("Closes the selected preview tab; the pinned chat tab is not closable."),
+        contexts: &[CHAT],
+        defaults: &["ctrl-w"],
+    },
+    BindingSpec {
+        scope: BindingScope::Application,
+        command: BindCommand::CyclePreviewTabs,
+        label: "Cycle preview tabs",
+        help: Some("Includes the pinned chat tab when it is part of the preview layout."),
+        contexts: &[CHAT],
+        defaults: &["ctrl-tab"],
     },
     BindingSpec {
         scope: BindingScope::Composer,
@@ -895,6 +911,8 @@ fn make_action(scope: BindingScope, command: BindCommand) -> Box<dyn Action> {
         (BindingScope::Application, BindCommand::IncreaseUiScale) => Box::new(IncreaseUiScale),
         (BindingScope::Application, BindCommand::DecreaseUiScale) => Box::new(DecreaseUiScale),
         (BindingScope::Application, BindCommand::ResetUiScale) => Box::new(ResetUiScale),
+        (BindingScope::Application, BindCommand::ClosePreviewTab) => Box::new(ClosePreviewTab),
+        (BindingScope::Application, BindCommand::CyclePreviewTabs) => Box::new(CyclePreviewTabs),
         (BindingScope::NonInput, BindCommand::ToggleMute) => Box::new(ToggleMute),
         (BindingScope::NonInput, BindCommand::ToggleDeafen) => Box::new(ToggleDeafen),
         (BindingScope::NonInput, BindCommand::ToggleVoice) => Box::new(ToggleVoice),
@@ -995,7 +1013,23 @@ mod tests {
             .iter()
             .map(|binding| binding.defaults.len() * binding.contexts.len())
             .sum::<usize>();
-        assert_eq!(expanded_default_count, 66);
+        assert_eq!(expanded_default_count, 68);
+        assert_eq!(
+            effective_sequences(
+                &GuiConfig::default(),
+                BindingScope::Application,
+                BindCommand::ClosePreviewTab
+            ),
+            vec!["ctrl-w"]
+        );
+        assert_eq!(
+            effective_sequences(
+                &GuiConfig::default(),
+                BindingScope::Application,
+                BindCommand::CyclePreviewTabs
+            ),
+            vec!["ctrl-tab"]
+        );
         assert_eq!(
             effective_scope(&GuiConfig::default().bindings, BindingScope::Composer)
                 .iter()

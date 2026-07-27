@@ -116,6 +116,12 @@ pub struct PreviewOpenResult {
     pub evicted: Option<AttachmentId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewTab {
+    Chat,
+    Preview(AttachmentId),
+}
+
 impl PreviewHistory {
     pub fn reset_code_measurements(&mut self) {
         for item in &mut self.items {
@@ -226,6 +232,36 @@ impl PreviewHistory {
         self.active = None;
         self.chat_selected = true;
         changed
+    }
+
+    /// Returns the tab after the selected one in the same order as the tab bar.
+    /// The chat tab is pinned before the preview tabs and is only present in
+    /// the tabbed layout.
+    pub fn next_tab(&self, include_chat: bool) -> Option<PreviewTab> {
+        if !self.tab_bar_visible() {
+            return None;
+        }
+        let Some(active) = self.active_key() else {
+            return self
+                .items
+                .first()
+                .map(|item| PreviewTab::Preview(item.key()));
+        };
+        let active_index = self
+            .items
+            .iter()
+            .position(|item| item.key() == active)
+            .expect("active preview belongs to history");
+        if let Some(next) = self.items.get(active_index + 1) {
+            return Some(PreviewTab::Preview(next.key()));
+        }
+        if include_chat {
+            Some(PreviewTab::Chat)
+        } else {
+            self.items
+                .first()
+                .map(|item| PreviewTab::Preview(item.key()))
+        }
     }
 
     pub fn close_panel(&mut self) -> bool {
@@ -675,6 +711,39 @@ mod tests {
         history.close_panel();
         assert!(history.active().is_none());
         assert_eq!(history.items().len(), 2);
+    }
+
+    #[test]
+    fn cycling_follows_tab_order_and_only_includes_chat_when_requested() {
+        let mut history = PreviewHistory::default();
+        history.open(item(1));
+        history.open(item(2));
+        history.open(item(3));
+
+        assert_eq!(
+            history.next_tab(false),
+            Some(PreviewTab::Preview(item(2).key()))
+        );
+        history.select(item(2).key());
+        assert_eq!(
+            history.next_tab(false),
+            Some(PreviewTab::Preview(item(1).key()))
+        );
+        history.select(item(1).key());
+        assert_eq!(
+            history.next_tab(false),
+            Some(PreviewTab::Preview(item(3).key()))
+        );
+        assert_eq!(history.next_tab(true), Some(PreviewTab::Chat));
+
+        history.select_chat();
+        assert_eq!(
+            history.next_tab(true),
+            Some(PreviewTab::Preview(item(3).key()))
+        );
+
+        history.close_panel();
+        assert_eq!(history.next_tab(true), None);
     }
 
     #[test]
