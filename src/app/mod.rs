@@ -1603,7 +1603,12 @@ impl ChattView {
                     return;
                 };
                 let coded_size = (share.coded_width, share.coded_height);
-                match MpvPlayer::new_live(self.video_wakeup.clone(), share, stream) {
+                let low_delay = cx
+                    .global::<ConfigurationState>()
+                    .0
+                    .config
+                    .live_low_delay_decode;
+                match MpvPlayer::new_live(self.video_wakeup.clone(), share, stream, low_delay) {
                     Ok(player) => {
                         self.live_players.insert(
                             stream_id,

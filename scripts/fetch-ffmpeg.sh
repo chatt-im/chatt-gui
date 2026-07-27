@@ -7,7 +7,8 @@ url="https://ffmpeg.org/releases/ffmpeg-$version.tar.xz"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository=$(CDPATH= cd -- "$script_dir/.." && pwd)
 destination="$repository/vendor/ffmpeg"
-patch_file="$repository/patches/ffmpeg-8.1.2-vaapi-configure.patch"
+patch_files="$repository/patches/ffmpeg-8.1.2-vaapi-configure.patch
+$repository/patches/ffmpeg-8.1.2-low-delay-no-reorder.patch"
 force=false
 
 usage() {
@@ -15,8 +16,8 @@ usage() {
 Usage: scripts/fetch-ffmpeg.sh [--force]
 
 Download and verify the pinned FFmpeg source archive, then apply the tracked
-Chatt VAAPI configure patch. Existing differing source is preserved unless
---force is supplied.
+Chatt patches. Existing differing source is preserved unless --force is
+supplied.
 EOF
 }
 
@@ -69,10 +70,12 @@ if [ ! -x "$extracted/configure" ] || [ ! -f "$extracted/VERSION" ]; then
     echo "FFmpeg archive did not contain the expected source tree." >&2
     exit 1
 fi
-if ! patch --batch --forward -d "$extracted" -p1 < "$patch_file"; then
-    echo "Could not apply the tracked FFmpeg configure patch." >&2
-    exit 1
-fi
+for patch_file in $patch_files; do
+    if ! patch --batch --forward -d "$extracted" -p1 < "$patch_file"; then
+        echo "Could not apply tracked FFmpeg patch: $patch_file" >&2
+        exit 1
+    fi
+done
 
 if [ -e "$destination" ]; then
     if diff -qr -- "$destination" "$extracted" >/dev/null; then

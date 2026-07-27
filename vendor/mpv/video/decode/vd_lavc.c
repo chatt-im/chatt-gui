@@ -217,6 +217,7 @@ typedef struct lavc_ctx {
     bool hwdec_failed;
     bool hwdec_notified;
     int64_t hwdec_attempt_started;
+    int reported_reorder_delay;
     bool force_eof;
     int wait_for_keyframe; // max number of frames to wait for keyframe after reset
 
@@ -1398,6 +1399,15 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
             handle_err(vd);
             return AVERROR_UNKNOWN;
         }
+    }
+
+    if (ctx->opts->low_latency && ctx->avctx &&
+        ctx->avctx->has_b_frames != ctx->reported_reorder_delay)
+    {
+        MP_WARN(vd, "Decoder reorder delay changed to %d frame(s); each one "
+                "holds low-latency output until another input frame arrives.\n",
+                ctx->avctx->has_b_frames);
+        ctx->reported_reorder_delay = ctx->avctx->has_b_frames;
     }
 
     if (!ctx->hwdec_notified) {

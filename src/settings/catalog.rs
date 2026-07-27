@@ -15,6 +15,7 @@ pub(crate) enum ToggleSetting {
     StatusBarVisible,
     RoomMenuVisible,
     NativeFullscreen,
+    LiveLowDelayDecode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +66,7 @@ const SYNTAX: &[CatalogItem] = &[CatalogItem::ThemeGroup(ThemeGroup::Syntax)];
 const MEDIA: &[CatalogItem] = &[
     CatalogItem::ThemeGroup(ThemeGroup::Media),
     CatalogItem::Toggle(ToggleSetting::NativeFullscreen),
+    CatalogItem::Toggle(ToggleSetting::LiveLowDelayDecode),
 ];
 const LAYOUT: &[CatalogItem] = &[
     CatalogItem::Toggle(ToggleSetting::StatusBarVisible),
@@ -168,6 +170,7 @@ pub(crate) fn path(row: RowRef) -> String {
         RowRef::Toggle(ToggleSetting::StatusBarVisible) => "layout.status-bar-visible".into(),
         RowRef::Toggle(ToggleSetting::RoomMenuVisible) => "layout.room-menu-visible".into(),
         RowRef::Toggle(ToggleSetting::NativeFullscreen) => "native-fullscreen".into(),
+        RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => "live-low-delay-decode".into(),
         RowRef::Binding(scope, command) => {
             format!("bindings.{}.{}", scope.key(), format!("{command:?}"))
         }
@@ -195,6 +198,7 @@ pub(crate) fn label(row: RowRef) -> &'static str {
         RowRef::Toggle(ToggleSetting::StatusBarVisible) => "Show status bar by default",
         RowRef::Toggle(ToggleSetting::RoomMenuVisible) => "Show room menu by default",
         RowRef::Toggle(ToggleSetting::NativeFullscreen) => "Use native fullscreen for media",
+        RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => "Low-delay decoding for live shares",
         RowRef::Binding(scope, command) => {
             crate::key_bindings::spec(scope, command)
                 .expect("binding row belongs to registry")
@@ -233,6 +237,11 @@ pub(crate) fn help(row: RowRef) -> Option<&'static str> {
         }
         RowRef::Toggle(ToggleSetting::NativeFullscreen) => Some(
             "When enabled, fullscreen videos and live streams also fullscreen the application window.",
+        ),
+        RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => Some(
+            "Shows every live share frame the moment it is decoded, assuming the stream \
+             carries no B-frames. Disable if a share encoded with B-frames plays back \
+             with dropped or reordered frames. Applies to shares opened after saving.",
         ),
         RowRef::Binding(scope, command) => {
             crate::key_bindings::spec(scope, command)
@@ -326,6 +335,20 @@ mod tests {
         assert_eq!(
             path(RowRef::Toggle(ToggleSetting::NativeFullscreen)),
             "native-fullscreen"
+        );
+    }
+
+    #[test]
+    fn media_section_contains_live_low_delay_decode_toggle() {
+        let media = SETTINGS_SECTIONS
+            .iter()
+            .find(|section| section.id == "media")
+            .expect("media section is registered");
+
+        assert!(rows(media, 0).contains(&RowRef::Toggle(ToggleSetting::LiveLowDelayDecode)));
+        assert_eq!(
+            path(RowRef::Toggle(ToggleSetting::LiveLowDelayDecode)),
+            "live-low-delay-decode"
         );
     }
 }

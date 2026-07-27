@@ -129,6 +129,7 @@ impl MpvPlayer {
             preferred_backend,
             None,
             Some(source_registry),
+            false,
         )
     }
 
@@ -136,6 +137,7 @@ impl MpvPlayer {
         gpui_wakeup: AsyncSender<()>,
         share: local_rpc::model::LiveShare,
         stream: std::os::unix::net::UnixStream,
+        low_delay: bool,
     ) -> Result<Self> {
         let source_wakeup = gpui_wakeup.clone();
         let render_size = (share.coded_width, share.coded_height);
@@ -146,6 +148,7 @@ impl MpvPlayer {
             None,
             Some(&share.codec),
             None,
+            low_delay,
         )?;
         let source = crate::live_stream::LiveStreamSource::start(
             player.mpv.clone(),
@@ -173,6 +176,7 @@ impl MpvPlayer {
         preferred_backend: Option<AttachmentRenderBackend>,
         live_codec: Option<&str>,
         source_registry: Option<crate::attachment_source::AttachmentSourceRegistry>,
+        live_low_delay: bool,
     ) -> Result<(Self, AttachmentRenderBackend)> {
         let player_id = NEXT_MPV_PLAYER_ID.fetch_add(1, Ordering::Relaxed);
         let force_live_software = live
@@ -324,14 +328,19 @@ impl MpvPlayer {
                 set_option!("swapchain-depth", "1");
                 set_option!("vd-lavc-threads", "1");
                 // Screen-share encoders emit frames in display order. Avoid
-                // mpv's two-frame hwdec-copy delay queue: with damage-driven
-                // input those retained frames could remain stale indefinitely.
+                // mpv's two-frame hwdec-copy delay queue and (via the vendored
+                // FFmpeg low-delay patch) the h264/hevc DPB reorder buffer:
+                // with damage-driven input those retained frames could remain
+                // stale indefinitely. The `live-low-delay-decode` setting is
+                // the escape hatch for streams that do carry B-frames.
                 //
                 // This disables FFmpeg frame threading. The Vulkan libmpv
                 // backend therefore has to return its mapped source frame
                 // immediately after submission so inter-frame decode can
                 // reacquire a reference frame's update mutex.
-                set_option!("vd-lavc-low-latency", "yes");
+                if live_low_delay {
+                    set_option!("vd-lavc-low-latency", "yes");
+                }
                 set_option!("interpolation", "no");
                 set_option!("stream-buffer-size", "4k");
             }

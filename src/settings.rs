@@ -1907,6 +1907,10 @@ impl SettingsView {
                 self.draft.native_fullscreen = defaults.native_fullscreen;
                 false
             }
+            RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => {
+                self.draft.live_low_delay_decode = defaults.live_low_delay_decode;
+                false
+            }
             RowRef::Binding(scope, command) => {
                 let defaults = key_bindings::effective_sequences(&defaults, scope, command);
                 key_bindings::set_sequences(&mut self.draft, scope, command, &defaults);
@@ -2356,6 +2360,7 @@ impl SettingsView {
             ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible,
             ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible,
             ToggleSetting::NativeFullscreen => self.draft.native_fullscreen,
+            ToggleSetting::LiveLowDelayDecode => self.draft.live_low_delay_decode,
         }
     }
 
@@ -2368,6 +2373,7 @@ impl SettingsView {
             ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible = value,
             ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible = value,
             ToggleSetting::NativeFullscreen => self.draft.native_fullscreen = value,
+            ToggleSetting::LiveLowDelayDecode => self.draft.live_low_delay_decode = value,
         }
         self.preview_layout_changes(before, cx);
         cx.notify();
@@ -3389,6 +3395,13 @@ fn render_row(
                 "Off".into()
             }
         }
+        RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => {
+            if draft.live_low_delay_decode {
+                "On".into()
+            } else {
+                "Off".into()
+            }
+        }
         RowRef::Binding(scope, command) => {
             let values = key_bindings::effective_sequences(draft, scope, command);
             if values.is_empty() {
@@ -3459,6 +3472,7 @@ fn render_row(
             ToggleSetting::StatusBarVisible => draft.layout.status_bar_visible,
             ToggleSetting::RoomMenuVisible => draft.layout.room_menu_visible,
             ToggleSetting::NativeFullscreen => draft.native_fullscreen,
+            ToggleSetting::LiveLowDelayDecode => draft.live_low_delay_decode,
         };
         div()
             .id(("settings-toggle", setting as usize))

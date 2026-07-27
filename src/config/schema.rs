@@ -24,6 +24,8 @@ pub(crate) struct GuiConfig {
     pub(crate) schema_version: u16,
     #[toml(default)]
     pub(crate) native_fullscreen: bool,
+    #[toml(default = true)]
+    pub(crate) live_low_delay_decode: bool,
     #[toml(default, style = Header)]
     pub(crate) theme: ThemeConfig,
     #[toml(default, style = Header)]
@@ -41,6 +43,7 @@ impl Default for GuiConfig {
         Self {
             schema_version: GUI_SCHEMA_VERSION,
             native_fullscreen: false,
+            live_low_delay_decode: true,
             theme: ThemeConfig::default(),
             fonts: FontConfig::default(),
             layout: LayoutConfig::default(),
@@ -683,6 +686,7 @@ code-size = 15.5
 
         assert_eq!(config.schema_version, GUI_SCHEMA_VERSION);
         assert!(!config.native_fullscreen);
+        assert!(config.live_low_delay_decode);
         assert_eq!(config.theme.text.link, Rgba8::rgb(0xaa, 0xbb, 0xcc));
         assert_eq!(
             config.theme.text.primary,
@@ -790,6 +794,7 @@ space = "TogglePlayback"
 
         assert!(rendered.contains("schema-version = 1"));
         assert!(rendered.contains("native-fullscreen = false"));
+        assert!(rendered.contains("live-low-delay-decode = true"));
         assert!(rendered.contains("[theme.surfaces]"));
         assert!(rendered.contains("window = "));
         assert!(rendered.contains("[fonts]"));
@@ -806,6 +811,17 @@ space = "TogglePlayback"
         let config: GuiConfig = toml_spanner::from_str("native-fullscreen = true").unwrap();
 
         assert!(config.native_fullscreen);
+
+        let rendered = toml_spanner::to_string(&config).unwrap();
+        let reparsed: GuiConfig = toml_spanner::from_str(&rendered).unwrap();
+        assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn live_low_delay_decode_is_configurable_and_round_trips() {
+        let config: GuiConfig = toml_spanner::from_str("live-low-delay-decode = false").unwrap();
+
+        assert!(!config.live_low_delay_decode);
 
         let rendered = toml_spanner::to_string(&config).unwrap();
         let reparsed: GuiConfig = toml_spanner::from_str(&rendered).unwrap();

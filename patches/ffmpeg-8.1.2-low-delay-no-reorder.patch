@@ -1,0 +1,76 @@
+Make h264/hevc honor AV_CODEC_FLAG_LOW_DELAY by never growing the output
+reorder buffer (avctx->has_b_frames / sps_max_num_reorder_pics): frames are
+emitted in the decode call that produced them instead of being held until the
+next access unit arrives. Without this, a damage-driven live stream can decode
+a frame that then sits in the DPB until the next frame arrives — an unbounded
+one-frame display lag. The H.264 POC-gap heuristic in h264_select_output_frame
+can latch that state permanently from a single idle gap when the SPS lacks VUI
+bitstream restriction.
+
+The flag only reaches these decoders when mpv sets vd-lavc-low-latency, which
+the GUI applies to live shares (gui.toml `live-low-delay-decode`, default on).
+Trade-off: a genuinely reordered (B-frame) live stream degrades under this
+behavior — h264 drops late frames at presentation, hevc emits decode order.
+Streams are user-supplied, so the GUI setting exists as the escape hatch.
+
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -413,7 +413,8 @@
+         }
+     }
+ 
+-    if (h->ps.sps && h->ps.sps->bitstream_restriction_flag &&
++    if (!(h->avctx->flags & AV_CODEC_FLAG_LOW_DELAY) &&
++        h->ps.sps && h->ps.sps->bitstream_restriction_flag &&
+         h->avctx->has_b_frames < h->ps.sps->num_reorder_frames) {
+         h->avctx->has_b_frames = h->ps.sps->num_reorder_frames;
+     }
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -1299,12 +1299,14 @@
+     H264Picture *out = h->cur_pic_ptr;
+     H264Picture *cur = h->cur_pic_ptr;
+     int i, pics, out_of_order, out_idx;
++    int low_delay = !!(h->avctx->flags & AV_CODEC_FLAG_LOW_DELAY);
+ 
+     cur->mmco_reset = h->mmco_reset;
+     h->mmco_reset = 0;
+ 
+-    if (sps->bitstream_restriction_flag ||
+-        h->avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT) {
++    if (!low_delay &&
++        (sps->bitstream_restriction_flag ||
++         h->avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT)) {
+         h->avctx->has_b_frames = FFMAX(h->avctx->has_b_frames, sps->num_reorder_frames);
+     }
+ 
+@@ -1327,7 +1329,8 @@
+             h->last_pocs[i] = INT_MIN;
+         h->last_pocs[0] = cur->poc;
+         cur->mmco_reset = 1;
+-    } else if(h->avctx->has_b_frames < out_of_order && !sps->bitstream_restriction_flag){
++    } else if(!low_delay &&
++              h->avctx->has_b_frames < out_of_order && !sps->bitstream_restriction_flag){
+         int loglevel = h->avctx->frame_num > 1 ? AV_LOG_WARNING : AV_LOG_VERBOSE;
+         av_log(h->avctx, loglevel, "Increasing reorder buffer to %d\n", out_of_order);
+         h->avctx->has_b_frames = out_of_order;
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -340,7 +340,8 @@
+     avctx->coded_height        = sps->height;
+     avctx->width               = sps->width  - ow->left_offset - ow->right_offset;
+     avctx->height              = sps->height - ow->top_offset  - ow->bottom_offset;
+-    avctx->has_b_frames        = sps->temporal_layer[sps->max_sub_layers - 1].num_reorder_pics;
++    avctx->has_b_frames        = (avctx->flags & AV_CODEC_FLAG_LOW_DELAY) ?
++                                 0 : sps->temporal_layer[sps->max_sub_layers - 1].num_reorder_pics;
+     avctx->profile             = sps->ptl.general_ptl.profile_idc;
+     avctx->level               = sps->ptl.general_ptl.level_idc;
+ 
+@@ -3382,6 +3383,7 @@
+     s->cur_frame->f->pict_type = 3 - s->sh.slice_type;
+ 
+     ret = ff_hevc_output_frames(s, s->layers_active_decode, s->layers_active_output,
++                                (s->avctx->flags & AV_CODEC_FLAG_LOW_DELAY) ? 0 :
+                                 sps->temporal_layer[sps->max_sub_layers - 1].num_reorder_pics,
+                                 sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering, 0);
+     if (ret < 0)
