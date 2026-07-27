@@ -99,10 +99,14 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         DaemonFrame::MessageReferenceResolved {
             request_id,
             room_id,
+            room_generation,
             message_id,
             message,
         } => {
-            effect.message_reference_resolved = Some((request_id, room_id, message_id, message));
+            if model.room_generation == Some(room_generation) {
+                effect.message_reference_resolved =
+                    Some((request_id, room_id, message_id, message));
+            }
         }
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
@@ -125,6 +129,7 @@ fn install_snapshot(model: &mut ChatModel, snapshot: StateSnapshot) {
     model.rooms = snapshot.rooms;
     model.selected_room = snapshot.selected_room;
     if let Some(room) = snapshot.room {
+        model.room_generation = Some(room.room_generation);
         model.older_cursor = room.older_cursor;
         model.at_start = room.at_start;
         model.participants = room.participants;
@@ -201,6 +206,7 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
         }
         StateDelta::RoomSnapshot(room) => {
             model.selected_room = Some(room.room_id);
+            model.room_generation = Some(room.room_generation);
             model.older_cursor = room.older_cursor;
             model.at_start = room.at_start;
             model.participants = room.participants;
@@ -215,11 +221,12 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
         }
         StateDelta::MessagesPrepended {
             room_id,
+            room_generation,
             messages,
             older_cursor,
             at_start,
         } => {
-            if !is_active_room(model, room_id, effect) {
+            if !is_active_room_generation(model, room_id, room_generation, effect) {
                 return;
             }
             model.older_cursor = older_cursor;
@@ -255,10 +262,11 @@ fn apply_delta(model: &mut ChatModel, delta: StateDelta, effect: &mut ReduceEffe
         }
         StateDelta::HistoryStateChanged {
             room_id,
+            room_generation,
             older_cursor,
             at_start,
         } => {
-            if !is_active_room(model, room_id, effect) {
+            if !is_active_room_generation(model, room_id, room_generation, effect) {
                 return;
             }
             model.older_cursor = older_cursor;
@@ -407,6 +415,15 @@ fn is_active_room(
     }
 }
 
+fn is_active_room_generation(
+    model: &mut ChatModel,
+    room_id: local_rpc::ids::RoomId,
+    room_generation: u64,
+    effect: &mut ReduceEffect,
+) -> bool {
+    is_active_room(model, room_id, effect) && model.room_generation == Some(room_generation)
+}
+
 fn request_resync(model: &mut ChatModel, effect: &mut ReduceEffect) {
     model.phase = ConnectionPhase::Syncing;
     effect.request_resync = !model.resync_requested;
@@ -421,9 +438,9 @@ mod tests {
         frame::{NegotiatedLimits, Operation, RequestOutcome, RequestResult, StateEvent, Welcome},
         model::{
             CommandArgKind, CommandCandidate, CommandCandidateKind, CommandInfo, CommandOutputLine,
-            ConnectionState, DaemonInstanceId, Participant, RequestId, ServerAvailability,
-            ServerSelectionError, ServerSelectionState, ServerSummary, VoiceSessionState,
-            VoiceState,
+            ConnectionState, DaemonInstanceId, Participant, RequestId, RoomSnapshot,
+            ServerAvailability, ServerSelectionError, ServerSelectionState, ServerSummary,
+            VoiceSessionState, VoiceState,
         },
     };
 
@@ -662,12 +679,14 @@ mod tests {
         let room_id = RoomId(3);
         let resolved = message(room_id, 42);
         let mut model = ChatModel::default();
+        model.room_generation = Some(7);
 
         let effect = apply(
             &mut model,
             DaemonFrame::MessageReferenceResolved {
                 request_id,
                 room_id,
+                room_generation: 7,
                 message_id: resolved.message_id,
                 message: Some(resolved.clone()),
             },
@@ -679,6 +698,63 @@ mod tests {
         );
         assert!(model.messages.is_empty());
         assert_eq!(model.selected_room, None);
+    }
+
+    #[test]
+    fn stale_room_generation_history_and_reference_frames_are_ignored() {
+        let room_id = RoomId(3);
+        let mut model = ChatModel::default();
+        let mut effect = ReduceEffect::default();
+        apply_delta(
+            &mut model,
+            StateDelta::RoomSnapshot(RoomSnapshot {
+                room_id,
+                room_generation: 7,
+                history_revision: 1,
+                messages: vec![message(room_id, 20)],
+                older_cursor: Some(local_rpc::ids::MessageId(20)),
+                at_start: false,
+                participants: Vec::new(),
+            }),
+            &mut effect,
+        );
+        let mut effect = ReduceEffect::default();
+        apply_delta(
+            &mut model,
+            StateDelta::MessagesPrepended {
+                room_id,
+                room_generation: 6,
+                messages: vec![message(room_id, 10)],
+                older_cursor: Some(local_rpc::ids::MessageId(10)),
+                at_start: true,
+            },
+            &mut effect,
+        );
+
+        assert_eq!(
+            model
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(model.older_cursor, Some(local_rpc::ids::MessageId(20)));
+        assert!(!model.at_start);
+        assert!(!effect.history_changed);
+        assert!(!effect.request_resync);
+
+        let effect = apply(
+            &mut model,
+            DaemonFrame::MessageReferenceResolved {
+                request_id: RequestId(10),
+                room_id,
+                room_generation: 6,
+                message_id: local_rpc::ids::MessageId(20),
+                message: Some(message(room_id, 20)),
+            },
+        );
+        assert!(effect.message_reference_resolved.is_none());
     }
 
     #[test]
@@ -730,6 +806,7 @@ mod tests {
             },
         );
         model.selected_room = Some(RoomId(1));
+        model.room_generation = Some(7);
         model.at_start = false;
         model.participants.push(Participant {
             user_id: UserId(1),
@@ -758,6 +835,7 @@ mod tests {
         );
         assert!(effect.replace_messages);
         assert!(effect.messages_changed);
+        assert_eq!(model.room_generation, Some(7));
         assert_eq!(model.selected_room, None);
         assert!(model.at_start);
         assert!(model.participants.is_empty());

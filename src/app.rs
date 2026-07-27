@@ -2980,6 +2980,7 @@ impl ChattView {
             _ => None,
         };
         let old_selected_room = self.model.selected_room;
+        let old_room_generation = self.model.room_generation;
         let old_daemon_instance = self.model.daemon_instance;
         let old_active_server = self.model.active_server.clone();
         let old_server_selector_visible = self.server_selector_visible();
@@ -3037,8 +3038,13 @@ impl ChattView {
         if self.model.selected_room != old_selected_room {
             self.collapsed_sections.clear();
         }
+        let room_generation_changed = matches!(
+            (old_room_generation, self.model.room_generation),
+            (Some(old), Some(current)) if old != current
+        );
         let media_namespace_changed = self.model.daemon_instance != old_daemon_instance
-            || self.model.active_server != old_active_server;
+            || self.model.active_server != old_active_server
+            || room_generation_changed;
         if self.model.selected_room != old_selected_room
             || effect.replace_messages
             || media_namespace_changed
@@ -3824,7 +3830,11 @@ impl ChattView {
         if !self.model.is_ready() || self.model.at_start || self.pending_message_jump.is_some() {
             return;
         }
-        let (Some(room_id), before) = (self.model.selected_room, self.model.older_cursor) else {
+        let (Some(room_id), Some(room_generation), Some(before)) = (
+            self.model.selected_room,
+            self.model.room_generation,
+            self.model.older_cursor,
+        ) else {
             return;
         };
         let request_id = self.request_id();
@@ -3840,7 +3850,8 @@ impl ChattView {
         if let Err(error) = self.daemon.send(ClientFrame::LoadOlder {
             request_id,
             room_id,
-            before,
+            room_generation,
+            before: Some(before),
             limit: 200,
         }) {
             self.model.pending.remove(&request_id);
@@ -3937,6 +3948,9 @@ impl ChattView {
             self.install_message_reference_preview(target, cached, None, cx);
             return;
         }
+        let Some(room_generation) = self.model.room_generation else {
+            return;
+        };
         let request_id = self.request_id();
         let Some(hover) = self
             .message_reference_hover
@@ -3950,6 +3964,7 @@ impl ChattView {
         if let Err(error) = self.daemon.send(ClientFrame::ResolveMessageReference {
             request_id,
             room_id: target.room_id,
+            room_generation,
             message_id: target.message_id,
         }) {
             hover.request_id = None;
@@ -4033,12 +4048,18 @@ impl ChattView {
         }
 
         let request_id = hover_request.unwrap_or_else(|| self.request_id());
+        let Some(room_generation) = self.model.room_generation else {
+            self.status = "Current room history is not ready".into();
+            cx.notify();
+            return;
+        };
         self.pending_message_reference_click =
             Some(PendingMessageReferenceClick { target, request_id });
         if hover_request.is_none()
             && let Err(error) = self.daemon.send(ClientFrame::ResolveMessageReference {
                 request_id,
                 room_id: target.room_id,
+                room_generation,
                 message_id: target.message_id,
             })
         {
@@ -4268,6 +4289,9 @@ impl ChattView {
             }
             MessageReferenceJumpDecision::LoadOlder(before) => before,
         };
+        let Some(room_generation) = self.model.room_generation else {
+            return;
+        };
 
         let request_id = self.request_id();
         self.model.pending.insert(
@@ -4288,6 +4312,7 @@ impl ChattView {
         if let Err(error) = self.daemon.send(ClientFrame::LoadOlder {
             request_id,
             room_id: target.room_id,
+            room_generation,
             before: Some(before),
             limit: REFERENCE_JUMP_PAGE_SIZE,
         }) {
