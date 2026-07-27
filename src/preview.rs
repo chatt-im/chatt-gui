@@ -17,6 +17,8 @@ pub const MIN_CHAT_WIDTH: f32 = 360.0;
 pub const DEFAULT_CHAT_WIDTH: f32 = 800.0;
 pub const DIVIDER_WIDTH: f32 = 9.0;
 pub const TABBED_LAYOUT_MAX_BODY_WIDTH: f32 = 1300.0;
+pub const STACKED_LAYOUT_MIN_HEIGHT: f32 = 1360.0;
+pub const STACKED_LAYOUT_MIN_HEIGHT_WITH_VIDEO: f32 = 1800.0;
 
 const MANUAL_ZOOM_MIN: f32 = 0.1;
 const MANUAL_ZOOM_MAX: f32 = 8.0;
@@ -422,10 +424,46 @@ impl ImageViewState {
     }
 }
 
-/// Whether the body is too narrow to split, so the preview replaces the chat
-/// and the chat becomes a pinned tab instead.
-pub fn tabbed_preview_layout(body_width: Pixels, rem_size: Pixels) -> bool {
-    body_width < crate::ui_scale::scaled_px(TABBED_LAYOUT_MAX_BODY_WIDTH, rem_size)
+/// How the viewer shares the window with the chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewLayout {
+    /// Viewer beside the chat.
+    Split,
+    /// Viewer in place of the chat, which becomes a pinned tab.
+    Tabbed,
+    /// Viewer above the chat, both on screen.
+    Stacked,
+}
+
+/// Whether a live share is playing above the viewer. Its pane needs enough of
+/// the window that the stacked layout only fits in a taller one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveVideo {
+    Playing,
+    Idle,
+}
+
+/// Picks the layout for the current window. A body too narrow to split gives
+/// the viewer the full width, stacked when the window is also tall enough to
+/// keep the chat below it and tabbed otherwise.
+pub fn preview_layout(
+    body_width: Pixels,
+    window_height: Pixels,
+    live_video: LiveVideo,
+    rem_size: Pixels,
+) -> PreviewLayout {
+    if body_width >= crate::ui_scale::scaled_px(TABBED_LAYOUT_MAX_BODY_WIDTH, rem_size) {
+        return PreviewLayout::Split;
+    }
+    let min_height = match live_video {
+        LiveVideo::Playing => STACKED_LAYOUT_MIN_HEIGHT_WITH_VIDEO,
+        LiveVideo::Idle => STACKED_LAYOUT_MIN_HEIGHT,
+    };
+    if window_height >= crate::ui_scale::scaled_px(min_height, rem_size) {
+        PreviewLayout::Stacked
+    } else {
+        PreviewLayout::Tabbed
+    }
 }
 
 pub fn clamp_panel_width(width: Pixels, body_width: Pixels, rem_size: Pixels) -> Pixels {
@@ -542,11 +580,54 @@ mod tests {
     }
 
     #[test]
-    fn the_tabbed_layout_threshold_tracks_the_rem_size() {
-        assert!(!tabbed_preview_layout(px(1_300.0), px(16.0)));
-        assert!(tabbed_preview_layout(px(1_299.0), px(16.0)));
-        assert!(!tabbed_preview_layout(px(2_600.0), px(32.0)));
-        assert!(tabbed_preview_layout(px(2_599.0), px(32.0)));
+    fn narrow_windows_prefer_stacked_over_tabbed_when_tall_enough() {
+        let layout = |width: f32, height: f32, live_video, rem_size: f32| {
+            preview_layout(px(width), px(height), live_video, px(rem_size))
+        };
+
+        assert_eq!(
+            layout(1_300.0, 400.0, LiveVideo::Idle, 16.0),
+            PreviewLayout::Split
+        );
+        assert_eq!(
+            layout(1_300.0, 2_400.0, LiveVideo::Playing, 16.0),
+            PreviewLayout::Split
+        );
+
+        assert_eq!(
+            layout(1_299.0, 1_359.0, LiveVideo::Idle, 16.0),
+            PreviewLayout::Tabbed
+        );
+        assert_eq!(
+            layout(1_299.0, 1_360.0, LiveVideo::Idle, 16.0),
+            PreviewLayout::Stacked
+        );
+
+        assert_eq!(
+            layout(1_299.0, 1_799.0, LiveVideo::Playing, 16.0),
+            PreviewLayout::Tabbed
+        );
+        assert_eq!(
+            layout(1_299.0, 1_800.0, LiveVideo::Playing, 16.0),
+            PreviewLayout::Stacked
+        );
+
+        assert_eq!(
+            layout(2_599.0, 2_719.0, LiveVideo::Idle, 32.0),
+            PreviewLayout::Tabbed
+        );
+        assert_eq!(
+            layout(2_599.0, 2_720.0, LiveVideo::Idle, 32.0),
+            PreviewLayout::Stacked
+        );
+        assert_eq!(
+            layout(2_599.0, 3_599.0, LiveVideo::Playing, 32.0),
+            PreviewLayout::Tabbed
+        );
+        assert_eq!(
+            layout(2_600.0, 400.0, LiveVideo::Idle, 32.0),
+            PreviewLayout::Split
+        );
     }
 
     #[test]

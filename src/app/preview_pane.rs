@@ -4,9 +4,10 @@ impl ChattView {
     fn begin_preview_session(&mut self, window: &Window, cx: &App) {
         if self.preview_history.active().is_none() {
             self.preview_return_focus = window.focused(cx).map(|focus| focus.downgrade());
-            // A tabbed body is narrower than any split the user would pick, so
-            // seeding from it would shrink the chat once the window grows back.
-            if !self.preview_layout_is_tabbed(window) {
+            // A body too narrow to split is narrower than any split the user
+            // would pick, so seeding from it would shrink the chat once the
+            // window grows back.
+            if self.preview_layout(window) == PreviewLayout::Split {
                 let body_width = self.chat_body_width(window);
                 self.preview_chat_width = default_chat_width(body_width, window.rem_size());
             }
@@ -22,16 +23,25 @@ impl ChattView {
             }
     }
 
-    pub(super) fn preview_layout_is_tabbed(&self, window: &Window) -> bool {
-        tabbed_preview_layout(self.chat_body_width(window), window.rem_size())
+    pub(super) fn preview_layout(&self, window: &Window) -> PreviewLayout {
+        preview_layout(
+            self.chat_body_width(window),
+            window.viewport_size().height,
+            if self.live_players.is_empty() {
+                LiveVideo::Idle
+            } else {
+                LiveVideo::Playing
+            },
+            window.rem_size(),
+        )
     }
 
     /// Distance from the top of the window to the top of the viewer surface.
-    /// The tab bar sits above it in both layouts, and the live share pane sits
-    /// above the tab bar in the tabbed layout.
-    pub(super) fn preview_chrome_top(&self, tabbed: bool, window: &Window) -> Pixels {
+    /// The tab bar sits above it in every layout, and the live share pane sits
+    /// above the tab bar in the layouts that share the body column with it.
+    pub(super) fn preview_chrome_top(&self, layout: PreviewLayout, window: &Window) -> Pixels {
         let tab_bar = crate::ui_scale::scaled_px(PREVIEW_TAB_BAR_HEIGHT, window.rem_size());
-        if !tabbed || self.model.live_shares.is_empty() {
+        if layout == PreviewLayout::Split || self.model.live_shares.is_empty() {
             return tab_bar;
         }
         // The cell keeps the last rendered bounds, so it is only meaningful
@@ -41,6 +51,27 @@ impl ChattView {
             .get()
             .map_or(px(0.), |bounds| bounds.bottom());
         tab_bar + live_pane_bottom
+    }
+
+    /// What the stacked viewer and the chat below it share, once the live pane
+    /// and the tab bar have taken their part of the window.
+    fn stacked_body_height(&self, window: &Window) -> Pixels {
+        (window.viewport_size().height - self.preview_chrome_top(PreviewLayout::Stacked, window))
+            .max(px(0.))
+    }
+
+    /// Window height the stacked viewer holds above the chat, which the live
+    /// pane must not be resized over. Zero unless that viewer is on screen.
+    pub(super) fn stacked_preview_reserved_height(&self, window: &Window) -> Pixels {
+        if self.preview_layout(window) != PreviewLayout::Stacked
+            || self.preview_history.active().is_none()
+        {
+            return px(0.);
+        }
+        crate::ui_scale::scaled_px(
+            MIN_STACKED_VIEWER_HEIGHT + PREVIEW_TAB_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH,
+            window.rem_size(),
+        )
     }
 
     pub(super) fn restore_preview_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -393,6 +424,7 @@ impl ChattView {
             return;
         }
         self.preview_pane_resize = None;
+        self.preview_stack_resize = None;
         if was_active {
             self.leave_preview(window, cx);
         }
@@ -629,6 +661,54 @@ impl ChattView {
 
     pub(super) fn finish_preview_pane_resize(&mut self, cx: &mut Context<Self>) {
         if self.preview_pane_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn begin_preview_stack_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start_height = stacked_viewer_height(
+            self.preview_stack_height,
+            self.stacked_body_height(window),
+            window.rem_size(),
+        );
+        self.preview_stack_height = Some(start_height);
+        self.preview_stack_resize = Some(PreviewStackResize {
+            start_y: event.position.y,
+            start_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn drag_preview_stack(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.preview_stack_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.finish_preview_stack_resize(cx);
+            return;
+        }
+        self.preview_stack_height = Some(stacked_viewer_height(
+            Some(resize.start_height + event.position.y - resize.start_y),
+            self.stacked_body_height(window),
+            window.rem_size(),
+        ));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn finish_preview_stack_resize(&mut self, cx: &mut Context<Self>) {
+        if self.preview_stack_resize.take().is_some() {
             cx.notify();
         }
     }
@@ -910,6 +990,81 @@ impl ChattView {
             .when(code, |surface| surface.key_context("ChattCodeViewer"))
             .track_focus(&self.code_viewer_focus)
             .child(body)
+    }
+
+    /// The stacked layout's pane: tab bar over a viewer of its own height, with
+    /// the chat below it. The chat needs no tab of its own there, and the tabs
+    /// outlive a viewer dismissed from the tabbed layout.
+    pub(super) fn render_stacked_preview(
+        &mut self,
+        active: Option<&PreviewItem>,
+        width: Pixels,
+        viewer_height: Pixels,
+        viewport: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let settings = AppliedSettings::get(cx);
+        let resizing = self.preview_stack_resize.is_some();
+        let tab_bar = self.render_preview_tab_bar(active, false, viewport, cx);
+        let surface = active.map(|active| self.render_preview_surface(active, width, viewport, cx));
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(tab_bar)
+            .when_some(surface, |pane, surface| {
+                pane.child(
+                    div()
+                        .w_full()
+                        .h(viewer_height)
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(surface),
+                )
+                .child(
+                    div()
+                        .id("preview-stack-resize")
+                        .h(rems_from_px(PREVIEW_DIVIDER_WIDTH))
+                        .w_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .cursor_row_resize()
+                        .hover({
+                            let hover = settings.theme.color(ThemeRole::StateSelection);
+                            move |divider| divider.bg(hover)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                this.begin_preview_stack_resize(event, window, cx)
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                this.finish_preview_stack_resize(cx)
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                this.finish_preview_stack_resize(cx)
+                            }),
+                        )
+                        .child(div().h(rems_from_px(3.0)).w_full().bg(settings.theme.color(
+                            if resizing {
+                                ThemeRole::BorderFocus
+                            } else {
+                                ThemeRole::BorderSubtle
+                            },
+                        ))),
+                )
+            })
     }
 
     /// The side-by-side layout's panel: tab bar stacked over the viewer.

@@ -297,6 +297,7 @@ impl ChattView {
         let start_height = clamp_live_pane_height(
             bounds.size.height,
             window.viewport_size().height,
+            self.stacked_preview_reserved_height(window),
             window.rem_size(),
         );
         self.live_pane_height = Some(start_height);
@@ -324,6 +325,7 @@ impl ChattView {
         self.live_pane_height = Some(clamp_live_pane_height(
             resize.start_height + event.position.y - resize.start_y,
             window.viewport_size().height,
+            self.stacked_preview_reserved_height(window),
             window.rem_size(),
         ));
         cx.stop_propagation();
@@ -373,11 +375,17 @@ impl ChattView {
         let settings = AppliedSettings::get(cx);
         let shares = self.model.live_shares.clone();
         let resizable = !self.live_players.is_empty();
+        let reserved = self.stacked_preview_reserved_height(window);
         let pane_height = resizable
             .then_some(self.live_pane_height)
             .flatten()
             .map(|height| {
-                clamp_live_pane_height(height, window.viewport_size().height, window.rem_size())
+                clamp_live_pane_height(
+                    height,
+                    window.viewport_size().height,
+                    reserved,
+                    window.rem_size(),
+                )
             });
         if resizable {
             self.live_pane_height = pane_height;

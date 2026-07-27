@@ -57,9 +57,9 @@ use crate::{
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode, VideoAdjustment, VideoEffect},
     preview::{
-        CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, PreviewContent,
-        PreviewHistory, PreviewItem, clamp_chat_width, default_chat_width,
-        panel_width_for_chat_width, tabbed_preview_layout,
+        CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, LiveVideo,
+        PreviewContent, PreviewHistory, PreviewItem, PreviewLayout, clamp_chat_width,
+        default_chat_width, panel_width_for_chat_width, preview_layout,
     },
     scroll_capture::capture_scroll,
     settings::{ConfigurationState, SettingsView, SettingsViewEvent},
@@ -122,6 +122,7 @@ const MAX_LIVE_ZOOM: f32 = 20.0;
 const MIN_LIVE_PANE_HEIGHT: f32 = 160.0;
 const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
+const MIN_STACKED_VIEWER_HEIGHT: f32 = 200.0;
 const LIVE_PANE_DIVIDER_SIZE: f32 = 9.0;
 const PREVIEW_TAB_BAR_HEIGHT: f32 = TOP_BAR_HEIGHT;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
@@ -319,6 +320,12 @@ struct PreviewPaneResize {
     start_chat_width: Pixels,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreviewStackResize {
+    start_y: Pixels,
+    start_height: Pixels,
+}
+
 #[derive(Clone)]
 struct CompletionView {
     context: CompletionContext,
@@ -499,8 +506,16 @@ fn zoom_live_pan(
     )
 }
 
-fn clamp_live_pane_height(height: Pixels, window_height: Pixels, rem_size: Pixels) -> Pixels {
+/// `reserved` is the window height the stacked viewer needs above the chat, so
+/// the live pane cannot be dragged over it; it is zero in the other layouts.
+fn clamp_live_pane_height(
+    height: Pixels,
+    window_height: Pixels,
+    reserved: Pixels,
+    rem_size: Pixels,
+) -> Pixels {
     let available = window_height
+        - reserved
         - crate::ui_scale::scaled_px(TOP_BAR_HEIGHT, rem_size)
         - crate::ui_scale::scaled_px(MIN_CHAT_PANE_HEIGHT, rem_size)
         - crate::ui_scale::scaled_px(LIVE_PANE_DIVIDER_SIZE, rem_size);
@@ -508,6 +523,20 @@ fn clamp_live_pane_height(height: Pixels, window_height: Pixels, rem_size: Pixel
         crate::ui_scale::scaled_px(MIN_CONSTRAINED_LIVE_PANE_HEIGHT, rem_size),
     ));
     height.clamp(min_height, available.max(min_height))
+}
+
+/// Height of the stacked viewer surface, excluding the tab bar above it.
+/// `available` is what the window has left below that bar, of which the divider
+/// takes its own width and the chat keeps `MIN_CHAT_PANE_HEIGHT`.
+fn stacked_viewer_height(preferred: Option<Pixels>, available: Pixels, rem_size: Pixels) -> Pixels {
+    let available =
+        (available - crate::ui_scale::scaled_px(PREVIEW_DIVIDER_WIDTH, rem_size)).max(px(0.));
+    let min_height = crate::ui_scale::scaled_px(MIN_STACKED_VIEWER_HEIGHT, rem_size).min(available);
+    let max_height =
+        (available - crate::ui_scale::scaled_px(MIN_CHAT_PANE_HEIGHT, rem_size)).max(min_height);
+    preferred
+        .unwrap_or(available / 2.0)
+        .clamp(min_height, max_height)
 }
 
 impl EagerImageFetch {
@@ -756,6 +785,8 @@ pub struct ChattView {
     preview_last_mouse_position: Option<Point<Pixels>>,
     preview_chat_width: Pixels,
     preview_pane_resize: Option<PreviewPaneResize>,
+    preview_stack_height: Option<Pixels>,
+    preview_stack_resize: Option<PreviewStackResize>,
     list_state: ListState,
     collapsed_sections: timeline::CollapsedSections,
     command_rows: Vec<timeline::LocalCommandRow>,
@@ -1008,6 +1039,8 @@ impl ChattView {
                 crate::ui_scale::rem_size(cx),
             ),
             preview_pane_resize: None,
+            preview_stack_height: None,
+            preview_stack_resize: None,
             list_state,
             collapsed_sections: timeline::CollapsedSections::new(),
             command_rows: Vec::new(),
@@ -1882,6 +1915,7 @@ impl ChattView {
             self.preview_image_viewport.set(None);
             self.preview_last_mouse_position = None;
             self.preview_pane_resize = None;
+            self.preview_stack_resize = None;
             self.message_reference_hover = None;
             self.message_reference_hover_task = None;
             self.message_reference_cache.clear();
@@ -4979,33 +5013,56 @@ impl Render for ChattView {
         let live_panel =
             (!self.model.live_shares.is_empty()).then(|| self.render_live_shares(window, cx));
         let resizing_live_pane = self.live_pane_resize.is_some();
-        let tabbed_preview_layout = self.preview_layout_is_tabbed(window);
+        let layout = self.preview_layout(window);
         let active_preview = self.preview_history.active().cloned();
         let body_width = self.chat_body_width(window);
-        let preview_width = if tabbed_preview_layout {
-            body_width
-        } else {
-            panel_width_for_chat_width(self.preview_chat_width, body_width, window.rem_size())
+        let preview_width = match layout {
+            PreviewLayout::Split => {
+                panel_width_for_chat_width(self.preview_chat_width, body_width, window.rem_size())
+            }
+            PreviewLayout::Tabbed | PreviewLayout::Stacked => body_width,
+        };
+        let chrome_top = self.preview_chrome_top(layout, window);
+        let available_height = (window.viewport_size().height - chrome_top).max(px(0.));
+        let viewer_height = match layout {
+            PreviewLayout::Stacked => stacked_viewer_height(
+                self.preview_stack_height,
+                available_height,
+                window.rem_size(),
+            ),
+            PreviewLayout::Split | PreviewLayout::Tabbed => available_height,
         };
         let preview_viewport = preview_image_viewport_bounds(
             window.viewport_size(),
             preview_width,
-            self.preview_chrome_top(tabbed_preview_layout, window),
+            chrome_top,
+            viewer_height,
         );
-        let preview_tab_bar = (tabbed_preview_layout && self.preview_history.tab_bar_visible())
-            .then(|| {
-                self.render_preview_tab_bar(active_preview.as_ref(), true, preview_viewport, cx)
-            });
+        let preview_tab_bar = (layout == PreviewLayout::Tabbed
+            && self.preview_history.tab_bar_visible())
+        .then(|| self.render_preview_tab_bar(active_preview.as_ref(), true, preview_viewport, cx));
         let tabbed_preview = active_preview
             .as_ref()
-            .filter(|_| tabbed_preview_layout)
+            .filter(|_| layout == PreviewLayout::Tabbed)
             .map(|active| self.render_preview_surface(active, preview_width, preview_viewport, cx));
         let show_room_view = tabbed_preview.is_none();
+        let stacked_preview = (layout == PreviewLayout::Stacked
+            && self.preview_history.tab_bar_visible())
+        .then(|| {
+            self.render_stacked_preview(
+                active_preview.as_ref(),
+                preview_width,
+                viewer_height,
+                preview_viewport,
+                cx,
+            )
+        });
         let preview_panel = active_preview
             .as_ref()
-            .filter(|_| !tabbed_preview_layout)
+            .filter(|_| layout == PreviewLayout::Split)
             .map(|active| self.render_preview_panel(active, preview_width, preview_viewport, cx));
         let resizing_preview_pane = self.preview_pane_resize.is_some();
+        let resizing_preview_stack = self.preview_stack_resize.is_some();
         let completion_view = self.completion_view(cx).filter(|view| {
             self.completion_session
                 .as_ref()
@@ -5086,6 +5143,8 @@ impl Render for ChattView {
                 {
                     if this.preview_pane_resize.is_some() {
                         this.drag_preview_pane(event, window, cx)
+                    } else if this.preview_stack_resize.is_some() {
+                        this.drag_preview_stack(event, window, cx)
                     } else if this.preview_last_mouse_position.is_some() {
                         this.preview_image_mouse_move(event, cx)
                     } else {
@@ -5102,6 +5161,7 @@ impl Render for ChattView {
                     this.finish_video_volume_drag(cx);
                     this.finish_live_pane_resize(cx);
                     this.finish_preview_pane_resize(cx);
+                    this.finish_preview_stack_resize(cx);
                     this.finish_preview_image_pan(cx)
                 }),
             )
@@ -5110,7 +5170,7 @@ impl Render for ChattView {
             .font_family(applied.fonts.interface_family.clone())
             .bg(applied.theme.color(ThemeRole::Window))
             .text_color(applied.theme.color(ThemeRole::TextPrimary))
-            .when(resizing_live_pane, |root| {
+            .when(resizing_live_pane || resizing_preview_stack, |root| {
                 root.child(
                     canvas(
                         |_, _, _| {},
@@ -5145,6 +5205,7 @@ impl Render for ChattView {
                     .when_some(live_panel, |column, live_panel| column.child(live_panel))
                     .when_some(preview_tab_bar, |column, tab_bar| column.child(tab_bar))
                     .when_some(tabbed_preview, |column, preview| column.child(preview))
+                    .when_some(stacked_preview, |column, preview| column.child(preview))
                     .when(show_room_view, |column| {
                         column.child(
                             div()
@@ -5595,10 +5656,11 @@ fn preview_image_viewport_bounds(
     window_size: gpui::Size<Pixels>,
     panel_width: Pixels,
     chrome_top: Pixels,
+    viewer_height: Pixels,
 ) -> Bounds<Pixels> {
     Bounds {
         origin: point(window_size.width - panel_width, chrome_top),
-        size: gpui::size(panel_width, (window_size.height - chrome_top).max(px(1.0))),
+        size: gpui::size(panel_width, viewer_height.max(px(1.0))),
     }
 }
 
@@ -5921,16 +5983,28 @@ mod tests {
     fn preview_image_viewport_starts_below_the_chrome_above_the_viewer() {
         let window = gpui::size(px(1_920.0), px(1_080.0));
 
-        let split = preview_image_viewport_bounds(window, px(900.0), px(52.0));
+        let split = preview_image_viewport_bounds(window, px(900.0), px(52.0), px(1_028.0));
         assert_eq!(PREVIEW_TAB_BAR_HEIGHT, TOP_BAR_HEIGHT);
         assert_eq!(split.origin, point(px(1_020.0), px(52.0)));
         assert_eq!(split.size, gpui::size(px(900.0), px(1_028.0)));
 
         // Tabbed: the viewer spans the body, below a live share pane and the
         // tab bar, so it starts at the sidebar edge and clears both.
-        let tabbed = preview_image_viewport_bounds(window, px(1_688.0), px(240.0) + px(52.0));
+        let tabbed =
+            preview_image_viewport_bounds(window, px(1_688.0), px(240.0) + px(52.0), px(788.0));
         assert_eq!(tabbed.origin, point(px(232.0), px(292.0)));
         assert_eq!(tabbed.size, gpui::size(px(1_688.0), px(788.0)));
+
+        // Stacked: same top edge as tabbed, but the chat below it keeps the
+        // rest of the window instead of the viewer running to the bottom.
+        let stacked = preview_image_viewport_bounds(
+            window,
+            px(1_688.0),
+            px(52.0),
+            stacked_viewer_height(None, px(1_028.0), px(16.0)),
+        );
+        assert_eq!(stacked.origin, point(px(232.0), px(52.0)));
+        assert_eq!(stacked.size, gpui::size(px(1_688.0), px(509.5)));
     }
 
     #[test]
@@ -6447,16 +6521,56 @@ mod tests {
     #[test]
     fn live_pane_height_preserves_both_video_and_chat() {
         assert_eq!(
-            clamp_live_pane_height(px(100.0), px(900.0), px(16.0)),
+            clamp_live_pane_height(px(100.0), px(900.0), px(0.0), px(16.0)),
             px(MIN_LIVE_PANE_HEIGHT),
         );
         assert_eq!(
-            clamp_live_pane_height(px(900.0), px(900.0), px(16.0)),
+            clamp_live_pane_height(px(900.0), px(900.0), px(0.0), px(16.0)),
             px(699.0),
         );
         assert_eq!(
-            clamp_live_pane_height(px(900.0), px(300.0), px(16.0)),
+            clamp_live_pane_height(px(900.0), px(300.0), px(0.0), px(16.0)),
             px(99.0),
         );
+    }
+
+    #[test]
+    fn live_pane_height_gives_up_room_reserved_for_the_stacked_viewer() {
+        let reserved =
+            px(MIN_STACKED_VIEWER_HEIGHT + PREVIEW_TAB_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH);
+
+        assert_eq!(
+            clamp_live_pane_height(px(900.0), px(900.0), reserved, px(16.0)),
+            px(438.0),
+        );
+        assert_eq!(
+            clamp_live_pane_height(px(900.0), px(1_800.0), reserved * 2.0, px(32.0)),
+            px(876.0),
+        );
+    }
+
+    #[test]
+    fn stacked_viewer_height_halves_the_body_and_keeps_the_chat_visible() {
+        assert_eq!(
+            stacked_viewer_height(None, px(1_309.0), px(16.0)),
+            px(650.0)
+        );
+        assert_eq!(
+            stacked_viewer_height(Some(px(1_200.0)), px(1_309.0), px(16.0)),
+            px(1_160.0),
+        );
+        assert_eq!(
+            stacked_viewer_height(Some(px(40.0)), px(1_309.0), px(16.0)),
+            px(MIN_STACKED_VIEWER_HEIGHT),
+        );
+        assert_eq!(
+            stacked_viewer_height(Some(px(40.0)), px(2_618.0), px(32.0)),
+            px(MIN_STACKED_VIEWER_HEIGHT * 2.0),
+        );
+        assert_eq!(
+            stacked_viewer_height(Some(px(900.0)), px(120.0), px(16.0)),
+            px(111.0),
+        );
+        assert_eq!(stacked_viewer_height(None, px(0.0), px(16.0)), px(0.0));
     }
 }
