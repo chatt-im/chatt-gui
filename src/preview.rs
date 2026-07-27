@@ -16,6 +16,7 @@ pub const MIN_PANEL_WIDTH: f32 = 320.0;
 pub const MIN_CHAT_WIDTH: f32 = 360.0;
 pub const DEFAULT_CHAT_WIDTH: f32 = 800.0;
 pub const DIVIDER_WIDTH: f32 = 9.0;
+pub const TABBED_LAYOUT_MAX_BODY_WIDTH: f32 = 1300.0;
 
 const MANUAL_ZOOM_MIN: f32 = 0.1;
 const MANUAL_ZOOM_MAX: f32 = 8.0;
@@ -101,6 +102,10 @@ pub enum CodePreviewState {
 pub struct PreviewHistory {
     items: Vec<PreviewItem>,
     active: Option<AttachmentId>,
+    /// Set while the chat is showing as the pinned tab rather than the viewer.
+    /// Only the tabbed layout can reach it; the split layout has no chat tab,
+    /// so there `active` alone decides whether the panel is on screen.
+    chat_selected: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -172,9 +177,16 @@ impl PreviewHistory {
         changed
     }
 
+    /// Whether the tabbed layout should show the tab bar. Closing the panel
+    /// hides it; the tabs themselves are kept for the next preview.
+    pub fn tab_bar_visible(&self) -> bool {
+        !self.items.is_empty() && (self.active.is_some() || self.chat_selected)
+    }
+
     pub fn open(&mut self, item: PreviewItem) -> PreviewOpenResult {
         let key = item.key();
         let active_changed = self.active_key() != Some(key);
+        self.chat_selected = false;
         let promoted = self
             .items
             .iter()
@@ -200,13 +212,25 @@ impl PreviewHistory {
         if !self.items.iter().any(|item| item.key() == key) {
             return false;
         }
-        let changed = self.active_key() != Some(key);
+        let changed = self.active_key() != Some(key) || self.chat_selected;
         self.active = Some(key);
+        self.chat_selected = false;
         changed
     }
 
-    pub fn close_panel(&mut self) {
+    /// Shows the chat in place of the viewer while keeping the tab bar.
+    pub fn select_chat(&mut self) -> bool {
+        let changed = self.active.is_some() || !self.chat_selected;
         self.active = None;
+        self.chat_selected = true;
+        changed
+    }
+
+    pub fn close_panel(&mut self) -> bool {
+        let changed = self.active.is_some() || self.chat_selected;
+        self.active = None;
+        self.chat_selected = false;
+        changed
     }
 
     pub fn close_tab(&mut self, key: AttachmentId) -> bool {
@@ -228,6 +252,7 @@ impl PreviewHistory {
     pub fn clear(&mut self) {
         self.items.clear();
         self.active = None;
+        self.chat_selected = false;
     }
 }
 
@@ -397,6 +422,12 @@ impl ImageViewState {
     }
 }
 
+/// Whether the body is too narrow to split, so the preview replaces the chat
+/// and the chat becomes a pinned tab instead.
+pub fn tabbed_preview_layout(body_width: Pixels, rem_size: Pixels) -> bool {
+    body_width < crate::ui_scale::scaled_px(TABBED_LAYOUT_MAX_BODY_WIDTH, rem_size)
+}
+
 pub fn clamp_panel_width(width: Pixels, body_width: Pixels, rem_size: Pixels) -> Pixels {
     let (min_width, max_width) = panel_width_bounds(body_width, rem_size);
     width.clamp(min_width, max_width)
@@ -511,6 +542,14 @@ mod tests {
     }
 
     #[test]
+    fn the_tabbed_layout_threshold_tracks_the_rem_size() {
+        assert!(!tabbed_preview_layout(px(1_300.0), px(16.0)));
+        assert!(tabbed_preview_layout(px(1_299.0), px(16.0)));
+        assert!(!tabbed_preview_layout(px(2_600.0), px(32.0)));
+        assert!(tabbed_preview_layout(px(2_599.0), px(32.0)));
+    }
+
+    #[test]
     fn panel_constraints_scale_with_the_window_rem_size() {
         assert_eq!(
             panel_width_for_chat_width(
@@ -555,6 +594,32 @@ mod tests {
         history.close_panel();
         assert!(history.active().is_none());
         assert_eq!(history.items().len(), 2);
+    }
+
+    #[test]
+    fn the_chat_tab_keeps_the_bar_while_closing_the_panel_hides_it() {
+        let mut history = PreviewHistory::default();
+        history.open(item(1));
+        history.open(item(2));
+
+        assert!(history.select_chat());
+        assert!(history.active().is_none());
+        assert!(history.tab_bar_visible());
+        assert!(!history.select_chat());
+
+        assert!(history.close_panel());
+        assert!(!history.tab_bar_visible());
+        assert_eq!(history.items().len(), 2);
+        assert!(!history.close_panel());
+
+        assert!(history.select(item(1).key()));
+        assert!(history.tab_bar_visible());
+
+        // The last tab closing leaves nothing to pin the chat tab to.
+        history.select_chat();
+        history.close_tab(item(1).key());
+        history.close_tab(item(2).key());
+        assert!(!history.tab_bar_visible());
     }
 
     #[test]

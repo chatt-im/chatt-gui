@@ -4,8 +4,12 @@ impl ChattView {
     fn begin_preview_session(&mut self, window: &Window, cx: &App) {
         if self.preview_history.active().is_none() {
             self.preview_return_focus = window.focused(cx).map(|focus| focus.downgrade());
-            let body_width = self.chat_body_width(window);
-            self.preview_chat_width = default_chat_width(body_width, window.rem_size());
+            // A tabbed body is narrower than any split the user would pick, so
+            // seeding from it would shrink the chat once the window grows back.
+            if !self.preview_layout_is_tabbed(window) {
+                let body_width = self.chat_body_width(window);
+                self.preview_chat_width = default_chat_width(body_width, window.rem_size());
+            }
         }
     }
 
@@ -16,6 +20,27 @@ impl ChattView {
             } else {
                 px(0.)
             }
+    }
+
+    pub(super) fn preview_layout_is_tabbed(&self, window: &Window) -> bool {
+        tabbed_preview_layout(self.chat_body_width(window), window.rem_size())
+    }
+
+    /// Distance from the top of the window to the top of the viewer surface.
+    /// The tab bar sits above it in both layouts, and the live share pane sits
+    /// above the tab bar in the tabbed layout.
+    pub(super) fn preview_chrome_top(&self, tabbed: bool, window: &Window) -> Pixels {
+        let tab_bar = crate::ui_scale::scaled_px(PREVIEW_TAB_BAR_HEIGHT, window.rem_size());
+        if !tabbed || self.model.live_shares.is_empty() {
+            return tab_bar;
+        }
+        // The cell keeps the last rendered bounds, so it is only meaningful
+        // while the live pane is on screen.
+        let live_pane_bottom = self
+            .live_pane_bounds
+            .get()
+            .map_or(px(0.), |bounds| bounds.bottom());
+        tab_bar + live_pane_bottom
     }
 
     pub(super) fn restore_preview_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -315,6 +340,11 @@ impl ChattView {
     }
 
     fn select_preview(&mut self, key: AttachmentId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview_history.item(key).is_none() {
+            return;
+        }
+        // Reached from the chat tab as well, so the session may need reopening.
+        self.begin_preview_session(window, cx);
         if self.preview_history.select(key) {
             self.code_selection.clear();
             self.close_code_search(cx);
@@ -333,17 +363,39 @@ impl ChattView {
         }
     }
 
-    fn close_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.preview_history.active().is_none() {
-            return;
-        }
-        self.preview_history.close_panel();
+    /// Teardown shared by every way of leaving the viewer.
+    fn leave_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.code_selection.clear();
         self.close_code_search(cx);
         self.preview_image_viewport.set(None);
         self.preview_last_mouse_position = None;
-        self.preview_pane_resize = None;
         self.restore_preview_focus(window, cx);
+    }
+
+    /// Swaps the viewer for the chat while keeping the tab bar, which is what
+    /// the pinned chat tab does in the tabbed layout.
+    fn show_chat_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_active = self.preview_history.active().is_some();
+        if !self.preview_history.select_chat() {
+            return;
+        }
+        if was_active {
+            self.leave_preview(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Dismisses the viewer entirely — the panel in the split layout, the tab
+    /// bar in the tabbed one. The tabs survive for the next preview.
+    fn close_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_active = self.preview_history.active().is_some();
+        if !self.preview_history.close_panel() {
+            return;
+        }
+        self.preview_pane_resize = None;
+        if was_active {
+            self.leave_preview(window, cx);
+        }
         cx.notify();
     }
 
@@ -583,13 +635,12 @@ impl ChattView {
 
     fn render_preview_tabs(
         &mut self,
-        active_key: AttachmentId,
+        active_key: Option<AttachmentId>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let settings = AppliedSettings::get(cx);
-        let tab_hover = settings.theme.color(ThemeRole::Raised);
-        let tab_hover_text = settings.theme.color(ThemeRole::TextPrimary);
         let close_hover = settings.theme.color(ThemeRole::StateHover);
+        let close_hover_text = settings.theme.color(ThemeRole::TextPrimary);
         let history = self.preview_history.items().to_vec();
         let mut tabs = div()
             .id("preview-tabs")
@@ -601,7 +652,7 @@ impl ChattView {
             .track_scroll(&self.preview_tabs_scroll);
         for item in history {
             let key = item.key();
-            let selected = key == active_key;
+            let selected = active_key == Some(key);
             let tab_icon = match item.content {
                 PreviewContent::Image { .. } => IconName::Image,
                 PreviewContent::Code(_) => IconName::FileText,
@@ -624,25 +675,7 @@ impl ChattView {
             )
             .into();
             tabs = tabs.child(
-                div()
-                    .h_full()
-                    .max_w(rems_from_px(210.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .border_r_1()
-                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
-                    .bg(settings.theme.color(if selected {
-                        ThemeRole::Window
-                    } else {
-                        ThemeRole::Panel
-                    }))
-                    .text_color(settings.theme.color(if selected {
-                        ThemeRole::MediaProgressKnob
-                    } else {
-                        ThemeRole::TextMuted
-                    }))
-                    .hover(move |tab| tab.bg(tab_hover).text_color(tab_hover_text))
+                preview_tab_shell(selected, &settings.theme)
                     .child(
                         div()
                             .id(select_id)
@@ -677,7 +710,9 @@ impl ChattView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .hover(move |button| button.bg(close_hover).text_color(tab_hover_text))
+                            .hover(move |button| {
+                                button.bg(close_hover).text_color(close_hover_text)
+                            })
                             .child(icon(
                                 IconName::Close,
                                 PREVIEW_HEADER_ICON_SIZE,
@@ -692,34 +727,233 @@ impl ChattView {
         tabs
     }
 
-    pub(super) fn render_preview_panel(
+    /// The pinned tab that brings the chat timeline back in the tabbed layout.
+    fn render_chat_tab(&mut self, selected: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let settings = AppliedSettings::get(cx);
+        let room_name = self
+            .model
+            .selected_room()
+            .map(|room| room.name.clone())
+            .unwrap_or_else(|| "Chat".into());
+        preview_tab_shell(selected, &settings.theme)
+            .id("preview-tab-chat")
+            .min_w_0()
+            .gap_2()
+            .px_3()
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(settings.theme.color(ThemeRole::TextDim))
+                    .child("#"),
+            )
+            .child(div().min_w_0().truncate().text_xs().child(room_name))
+            .on_click(cx.listener(|this, _, window, cx| this.show_chat_tab(window, cx)))
+    }
+
+    /// The controls at the right end of the tab bar. Everything but the close
+    /// button acts on the active preview, so the chat tab keeps only that one —
+    /// it dismisses the whole bar.
+    fn render_preview_actions(
         &mut self,
-        active: PreviewItem,
+        active: Option<&PreviewItem>,
+        viewport: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let settings = AppliedSettings::get(cx);
+        let actions = div()
+            .h_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(settings.theme.color(ThemeRole::Panel));
+        let Some(active) = active else {
+            return actions.child(
+                preview_action_button("preview-close", IconName::Close, &settings.theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.close_preview(window, cx))),
+            );
+        };
+        let actions = match &active.content {
+            PreviewContent::Image { .. } => {
+                let zoom_percent = self.preview_image.zoom_percent(viewport);
+                actions
+                    .child(
+                        preview_control_button("preview-fit", "Fit", &settings.theme)
+                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .on_click(cx.listener(|this, _, _, cx| this.fit_preview_image(cx))),
+                    )
+                    .child(
+                        preview_control_button("preview-actual", "1:1", &settings.theme)
+                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.actual_size_preview_image(cx)),
+                            ),
+                    )
+                    .child(
+                        preview_control_button("preview-zoom-out", "−", &settings.theme)
+                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.zoom_preview_image(-0.25, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(rems_from_px(44.0))
+                            .text_center()
+                            .text_xs()
+                            .text_color(settings.theme.color(ThemeRole::TextMuted))
+                            .child(format!("{zoom_percent}%")),
+                    )
+                    .child(
+                        preview_control_button("preview-zoom-in", "+", &settings.theme)
+                            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.zoom_preview_image(0.25, cx)),
+                            ),
+                    )
+            }
+            PreviewContent::Code(preview) => {
+                let ready = matches!(preview.state, CodePreviewState::Ready(_));
+                actions.when(ready, |actions| {
+                    actions
+                        .child(
+                            preview_action_button(
+                                "preview-find-code",
+                                IconName::Search,
+                                &settings.theme,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_code_search(window, cx)
+                                }),
+                            ),
+                        )
+                        .child(
+                            preview_action_button(
+                                "preview-copy-code",
+                                IconName::Copy,
+                                &settings.theme,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_preview_code(cx))),
+                        )
+                })
+            }
+        };
+        actions
+            .child(
+                preview_action_button("preview-save", IconName::Download, &settings.theme)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.save_preview_attachment(window, cx)),
+                    ),
+            )
+            .child(
+                preview_action_button("preview-close", IconName::Close, &settings.theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.close_preview(window, cx))),
+            )
+    }
+
+    /// The tab strip. In the tabbed layout it also owns the chat/viewer switch,
+    /// so it is rendered above both of them rather than inside the panel.
+    pub(super) fn render_preview_tab_bar(
+        &mut self,
+        active: Option<&PreviewItem>,
+        tabbed: bool,
+        viewport: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let settings = AppliedSettings::get(cx);
+        let chat_tab = tabbed.then(|| self.render_chat_tab(active.is_none(), cx));
+        let tabs = self.render_preview_tabs(active.map(PreviewItem::key), cx);
+        let actions = self.render_preview_actions(active, viewport, cx);
+        div()
+            .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .min_w_0()
+            .border_b_1()
+            .border_color(settings.theme.color(ThemeRole::BorderSubtle))
+            .bg(settings.theme.color(ThemeRole::Panel))
+            .when_some(chat_tab, |bar, chat_tab| bar.child(chat_tab))
+            .child(tabs)
+            .child(actions)
+    }
+
+    /// The viewer itself, without the tab bar. Owns the code viewer focus in
+    /// both layouts.
+    pub(super) fn render_preview_surface(
+        &mut self,
+        active: &PreviewItem,
         width: Pixels,
-        window: &mut Window,
+        viewport: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        if matches!(active.content, PreviewContent::Code(_)) {
-            return self.render_code_preview_panel(active, width, cx);
-        }
+        let settings = AppliedSettings::get(cx);
+        let code = matches!(active.content, PreviewContent::Code(_));
+        let body = match active.content {
+            PreviewContent::Image { .. } => self.render_image_preview_body(active, viewport, cx),
+            PreviewContent::Code(_) => self.render_code_preview_body(active, width, cx),
+        };
+        div()
+            .id("preview-surface")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(settings.theme.color(ThemeRole::Window))
+            .when(code, |surface| surface.key_context("ChattCodeViewer"))
+            .track_focus(&self.code_viewer_focus)
+            .child(body)
+    }
+
+    /// The side-by-side layout's panel: tab bar stacked over the viewer.
+    pub(super) fn render_preview_panel(
+        &mut self,
+        active: &PreviewItem,
+        width: Pixels,
+        viewport: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let tab_bar = self.render_preview_tab_bar(Some(active), false, viewport, cx);
+        let surface = self.render_preview_surface(active, width, viewport, cx);
+        div()
+            .w(width)
+            .h_full()
+            .min_w_0()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(tab_bar)
+            .child(surface)
+    }
+
+    fn render_image_preview_body(
+        &mut self,
+        active: &PreviewItem,
+        viewport: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let settings = AppliedSettings::get(cx);
         let muted = settings.theme.color(ThemeRole::TextMuted);
-        let tabs = self.render_preview_tabs(active.key(), cx);
         let cached_attachment = self
             .media_cache
             .lock()
             .expect("media cache lock poisoned")
             .get(active.descriptor.id);
         let cache_missing = cached_attachment.is_none();
-        let viewport =
-            preview_image_viewport_bounds(window.viewport_size(), width, window.rem_size());
         self.preview_image_viewport.set(Some(viewport));
         let geometry = self.preview_image.geometry(viewport);
-        let zoom_percent = self.preview_image.zoom_percent(viewport);
         let can_pan = self.preview_image.can_pan(viewport);
         let panning = self.preview_last_mouse_position.is_some() && can_pan;
 
-        let viewport_element = div()
+        div()
             .id("preview-image-viewport")
             .relative()
             .flex_1()
@@ -805,111 +1039,17 @@ impl ChattView {
                         .text_color(muted)
                         .child("image is no longer cached"),
                 )
-            });
-
-        div()
-            .id("preview-panel")
-            .w(width)
-            .h_full()
-            .min_w_0()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .bg(settings.theme.color(ThemeRole::Window))
-            .track_focus(&self.code_viewer_focus)
-            .child(
-                div()
-                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .min_w_0()
-                    .border_b_1()
-                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
-                    .bg(settings.theme.color(ThemeRole::Panel))
-                    .child(tabs)
-                    .child(
-                        div()
-                            .h_full()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .bg(settings.theme.color(ThemeRole::Panel))
-                            .child(
-                                preview_control_button("preview-fit", "Fit", &settings.theme)
-                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.fit_preview_image(cx)),
-                                    ),
-                            )
-                            .child(
-                                preview_control_button("preview-actual", "1:1", &settings.theme)
-                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.actual_size_preview_image(cx)
-                                    })),
-                            )
-                            .child(
-                                preview_control_button("preview-zoom-out", "−", &settings.theme)
-                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.zoom_preview_image(-0.25, cx)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .w(rems_from_px(44.0))
-                                    .text_center()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(format!("{zoom_percent}%")),
-                            )
-                            .child(
-                                preview_control_button("preview-zoom-in", "+", &settings.theme)
-                                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.zoom_preview_image(0.25, cx)
-                                    })),
-                            )
-                            .child(
-                                preview_action_button(
-                                    "preview-save",
-                                    IconName::Download,
-                                    &settings.theme,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.save_preview_attachment(window, cx),
-                                )),
-                            )
-                            .child(
-                                preview_action_button(
-                                    "preview-close",
-                                    IconName::Close,
-                                    &settings.theme,
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.close_preview(window, cx)
-                                    }),
-                                ),
-                            ),
-                    ),
-            )
-            .child(viewport_element)
+            })
+            .into_any_element()
     }
 
-    fn render_code_preview_panel(
+    fn render_code_preview_body(
         &mut self,
-        active: PreviewItem,
+        active: &PreviewItem,
         width: Pixels,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> AnyElement {
         let settings = AppliedSettings::get(cx);
-        let tabs = self.render_preview_tabs(active.key(), cx);
         let preview = active
             .code_preview()
             .expect("code preview panel requires code content")
@@ -990,91 +1130,13 @@ impl ChattView {
         };
 
         div()
-            .id("preview-panel")
-            .w(width)
-            .h_full()
+            .flex_1()
             .min_w_0()
-            .flex_none()
+            .min_h_0()
             .flex()
             .flex_col()
-            .overflow_hidden()
-            .bg(settings.theme.color(ThemeRole::Window))
-            .key_context("ChattCodeViewer")
-            .track_focus(&self.code_viewer_focus)
-            .child(
-                div()
-                    .min_h(rems_from_px(PREVIEW_TAB_BAR_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .min_w_0()
-                    .border_b_1()
-                    .border_color(settings.theme.color(ThemeRole::BorderSubtle))
-                    .bg(settings.theme.color(ThemeRole::Panel))
-                    .child(tabs)
-                    .child(
-                        div()
-                            .h_full()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .bg(settings.theme.color(ThemeRole::Panel))
-                            .when(ready, |actions| {
-                                actions
-                                    .child(
-                                        preview_action_button(
-                                            "preview-find-code",
-                                            IconName::Search,
-                                            &settings.theme,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.open_code_search(window, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        preview_action_button(
-                                            "preview-copy-code",
-                                            IconName::Copy,
-                                            &settings.theme,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.copy_preview_code(cx)
-                                            }),
-                                        ),
-                                    )
-                            })
-                            .child(
-                                preview_action_button(
-                                    "preview-save",
-                                    IconName::Download,
-                                    &settings.theme,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.save_preview_attachment(window, cx),
-                                )),
-                            )
-                            .child(
-                                preview_action_button(
-                                    "preview-close",
-                                    IconName::Close,
-                                    &settings.theme,
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.close_preview(window, cx)
-                                    }),
-                                ),
-                            ),
-                    ),
-            )
-            .when(self.code_search_open && ready, |panel| {
-                panel.child(
+            .when(self.code_search_open && ready, |column| {
+                column.child(
                     div()
                         .min_h(rems_from_px(PREVIEW_SEARCH_BAR_HEIGHT))
                         .flex_none()
@@ -1135,5 +1197,30 @@ impl ChattView {
                 )
             })
             .child(body)
+            .into_any_element()
     }
+}
+
+fn preview_tab_shell(selected: bool, palette: &ThemePalette) -> Div {
+    let hover = palette.color(ThemeRole::Raised);
+    let hover_text = palette.color(ThemeRole::TextPrimary);
+    div()
+        .h_full()
+        .max_w(rems_from_px(210.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .border_r_1()
+        .border_color(palette.color(ThemeRole::BorderSubtle))
+        .bg(palette.color(if selected {
+            ThemeRole::Window
+        } else {
+            ThemeRole::Panel
+        }))
+        .text_color(palette.color(if selected {
+            ThemeRole::MediaProgressKnob
+        } else {
+            ThemeRole::TextMuted
+        }))
+        .hover(move |tab| tab.bg(hover).text_color(hover_text))
 }

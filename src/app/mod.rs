@@ -59,7 +59,7 @@ use crate::{
     preview::{
         CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, PreviewContent,
         PreviewHistory, PreviewItem, clamp_chat_width, default_chat_width,
-        panel_width_for_chat_width,
+        panel_width_for_chat_width, tabbed_preview_layout,
     },
     scroll_capture::capture_scroll,
     settings::{ConfigurationState, SettingsView, SettingsViewEvent},
@@ -4979,13 +4979,32 @@ impl Render for ChattView {
         let live_panel =
             (!self.model.live_shares.is_empty()).then(|| self.render_live_shares(window, cx));
         let resizing_live_pane = self.live_pane_resize.is_some();
+        let tabbed_preview_layout = self.preview_layout_is_tabbed(window);
         let active_preview = self.preview_history.active().cloned();
-        let preview_panel = active_preview.map(|active| {
-            let body_width = self.chat_body_width(window);
-            let panel_width =
-                panel_width_for_chat_width(self.preview_chat_width, body_width, window.rem_size());
-            self.render_preview_panel(active, panel_width, window, cx)
-        });
+        let body_width = self.chat_body_width(window);
+        let preview_width = if tabbed_preview_layout {
+            body_width
+        } else {
+            panel_width_for_chat_width(self.preview_chat_width, body_width, window.rem_size())
+        };
+        let preview_viewport = preview_image_viewport_bounds(
+            window.viewport_size(),
+            preview_width,
+            self.preview_chrome_top(tabbed_preview_layout, window),
+        );
+        let preview_tab_bar = (tabbed_preview_layout && self.preview_history.tab_bar_visible())
+            .then(|| {
+                self.render_preview_tab_bar(active_preview.as_ref(), true, preview_viewport, cx)
+            });
+        let tabbed_preview = active_preview
+            .as_ref()
+            .filter(|_| tabbed_preview_layout)
+            .map(|active| self.render_preview_surface(active, preview_width, preview_viewport, cx));
+        let show_room_view = tabbed_preview.is_none();
+        let preview_panel = active_preview
+            .as_ref()
+            .filter(|_| !tabbed_preview_layout)
+            .map(|active| self.render_preview_panel(active, preview_width, preview_viewport, cx));
         let resizing_preview_pane = self.preview_pane_resize.is_some();
         let completion_view = self.completion_view(cx).filter(|view| {
             self.completion_session
@@ -5124,368 +5143,372 @@ impl Render for ChattView {
                     .flex()
                     .flex_col()
                     .when_some(live_panel, |column, live_panel| column.child(live_panel))
-                    .child(
-                        div()
-                            .id("room-view")
-                            .flex_1()
-                            .min_h_0()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .when(self.show_top_status_bar, |panel| {
-                                panel.child(
-                                div()
-                            .min_h(rems_from_px(TOP_BAR_HEIGHT))
-                            .flex_none()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_3()
-                            .px_4()
-                            .border_b_1()
-                            .border_color(applied.theme.color(ThemeRole::BorderSubtle))
-                            .bg(applied.theme.color(ThemeRole::Toolbar))
-                            .child(
-                                div()
-                                    .text_color(applied.theme.color(ThemeRole::TextDim))
-                                    .child("#"),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(selected_name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(applied.theme.color(ThemeRole::TextDim))
-                                    .child(format!("{count} messages")),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(applied.theme.color(ThemeRole::TextDim))
-                                    .child(format!("{online} online")),
-                            )
-                            .when(!security.is_empty(), |bar| {
-                                bar.child(
+                    .when_some(preview_tab_bar, |column, tab_bar| column.child(tab_bar))
+                    .when_some(tabbed_preview, |column, preview| column.child(preview))
+                    .when(show_room_view, |column| {
+                        column.child(
+                            div()
+                                .id("room-view")
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .when(self.show_top_status_bar, |panel| {
+                                    panel.child(
+                                    div()
+                                .min_h(rems_from_px(TOP_BAR_HEIGHT))
+                                .flex_none()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_3()
+                                .px_4()
+                                .border_b_1()
+                                .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+                                .bg(applied.theme.color(ThemeRole::Toolbar))
+                                .child(
+                                    div()
+                                        .text_color(applied.theme.color(ThemeRole::TextDim))
+                                        .child("#"),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(selected_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(applied.theme.color(ThemeRole::TextDim))
+                                        .child(format!("{count} messages")),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(applied.theme.color(ThemeRole::TextDim))
+                                        .child(format!("{online} online")),
+                                )
+                                .when(!security.is_empty(), |bar| {
+                                    bar.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                            .child(security),
+                                    )
+                                })
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if ready {
+                                            applied.theme.color(ThemeRole::StateSuccess)
+                                        } else {
+                                            applied.theme.color(ThemeRole::StateWarning)
+                                        })
+                                        .child(self.status.clone()),
+                                )
+                                .when(!ready, |bar| {
+                                    bar.child(
+                                        toolbar_button(
+                                            "retry",
+                                            Some(IconName::RotateCcw),
+                                            "Retry",
+                                            &applied.theme,
+                                        )
+                                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                                    )
+                                })
+                                .child(
+                                    toolbar_button(
+                                        "mute",
+                                        Some(if self.model.voice.state.is_muted() {
+                                            IconName::MicOff
+                                        } else {
+                                            IconName::Mic
+                                        }),
+                                        if self.model.voice.state.is_muted() {
+                                            "Unmute"
+                                        } else {
+                                            "Mute"
+                                        },
+                                        &applied.theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.toggle_mute(&ToggleMute, window, cx),
+                                    )),
+                                )
+                                .child(
+                                    toolbar_button(
+                                        "deafen",
+                                        Some(if self.model.voice.state.is_deafened() {
+                                            IconName::AudioOff
+                                        } else {
+                                            IconName::AudioOn
+                                        }),
+                                        if self.model.voice.state.is_deafened() {
+                                            "Undeafen"
+                                        } else {
+                                            "Deafen"
+                                        },
+                                        &applied.theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.toggle_deafen(&ToggleDeafen, window, cx)
+                                        },
+                                    )),
+                                )
+                                .child(toolbar_button(
+                                    "output-down",
+                                    None,
+                                    "Vol −",
+                                    &applied.theme,
+                                ).on_click(
+                                    cx.listener(|this, _, _, cx| this.adjust_output_volume(-5., cx)),
+                                ))
+                                .child(
                                     div()
                                         .text_xs()
                                         .text_color(applied.theme.color(ThemeRole::TextMuted))
-                                        .child(security),
+                                        .child(format!("{}", self.model.voice.output_volume.round())),
                                 )
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if ready {
-                                        applied.theme.color(ThemeRole::StateSuccess)
-                                    } else {
-                                        applied.theme.color(ThemeRole::StateWarning)
-                                    })
-                                    .child(self.status.clone()),
-                            )
-                            .when(!ready, |bar| {
-                                bar.child(
+                                .child(toolbar_button(
+                                    "output-up",
+                                    None,
+                                    "Vol +",
+                                    &applied.theme,
+                                ).on_click(
+                                    cx.listener(|this, _, _, cx| this.adjust_output_volume(5., cx)),
+                                ))
+                                .child(
                                     toolbar_button(
-                                        "retry",
-                                        Some(IconName::RotateCcw),
-                                        "Retry",
-                                        &applied.theme,
-                                    )
-                                        .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
-                                )
-                            })
-                            .child(
-                                toolbar_button(
-                                    "mute",
-                                    Some(if self.model.voice.state.is_muted() {
-                                        IconName::MicOff
-                                    } else {
-                                        IconName::Mic
-                                    }),
-                                    if self.model.voice.state.is_muted() {
-                                        "Unmute"
-                                    } else {
-                                        "Mute"
-                                    },
-                                    &applied.theme,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.toggle_mute(&ToggleMute, window, cx),
-                                )),
-                            )
-                            .child(
-                                toolbar_button(
-                                    "deafen",
-                                    Some(if self.model.voice.state.is_deafened() {
-                                        IconName::AudioOff
-                                    } else {
-                                        IconName::AudioOn
-                                    }),
-                                    if self.model.voice.state.is_deafened() {
-                                        "Undeafen"
-                                    } else {
-                                        "Deafen"
-                                    },
-                                    &applied.theme,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.toggle_deafen(&ToggleDeafen, window, cx)
-                                    },
-                                )),
-                            )
-                            .child(toolbar_button(
-                                "output-down",
-                                None,
-                                "Vol −",
-                                &applied.theme,
-                            ).on_click(
-                                cx.listener(|this, _, _, cx| this.adjust_output_volume(-5., cx)),
-                            ))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(applied.theme.color(ThemeRole::TextMuted))
-                                    .child(format!("{}", self.model.voice.output_volume.round())),
-                            )
-                            .child(toolbar_button(
-                                "output-up",
-                                None,
-                                "Vol +",
-                                &applied.theme,
-                            ).on_click(
-                                cx.listener(|this, _, _, cx| this.adjust_output_volume(5., cx)),
-                            ))
-                            .child(
-                                toolbar_button(
-                                    "voice",
-                                    Some(
+                                        "voice",
+                                        Some(
+                                            if self.model.voice.joined_room == self.model.selected_room
+                                                && self.model.selected_room.is_some()
+                                            {
+                                                IconName::Stop
+                                            } else {
+                                                IconName::Play
+                                            },
+                                        ),
                                         if self.model.voice.joined_room == self.model.selected_room
                                             && self.model.selected_room.is_some()
                                         {
-                                            IconName::Stop
+                                            "Leave voice"
                                         } else {
-                                            IconName::Play
+                                            "Join voice"
                                         },
-                                    ),
-                                    if self.model.voice.joined_room == self.model.selected_room
-                                        && self.model.selected_room.is_some()
-                                    {
-                                        "Leave voice"
-                                    } else {
-                                        "Join voice"
-                                    },
-                                    &applied.theme,
+                                        &applied.theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.toggle_voice(&ToggleVoice, window, cx)
+                                        },
+                                    )),
                                 )
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.toggle_voice(&ToggleVoice, window, cx)
-                                    },
-                                )),
-                            )
-                            )
-                            })
-                    .when(show_config_diagnostic, |panel| {
-                        let diagnostic = &applied.diagnostics[0];
-                        panel.child(
-                            div()
-                                .flex_none()
-                                .px_4()
-                                .py_2()
-                                .border_b_1()
-                                .border_color(applied.theme.color(ThemeRole::BorderSubtle))
-                                .bg(applied.theme.color(ThemeRole::Panel))
-                                .text_sm()
-                                .text_color(match diagnostic.severity {
-                                    crate::config::validation::DiagnosticSeverity::Warning => {
-                                        applied.theme.color(ThemeRole::StateWarning)
-                                    }
-                                    crate::config::validation::DiagnosticSeverity::Error => {
-                                        applied.theme.color(ThemeRole::StateDanger)
-                                    }
+                                )
                                 })
-                                .child(format!(
-                                    "{}: {} — open Settings for details",
-                                    diagnostic.path, diagnostic.message
-                                )),
-                        )
-                    })
-                    .when(
-                        !self.model.at_start && self.model.older_cursor.is_some(),
-                        |panel| {
+                        .when(show_config_diagnostic, |panel| {
+                            let diagnostic = &applied.diagnostics[0];
                             panel.child(
                                 div()
-                                    .min_h(rems_from_px(34.))
                                     .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
+                                    .px_4()
+                                    .py_2()
                                     .border_b_1()
                                     .border_color(applied.theme.color(ThemeRole::BorderSubtle))
-                                    .child(
-                                        compact_action_button(
-                                            "load-older",
-                                            Some(IconName::Download),
-                                            "Load older messages",
-                                            &applied.theme,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.load_older(cx)),
-                                        ),
-                                    ),
+                                    .bg(applied.theme.color(ThemeRole::Panel))
+                                    .text_sm()
+                                    .text_color(match diagnostic.severity {
+                                        crate::config::validation::DiagnosticSeverity::Warning => {
+                                            applied.theme.color(ThemeRole::StateWarning)
+                                        }
+                                        crate::config::validation::DiagnosticSeverity::Error => {
+                                            applied.theme.color(ThemeRole::StateDanger)
+                                        }
+                                    })
+                                    .child(format!(
+                                        "{}: {} — open Settings for details",
+                                        diagnostic.path, diagnostic.message
+                                    )),
                             )
-                        },
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .child(timeline)
-                            .when(count == 0 && self.command_rows.is_empty(), |area| {
-                                area.child(
+                        })
+                        .when(
+                            !self.model.at_start && self.model.older_cursor.is_some(),
+                            |panel| {
+                                panel.child(
                                     div()
-                                        .absolute()
-                                        .top(rems_from_px(40.))
-                                        .left_0()
-                                        .right_0()
-                                        .px_4()
-                                        .text_center()
-                                        .text_color(
-                                            applied.theme.color(ThemeRole::TextDim),
-                                        )
-                                        .child(empty_state(&self.model)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .key_context(completion_key_context)
-                            .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .items_stretch()
-                            .pl(rems_from_px(28.))
-                            .pr(rems_from_px(28.))
-                            .border_t_1()
-                            .border_color(applied.theme.color(ThemeRole::BorderSubtle))
-                            .bg(applied.theme.color(ThemeRole::Input))
-                            .when_some(composer_menu, |bar, menu| bar.child(menu))
-                            .when_some(completion_popup, |bar, popup| bar.child(popup))
-                            .when_some(queued_file_row, |bar, files| bar.child(files))
-                            .when_some(self.composer_error.clone(), |bar, error| {
-                                bar.child(
-                                    div()
-                                        .mb_1()
-                                        .mt_2()
-                                        .text_sm()
-                                        .text_color(applied.theme.color(ThemeRole::StateWarning))
-                                        .child(format!(
-                                            "{error}. Your draft and queued files were retained."
-                                        )),
-                                )
-                            })
-                            .when(!ready, |bar| {
-                                bar.child(
-                                    div()
-                                        .mb_1()
-                                        .mt_2()
-                                        .text_sm()
-                                        .text_color(applied.theme.color(ThemeRole::TextMuted))
+                                        .min_h(rems_from_px(34.))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .border_b_1()
+                                        .border_color(applied.theme.color(ThemeRole::BorderSubtle))
                                         .child(
-                                            "Daemon offline — your draft and queued files are retained; sending is disabled.",
+                                            compact_action_button(
+                                                "load-older",
+                                                Some(IconName::Download),
+                                                "Load older messages",
+                                                &applied.theme,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.load_older(cx)),
+                                            ),
                                         ),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
-                                    .flex()
-                                    .items_stretch()
-                                    .child(
+                            },
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .child(timeline)
+                                .when(count == 0 && self.command_rows.is_empty(), |area| {
+                                    area.child(
                                         div()
-                                            .id("add-media-region")
-                                            .ml(rems_from_px(-28.))
-                                            .w(rems_from_px(64.))
-                                            .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .mr(rems_from_px(15.))
-                                            .child(composer_add_button(
-                                                can_attach,
-                                                &applied.theme,
-                                            ))
-                                            .on_click(cx.listener(
-                                                |this, _, window, cx| {
-                                                    this.composer_menu_open = false;
-                                                    this.composer_menu_action_taken = false;
-                                                    this.open_media(&OpenMedia, window, cx)
-                                                },
+                                            .absolute()
+                                            .top(rems_from_px(40.))
+                                            .left_0()
+                                            .right_0()
+                                            .px_4()
+                                            .text_center()
+                                            .text_color(
+                                                applied.theme.color(ThemeRole::TextDim),
+                                            )
+                                            .child(empty_state(&self.model)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .key_context(completion_key_context)
+                                .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
+                                .flex_none()
+                                .flex()
+                                .flex_col()
+                                .items_stretch()
+                                .pl(rems_from_px(28.))
+                                .pr(rems_from_px(28.))
+                                .border_t_1()
+                                .border_color(applied.theme.color(ThemeRole::BorderSubtle))
+                                .bg(applied.theme.color(ThemeRole::Input))
+                                .when_some(composer_menu, |bar, menu| bar.child(menu))
+                                .when_some(completion_popup, |bar, popup| bar.child(popup))
+                                .when_some(queued_file_row, |bar, files| bar.child(files))
+                                .when_some(self.composer_error.clone(), |bar, error| {
+                                    bar.child(
+                                        div()
+                                            .mb_1()
+                                            .mt_2()
+                                            .text_sm()
+                                            .text_color(applied.theme.color(ThemeRole::StateWarning))
+                                            .child(format!(
+                                                "{error}. Your draft and queued files were retained."
                                             )),
                                     )
-                                    .child(
+                                })
+                                .when(!ready, |bar| {
+                                    bar.child(
                                         div()
-                                            .min_w_0()
-                                            .min_h(rems_from_px(40.))
-                                            .flex_1()
-                                            .flex()
-                                            .items_center()
-                                            .child(self.composer.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("composer-menu")
-                                            .relative()
-                                            .ml(rems_from_px(15.))
-                                            .mr(rems_from_px(-28.))
-                                            .w(rems_from_px(64.))
-                                            .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
+                                            .mb_1()
+                                            .mt_2()
+                                            .text_sm()
+                                            .text_color(applied.theme.color(ThemeRole::TextMuted))
                                             .child(
-                                                canvas(
-                                                    move |bounds, _, _| {
-                                                        composer_menu_trigger_bounds
-                                                            .set(Some(bounds));
+                                                "Daemon offline — your draft and queued files are retained; sending is disabled.",
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
+                                        .flex()
+                                        .items_stretch()
+                                        .child(
+                                            div()
+                                                .id("add-media-region")
+                                                .ml(rems_from_px(-28.))
+                                                .w(rems_from_px(64.))
+                                                .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .cursor_pointer()
+                                                .mr(rems_from_px(15.))
+                                                .child(composer_add_button(
+                                                    can_attach,
+                                                    &applied.theme,
+                                                ))
+                                                .on_click(cx.listener(
+                                                    |this, _, window, cx| {
+                                                        this.composer_menu_open = false;
+                                                        this.composer_menu_action_taken = false;
+                                                        this.open_media(&OpenMedia, window, cx)
                                                     },
-                                                    |_, _, _, _| {},
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .min_h(rems_from_px(40.))
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .child(self.composer.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("composer-menu")
+                                                .relative()
+                                                .ml(rems_from_px(15.))
+                                                .mr(rems_from_px(-28.))
+                                                .w(rems_from_px(64.))
+                                                .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .cursor_pointer()
+                                                .child(
+                                                    canvas(
+                                                        move |bounds, _, _| {
+                                                            composer_menu_trigger_bounds
+                                                                .set(Some(bounds));
+                                                        },
+                                                        |_, _, _, _| {},
+                                                    )
+                                                    .absolute()
+                                                    .size_full(),
                                                 )
-                                                .absolute()
-                                                .size_full(),
-                                            )
-                                            .child(icon(
-                                                IconName::Menu,
-                                                24.0,
-                                                applied.theme.color(
-                                                    if self.composer_menu_open {
-                                                        ThemeRole::TextPrimary
-                                                    } else {
-                                                        ThemeRole::TextMuted
-                                                    },
-                                                ),
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_composer_menu(cx)
-                                            })),
-                                    ),
-                            ),
-                    ),
-                    ),
+                                                .child(icon(
+                                                    IconName::Menu,
+                                                    24.0,
+                                                    applied.theme.color(
+                                                        if self.composer_menu_open {
+                                                            ThemeRole::TextPrimary
+                                                        } else {
+                                                            ThemeRole::TextMuted
+                                                        },
+                                                    ),
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_composer_menu(cx)
+                                                })),
+                                        ),
+                                ),
+                        ),
+                        )
+                    }),
             )
             .when_some(preview_panel, |root, preview_panel| {
                 root.child(
@@ -5571,15 +5594,11 @@ fn image_box_size(descriptor: &AttachmentDescriptor) -> (f32, f32) {
 fn preview_image_viewport_bounds(
     window_size: gpui::Size<Pixels>,
     panel_width: Pixels,
-    rem_size: Pixels,
+    chrome_top: Pixels,
 ) -> Bounds<Pixels> {
-    let chrome_height = crate::ui_scale::scaled_px(PREVIEW_TAB_BAR_HEIGHT, rem_size);
     Bounds {
-        origin: point(window_size.width - panel_width, chrome_height),
-        size: gpui::size(
-            panel_width,
-            (window_size.height - chrome_height).max(px(1.0)),
-        ),
+        origin: point(window_size.width - panel_width, chrome_top),
+        size: gpui::size(panel_width, (window_size.height - chrome_top).max(px(1.0))),
     }
 }
 
@@ -5899,16 +5918,19 @@ mod tests {
     }
 
     #[test]
-    fn preview_image_viewport_uses_fixed_panel_chrome_without_measurement() {
-        let bounds = preview_image_viewport_bounds(
-            gpui::size(px(1_920.0), px(1_080.0)),
-            px(900.0),
-            px(16.0),
-        );
+    fn preview_image_viewport_starts_below_the_chrome_above_the_viewer() {
+        let window = gpui::size(px(1_920.0), px(1_080.0));
 
+        let split = preview_image_viewport_bounds(window, px(900.0), px(52.0));
         assert_eq!(PREVIEW_TAB_BAR_HEIGHT, TOP_BAR_HEIGHT);
-        assert_eq!(bounds.origin, point(px(1_020.0), px(52.0)));
-        assert_eq!(bounds.size, gpui::size(px(900.0), px(1_028.0)));
+        assert_eq!(split.origin, point(px(1_020.0), px(52.0)));
+        assert_eq!(split.size, gpui::size(px(900.0), px(1_028.0)));
+
+        // Tabbed: the viewer spans the body, below a live share pane and the
+        // tab bar, so it starts at the sidebar edge and clears both.
+        let tabbed = preview_image_viewport_bounds(window, px(1_688.0), px(240.0) + px(52.0));
+        assert_eq!(tabbed.origin, point(px(232.0), px(292.0)));
+        assert_eq!(tabbed.size, gpui::size(px(1_688.0), px(788.0)));
     }
 
     #[test]

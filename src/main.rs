@@ -40,11 +40,21 @@ use gpui_platform::application;
 
 use crate::app::ChattView;
 
+const DEFAULT_APP_ID: &str = "chatt-gui";
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let logger_guard = logger::init();
+    let app_id = match app_id_from_args(std::env::args().skip(1)) {
+        Ok(app_id) => app_id,
+        Err(error) => {
+            kvlog::error!("invalid command line arguments", err = %error);
+            logger_guard.flush();
+            std::process::exit(2);
+        }
+    };
     ensure_graphical_backend();
     let mut loaded = config::io::load();
     let binding_diagnostics = key_bindings::validate(&loaded.config);
@@ -68,6 +78,7 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    app_id: Some(app_id),
                     ..Default::default()
                 },
                 move |window, cx| {
@@ -124,6 +135,31 @@ fn main() {
             cx.activate(true);
         });
     logger_guard.flush();
+}
+
+fn app_id_from_args(args: impl IntoIterator<Item = String>) -> Result<String, String> {
+    let mut args = args.into_iter();
+    let mut app_id = None;
+
+    while let Some(argument) = args.next() {
+        let value = if argument == "--app-id" {
+            Some(
+                args.next()
+                    .ok_or_else(|| "`--app-id` requires a value".to_owned())?,
+            )
+        } else {
+            argument.strip_prefix("--app-id=").map(ToOwned::to_owned)
+        };
+
+        if let Some(value) = value {
+            if value.is_empty() {
+                return Err("`--app-id` requires a non-empty value".to_owned());
+            }
+            app_id = Some(value);
+        }
+    }
+
+    Ok(app_id.unwrap_or_else(|| DEFAULT_APP_ID.to_owned()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -194,28 +230,69 @@ fn headless_backend_error(
         .to_owned()
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(test)]
 mod tests {
-    use super::headless_backend_error;
+    use super::{DEFAULT_APP_ID, app_id_from_args};
 
     #[test]
+    fn uses_default_app_id_without_override() {
+        assert_eq!(
+            app_id_from_args(Vec::new()).unwrap(),
+            DEFAULT_APP_ID.to_owned()
+        );
+    }
+
+    #[test]
+    fn reads_app_id_override() {
+        assert_eq!(
+            app_id_from_args(["--app-id", "org.example.Chatt"].map(str::to_owned)).unwrap(),
+            "org.example.Chatt"
+        );
+        assert_eq!(
+            app_id_from_args(["--app-id=org.example.Chatt"].map(str::to_owned)).unwrap(),
+            "org.example.Chatt"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_app_id() {
+        assert_eq!(
+            app_id_from_args(["--app-id".to_owned()]).unwrap_err(),
+            "`--app-id` requires a value"
+        );
+        assert_eq!(
+            app_id_from_args(["--app-id=".to_owned()]).unwrap_err(),
+            "`--app-id` requires a non-empty value"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
     fn reports_x11_display_without_compiled_x11_support() {
+        use super::headless_backend_error;
+
         assert_eq!(
             headless_backend_error(true, false, false, true, false),
             "refusing to start chatt-gui headlessly: DISPLAY is set but X11 support was not compiled in; rebuild with `--features x11`"
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn reports_explicit_headless_override() {
+        use super::headless_backend_error;
+
         assert_eq!(
             headless_backend_error(true, true, true, true, true),
             "refusing to start chatt-gui headlessly because ZED_HEADLESS is set; unset it to open a window"
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn reports_missing_display_environment() {
+        use super::headless_backend_error;
+
         assert_eq!(
             headless_backend_error(true, true, false, false, false),
             "refusing to start chatt-gui headlessly: neither WAYLAND_DISPLAY nor DISPLAY identifies a supported graphical session"
