@@ -442,7 +442,7 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.exit_video_theater(cx) {
+        if self.exit_video_theater(window, cx) {
             return;
         }
         self.close_preview(window, cx);

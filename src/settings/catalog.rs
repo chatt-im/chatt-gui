@@ -14,6 +14,7 @@ pub(crate) enum ScalarSetting {
 pub(crate) enum ToggleSetting {
     StatusBarVisible,
     RoomMenuVisible,
+    NativeFullscreen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +62,10 @@ const TYPOGRAPHY: &[CatalogItem] = &[
     CatalogItem::Choice(ScalarSetting::FontRendering),
 ];
 const SYNTAX: &[CatalogItem] = &[CatalogItem::ThemeGroup(ThemeGroup::Syntax)];
-const MEDIA: &[CatalogItem] = &[CatalogItem::ThemeGroup(ThemeGroup::Media)];
+const MEDIA: &[CatalogItem] = &[
+    CatalogItem::ThemeGroup(ThemeGroup::Media),
+    CatalogItem::Toggle(ToggleSetting::NativeFullscreen),
+];
 const LAYOUT: &[CatalogItem] = &[
     CatalogItem::Toggle(ToggleSetting::StatusBarVisible),
     CatalogItem::Toggle(ToggleSetting::RoomMenuVisible),
@@ -163,6 +167,7 @@ pub(crate) fn path(row: RowRef) -> String {
         RowRef::Choice(ScalarSetting::BindingMode) => "input.default-binding-mode".into(),
         RowRef::Toggle(ToggleSetting::StatusBarVisible) => "layout.status-bar-visible".into(),
         RowRef::Toggle(ToggleSetting::RoomMenuVisible) => "layout.room-menu-visible".into(),
+        RowRef::Toggle(ToggleSetting::NativeFullscreen) => "native-fullscreen".into(),
         RowRef::Binding(scope, command) => {
             format!("bindings.{}.{}", scope.key(), format!("{command:?}"))
         }
@@ -189,6 +194,7 @@ pub(crate) fn label(row: RowRef) -> &'static str {
         RowRef::Choice(ScalarSetting::BindingMode) => "Default composer mode",
         RowRef::Toggle(ToggleSetting::StatusBarVisible) => "Show status bar by default",
         RowRef::Toggle(ToggleSetting::RoomMenuVisible) => "Show room menu by default",
+        RowRef::Toggle(ToggleSetting::NativeFullscreen) => "Use native fullscreen for media",
         RowRef::Binding(scope, command) => {
             crate::key_bindings::spec(scope, command)
                 .expect("binding row belongs to registry")
@@ -225,6 +231,9 @@ pub(crate) fn help(row: RowRef) -> Option<&'static str> {
         RowRef::Toggle(ToggleSetting::RoomMenuVisible) => {
             Some("Controls whether the room menu sidebar is shown when the GUI starts.")
         }
+        RowRef::Toggle(ToggleSetting::NativeFullscreen) => Some(
+            "When enabled, fullscreen videos and live streams also fullscreen the application window.",
+        ),
         RowRef::Binding(scope, command) => {
             crate::key_bindings::spec(scope, command)
                 .expect("binding row belongs to registry")
@@ -303,6 +312,20 @@ mod tests {
                 RowRef::Toggle(ToggleSetting::StatusBarVisible),
                 RowRef::Toggle(ToggleSetting::RoomMenuVisible),
             ]
+        );
+    }
+
+    #[test]
+    fn media_section_contains_native_fullscreen_toggle() {
+        let media = SETTINGS_SECTIONS
+            .iter()
+            .find(|section| section.id == "media")
+            .expect("media section is registered");
+
+        assert!(rows(media, 0).contains(&RowRef::Toggle(ToggleSetting::NativeFullscreen)));
+        assert_eq!(
+            path(RowRef::Toggle(ToggleSetting::NativeFullscreen)),
+            "native-fullscreen"
         );
     }
 }

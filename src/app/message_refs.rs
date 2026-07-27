@@ -285,6 +285,7 @@ impl ChattView {
                     descriptor,
                     source,
                 },
+                window,
                 cx,
             );
             self.pump_video_sources(cx);

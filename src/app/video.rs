@@ -58,10 +58,10 @@ impl ChattView {
         };
         let view = cx.entity().downgrade();
         let event_source = source.clone();
-        let handler: VideoPlayerHandler = Rc::new(move |event, _, cx| {
+        let handler: VideoPlayerHandler = Rc::new(move |event, window, cx| {
             let source = event_source.clone();
             let _ = view.update(cx, |this, cx| {
-                this.handle_video_player_event(source, duration, event, cx)
+                this.handle_video_player_event(source, duration, event, window, cx)
             });
         });
         let fallback_label = video.error.clone().unwrap_or_else(|| {
@@ -108,6 +108,7 @@ impl ChattView {
         source: TheaterVideo,
         duration: f64,
         event: VideoPlayerEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = source.key;
@@ -117,7 +118,7 @@ impl ChattView {
             VideoPlayerEvent::SurfaceClicked {
                 click_count,
                 unstarted,
-            } => self.click_video_surface(source, click_count, unstarted, cx),
+            } => self.click_video_surface(source, click_count, unstarted, window, cx),
             VideoPlayerEvent::Play => {
                 self.video_surface_click_task.take();
                 self.play_video(key, cx);
@@ -138,7 +139,7 @@ impl ChattView {
             VideoPlayerEvent::VolumePressed { bounds, event } => {
                 self.begin_video_volume_drag(key, bounds, &event, cx)
             }
-            VideoPlayerEvent::ToggleTheater => self.toggle_video_theater(source, cx),
+            VideoPlayerEvent::ToggleTheater => self.toggle_video_theater(source, window, cx),
         }
     }
 
@@ -603,12 +604,13 @@ impl ChattView {
         source: TheaterVideo,
         click_count: usize,
         unstarted: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
         if click_count >= 2 {
             self.video_surface_click_task.take();
-            self.toggle_video_theater(source, cx);
+            self.toggle_video_theater(source, window, cx);
             return;
         }
         if click_count != 1 {
@@ -632,16 +634,22 @@ impl ChattView {
         }));
     }
 
-    pub(super) fn toggle_video_theater(&mut self, source: TheaterVideo, cx: &mut Context<Self>) {
+    pub(super) fn toggle_video_theater(
+        &mut self,
+        source: TheaterVideo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .theater_video
             .as_ref()
             .is_some_and(|active| active.key == source.key)
         {
-            self.exit_video_theater(cx);
+            self.exit_video_theater(window, cx);
             return;
         }
         self.theater_video = Some(source.clone());
+        self.enter_native_media_fullscreen(window, cx);
         let source_key = self.source_key(source.key.room_id, source.key.attachment_id);
         self.video_sources
             .promote(source_key, source.descriptor.clone());
@@ -653,10 +661,15 @@ impl ChattView {
         cx.notify();
     }
 
-    pub(super) fn exit_video_theater(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(super) fn exit_video_theater(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(theater) = self.theater_video.take() else {
             return false;
         };
+        self.exit_native_media_fullscreen_if_inactive(window);
         self.video_surface_click_task.take();
         self.finish_video_scrub(cx);
         self.finish_video_volume_drag(cx);
@@ -667,6 +680,28 @@ impl ChattView {
         self.pump_video_sources(cx);
         cx.notify();
         true
+    }
+
+    pub(super) fn enter_native_media_fullscreen(&mut self, window: &mut Window, cx: &App) {
+        if !self.media_native_fullscreen
+            && cx.global::<ConfigurationState>().0.config.native_fullscreen
+            && !window.is_fullscreen()
+        {
+            window.toggle_fullscreen();
+            self.media_native_fullscreen = true;
+        }
+    }
+
+    pub(super) fn exit_native_media_fullscreen_if_inactive(&mut self, window: &mut Window) {
+        if self.media_native_fullscreen
+            && self.theater_video.is_none()
+            && self.fullscreen_share.is_none()
+        {
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+            self.media_native_fullscreen = false;
+        }
     }
 
     fn hover_video_scrub(&mut self, key: VideoKey, fraction: f64, cx: &mut Context<Self>) {

@@ -1903,6 +1903,10 @@ impl SettingsView {
                 self.draft.layout.room_menu_visible = defaults.layout.room_menu_visible;
                 false
             }
+            RowRef::Toggle(ToggleSetting::NativeFullscreen) => {
+                self.draft.native_fullscreen = defaults.native_fullscreen;
+                false
+            }
             RowRef::Binding(scope, command) => {
                 let defaults = key_bindings::effective_sequences(&defaults, scope, command);
                 key_bindings::set_sequences(&mut self.draft, scope, command, &defaults);
@@ -2351,6 +2355,7 @@ impl SettingsView {
         match setting {
             ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible,
             ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible,
+            ToggleSetting::NativeFullscreen => self.draft.native_fullscreen,
         }
     }
 
@@ -2362,6 +2367,7 @@ impl SettingsView {
         match setting {
             ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible = value,
             ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible = value,
+            ToggleSetting::NativeFullscreen => self.draft.native_fullscreen = value,
         }
         self.preview_layout_changes(before, cx);
         cx.notify();
@@ -3376,6 +3382,13 @@ fn render_row(
                 "Off".into()
             }
         }
+        RowRef::Toggle(ToggleSetting::NativeFullscreen) => {
+            if draft.native_fullscreen {
+                "On".into()
+            } else {
+                "Off".into()
+            }
+        }
         RowRef::Binding(scope, command) => {
             let values = key_bindings::effective_sequences(draft, scope, command);
             if values.is_empty() {
@@ -3445,6 +3458,7 @@ fn render_row(
         let enabled = match setting {
             ToggleSetting::StatusBarVisible => draft.layout.status_bar_visible,
             ToggleSetting::RoomMenuVisible => draft.layout.room_menu_visible,
+            ToggleSetting::NativeFullscreen => draft.native_fullscreen,
         };
         div()
             .id(("settings-toggle", setting as usize))
@@ -4517,6 +4531,27 @@ mod tests {
                 settings.reset_row(RowRef::Toggle(ToggleSetting::RoomMenuVisible), cx);
                 assert!(settings.draft.layout.status_bar_visible);
                 assert!(settings.draft.layout.room_menu_visible);
+                assert!(!settings.local_dirty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn native_fullscreen_toggle_updates_the_draft_and_resets_to_disabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings(cx);
+
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                assert!(!settings.draft.native_fullscreen);
+
+                settings.toggle(ToggleSetting::NativeFullscreen, cx);
+                assert!(settings.draft.native_fullscreen);
+                assert!(settings.local_dirty());
+
+                settings.reset_row(RowRef::Toggle(ToggleSetting::NativeFullscreen), cx);
+                assert!(!settings.draft.native_fullscreen);
                 assert!(!settings.local_dirty());
             });
         });

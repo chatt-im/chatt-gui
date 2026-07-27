@@ -838,6 +838,7 @@ pub struct ChattView {
     live_players: HashMap<StreamId, LivePlayerView>,
     fullscreen_share: Option<StreamId>,
     fullscreen_live_controls_hovered: bool,
+    media_native_fullscreen: bool,
     live_pane_height: Option<Pixels>,
     live_pane_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     live_pane_resize: Option<LivePaneResize>,
@@ -1093,6 +1094,7 @@ impl ChattView {
             live_players: HashMap::new(),
             fullscreen_share: None,
             fullscreen_live_controls_hovered: false,
+            media_native_fullscreen: false,
             live_pane_height: None,
             live_pane_bounds: Rc::new(Cell::new(None)),
             live_pane_resize: None,
@@ -1349,7 +1351,7 @@ impl ChattView {
                 self.pending_message_jump = None;
                 self.message_reference_flash = None;
                 self.message_reference_flash_task = None;
-                self.reset_attachment_source_state();
+                self.reset_attachment_source_state(window);
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Offline · Submission outcome unknown; verify the timeline after reconnecting · {reason}"
@@ -1382,7 +1384,7 @@ impl ChattView {
                 self.pending_message_jump = None;
                 self.message_reference_flash = None;
                 self.message_reference_flash_task = None;
-                self.reset_attachment_source_state();
+                self.reset_attachment_source_state(window);
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Cannot connect · Submission outcome unknown; verify before retrying · {details}"
@@ -1507,6 +1509,7 @@ impl ChattView {
                     drop(fd);
                     self.attachment_source_protocol_error(
                         "attachment source response identity does not match its request",
+                        window,
                         cx,
                     );
                     return;
@@ -1522,6 +1525,7 @@ impl ChattView {
                     Err(error) => {
                         self.attachment_source_protocol_error(
                             &format!("invalid attachment source descriptor: {error:#}"),
+                            window,
                             cx,
                         );
                         return;
@@ -1536,6 +1540,7 @@ impl ChattView {
                     Err(error) => {
                         self.attachment_source_protocol_error(
                             &format!("invalid attachment source completion: {error:#}"),
+                            window,
                             cx,
                         );
                         return;
@@ -1927,7 +1932,7 @@ impl ChattView {
             self.message_reference_flash_task = None;
         }
         if media_namespace_changed || self.model.selected_room != old_selected_room {
-            self.reset_attachment_source_state();
+            self.reset_attachment_source_state(window);
         }
         let available = self
             .model
@@ -1943,9 +1948,7 @@ impl ChattView {
         {
             self.fullscreen_share = None;
             self.fullscreen_live_controls_hovered = false;
-            if window.is_fullscreen() {
-                window.toggle_fullscreen();
-            }
+            self.exit_native_media_fullscreen_if_inactive(window);
         }
         if self.model.selected_room != old_selected_room || effect.replace_messages {
             self.timeline_selection.clear();
@@ -1998,7 +2001,7 @@ impl ChattView {
                 .as_ref()
                 .is_some_and(|theater| !retained.contains(&theater.key))
             {
-                self.clear_video_interactions();
+                self.clear_video_interactions(window);
             }
         }
         if self.model.selected_room != old_selected_room || effect.messages_changed {
@@ -2090,6 +2093,7 @@ impl ChattView {
                     RequestOutcome::Accepted => {
                         self.attachment_source_protocol_error(
                             "attachment source open returned an accepted result without a descriptor",
+                            window,
                             cx,
                         );
                     }
@@ -4816,7 +4820,7 @@ impl Render for ChattView {
                 .when_some(self.settings.clone(), |root, settings| root.child(settings));
         }
         if !self.live_players.is_empty() {
-            self.advance_live_video();
+            self.advance_live_video(window);
         }
         if let Some(theater) = self.theater_video.clone() {
             let source_key = self.source_key(theater.key.room_id, theater.key.attachment_id);

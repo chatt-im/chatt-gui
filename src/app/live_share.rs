@@ -1,7 +1,7 @@
 use super::*;
 
 impl ChattView {
-    pub(super) fn advance_live_video(&mut self) {
+    pub(super) fn advance_live_video(&mut self, window: &mut Window) {
         let mut ended = Vec::new();
         for (stream_id, view) in &mut self.live_players {
             match view.player.drain_events() {
@@ -21,9 +21,14 @@ impl ChattView {
         }
         for (stream_id, status) in ended {
             self.live_players.remove(&stream_id);
+            if self.fullscreen_share == Some(stream_id) {
+                self.fullscreen_share = None;
+                self.fullscreen_live_controls_hovered = false;
+            }
             self.send_stop_live_share(stream_id);
             self.status = status.into();
         }
+        self.exit_native_media_fullscreen_if_inactive(window);
         if self.live_players.is_empty() {
             self.live_pane_resize = None;
         }
@@ -60,7 +65,12 @@ impl ChattView {
         cx.notify();
     }
 
-    fn stop_live_share(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
+    fn stop_live_share(
+        &mut self,
+        stream_id: StreamId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.live_players.remove(&stream_id);
         if self.live_players.is_empty() {
             self.live_pane_resize = None;
@@ -69,6 +79,7 @@ impl ChattView {
             self.fullscreen_share = None;
             self.fullscreen_live_controls_hovered = false;
         }
+        self.exit_native_media_fullscreen_if_inactive(window);
         self.send_stop_live_share(stream_id);
         self.status = "Stopped screen share".into();
         cx.notify();
@@ -352,12 +363,13 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         self.fullscreen_live_controls_hovered = false;
-        self.fullscreen_share = if self.fullscreen_share == Some(stream_id) {
-            None
+        let exiting = self.fullscreen_share == Some(stream_id);
+        self.fullscreen_share = if exiting { None } else { Some(stream_id) };
+        if exiting {
+            self.exit_native_media_fullscreen_if_inactive(window);
         } else {
-            Some(stream_id)
-        };
-        window.toggle_fullscreen();
+            self.enter_native_media_fullscreen(window, cx);
+        }
         cx.notify();
     }
 
@@ -365,9 +377,8 @@ impl ChattView {
         self.live_players.clear();
         self.live_pane_resize = None;
         self.fullscreen_live_controls_hovered = false;
-        if self.fullscreen_share.take().is_some() && window.is_fullscreen() {
-            window.toggle_fullscreen();
-        }
+        self.fullscreen_share = None;
+        self.exit_native_media_fullscreen_if_inactive(window);
     }
 
     pub(super) fn render_live_shares(
@@ -541,10 +552,7 @@ impl ChattView {
                         &settings.theme,
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.fullscreen_share == Some(stop_id) && window.is_fullscreen() {
-                            window.toggle_fullscreen();
-                        }
-                        this.stop_live_share(stop_id, cx)
+                        this.stop_live_share(stop_id, window, cx)
                     })),
                 )
                 .child(

@@ -22,6 +22,8 @@ pub(crate) const DEFAULT_CODE_SIZE: f32 = 14.0;
 pub(crate) struct GuiConfig {
     #[toml(default = GUI_SCHEMA_VERSION)]
     pub(crate) schema_version: u16,
+    #[toml(default)]
+    pub(crate) native_fullscreen: bool,
     #[toml(default, style = Header)]
     pub(crate) theme: ThemeConfig,
     #[toml(default, style = Header)]
@@ -38,6 +40,7 @@ impl Default for GuiConfig {
     fn default() -> Self {
         Self {
             schema_version: GUI_SCHEMA_VERSION,
+            native_fullscreen: false,
             theme: ThemeConfig::default(),
             fonts: FontConfig::default(),
             layout: LayoutConfig::default(),
@@ -679,6 +682,7 @@ code-size = 15.5
         .unwrap();
 
         assert_eq!(config.schema_version, GUI_SCHEMA_VERSION);
+        assert!(!config.native_fullscreen);
         assert_eq!(config.theme.text.link, Rgba8::rgb(0xaa, 0xbb, 0xcc));
         assert_eq!(
             config.theme.text.primary,
@@ -785,6 +789,7 @@ space = "TogglePlayback"
         let rendered = toml_spanner::to_string(&GuiConfig::default()).unwrap();
 
         assert!(rendered.contains("schema-version = 1"));
+        assert!(rendered.contains("native-fullscreen = false"));
         assert!(rendered.contains("[theme.surfaces]"));
         assert!(rendered.contains("window = "));
         assert!(rendered.contains("[fonts]"));
@@ -794,6 +799,17 @@ space = "TogglePlayback"
         assert!(rendered.contains("room-menu-visible = true"));
         assert!(rendered.contains("[input]"));
         assert!(rendered.contains("default-binding-mode = \"vim\""));
+    }
+
+    #[test]
+    fn native_fullscreen_is_configurable_and_round_trips() {
+        let config: GuiConfig = toml_spanner::from_str("native-fullscreen = true").unwrap();
+
+        assert!(config.native_fullscreen);
+
+        let rendered = toml_spanner::to_string(&config).unwrap();
+        let reparsed: GuiConfig = toml_spanner::from_str(&rendered).unwrap();
+        assert_eq!(reparsed, config);
     }
 
     #[test]
