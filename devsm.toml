@@ -39,7 +39,7 @@ if [ ! -e "$RUNTIME_CONFIG" ]; then
   mkdir -p "$(dirname "$RUNTIME_CONFIG")"
   cp dev/chatt-alice.toml "$RUNTIME_CONFIG"
 fi
-cargo run --release --features diagnostic-logs
+cargo run --release --features input-latency
 '''
 info = "Run the Alice client; trailing args run a chatt subcommand against it"
 

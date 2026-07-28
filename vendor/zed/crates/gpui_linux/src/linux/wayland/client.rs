@@ -410,6 +410,32 @@ impl WaylandClientState {
 pub struct WaylandClientStatePtr(Weak<RefCell<WaylandClientState>>);
 
 impl WaylandClientStatePtr {
+    /// Draws any window that the batch of events just dispatched has dirtied,
+    /// so input doesn't sit idle waiting for the next frame callback.
+    ///
+    /// Done once per batch rather than per event so that a burst — key repeat,
+    /// a paste, a flurry of pointer motion — still costs a single draw. Only
+    /// the focused windows can have received input; a window that is clean, or
+    /// that has already presented since its last frame callback, does nothing
+    /// here.
+    fn present_after_input(&self) {
+        let Some(client) = self.0.upgrade() else {
+            return;
+        };
+        // Cloned out so the client is not borrowed while drawing, which
+        // re-enters this state through the platform callbacks.
+        let focused = {
+            let state = client.borrow();
+            [
+                state.keyboard_focused_window.clone(),
+                state.mouse_focused_window.clone(),
+            ]
+        };
+        for window in focused.into_iter().flatten() {
+            window.present_on_input();
+        }
+    }
+
     pub fn get_client(&self) -> Rc<RefCell<WaylandClientState>> {
         self.0
             .upgrade()
@@ -1082,7 +1108,7 @@ impl LinuxClient for WaylandClient {
             .run(
                 None,
                 &mut WaylandClientStatePtr(Rc::downgrade(&self.0)),
-                |_| {},
+                |state| state.present_after_input(),
             )
             .log_err();
     }

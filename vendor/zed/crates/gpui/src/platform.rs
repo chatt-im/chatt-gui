@@ -717,6 +717,14 @@ pub struct RequestFrameOptions {
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
+    /// Set when input arriving — rather than the display's frame callback —
+    /// triggered this draw, so that a keystroke doesn't have to wait out the
+    /// rest of the refresh interval before anything is shown.
+    ///
+    /// Such a draw is an optimization, not an obligation: it must do nothing at
+    /// all when the window is already clean, because committing would spend the
+    /// compositor's next presentation slot on a frame with no new content.
+    pub input_driven: bool,
 }
 
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
@@ -1433,8 +1441,12 @@ impl PlatformInputHandler {
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
+                #[cfg(feature = "input-latency-histogram")]
+                let external_input = window.begin_external_input();
                 self.handler
                     .replace_text_in_range(replacement_range, text, window, cx);
+                #[cfg(feature = "input-latency-histogram")]
+                window.end_external_input(external_input);
             })
             .ok();
     }
@@ -1447,13 +1459,17 @@ impl PlatformInputHandler {
     ) {
         self.cx
             .update(|window, cx| {
+                #[cfg(feature = "input-latency-histogram")]
+                let external_input = window.begin_external_input();
                 self.handler.replace_and_mark_text_in_range(
                     range_utf16,
                     new_text,
                     new_selected_range,
                     window,
                     cx,
-                )
+                );
+                #[cfg(feature = "input-latency-histogram")]
+                window.end_external_input(external_input);
             })
             .ok();
     }

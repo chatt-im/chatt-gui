@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 [features]
 default = ["wayland"]
 diagnostic-logs = []
+input-latency = ["diagnostic-logs", "gpui/input-latency-histogram"]
 wayland = ["gpui/wayland", "gpui_platform/wayland"]
 x11 = ["gpui/x11", "gpui_platform/x11"]
 

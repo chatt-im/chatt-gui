@@ -124,6 +124,19 @@ pub struct WaylandWindowState {
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
     renderer_presented: bool,
+    /// Whether the compositor is still waiting on us for a presentation.
+    ///
+    /// The frame callback grants it and a presentation spends it, so drawing
+    /// the instant input arrives can never outrun the display: at most one
+    /// buffer is committed per callback, exactly as when the callback itself
+    /// drove every draw.
+    can_present: bool,
+    /// Whether a `wl_surface.frame` request is queued for the next commit.
+    frame_request_armed: bool,
+    /// Whether a commit has already flushed a frame request whose callback has
+    /// not arrived yet. Guards against arming a second request for the same
+    /// callback, which would otherwise double the callback rate for good.
+    frame_callback_pending: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -625,6 +638,9 @@ impl WaylandWindowState {
             hovered: false,
             force_render_after_recovery: false,
             renderer_presented: false,
+            can_present: true,
+            frame_request_armed: false,
+            frame_callback_pending: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -844,6 +860,9 @@ impl WaylandWindowStatePtr {
     pub fn frame(&self) {
         let mut state = self.state.borrow_mut();
         state.surface.frame(&state.globals.qh, state.surface.id());
+        state.frame_request_armed = true;
+        state.frame_callback_pending = false;
+        state.can_present = true;
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
         state.force_render_after_recovery = false;
@@ -856,6 +875,27 @@ impl WaylandWindowStatePtr {
                 ..Default::default()
             });
             self.update_ime_enabled();
+        }
+    }
+
+    /// Draws and presents now if input has dirtied the window and the
+    /// compositor is still waiting on us, rather than leaving the new content
+    /// to sit until the next frame callback.
+    ///
+    /// Called once per dispatched event batch. Without it a keystroke waits out
+    /// whatever remains of the refresh interval — uniformly distributed, so
+    /// half a frame on average — before any work starts.
+    pub fn present_on_input(&self) {
+        if !self.state.borrow().can_present {
+            return;
+        }
+
+        let mut callbacks = self.callbacks.borrow_mut();
+        if let Some(request_frame) = callbacks.request_frame.as_mut() {
+            request_frame(RequestFrameOptions {
+                input_driven: true,
+                ..Default::default()
+            });
         }
     }
 
@@ -1734,7 +1774,23 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
+        // An input-driven draw commits outside the callback, where `frame` has
+        // not armed anything, so arm here unless a callback is already owed to
+        // us.
+        if !state.frame_request_armed && !state.frame_callback_pending {
+            state.surface.frame(&state.globals.qh, state.surface.id());
+            state.frame_request_armed = true;
+        }
+
         state.renderer_presented = state.renderer.draw(scene);
+
+        if state.renderer_presented {
+            state.can_present = false;
+            if state.frame_request_armed {
+                state.frame_request_armed = false;
+                state.frame_callback_pending = true;
+            }
+        }
 
         if state.renderer.needs_redraw() {
             state.force_render_after_recovery = true;
@@ -1748,6 +1804,10 @@ impl PlatformWindow for WaylandWindow {
         // can cause invalid synchronization that leads to graphical corruption.
         if !state.renderer_presented {
             state.surface.commit();
+            if state.frame_request_armed {
+                state.frame_request_armed = false;
+                state.frame_callback_pending = true;
+            }
         }
 
         state.renderer_presented = false;

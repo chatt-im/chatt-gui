@@ -1477,6 +1477,13 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                // Nothing to show, so leave the compositor's presentation slot
+                // for the frame callback to use. Checked before anything else
+                // because every path below can commit.
+                if request_frame_options.input_driven && !invalidator.is_dirty() {
+                    return;
+                }
+
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1484,7 +1491,11 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !request_frame_options.force_render
+                let min_frame_interval = if request_frame_options.input_driven {
+                    // Already paced by the presentation token the platform
+                    // spends here, which the frame callback alone replenishes.
+                    None
+                } else if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
@@ -2873,6 +2884,35 @@ impl Window {
     #[cfg(feature = "input-latency-histogram")]
     pub fn input_latency_snapshot(&self) -> InputLatencySnapshot {
         self.input_latency_tracker.snapshot()
+    }
+
+    /// Opens a latency measurement for input that reaches the input handler
+    /// without passing through [`Window::dispatch_event`].
+    ///
+    /// Platform text insertion and IME take that route — on Wayland a printable
+    /// key falls through the dispatch path unhandled and is then applied via
+    /// `replace_text_in_range` — so without this the tracker records mouse and
+    /// bound-key events but not a single typed character.
+    ///
+    /// Pair with [`Window::end_external_input`].
+    #[cfg(feature = "input-latency-histogram")]
+    pub(crate) fn begin_external_input(&self) -> (Instant, usize) {
+        (Instant::now(), self.invalidator.update_count())
+    }
+
+    /// Closes a measurement opened by [`Window::begin_external_input`],
+    /// recording it only if the input actually invalidated the window.
+    #[cfg(feature = "input-latency-histogram")]
+    pub(crate) fn end_external_input(&mut self, opened: (Instant, usize)) {
+        let (dispatch_time, update_count_before) = opened;
+        if self.invalidator.update_count() <= update_count_before {
+            return;
+        }
+        if self.invalidator.not_drawing() {
+            self.input_latency_tracker.record_input(dispatch_time);
+        } else {
+            self.input_latency_tracker.record_mid_draw_input();
+        }
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
