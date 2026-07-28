@@ -63,6 +63,7 @@ pub(crate) struct VideoView {
     pub duration: f64,
     pub paused: bool,
     pub finished: bool,
+    pub looping: bool,
     pub volume: f64,
     pub loading: bool,
     pub error: Option<String>,
@@ -77,6 +78,7 @@ impl Default for VideoView {
             duration: 0.0,
             paused: true,
             finished: false,
+            looping: false,
             volume: 100.0,
             loading: false,
             error: None,
@@ -92,6 +94,7 @@ struct VideoSession {
     duration: f64,
     paused: bool,
     finished: bool,
+    looping: bool,
     frame_ready: bool,
     visible: bool,
     touched: u64,
@@ -102,7 +105,7 @@ struct VideoSession {
 }
 
 impl VideoSession {
-    fn new(source: RegisteredAttachmentSource, touched: u64) -> Self {
+    fn new(source: RegisteredAttachmentSource, touched: u64, looping: bool) -> Self {
         Self {
             source: Some(source),
             player: None,
@@ -110,6 +113,7 @@ impl VideoSession {
             duration: 0.0,
             paused: true,
             finished: false,
+            looping,
             frame_ready: false,
             visible: false,
             touched,
@@ -145,6 +149,9 @@ pub(crate) struct AttachmentVideoManager {
     last_interacted: Option<VideoKey>,
     volume: f64,
     last_audible_volume: f64,
+    /// The loop state a session starts in, kept here rather than passed in per
+    /// call so reading it never has to touch a session.
+    loop_by_default: bool,
     clock: u64,
 }
 
@@ -176,8 +183,15 @@ impl AttachmentVideoManager {
             last_interacted: None,
             volume: 100.0,
             last_audible_volume: 100.0,
+            loop_by_default: false,
             clock: 0,
         }
+    }
+
+    /// Sets the loop state new sessions start in. Existing sessions keep
+    /// whatever the viewer last chose for them.
+    pub(crate) fn set_loop_by_default(&mut self, loop_by_default: bool) {
+        self.loop_by_default = loop_by_default;
     }
 
     pub(crate) fn ensure_source(&mut self, key: VideoKey, source: RegisteredAttachmentSource) {
@@ -185,18 +199,22 @@ impl AttachmentVideoManager {
         if !self.sessions.contains_key(&key) {
             self.trim_sessions_to(MAX_SESSION_ENTRIES.saturating_sub(1));
         }
+        let looping = self.loop_by_default;
         let session = self
             .sessions
             .entry(key)
-            .or_insert_with(|| VideoSession::new(source.clone(), self.clock));
+            .or_insert_with(|| VideoSession::new(source.clone(), self.clock, looping));
         session.source = Some(source);
         session.touched = self.clock;
     }
 
     pub(crate) fn view(&self, key: VideoKey) -> VideoView {
         let Some(session) = self.sessions.get(&key) else {
+            // Reported before anything is playing, so the loop control shows the
+            // state a session would actually start in.
             return VideoView {
                 volume: self.volume,
+                looping: self.loop_by_default,
                 ..VideoView::default()
             };
         };
@@ -209,6 +227,7 @@ impl AttachmentVideoManager {
             duration: session.duration,
             paused: session.paused,
             finished: session.finished,
+            looping: session.looping,
             volume: self.volume,
             loading: self.queued_keys.contains(&key)
                 || (session.player.is_some() && !session.frame_ready && !session.paused),
@@ -231,7 +250,14 @@ impl AttachmentVideoManager {
         session.error = None;
         if let Some(player) = session.player.as_mut() {
             if session.finished {
-                player.load_at(source.url(), false, volume, session.playback_speed, 0.0)?;
+                player.load_at(
+                    source.url(),
+                    false,
+                    volume,
+                    session.playback_speed,
+                    0.0,
+                    session.looping,
+                )?;
                 apply_video_effects(player, session.effects)?;
                 session.position = 0.0;
                 session.duration = 0.0;
@@ -397,6 +423,20 @@ impl AttachmentVideoManager {
         } else {
             self.set_volume(self.last_audible_volume.max(1.0))
         }
+    }
+
+    pub(crate) fn toggle_looping(&mut self, key: VideoKey) -> Result<bool> {
+        self.touch(key);
+        self.last_interacted = Some(key);
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return Err(anyhow!("video source is no longer cached"));
+        };
+        let looping = !session.looping;
+        if let Some(player) = session.player.as_ref() {
+            player.set_looping(looping)?;
+        }
+        session.looping = looping;
+        Ok(looping)
     }
 
     fn set_volume(&mut self, volume: f64) -> Result<()> {
@@ -672,6 +712,7 @@ impl AttachmentVideoManager {
                 self.volume,
                 session.playback_speed,
                 session.position,
+                session.looping,
             )
             .and_then(|()| apply_video_effects(&player, session.effects))
         {
@@ -811,8 +852,39 @@ mod tests {
     fn default_video_view_is_paused_at_full_volume() {
         let view = VideoView::default();
         assert!(view.paused);
+        assert!(!view.looping);
         assert_eq!(view.volume, 100.0);
         assert!(!view.loading);
+    }
+
+    /// The loop control is drawn before anything is playing, so a key with no
+    /// session yet must still report the state a session would start in — the
+    /// view is what the button reads, and it must not need a session to exist.
+    #[test]
+    fn a_key_without_a_session_reports_the_configured_loop_default() {
+        let mut videos = manager();
+        assert!(!videos.view(key(7)).looping);
+        videos.set_loop_by_default(true);
+        assert!(videos.view(key(7)).looping);
+    }
+
+    #[test]
+    fn video_loop_default_initializes_each_session_and_can_be_overridden() {
+        let mut videos = manager();
+        let looping = key(8);
+        let not_looping = key(9);
+        videos.set_loop_by_default(true);
+        ensure_source(&mut videos, looping);
+        videos.set_loop_by_default(false);
+        ensure_source(&mut videos, not_looping);
+
+        assert!(videos.view(looping).looping);
+        assert!(!videos.view(not_looping).looping);
+
+        assert!(!videos.toggle_looping(looping).unwrap());
+        assert!(!videos.view(looping).looping);
+        assert!(videos.toggle_looping(not_looping).unwrap());
+        assert!(videos.view(not_looping).looping);
     }
 
     #[test]

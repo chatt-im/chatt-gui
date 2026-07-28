@@ -12,6 +12,7 @@ mod fonts;
 mod formatted_message;
 mod frame_stats;
 mod icons;
+mod identity;
 mod image_cache;
 mod key_bindings;
 mod libplacebo_numeric;

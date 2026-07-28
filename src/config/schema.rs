@@ -24,6 +24,8 @@ pub(crate) struct GuiConfig {
     pub(crate) schema_version: u16,
     #[toml(default)]
     pub(crate) native_fullscreen: bool,
+    #[toml(default)]
+    pub(crate) video_loop_by_default: bool,
     #[toml(default = true)]
     pub(crate) live_low_delay_decode: bool,
     #[toml(default, style = Header)]
@@ -43,6 +45,7 @@ impl Default for GuiConfig {
         Self {
             schema_version: GUI_SCHEMA_VERSION,
             native_fullscreen: false,
+            video_loop_by_default: false,
             live_low_delay_decode: true,
             theme: ThemeConfig::default(),
             fonts: FontConfig::default(),
@@ -111,7 +114,7 @@ pub(crate) struct SurfaceColors {
     pub(crate) input: Rgba8,
     #[toml(default = Rgba8::rgb(0x0e, 0x0e, 0x0e))]
     pub(crate) code: Rgba8,
-    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0xdd))]
+    #[toml(default = Rgba8::rgba(0x00, 0x00, 0x00, 0x66))]
     pub(crate) scrim: Rgba8,
 }
 
@@ -126,7 +129,7 @@ impl Default for SurfaceColors {
             panel: Rgba8::rgb(0x1d, 0x1d, 0x1d),
             input: Rgba8::rgb(0x1d, 0x1d, 0x1d),
             code: Rgba8::rgb(0x0e, 0x0e, 0x0e),
-            scrim: Rgba8::rgba(0x00, 0x00, 0x00, 0xdd),
+            scrim: Rgba8::rgba(0x00, 0x00, 0x00, 0x66),
         }
     }
 }
@@ -686,6 +689,7 @@ code-size = 15.5
 
         assert_eq!(config.schema_version, GUI_SCHEMA_VERSION);
         assert!(!config.native_fullscreen);
+        assert!(!config.video_loop_by_default);
         assert!(config.live_low_delay_decode);
         assert_eq!(config.theme.text.link, Rgba8::rgb(0xaa, 0xbb, 0xcc));
         assert_eq!(
@@ -794,6 +798,7 @@ space = "TogglePlayback"
 
         assert!(rendered.contains("schema-version = 1"));
         assert!(rendered.contains("native-fullscreen = false"));
+        assert!(rendered.contains("video-loop-by-default = false"));
         assert!(rendered.contains("live-low-delay-decode = true"));
         assert!(rendered.contains("[theme.surfaces]"));
         assert!(rendered.contains("window = "));
@@ -811,6 +816,17 @@ space = "TogglePlayback"
         let config: GuiConfig = toml_spanner::from_str("native-fullscreen = true").unwrap();
 
         assert!(config.native_fullscreen);
+
+        let rendered = toml_spanner::to_string(&config).unwrap();
+        let reparsed: GuiConfig = toml_spanner::from_str(&rendered).unwrap();
+        assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn video_loop_by_default_is_configurable_and_round_trips() {
+        let config: GuiConfig = toml_spanner::from_str("video-loop-by-default = true").unwrap();
+
+        assert!(config.video_loop_by_default);
 
         let rendered = toml_spanner::to_string(&config).unwrap();
         let reparsed: GuiConfig = toml_spanner::from_str(&rendered).unwrap();

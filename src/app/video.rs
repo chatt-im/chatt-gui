@@ -142,6 +142,7 @@ impl ChattView {
                 self.hover_video_volume_popup(key, hovered, cx)
             }
             VideoPlayerEvent::ToggleMute => self.toggle_video_mute(key, cx),
+            VideoPlayerEvent::ToggleLoop => self.toggle_video_loop(key, cx),
             VideoPlayerEvent::VolumePressed { bounds, event } => {
                 self.begin_video_volume_drag(key, bounds, &event, cx)
             }
@@ -943,6 +944,24 @@ impl ChattView {
         }
         self.show_video_controls(key, cx);
         self.video_controls.volume_open = true;
+        cx.notify();
+    }
+
+    fn toggle_video_loop(&mut self, key: VideoKey, cx: &mut Context<Self>) {
+        self.note_media_interaction(MediaPlaybackTarget::Video(key));
+        if let Err(error) = self.videos.toggle_looping(key) {
+            kvlog::error!(
+                "embedded video loop toggle failed",
+                room_id = key.room_id,
+                message_id = key.message_id,
+                attachment_timestamp_ms = key.attachment_id.timestamp_ms,
+                attachment_transfer_id = key.attachment_id.transfer_id,
+                err = %error
+            );
+            self.status = format!("Video loop failed: {error}").into();
+        }
+        self.show_video_controls(key, cx);
+        self.schedule_video_controls_hide(key, cx);
         cx.notify();
     }
 

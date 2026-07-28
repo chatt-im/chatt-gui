@@ -36,6 +36,7 @@ pub(crate) enum VideoPlayerEvent {
     VolumeHovered(bool),
     VolumePopupHovered(bool),
     ToggleMute,
+    ToggleLoop,
     VolumePressed {
         bounds: Bounds<Pixels>,
         event: MouseDownEvent,
@@ -540,6 +541,7 @@ pub(crate) fn render_video_player(
         }
 
         let play = handler.clone();
+        let loop_toggle = handler.clone();
         let theater_toggle = handler.clone();
         let control_row = div()
             .min_h(rems_from_px(38.0))
@@ -578,6 +580,24 @@ pub(crate) fn render_video_player(
                     )),
             )
             .child(div().flex_1())
+            .child(
+                video_control_button(
+                    ("video-loop", key.message_id as usize),
+                    if video.looping {
+                        IconName::Repeat1
+                    } else {
+                        IconName::RepeatOff
+                    },
+                    &settings,
+                )
+                .when(video.looping, |button| {
+                    button.bg(settings.theme.color(ThemeRole::StateInlineCode))
+                })
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    loop_toggle(VideoPlayerEvent::ToggleLoop, window, cx)
+                }),
+            )
             .child(
                 video_control_button(
                     ("video-theater", key.message_id as usize),

@@ -603,7 +603,7 @@ impl MpvPlayer {
     }
 
     pub fn load(&mut self, path: &str) -> Result<()> {
-        self.load_at(path, false, 100.0, 1.0, 0.0)
+        self.load_at(path, false, 100.0, 1.0, 0.0, false)
     }
 
     pub(crate) fn load_at(
@@ -613,6 +613,7 @@ impl MpvPlayer {
         volume: f64,
         speed: f64,
         position: f64,
+        looping: bool,
     ) -> Result<()> {
         let startup = StartupLogContext::new(self.player_id);
         self.playback.reset();
@@ -627,6 +628,7 @@ impl MpvPlayer {
             volume: volume.clamp(0.0, 100.0),
             speed: speed.clamp(0.25, 4.0),
             position: position.max(0.0),
+            looping,
         })
     }
 
@@ -668,6 +670,10 @@ impl MpvPlayer {
 
     pub(crate) fn set_speed(&self, speed: f64) -> Result<()> {
         self.send_control(ControlCommand::SetSpeed(speed.clamp(0.25, 4.0)))
+    }
+
+    pub(crate) fn set_looping(&self, looping: bool) -> Result<()> {
+        self.send_control(ControlCommand::SetLooping(looping))
     }
 
     pub(crate) fn adjust_video(&self, adjustment: VideoAdjustment) -> Result<()> {
@@ -719,6 +725,10 @@ fn observe_playback_properties(mpv: &Mpv) -> Result<()> {
 
 fn keep_open_policy(live: bool) -> &'static str {
     if live { "no" } else { "yes" }
+}
+
+const fn loop_file_value(looping: bool) -> &'static str {
+    if looping { "inf" } else { "no" }
 }
 
 impl MpvAudioPlayer {
@@ -820,6 +830,7 @@ impl MpvAudioPlayer {
             volume: volume.clamp(0.0, 100.0),
             speed: speed.clamp(0.25, 4.0),
             position: position.max(0.0),
+            looping: false,
         })
     }
 
@@ -1294,6 +1305,7 @@ pub(crate) enum ControlCommand {
         volume: f64,
         speed: f64,
         position: f64,
+        looping: bool,
     },
     SetPause(bool),
     SeekAbsolute {
@@ -1307,6 +1319,7 @@ pub(crate) enum ControlCommand {
     },
     SetVolume(f64),
     SetSpeed(f64),
+    SetLooping(bool),
     AdjustVideo(VideoAdjustment),
     SetVideoEffect {
         effect: VideoEffect,
@@ -1846,6 +1859,7 @@ fn control_worker(
                     volume,
                     speed,
                     position,
+                    looping,
                 } => {
                     #[cfg(feature = "diagnostic-logs")]
                     if crate::logger::media_logging_enabled() {
@@ -1877,6 +1891,7 @@ fn control_worker(
                         .and_then(|()| mpv.set_property("pause", paused))
                         .and_then(|()| mpv.set_property("volume", volume))
                         .and_then(|()| mpv.set_property("speed", speed))
+                        .and_then(|()| mpv.set_property("loop-file", loop_file_value(looping)))
                         .and_then(|()| mpv.command("loadfile", &[&path, "replace"]));
                     if result.is_ok() {
                         #[cfg(feature = "diagnostic-logs")]
@@ -1890,7 +1905,8 @@ fn control_worker(
                                 paused,
                                 volume,
                                 speed,
-                                start_position = position
+                                start_position = position,
+                                looping
                             );
                         }
                     }
@@ -1962,6 +1978,13 @@ fn control_worker(
                         kvlog::info!("setting mpv speed", group = "media", speed);
                     }
                     mpv.set_property("speed", speed)
+                }
+                ControlCommand::SetLooping(looping) => {
+                    #[cfg(feature = "diagnostic-logs")]
+                    if crate::logger::media_logging_enabled() {
+                        kvlog::info!("setting mpv file loop", group = "media", looping);
+                    }
+                    mpv.set_property("loop-file", loop_file_value(looping))
                 }
                 ControlCommand::AdjustVideo(adjustment) => {
                     let (command, property, amount) = adjustment.mpv_command();
@@ -2788,6 +2811,12 @@ mod tests {
         assert_eq!(checked_video_size(0, 240), None);
         assert_eq!(checked_video_size(320, -1), None);
         assert_eq!(checked_video_size(i64::from(u32::MAX) + 1, 240), None);
+    }
+
+    #[test]
+    fn file_loop_uses_mpv_infinite_and_disabled_values() {
+        assert_eq!(loop_file_value(true), "inf");
+        assert_eq!(loop_file_value(false), "no");
     }
 
     #[test]

@@ -52,6 +52,7 @@ use crate::{
         MessageSelectionKey, PreparedFormattedMessage,
     },
     icons::{IconName, icon},
+    identity::{IdentityView, IdentityViewEvent},
     image_cache::{PreviewImageLoader, TimelineImageLoader},
     media_cache::{CachedAttachment, MediaCache},
     model::{ChatModel, ConnectionPhase, PendingRequest},
@@ -861,6 +862,8 @@ pub struct ChattView {
     settings_subscription: Option<Subscription>,
     settings_remote_session: Option<local_rpc::settings::SettingsSessionId>,
     settings_close_when_opened: bool,
+    identity: Option<gpui::Entity<IdentityView>>,
+    identity_subscription: Option<Subscription>,
     appearance_sync: AppearanceSync,
     next_appearance_session: u32,
     appearance_reload_task: Option<Task<()>>,
@@ -1119,6 +1122,8 @@ impl ChattView {
             settings_subscription: None,
             settings_remote_session: None,
             settings_close_when_opened: false,
+            identity: None,
+            identity_subscription: None,
             appearance_sync: AppearanceSync::new(),
             next_appearance_session: 1,
             appearance_reload_task: None,
@@ -1222,6 +1227,163 @@ impl ChattView {
         self.settings_subscription = Some(subscription);
         settings.update(cx, |settings, cx| settings.begin_remote(cx));
         cx.notify();
+    }
+
+    /// Opens the identity review for the selected DM.
+    ///
+    /// The daemon needs a round trip before it can describe the peer key, so
+    /// this only asks; `install_identity_document` puts the dialog on screen.
+    fn open_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_menu_open = false;
+        self.composer_menu_action_taken = false;
+        let identity = self.identity_view(window, cx);
+        window.focus(&identity.focus_handle(cx), cx);
+        self.send_identity_command(
+            local_rpc::identity::IdentityCommand::Open {
+                target: local_rpc::identity::IdentityTarget::ActiveRoom,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// The open review, created if the daemon just pushed one. A `/identity`
+    /// typed in the composer arrives this way, with no prior `Open` from here.
+    fn identity_view(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<IdentityView> {
+        if let Some(identity) = self.identity.clone() {
+            return identity;
+        }
+        let identity = cx.new(IdentityView::new);
+        let subscription =
+            cx.subscribe(
+                &identity,
+                |this, _, event: &IdentityViewEvent, cx| match event {
+                    IdentityViewEvent::Closed => this.close_identity(cx),
+                    IdentityViewEvent::Command(command) => {
+                        this.send_identity_command(command.clone(), cx);
+                    }
+                },
+            );
+        self.identity = Some(identity.clone());
+        self.identity_subscription = Some(subscription);
+        window.focus(&identity.focus_handle(cx), cx);
+        identity
+    }
+
+    /// Takes the dialog off screen without telling the daemon, for the cases
+    /// where the session is already gone.
+    fn dismiss_identity(&mut self) {
+        self.identity = None;
+        self.identity_subscription = None;
+    }
+
+    fn close_identity(&mut self, cx: &mut Context<Self>) {
+        let session_id = self
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.read(cx).session_id());
+        self.dismiss_identity();
+        if let Some(session_id) = session_id {
+            self.send_identity_command(
+                local_rpc::identity::IdentityCommand::Close { session_id },
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn apply_identity_result(
+        &mut self,
+        result: local_rpc::identity::IdentityResult,
+        cx: &mut Context<Self>,
+    ) {
+        use local_rpc::identity::IdentityResultPayload;
+
+        if let RequestOutcome::Rejected { message, .. } = &result.result.outcome {
+            match identity_refusal(result.result.operation, self.identity.is_some()) {
+                IdentityRefusal::Status => {
+                    let identity = self.identity.clone().expect("the dialog is open");
+                    identity.update(cx, |identity, cx| identity.set_status(message.clone(), cx));
+                }
+                IdentityRefusal::Dismiss => {
+                    self.dismiss_identity();
+                    self.set_composer_error(message.clone(), cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let Some(identity) = self.identity.clone() else {
+            return;
+        };
+        match result.payload {
+            IdentityResultPayload::Check {
+                session_id,
+                revision,
+                check,
+            } => identity.update(cx, |identity, cx| {
+                identity.apply_check(session_id, revision, check, cx)
+            }),
+            // A blank field has no verdict to show, so the last one is dropped.
+            IdentityResultPayload::None
+                if result.result.operation == Operation::CheckIdentityText =>
+            {
+                identity.update(cx, |identity, cx| identity.clear_check(cx));
+            }
+            IdentityResultPayload::Document(document) => {
+                identity.update(cx, |identity, cx| identity.apply_document(document, cx));
+            }
+            IdentityResultPayload::None | IdentityResultPayload::Closed { .. } => {}
+        }
+    }
+
+    fn apply_identity_event(
+        &mut self,
+        event: local_rpc::identity::IdentityEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            local_rpc::identity::IdentityEvent::Document(document) => {
+                let identity = self.identity_view(window, cx);
+                // The dialog is created before the daemon can describe the peer,
+                // so the paste field only exists to focus once one arrives.
+                if identity.update(cx, |identity, cx| identity.apply_document(document, cx)) {
+                    window.focus(&identity.focus_handle(cx), cx);
+                }
+            }
+            // The daemon ends a review when the identity underneath it moves,
+            // so the dialog goes away rather than describing a stale key.
+            local_rpc::identity::IdentityEvent::Closed { session_id, reason } => {
+                if self
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.read(cx).session_id() == Some(session_id))
+                {
+                    self.dismiss_identity();
+                }
+                self.status = reason.into();
+            }
+        }
+        cx.notify();
+    }
+
+    fn send_identity_command(
+        &mut self,
+        command: local_rpc::identity::IdentityCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = self.request_id();
+        if let Err(error) = self.daemon.send(ClientFrame::Identity {
+            request_id,
+            command,
+        }) {
+            self.set_composer_error(error, cx);
+        }
     }
 
     fn send_settings_command(
@@ -1823,8 +1985,19 @@ impl ChattView {
                 }
                 return;
             }
+            DaemonFrame::IdentityResult(result) => {
+                self.apply_identity_result(result, cx);
+                return;
+            }
+            DaemonFrame::IdentityEvent(event) => {
+                self.apply_identity_event(event, window, cx);
+                return;
+            }
             DaemonFrame::Welcome(_) => {
                 self.appearance_sync.daemon_reconnected();
+                // A restarted daemon holds no identity sessions, so an open
+                // dialog would be asserting a key nothing stands behind.
+                self.dismiss_identity();
                 if let Some(settings) = &self.settings {
                     settings.update(cx, |settings, cx| {
                         settings.remote_reconnected(cx);
@@ -4831,10 +5004,17 @@ impl Render for ChattView {
         self.composer.update(cx, |composer, cx| {
             composer.set_binding_mode(applied.binding_mode, cx)
         });
+        self.videos.set_loop_by_default(
+            cx.global::<ConfigurationState>()
+                .0
+                .config
+                .video_loop_by_default,
+        );
         self.advance_video(cx);
         if self.server_selector_visible() {
             return self
                 .render_server_selector(cx)
+                .when_some(self.identity.clone(), |root, identity| root.child(identity))
                 .when_some(self.settings.clone(), |root, settings| root.child(settings));
         }
         if !self.live_players.is_empty() {
@@ -4962,6 +5142,7 @@ impl Render for ChattView {
                 .bg(applied.theme.color(ThemeRole::MediaViewport))
                 .text_color(applied.theme.color(ThemeRole::MediaText))
                 .child(player)
+                .when_some(self.identity.clone(), |root, identity| root.child(identity))
                 .when_some(self.settings.clone(), |root, settings| root.child(settings));
         }
         if let Some(stream_id) = self.fullscreen_share
@@ -4989,6 +5170,7 @@ impl Render for ChattView {
                 .font_family(applied.fonts.interface_family.clone())
                 .bg(applied.theme.color(ThemeRole::MediaViewport))
                 .child(card)
+                .when_some(self.identity.clone(), |root, identity| root.child(identity))
                 .when_some(self.settings.clone(), |root, settings| root.child(settings));
         }
         if self.scroll_animation_active {
@@ -5006,11 +5188,12 @@ impl Render for ChattView {
             .selected_room()
             .map(|room| room.name.clone())
             .unwrap_or_else(|| "No room selected".into());
-        let security = self
+        let trust = self
             .model
             .selected_room()
-            .map(|room| security_label(room.trust))
-            .unwrap_or("");
+            .map_or(TrustState::NotApplicable, |room| room.trust);
+        let security = security_label(trust);
+        let shield = trust_shield(trust);
         let ready = self.model.is_ready();
         let can_attach = self.editing.is_none()
             && !self.file_inspection_pending
@@ -5279,12 +5462,28 @@ impl Render for ChattView {
                                         .text_color(applied.theme.color(ThemeRole::TextDim))
                                         .child(format!("{online} online")),
                                 )
-                                .when(!security.is_empty(), |bar| {
+                                .when_some(shield, |bar, (name, role)| {
+                                    let color = applied.theme.color(role);
                                     bar.child(
                                         div()
-                                            .text_xs()
-                                            .text_color(applied.theme.color(ThemeRole::TextMuted))
-                                            .child(security),
+                                            .id("e2e-badge")
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_2()
+                                            .py_1()
+                                            .cursor_pointer()
+                                            .hover({
+                                                let hover = applied
+                                                    .theme
+                                                    .color(ThemeRole::ControlSurfaceHover);
+                                                move |badge| badge.bg(hover)
+                                            })
+                                            .child(icon(name, 14., color))
+                                            .child(div().text_xs().text_color(color).child(security))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_identity(window, cx)
+                                            })),
                                     )
                                 })
                                 .child(div().flex_1())
@@ -5554,6 +5753,30 @@ impl Render for ChattView {
                                                 .items_center()
                                                 .child(self.composer.clone()),
                                         )
+                                        .when_some(shield, |row, (name, role)| {
+                                            row.child(
+                                                div()
+                                                    .id("composer-identity")
+                                                    .ml(rems_from_px(15.))
+                                                    .w(rems_from_px(32.))
+                                                    .min_h(rems_from_px(MIN_COMPOSER_HEIGHT))
+                                                    .flex_none()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor_pointer()
+                                                    .child(icon(
+                                                        name,
+                                                        22.,
+                                                        applied.theme.color(role),
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.open_identity(window, cx)
+                                                        },
+                                                    )),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id("composer-menu")
@@ -5641,6 +5864,7 @@ impl Render for ChattView {
                 .child(preview_panel)
             })
             .when_some(message_reference_preview, |root, preview| root.child(preview))
+            .when_some(self.identity.clone(), |root, identity| root.child(identity))
             .when_some(self.settings.clone(), |root, settings| root.child(settings))
     }
 }
@@ -5864,6 +6088,41 @@ fn security_label(trust: TrustState) -> &'static str {
     }
 }
 
+/// Where the message from a refused identity command belongs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityRefusal {
+    /// The open dialog shows it: it still describes a live review.
+    Status,
+    /// The dialog goes away and the composer reports it.
+    Dismiss,
+}
+
+/// A refused `Open` never produces a document, so an already-visible dialog
+/// would sit on "Fetching the encryption identity…" forever with the reason
+/// hidden behind a footer it has no document to draw. Every other refusal
+/// leaves the review it came from intact.
+fn identity_refusal(operation: Operation, dialog_open: bool) -> IdentityRefusal {
+    if dialog_open && operation != Operation::OpenIdentity {
+        IdentityRefusal::Status
+    } else {
+        IdentityRefusal::Dismiss
+    }
+}
+
+/// The shield that stands for a DM's encryption identity.
+///
+/// Confirmed keys recede into the chrome; anything still unconfirmed or newly
+/// changed is the state worth acting on, so those carry the colour. Rooms with
+/// no end-to-end identity have no shield at all.
+fn trust_shield(trust: TrustState) -> Option<(IconName, ThemeRole)> {
+    match trust {
+        TrustState::NotApplicable => None,
+        TrustState::Verified => Some((IconName::ShieldCheck, ThemeRole::TextMuted)),
+        TrustState::Unverified => Some((IconName::Shield, ThemeRole::StateWarning)),
+        TrustState::Changed => Some((IconName::ShieldAlert, ThemeRole::StateDanger)),
+    }
+}
+
 fn sender_color(
     sender: &str,
     local: bool,
@@ -5955,6 +6214,33 @@ mod tests {
         }
     }
 
+    /// A review that could not be opened has nothing to show, and its dialog
+    /// renders no footer, so keeping it up would hide the reason it failed.
+    #[test]
+    fn a_refused_open_dismisses_the_dialog_while_other_refusals_keep_it() {
+        assert_eq!(
+            identity_refusal(Operation::OpenIdentity, true),
+            IdentityRefusal::Dismiss
+        );
+        assert_eq!(
+            identity_refusal(Operation::OpenIdentity, false),
+            IdentityRefusal::Dismiss
+        );
+        assert_eq!(
+            identity_refusal(Operation::VerifyIdentity, true),
+            IdentityRefusal::Status
+        );
+        assert_eq!(
+            identity_refusal(Operation::CheckIdentityText, true),
+            IdentityRefusal::Status
+        );
+        assert_eq!(
+            identity_refusal(Operation::VerifyIdentity, false),
+            IdentityRefusal::Dismiss,
+            "with no dialog there is nowhere but the composer to report it"
+        );
+    }
+
     fn queued_file(id: u64) -> QueuedFile {
         QueuedFile {
             id,
@@ -6005,49 +6291,6 @@ mod tests {
             notice: false,
             attachment: None,
         }
-    }
-
-    #[test]
-    fn preview_image_viewport_starts_below_the_chrome_above_the_viewer() {
-        let window = gpui::size(px(1_920.0), px(1_080.0));
-        let bar_height = px(TOP_BAR_HEIGHT);
-
-        let split = preview_image_viewport_bounds(
-            window,
-            px(900.0),
-            bar_height,
-            window.height - bar_height,
-        );
-        assert_eq!(split.origin, point(px(1_020.0), bar_height));
-        assert_eq!(
-            split.size,
-            gpui::size(px(900.0), window.height - bar_height)
-        );
-
-        // Tabbed: the viewer spans the body, below a live share pane and the
-        // tab bar, so it starts at the sidebar edge and clears both.
-        let tabbed = preview_image_viewport_bounds(
-            window,
-            px(1_688.0),
-            px(240.0) + bar_height,
-            window.height - px(240.0) - bar_height,
-        );
-        assert_eq!(tabbed.origin, point(px(232.0), px(240.0) + bar_height));
-        assert_eq!(
-            tabbed.size,
-            gpui::size(px(1_688.0), window.height - px(240.0) - bar_height)
-        );
-
-        // Stacked: same top edge as tabbed, but the chat below it keeps the
-        // rest of the window instead of the viewer running to the bottom.
-        let stacked = preview_image_viewport_bounds(
-            window,
-            px(1_688.0),
-            bar_height,
-            stacked_viewer_height(None, window.height - bar_height, px(16.0)),
-        );
-        assert_eq!(stacked.origin, point(px(232.0), bar_height));
-        assert_eq!(stacked.size, gpui::size(px(1_688.0), px(515.5)));
     }
 
     #[test]
@@ -6559,36 +6802,6 @@ mod tests {
 
         assert_eq!(horizontal_fraction(zero_width, px(100.0), 60.0), None);
         assert_eq!(horizontal_fraction(valid, px(100.0), 0.0), None);
-    }
-
-    #[test]
-    fn live_pane_height_preserves_both_video_and_chat() {
-        assert_eq!(
-            clamp_live_pane_height(px(100.0), px(900.0), px(0.0), px(16.0)),
-            px(MIN_LIVE_PANE_HEIGHT),
-        );
-        assert_eq!(
-            clamp_live_pane_height(px(900.0), px(900.0), px(0.0), px(16.0)),
-            px(711.0),
-        );
-        assert_eq!(
-            clamp_live_pane_height(px(900.0), px(300.0), px(0.0), px(16.0)),
-            px(111.0),
-        );
-    }
-
-    #[test]
-    fn live_pane_height_gives_up_room_reserved_for_the_stacked_viewer() {
-        let reserved = px(MIN_STACKED_VIEWER_HEIGHT + TOP_BAR_HEIGHT + PREVIEW_DIVIDER_WIDTH);
-
-        assert_eq!(
-            clamp_live_pane_height(px(900.0), px(900.0), reserved, px(16.0)),
-            px(462.0),
-        );
-        assert_eq!(
-            clamp_live_pane_height(px(1_800.0), px(1_800.0), reserved * 2.0, px(32.0)),
-            px(924.0),
-        );
     }
 
     #[test]

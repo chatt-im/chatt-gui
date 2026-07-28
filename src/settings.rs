@@ -1907,6 +1907,10 @@ impl SettingsView {
                 self.draft.native_fullscreen = defaults.native_fullscreen;
                 false
             }
+            RowRef::Toggle(ToggleSetting::VideoLoopByDefault) => {
+                self.draft.video_loop_by_default = defaults.video_loop_by_default;
+                false
+            }
             RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => {
                 self.draft.live_low_delay_decode = defaults.live_low_delay_decode;
                 false
@@ -2360,6 +2364,7 @@ impl SettingsView {
             ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible,
             ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible,
             ToggleSetting::NativeFullscreen => self.draft.native_fullscreen,
+            ToggleSetting::VideoLoopByDefault => self.draft.video_loop_by_default,
             ToggleSetting::LiveLowDelayDecode => self.draft.live_low_delay_decode,
         }
     }
@@ -2373,6 +2378,7 @@ impl SettingsView {
             ToggleSetting::StatusBarVisible => self.draft.layout.status_bar_visible = value,
             ToggleSetting::RoomMenuVisible => self.draft.layout.room_menu_visible = value,
             ToggleSetting::NativeFullscreen => self.draft.native_fullscreen = value,
+            ToggleSetting::VideoLoopByDefault => self.draft.video_loop_by_default = value,
             ToggleSetting::LiveLowDelayDecode => self.draft.live_low_delay_decode = value,
         }
         self.preview_layout_changes(before, cx);
@@ -3143,7 +3149,7 @@ impl Render for SettingsView {
         window.set_rem_size(crate::ui_scale::rem_size(cx));
         div()
             .id("settings")
-            .key_context("ChattSettings")
+            .key_context("ChattSettings ChattModal")
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::handle_key_down))
             .absolute()
@@ -3395,6 +3401,13 @@ fn render_row(
                 "Off".into()
             }
         }
+        RowRef::Toggle(ToggleSetting::VideoLoopByDefault) => {
+            if draft.video_loop_by_default {
+                "On".into()
+            } else {
+                "Off".into()
+            }
+        }
         RowRef::Toggle(ToggleSetting::LiveLowDelayDecode) => {
             if draft.live_low_delay_decode {
                 "On".into()
@@ -3472,6 +3485,7 @@ fn render_row(
             ToggleSetting::StatusBarVisible => draft.layout.status_bar_visible,
             ToggleSetting::RoomMenuVisible => draft.layout.room_menu_visible,
             ToggleSetting::NativeFullscreen => draft.native_fullscreen,
+            ToggleSetting::VideoLoopByDefault => draft.video_loop_by_default,
             ToggleSetting::LiveLowDelayDecode => draft.live_low_delay_decode,
         };
         div()
@@ -4566,6 +4580,27 @@ mod tests {
 
                 settings.reset_row(RowRef::Toggle(ToggleSetting::NativeFullscreen), cx);
                 assert!(!settings.draft.native_fullscreen);
+                assert!(!settings.local_dirty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn video_loop_default_toggle_updates_the_draft_and_resets_to_disabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings = create_settings(cx);
+
+        cx.update(|cx| {
+            settings.update(cx, |settings, cx| {
+                assert!(!settings.draft.video_loop_by_default);
+
+                settings.toggle(ToggleSetting::VideoLoopByDefault, cx);
+                assert!(settings.draft.video_loop_by_default);
+                assert!(settings.local_dirty());
+
+                settings.reset_row(RowRef::Toggle(ToggleSetting::VideoLoopByDefault), cx);
+                assert!(!settings.draft.video_loop_by_default);
                 assert!(!settings.local_dirty());
             });
         });

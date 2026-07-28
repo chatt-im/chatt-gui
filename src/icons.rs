@@ -27,8 +27,13 @@ pub(crate) enum IconName {
     Pencil,
     Play,
     Plus,
+    Repeat1,
+    RepeatOff,
     RotateCcw,
     Search,
+    Shield,
+    ShieldAlert,
+    ShieldCheck,
     Stop,
     Trash,
     VolumeHigh,
@@ -62,8 +67,13 @@ impl IconName {
             Self::Pencil => "icons/pencil.svg",
             Self::Play => "icons/play.svg",
             Self::Plus => "icons/plus.svg",
+            Self::Repeat1 => "icons/repeat-1.svg",
+            Self::RepeatOff => "icons/repeat-off.svg",
             Self::RotateCcw => "icons/rotate-ccw.svg",
             Self::Search => "icons/search.svg",
+            Self::Shield => "icons/shield.svg",
+            Self::ShieldAlert => "icons/shield-alert.svg",
+            Self::ShieldCheck => "icons/shield-check.svg",
             Self::Stop => "icons/stop.svg",
             Self::Trash => "icons/trash.svg",
             Self::VolumeHigh => "icons/volume-high.svg",
@@ -127,8 +137,13 @@ const ICON_PATHS: &[&str] = &[
     "icons/pencil.svg",
     "icons/play.svg",
     "icons/plus.svg",
+    "icons/repeat-1.svg",
+    "icons/repeat-off.svg",
     "icons/rotate-ccw.svg",
     "icons/search.svg",
+    "icons/shield.svg",
+    "icons/shield-alert.svg",
+    "icons/shield-check.svg",
     "icons/stop.svg",
     "icons/trash.svg",
     "icons/volume-high.svg",
@@ -201,8 +216,23 @@ fn icon_svg(path: &str) -> Option<String> {
             r#"<path d="M5 5a2 2 0 0 1 3.01-1.73l12 7a2 2 0 0 1 0 3.46l-12 7A2 2 0 0 1 5 19z"/>"#
         }
         "icons/plus.svg" => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
+        "icons/repeat-1.svg" => {
+            r#"<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/>"#
+        }
+        "icons/repeat-off.svg" => {
+            r#"<path d="M11.656 6H21l-4-4"/><path d="M17.898 17.898A4 4 0 0 1 17 18H3l4-4"/><path d="m2 2 20 20"/><path d="M21 13v1a4 4 0 0 1-.171 1.159"/><path d="m21 6-4 4"/><path d="M3 11v-1a4 4 0 0 1 3.102-3.898"/><path d="m7 22-4-4"/>"#
+        }
         "icons/rotate-ccw.svg" => r#"<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>"#,
         "icons/search.svg" => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>"#,
+        "icons/shield.svg" => {
+            r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>"#
+        }
+        "icons/shield-alert.svg" => {
+            r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/>"#
+        }
+        "icons/shield-check.svg" => {
+            r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>"#
+        }
         "icons/stop.svg" => r#"<rect x="4" y="4" width="16" height="16" rx="2"/>"#,
         "icons/trash.svg" => {
             r#"<path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>"#

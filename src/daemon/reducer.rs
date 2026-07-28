@@ -116,7 +116,9 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         | DaemonFrame::BulkCanceled { .. }
         | DaemonFrame::SettingsResult(_)
         | DaemonFrame::SettingsEvent(_)
-        | DaemonFrame::Appearance(_) => {}
+        | DaemonFrame::Appearance(_)
+        | DaemonFrame::IdentityResult(_)
+        | DaemonFrame::IdentityEvent(_) => {}
     }
     effect
 }

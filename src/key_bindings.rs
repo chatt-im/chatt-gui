@@ -88,16 +88,19 @@ pub(crate) struct BindingSpec {
     pub(crate) defaults: &'static [&'static str],
 }
 
-const CHAT: &str = "Chatt && !ChattSettings";
-const NON_INPUT: &str = "Chatt && !ChattSettings && !ChattComposer && !ChattCodeSearch";
-const CODE_VIEWER: &str = "ChattCodeViewer && !ChattCodeSearch && !ChattSettings";
-const CODE_SEARCH: &str = "ChattCodeSearch && !ChattSettings";
-const COMPOSER_INSERT: &str = "ComposerInsert && !ChattSettings";
+// `ChattModal` is carried by every dialog that takes over the window, alongside
+// its own name. Bindings exclude the one context instead of naming each dialog,
+// so a new dialog does not mean editing every predicate below.
+const CHAT: &str = "Chatt && !ChattModal";
+const NON_INPUT: &str = "Chatt && !ChattModal && !ChattComposer && !ChattCodeSearch";
+const CODE_VIEWER: &str = "ChattCodeViewer && !ChattCodeSearch && !ChattModal";
+const CODE_SEARCH: &str = "ChattCodeSearch && !ChattModal";
+const COMPOSER_INSERT: &str = "ComposerInsert && !ChattModal";
 const CHAT_COMPOSER_INSERT: &str =
-    "ChattComposer && ComposerInsert && !CompletionEngaged && !ChattSettings";
-const COMPLETION_OPEN: &str = "ChattComposer && ComposerInsert && CompletionOpen && !ChattSettings";
+    "ChattComposer && ComposerInsert && !CompletionEngaged && !ChattModal";
+const COMPLETION_OPEN: &str = "ChattComposer && ComposerInsert && CompletionOpen && !ChattModal";
 const COMPLETION_ENGAGED: &str =
-    "ChattComposer && ComposerInsert && CompletionEngaged && !ChattSettings";
+    "ChattComposer && ComposerInsert && CompletionEngaged && !ChattModal";
 const UI_SCALE_CONTEXT: &str = "Chatt";
 
 #[cfg(target_os = "windows")]
@@ -263,7 +266,7 @@ pub(crate) static BINDINGS: &[BindingSpec] = &[
         command: BindCommand::InsertTab,
         label: "Insert tab",
         help: None,
-        contexts: &["ComposerInsert && !CompletionOpen && !ChattSettings"],
+        contexts: &["ComposerInsert && !CompletionOpen && !ChattModal"],
         defaults: &["tab"],
     },
     BindingSpec {
@@ -311,7 +314,7 @@ pub(crate) static BINDINGS: &[BindingSpec] = &[
         command: BindCommand::Paste,
         label: "Paste in Vim mode",
         help: None,
-        contexts: &["VimMode && !ChattSettings"],
+        contexts: &["VimMode && !ChattModal"],
         defaults: &["secondary-v"],
     },
     BindingSpec {
@@ -447,7 +450,7 @@ pub(crate) static BINDINGS: &[BindingSpec] = &[
         command: BindCommand::Copy,
         label: "Copy message text",
         help: None,
-        contexts: &["ChattFormattedText && !ChattSettings"],
+        contexts: &["ChattFormattedText && !ChattModal"],
         defaults: &["secondary-c", "y"],
     },
     BindingSpec {
