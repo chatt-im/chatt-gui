@@ -892,9 +892,24 @@ impl crate::Device for super::Device {
         let is_cpu_read = desc.usage.contains(wgt::BufferUses::MAP_READ);
         let is_cpu_write = desc.usage.contains(wgt::BufferUses::MAP_WRITE);
 
+        // A write-only transient buffer is a staging source: the CPU fills it
+        // once and the GPU reads it through a copy, never in place. Sending it
+        // to `CpuToGpu` asks gpu-allocator for
+        // `HOST_VISIBLE | HOST_COHERENT | DEVICE_LOCAL`, whose first match on a
+        // ReBAR-capable discrete GPU is VRAM behind the PCIe BAR — so every
+        // byte the CPU writes crosses PCIe uncached. Measured at ~166 MB/s
+        // here, which made `Queue::write_buffer` cost more per frame than all
+        // of `Window::draw`. `GpuToCpu` is named for its usual direction, but
+        // what it actually asks for is host-cached system memory, which is what
+        // a staging buffer wants: full-speed CPU writes, then one DMA.
+        let is_staging = is_cpu_write
+            && !is_cpu_read
+            && desc.memory_flags.contains(crate::MemoryFlags::TRANSIENT);
+
         let location = match (is_cpu_read, is_cpu_write) {
             (true, true) => gpu_allocator::MemoryLocation::CpuToGpu,
             (true, false) => gpu_allocator::MemoryLocation::GpuToCpu,
+            (false, true) if is_staging => gpu_allocator::MemoryLocation::GpuToCpu,
             (false, true) => gpu_allocator::MemoryLocation::CpuToGpu,
             (false, false) => gpu_allocator::MemoryLocation::GpuOnly,
         };
