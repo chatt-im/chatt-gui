@@ -1,13 +1,14 @@
-use std::{ops::Range, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, ops::Range, rc::Rc, sync::Arc};
 
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
-    FontStyle, FontWeight, GlobalElementId, Hsla, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Rems, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    App, AvailableSpace, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla, KeyDownEvent, LayoutId,
+    LineLayout, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Rems,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions,
+    div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 mod buffer;
 pub(crate) mod completion;
@@ -29,9 +30,10 @@ use crate::{
 use chatt_message_format::highlight::PaletteRole;
 use highlight::{ComposerColor, ComposerSyntax, ComposerTextStyle, ComposerTypeface};
 pub(crate) use mode::Mode;
-use vim::{VimEditor, VimKey};
+use vim::{DisplayLine as VimDisplayLine, DisplayPoint as VimDisplayPoint, VimEditor, VimKey};
 
 const MAX_VISIBLE_LINES: usize = 8;
+pub(crate) const MIN_COMPOSER_HEIGHT: f32 = 64.0;
 
 actions!(
     composer,
@@ -90,9 +92,9 @@ pub struct TextEditor {
     completion_open: bool,
     completion_engaged: bool,
     expand_emoji_shortcodes: bool,
-    last_layout: Vec<ComposerLine>,
-    last_bounds: Option<Bounds<Pixels>>,
-    last_line_height: Option<Pixels>,
+    last_layout: Option<ComposerGeometry>,
+    layout_width: Option<Pixels>,
+    layout_invalidated: bool,
     syntax: Option<ComposerSyntax>,
 }
 
@@ -116,7 +118,7 @@ impl TextEditor {
             multiline: true,
             vim_enabled: binding_mode == crate::config::schema::BindingMode::Vim,
             accepts_image_paste: true,
-            min_height: rems_from_px(42.),
+            min_height: rems_from_px(MIN_COMPOSER_HEIGHT),
             selected: 0..0,
             reversed: false,
             mouse_anchor: None,
@@ -125,9 +127,9 @@ impl TextEditor {
             completion_open: false,
             completion_engaged: false,
             expand_emoji_shortcodes: true,
-            last_layout: Vec::new(),
-            last_bounds: None,
-            last_line_height: None,
+            last_layout: None,
+            layout_width: None,
+            layout_invalidated: false,
             syntax: Some(ComposerSyntax::default()),
         }
     }
@@ -153,9 +155,9 @@ impl TextEditor {
             completion_open: false,
             completion_engaged: false,
             expand_emoji_shortcodes: false,
-            last_layout: Vec::new(),
-            last_bounds: None,
-            last_line_height: None,
+            last_layout: None,
+            layout_width: None,
+            layout_invalidated: false,
             syntax: None,
         }
     }
@@ -260,7 +262,8 @@ impl TextEditor {
         self.selected = 0..0;
         self.reversed = false;
         self.marked = None;
-        self.last_layout.clear();
+        self.last_layout = None;
+        self.layout_invalidated = true;
         self.refresh_syntax();
         cx.emit(ComposerChanged);
         cx.emit(ComposerStateChanged);
@@ -278,7 +281,8 @@ impl TextEditor {
         self.selected = cursor..cursor;
         self.reversed = false;
         self.marked = None;
-        self.last_layout.clear();
+        self.last_layout = None;
+        self.layout_invalidated = true;
         self.refresh_syntax();
         cx.emit(ComposerChanged);
         cx.emit(ComposerStateChanged);
@@ -309,7 +313,8 @@ impl TextEditor {
         self.selected = cursor..cursor;
         self.reversed = false;
         self.marked = None;
-        self.last_layout.clear();
+        self.last_layout = None;
+        self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -329,6 +334,7 @@ impl TextEditor {
         let offset = self.editor.cursor_offset();
         self.selected = offset..offset;
         self.reversed = false;
+        self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -342,6 +348,7 @@ impl TextEditor {
             self.reversed = !self.reversed;
             self.selected = self.selected.end..self.selected.start;
         }
+        self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -375,6 +382,7 @@ impl TextEditor {
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected = 0..self.editor.len();
+        self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -534,7 +542,8 @@ impl TextEditor {
         self.selected = end..end;
         self.editor.set_cursor_offset(end);
         self.marked = None;
-        self.last_layout.clear();
+        self.last_layout = None;
+        self.layout_invalidated = true;
         self.refresh_syntax();
         cx.emit(ComposerChanged);
         cx.emit(ComposerStateChanged);
@@ -551,13 +560,7 @@ impl TextEditor {
     }
 
     fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
-        let local = self.last_bounds?.localize(&point)?;
-        let line_height = self.last_line_height?;
-        let line_index =
-            ((local.y / line_height).floor() as usize).min(self.last_layout.len().checked_sub(1)?);
-        let line = &self.last_layout[line_index];
-        let offset = line.layout.closest_index_for_x(local.x);
-        Some(line.range.start + offset)
+        self.last_layout.as_ref()?.offset_for_point(point)
     }
 
     fn set_mouse_selection(&mut self, anchor: usize, head: usize, cx: &mut Context<Self>) {
@@ -567,6 +570,7 @@ impl TextEditor {
         self.reversed = head < anchor;
         self.editor.set_cursor_offset(head);
         self.marked = None;
+        self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -613,15 +617,18 @@ impl TextEditor {
             return;
         };
         let offset = self.offset_for_point(event.position).unwrap_or_else(|| {
-            self.last_bounds.map_or(self.editor.len(), |bounds| {
-                if event.position.y < bounds.top()
-                    || (event.position.y <= bounds.bottom() && event.position.x < bounds.left())
-                {
-                    0
-                } else {
-                    self.editor.len()
-                }
-            })
+            self.last_layout
+                .as_ref()
+                .map(|layout| layout.bounds)
+                .map_or(self.editor.len(), |bounds| {
+                    if event.position.y < bounds.top()
+                        || (event.position.y <= bounds.bottom() && event.position.x < bounds.left())
+                    {
+                        0
+                    } else {
+                        self.editor.len()
+                    }
+                })
         });
         self.set_mouse_selection(anchor, offset, cx);
     }
@@ -774,7 +781,8 @@ impl TextEditor {
         self.selected = cursor..cursor;
         self.reversed = false;
         self.marked = None;
-        self.last_layout.clear();
+        self.last_layout = None;
+        self.layout_invalidated = true;
         if self.editor.text_version() != version {
             self.refresh_syntax();
             cx.emit(ComposerChanged);
@@ -913,13 +921,6 @@ fn visible_line_range(line_count: usize, cursor_row: usize) -> Range<usize> {
     start..start + visible_count
 }
 
-fn line_for_offset(lines: &[ComposerLine], offset: usize) -> Option<&ComposerLine> {
-    lines
-        .iter()
-        .find(|line| offset <= line.range.end)
-        .or_else(|| lines.last())
-}
-
 impl EntityInputHandler for TextEditor {
     fn text_for_range(
         &mut self,
@@ -981,41 +982,12 @@ impl EntityInputHandler for TextEditor {
     fn bounds_for_range(
         &mut self,
         range: Range<usize>,
-        bounds: Bounds<Pixels>,
+        _: Bounds<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range);
-        let start_line = line_for_offset(&self.last_layout, range.start)?;
-        let end_line = line_for_offset(&self.last_layout, range.end)?;
-        let start_offset = start_line.local_offset(range.start);
-        let end_offset = end_line.local_offset(range.end);
-        let start_line_offset = self.last_layout.element_offset(start_line)?;
-        let end_line_offset = self.last_layout.element_offset(end_line)?;
-        let line_height = self.last_line_height?;
-        if std::ptr::eq(start_line, end_line) {
-            Some(Bounds::from_corners(
-                point(
-                    bounds.left() + start_line.layout.x_for_index(start_offset),
-                    bounds.top() + line_height * start_line_offset as f32,
-                ),
-                point(
-                    bounds.left() + end_line.layout.x_for_index(end_offset),
-                    bounds.top() + line_height * (end_line_offset + 1) as f32,
-                ),
-            ))
-        } else {
-            Some(Bounds::from_corners(
-                point(
-                    bounds.left(),
-                    bounds.top() + line_height * start_line_offset as f32,
-                ),
-                point(
-                    bounds.right(),
-                    bounds.top() + line_height * (end_line_offset + 1) as f32,
-                ),
-            ))
-        }
+        self.last_layout.as_ref()?.bounds_for_range(range)
     }
     fn character_index_for_point(
         &mut self,
@@ -1037,6 +1009,7 @@ impl EntityInputHandler for TextEditor {
         self.selected = range.clone();
         self.reversed = false;
         self.editor.set_cursor_offset(range.end);
+        self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
     }
@@ -1054,17 +1027,252 @@ impl EventEmitter<ComposerChanged> for TextEditor {}
 impl EventEmitter<ComposerStateChanged> for TextEditor {}
 impl EventEmitter<ComposerImagePaste> for TextEditor {}
 
-#[derive(Clone)]
-struct ComposerLine {
+#[derive(Clone, Debug)]
+struct ComposerVisualLine {
     range: Range<usize>,
-    layout: ShapedLine,
+    logical_start: usize,
+    logical_end: usize,
+    layout: Arc<LineLayout>,
+    unwrapped_start_x: Pixels,
+    is_last_in_logical_line: bool,
 }
 
-impl ComposerLine {
+impl ComposerVisualLine {
+    fn local_range(&self) -> Range<usize> {
+        self.range.start.saturating_sub(self.logical_start)
+            ..self.range.end.saturating_sub(self.logical_start)
+    }
+
     fn local_offset(&self, offset: usize) -> usize {
+        let range = self.local_range();
         offset
-            .saturating_sub(self.range.start)
-            .min(self.range.len())
+            .saturating_sub(self.logical_start)
+            .clamp(range.start, range.end)
+    }
+
+    fn x_for_offset(&self, offset: usize) -> Pixels {
+        self.layout.x_for_index(self.local_offset(offset)) - self.unwrapped_start_x
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ComposerGeometry {
+    bounds: Bounds<Pixels>,
+    text_bounds: Bounds<Pixels>,
+    line_height: Pixels,
+    horizontal_scroll: Pixels,
+    lines: Vec<ComposerVisualLine>,
+}
+
+impl ComposerGeometry {
+    fn line_index_for_offset(&self, offset: usize) -> Option<usize> {
+        self.lines.iter().position(|line| {
+            offset >= line.range.start
+                && (offset < line.range.end
+                    || (line.is_last_in_logical_line && offset <= line.range.end))
+        })
+    }
+
+    fn line_index_for_range_end(&self, offset: usize) -> Option<usize> {
+        self.lines.iter().position(|line| {
+            offset > line.range.start && offset <= line.range.end
+                || (line.range.is_empty()
+                    && line.is_last_in_logical_line
+                    && offset == line.range.end)
+        })
+    }
+
+    fn screen_x_for_offset(&self, line: &ComposerVisualLine, offset: usize) -> Pixels {
+        self.text_bounds.left() - self.horizontal_scroll + line.x_for_offset(offset)
+    }
+
+    fn offset_for_point(&self, point: gpui::Point<Pixels>) -> Option<usize> {
+        if !self.bounds.contains(&point) {
+            return None;
+        }
+        let line_count = self.lines.len();
+        if line_count == 0 {
+            return None;
+        }
+        let row = if point.y <= self.text_bounds.top() {
+            0
+        } else if point.y >= self.text_bounds.bottom() {
+            line_count - 1
+        } else {
+            ((point.y - self.text_bounds.top()) / self.line_height)
+                .floor()
+                .max(0.) as usize
+        }
+        .min(line_count - 1);
+        let line = &self.lines[row];
+        let local_range = line.local_range();
+        let shaped_x =
+            point.x - self.text_bounds.left() + self.horizontal_scroll + line.unwrapped_start_x;
+        let local = line
+            .layout
+            .closest_index_for_x(shaped_x)
+            .clamp(local_range.start, local_range.end);
+        Some(line.logical_start + local)
+    }
+
+    fn bounds_for_range(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
+        let first = self.lines.first()?;
+        let last = self.lines.last()?;
+        let start_line = self
+            .line_index_for_offset(range.start)
+            .or_else(|| (range.start <= first.range.start).then_some(0))?;
+        let end_line = if range.is_empty() {
+            self.line_index_for_offset(range.end)
+        } else {
+            self.line_index_for_range_end(range.end)
+                .or_else(|| self.line_index_for_offset(range.end))
+        }
+        .or_else(|| (range.end >= last.range.end).then_some(self.lines.len() - 1))?;
+        let start = &self.lines[start_line];
+        let end = &self.lines[end_line];
+        if start_line == end_line {
+            Some(Bounds::from_corners(
+                point(
+                    self.screen_x_for_offset(start, range.start),
+                    self.text_bounds.top() + self.line_height * start_line as f32,
+                ),
+                point(
+                    self.screen_x_for_offset(end, range.end),
+                    self.text_bounds.top() + self.line_height * (end_line + 1) as f32,
+                ),
+            ))
+        } else {
+            Some(Bounds::from_corners(
+                point(
+                    self.text_bounds.left(),
+                    self.text_bounds.top() + self.line_height * start_line as f32,
+                ),
+                point(
+                    self.text_bounds.right(),
+                    self.text_bounds.top() + self.line_height * (end_line + 1) as f32,
+                ),
+            ))
+        }
+    }
+}
+
+struct ComposerLogicalLine {
+    range: Range<usize>,
+    layout: WrappedLine,
+    first_visual_line: usize,
+    visual_line_count: usize,
+}
+
+struct ComposerLayout {
+    logical_lines: Vec<ComposerLogicalLine>,
+    visual_lines: Vec<ComposerVisualLine>,
+    visible_lines: Range<usize>,
+    line_height: Pixels,
+    vertical_inset: Pixels,
+    horizontal_scroll: Pixels,
+    width: Pixels,
+    font_size: Pixels,
+}
+
+impl ComposerLayout {
+    fn height(&self) -> Pixels {
+        self.vertical_inset * 2.
+            + self.line_height * self.visible_lines.len().max(1) as f32
+    }
+
+    fn geometry(&self, bounds: Bounds<Pixels>) -> ComposerGeometry {
+        let text_bounds = Bounds::new(
+            point(bounds.left(), bounds.top() + self.vertical_inset),
+            size(
+                bounds.size.width,
+                self.line_height * self.visible_lines.len().max(1) as f32,
+            ),
+        );
+        ComposerGeometry {
+            bounds,
+            text_bounds,
+            line_height: self.line_height,
+            horizontal_scroll: self.horizontal_scroll,
+            lines: self.visual_lines[self.visible_lines.clone()].to_vec(),
+        }
+    }
+
+    fn vim_display_lines(&self, input: &TextEditor) -> Vec<VimDisplayLine> {
+        self.visual_lines
+            .iter()
+            .map(|line| {
+                let mut points = input
+                    .editor
+                    .slice(line.range.clone())
+                    .grapheme_indices(true)
+                    .map(|(index, _)| {
+                        let offset = line.range.start + index;
+                        VimDisplayPoint {
+                            offset,
+                            x: f32::from(line.x_for_offset(offset)),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if points
+                    .first()
+                    .is_none_or(|point| point.offset != line.range.start)
+                {
+                    points.insert(
+                        0,
+                        VimDisplayPoint {
+                            offset: line.range.start,
+                            x: f32::from(line.x_for_offset(line.range.start)),
+                        },
+                    );
+                }
+                if line.is_last_in_logical_line
+                    && points
+                        .last()
+                        .is_none_or(|point| point.offset != line.range.end)
+                {
+                    points.push(VimDisplayPoint {
+                        offset: line.range.end,
+                        x: f32::from(line.x_for_offset(line.range.end)),
+                    });
+                }
+                VimDisplayLine {
+                    range: line.range.clone(),
+                    logical_end: line.logical_end,
+                    is_last_in_logical_line: line.is_last_in_logical_line,
+                    points,
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Default)]
+struct ComposerLayoutState(Rc<RefCell<Option<ComposerLayout>>>);
+
+#[derive(Clone)]
+struct ComposerLayoutStyle {
+    applied: Option<Arc<ResolvedSettings>>,
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    base_color: Hsla,
+    min_height: Pixels,
+    cursor_width: Pixels,
+}
+
+impl ComposerLayoutStyle {
+    fn capture(input: &TextEditor, window: &Window, cx: &App) -> Self {
+        Self {
+            applied: cx
+                .try_global::<AppliedSettings>()
+                .map(|settings| settings.0.clone()),
+            font: window.text_style().font(),
+            font_size: window.text_style().font_size.to_pixels(window.rem_size()),
+            line_height: window.line_height(),
+            base_color: window.text_style().color,
+            min_height: input.min_height.to_pixels(window.rem_size()),
+            cursor_width: crate::ui_scale::scaled_px(2.0, window.rem_size()),
+        }
     }
 }
 
@@ -1168,13 +1376,190 @@ fn composer_text_run(
     }
 }
 
+fn build_composer_layout(
+    input: &TextEditor,
+    available_width: Option<Pixels>,
+    style: &ComposerLayoutStyle,
+    window: &mut Window,
+) -> ComposerLayout {
+    let is_placeholder = input.editor.len() == 0;
+    let color = if is_placeholder {
+        style
+            .applied
+            .as_ref()
+            .map(|settings| settings.theme.color(ThemeRole::TextDim).into())
+            .unwrap_or_else(|| rgb(0x747a84).into())
+    } else {
+        style.base_color
+    };
+    let wrap_width = if input.multiline && !is_placeholder {
+        available_width.map(|width| if width > px(1.) { width } else { px(1.) })
+    } else {
+        None
+    };
+
+    let shape_line = |row: usize, range: Range<usize>, text: SharedString| {
+        let runs = if is_placeholder {
+            vec![TextRun {
+                len: text.len(),
+                font: style.font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }]
+        } else {
+            composer_text_runs(
+                input.syntax.as_ref(),
+                range.clone(),
+                &style.font,
+                color,
+                style.applied.as_deref(),
+            )
+        };
+        let layout =
+            match window
+                .text_system()
+                .shape_text(text, style.font_size, &runs, wrap_width, None)
+            {
+                Ok(mut lines) => lines.pop().unwrap_or_default(),
+                Err(error) => {
+                    kvlog::error!("failed to shape composer text", row, err = %error);
+                    WrappedLine::default()
+                }
+            };
+        ComposerLogicalLine {
+            range,
+            layout,
+            first_visual_line: 0,
+            visual_line_count: 0,
+        }
+    };
+
+    let mut logical_lines = VecDeque::new();
+    if is_placeholder {
+        logical_lines.push_back(shape_line(0, 0..0, input.placeholder.clone()));
+    } else {
+        let cursor_row = input.editor.offset_to_rowcol(input.cursor()).0;
+        let line_for_row = |row| {
+            let start = input.editor.line_start(row);
+            let text = input.editor.line(row);
+            let range = start..start + text.len();
+            shape_line(row, range, text.into_owned().into())
+        };
+        logical_lines.push_back(line_for_row(cursor_row));
+        let mut preceding_visual_count = 0;
+        let mut first_row = cursor_row;
+        while preceding_visual_count < MAX_VISIBLE_LINES && first_row > 0 {
+            first_row -= 1;
+            let line = line_for_row(first_row);
+            preceding_visual_count += line.layout.wrap_boundaries().len() + 1;
+            logical_lines.push_front(line);
+        }
+        let mut following_visual_count = 0;
+        let mut next_row = cursor_row + 1;
+        while following_visual_count < MAX_VISIBLE_LINES && next_row < input.editor.line_count() {
+            let line = line_for_row(next_row);
+            following_visual_count += line.layout.wrap_boundaries().len() + 1;
+            logical_lines.push_back(line);
+            next_row += 1;
+        }
+    }
+
+    let mut logical_lines = logical_lines.into_iter().collect::<Vec<_>>();
+    let mut visual_lines = Vec::new();
+    for logical in &mut logical_lines {
+        logical.first_visual_line = visual_lines.len();
+        let mut starts = Vec::with_capacity(logical.layout.wrap_boundaries().len() + 1);
+        starts.push(0);
+        for boundary in logical.layout.wrap_boundaries() {
+            let Some(run) = logical.layout.runs().get(boundary.run_ix) else {
+                continue;
+            };
+            let Some(glyph) = run.glyphs.get(boundary.glyph_ix) else {
+                continue;
+            };
+            starts.push(glyph.index);
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        let local_end = logical.range.len();
+        for (index, start) in starts.iter().copied().enumerate() {
+            let end = starts.get(index + 1).copied().unwrap_or(local_end);
+            visual_lines.push(ComposerVisualLine {
+                range: logical.range.start + start..logical.range.start + end,
+                logical_start: logical.range.start,
+                logical_end: logical.range.end,
+                layout: logical.layout.unwrapped_layout.clone(),
+                unwrapped_start_x: logical.layout.unwrapped_layout.x_for_index(start),
+                is_last_in_logical_line: index + 1 == starts.len(),
+            });
+        }
+        logical.visual_line_count = starts.len().max(1);
+    }
+
+    if visual_lines.is_empty() {
+        visual_lines.push(ComposerVisualLine {
+            range: 0..0,
+            logical_start: 0,
+            logical_end: 0,
+            layout: Arc::new(LineLayout::default()),
+            unwrapped_start_x: Pixels::ZERO,
+            is_last_in_logical_line: true,
+        });
+    }
+    let cursor = input.cursor();
+    let cursor_visual_line = visual_lines
+        .iter()
+        .position(|line| {
+            cursor >= line.range.start
+                && (cursor < line.range.end
+                    || (line.is_last_in_logical_line && cursor <= line.range.end))
+        })
+        .unwrap_or_else(|| visual_lines.len() - 1);
+    let visible_lines = visible_line_range(visual_lines.len(), cursor_visual_line);
+    let natural_width = logical_lines
+        .iter()
+        .map(|line| line.layout.width())
+        .fold(Pixels::ZERO, |width, line_width| width.max(line_width));
+    let width = available_width.unwrap_or(natural_width);
+    let horizontal_scroll = if input.multiline {
+        Pixels::ZERO
+    } else {
+        let cursor_x = visual_lines[cursor_visual_line].x_for_offset(cursor);
+        let cursor_right = cursor_x + style.cursor_width;
+        if cursor_right > width {
+            cursor_right - width
+        } else {
+            Pixels::ZERO
+        }
+    };
+    let vertical_inset = if style.min_height > style.line_height {
+        (style.min_height - style.line_height) / 2.
+    } else {
+        Pixels::ZERO
+    };
+
+    ComposerLayout {
+        logical_lines,
+        visual_lines,
+        visible_lines,
+        line_height: style.line_height,
+        vertical_inset,
+        horizontal_scroll,
+        width,
+        font_size: style.font_size,
+    }
+}
+
 struct ComposerElement {
     input: Entity<TextEditor>,
 }
 struct Prepaint {
-    lines: Vec<ComposerLine>,
+    geometry: ComposerGeometry,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    needs_relayout: bool,
 }
 impl IntoElement for ComposerElement {
     type Element = Self;
@@ -1183,7 +1568,7 @@ impl IntoElement for ComposerElement {
     }
 }
 impl Element for ComposerElement {
-    type RequestLayoutState = ();
+    type RequestLayoutState = ComposerLayoutState;
     type PrepaintState = Prepaint;
     fn id(&self) -> Option<ElementId> {
         None
@@ -1197,24 +1582,58 @@ impl Element for ComposerElement {
         _: Option<&gpui::InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, ()) {
-        let input = self.input.read(cx);
-        let line_count = if input.multiline {
-            input.editor.line_count().clamp(1, MAX_VISIBLE_LINES)
-        } else {
-            1
-        };
+    ) -> (LayoutId, ComposerLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = (window.line_height() * line_count as f32).into();
-        (window.request_layout(style, [], cx), ())
+        let state = ComposerLayoutState::default();
+        let input = self.input.clone();
+        let (layout_style, width_hint) = {
+            let input_ref = input.read(cx);
+            (
+                ComposerLayoutStyle::capture(input_ref, window, cx),
+                input_ref
+                    .layout_invalidated
+                    .then_some(input_ref.layout_width)
+                    .flatten(),
+            )
+        };
+        let layout_id = if let Some(width) = width_hint {
+            let layout = build_composer_layout(input.read(cx), Some(width), &layout_style, window);
+            style.size.height = layout.height().into();
+            state.0.borrow_mut().replace(layout);
+            window.request_layout(style, [], cx)
+        } else {
+            let measured_state = state.clone();
+            window.request_measured_layout(
+                style,
+                move |known_dimensions, available_space, window, cx| {
+                    let available_width = known_dimensions.width.or(match available_space.width {
+                        AvailableSpace::Definite(width) => Some(width),
+                        AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+                    });
+                    let layout = build_composer_layout(
+                        input.read(cx),
+                        available_width,
+                        &layout_style,
+                        window,
+                    );
+                    let measured = size(
+                        available_width.unwrap_or(layout.width),
+                        layout.height(),
+                    );
+                    measured_state.0.borrow_mut().replace(layout);
+                    measured
+                },
+            )
+        };
+        (layout_id, state)
     }
     fn prepaint(
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
+        layout_state: &mut ComposerLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
@@ -1222,66 +1641,28 @@ impl Element for ComposerElement {
         let applied = cx
             .try_global::<AppliedSettings>()
             .map(|settings| settings.0.clone());
-        let is_placeholder = input.editor.len() == 0;
-        let color = if is_placeholder {
-            applied
-                .as_ref()
-                .map(|settings| settings.theme.color(ThemeRole::TextDim).into())
-                .unwrap_or_else(|| rgb(0x747a84).into())
-        } else {
-            window.text_style().color
-        };
-        let font = window.text_style().font();
-        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        let shape_line = |range: Range<usize>, text: SharedString| {
-            let runs = if is_placeholder {
-                vec![TextRun {
-                    len: text.len(),
-                    font: font.clone(),
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }]
-            } else {
-                composer_text_runs(
-                    input.syntax.as_ref(),
-                    range.clone(),
-                    &font,
-                    color,
-                    applied.as_deref(),
-                )
-            };
-            ComposerLine {
-                range,
-                layout: window
-                    .text_system()
-                    .shape_line(text, font_size, &runs, None),
-            }
-        };
-        let cursor_row = input.editor.offset_to_rowcol(input.cursor()).0;
-        let visible_rows = visible_line_range(input.editor.line_count(), cursor_row);
-        let lines = if is_placeholder {
-            vec![shape_line(0..0, input.placeholder.clone())]
-        } else {
-            visible_rows
-                .map(|row| {
-                    let start = input.editor.line_start(row);
-                    let text = input.editor.line(row);
-                    let range = start..start + text.len();
-                    shape_line(range, text.into_owned().into())
-                })
-                .collect::<Vec<_>>()
-        };
-        let line_height = window.line_height();
-        let cursor_line = line_for_offset(&lines, input.cursor())
-            .expect("composer always lays out at least one logical line");
-        let cursor_line_offset = lines
-            .element_offset(cursor_line)
-            .expect("cursor line belongs to the composer layout");
-        let cursor_x = cursor_line
-            .layout
-            .x_for_index(cursor_line.local_offset(input.cursor()));
+        let needs_width_refresh = layout_state
+            .0
+            .borrow()
+            .as_ref()
+            .is_none_or(|layout| layout.width != bounds.size.width);
+        if needs_width_refresh {
+            let style = ComposerLayoutStyle::capture(input, window, cx);
+            layout_state.0.borrow_mut().replace(build_composer_layout(
+                input,
+                Some(bounds.size.width),
+                &style,
+                window,
+            ));
+        }
+        let layout = layout_state.0.borrow();
+        let layout = layout
+            .as_ref()
+            .expect("composer layout is measured before prepaint");
+        let needs_relayout =
+            (f32::from(layout.height()) - f32::from(bounds.size.height)).abs() > 0.5;
+        let font_size = layout.font_size;
+        let geometry = layout.geometry(bounds);
         let selection_ranges = if input.vim_enabled && input.editor.mode().is_visual() {
             input.editor.visual_ranges()
         } else {
@@ -1292,29 +1673,31 @@ impl Element for ComposerElement {
         let selection = selection_ranges
             .iter()
             .flat_map(|selected| {
-                let mut line_top = bounds.top();
-                lines
+                geometry
+                    .lines
                     .iter()
-                    .filter_map(|line| {
-                        let top = line_top;
-                        line_top += line_height;
+                    .enumerate()
+                    .filter_map(|(row, line)| {
                         let selects_text =
                             selected.start < line.range.end && selected.end > line.range.start;
-                        let selects_newline = line.range.end < input.editor.len()
-                            && selected.start <= line.range.end
-                            && selected.end > line.range.end;
+                        let selects_newline = line.is_last_in_logical_line
+                            && line.logical_end < input.editor.len()
+                            && selected.start <= line.logical_end
+                            && selected.end > line.logical_end;
                         if !selects_text && !selects_newline {
                             return None;
                         }
-                        let start = line.local_offset(selected.start);
-                        let end = line.local_offset(selected.end);
-                        let left = bounds.left() + line.layout.x_for_index(start);
-                        let mut right = bounds.left() + line.layout.x_for_index(end);
+                        let left = geometry.screen_x_for_offset(line, selected.start);
+                        let mut right = geometry.screen_x_for_offset(line, selected.end);
                         if selects_newline {
                             right += font_size * 0.25;
                         }
+                        let top = geometry.text_bounds.top() + geometry.line_height * row as f32;
                         Some(fill(
-                            Bounds::from_corners(point(left, top), point(right, top + line_height)),
+                            Bounds::from_corners(
+                                point(left, top),
+                                point(right, top + geometry.line_height),
+                            ),
                             applied
                                 .as_ref()
                                 .map(|settings| {
@@ -1326,13 +1709,15 @@ impl Element for ComposerElement {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let cursor_line_offset = geometry
+            .line_index_for_offset(input.cursor())
+            .expect("the measured composer viewport contains its cursor");
+        let cursor_line = &geometry.lines[cursor_line_offset];
+        let cursor_x = geometry.screen_x_for_offset(cursor_line, input.cursor());
         let cursor_width = if input.vim_enabled && input.editor.mode() != Mode::Insert {
             let next = input.editor.next_offset(input.cursor());
             let width = if next <= cursor_line.range.end {
-                cursor_line
-                    .layout
-                    .x_for_index(cursor_line.local_offset(next))
-                    - cursor_x
+                geometry.screen_x_for_offset(cursor_line, next) - cursor_x
             } else {
                 font_size * 0.5
             };
@@ -1348,10 +1733,11 @@ impl Element for ComposerElement {
             fill(
                 Bounds::new(
                     point(
-                        bounds.left() + cursor_x,
-                        bounds.top() + line_height * cursor_line_offset as f32,
+                        cursor_x,
+                        geometry.text_bounds.top()
+                            + geometry.line_height * cursor_line_offset as f32,
                     ),
-                    size(cursor_width, line_height),
+                    size(cursor_width, geometry.line_height),
                 ),
                 if input.vim_enabled && input.editor.mode() != Mode::Insert {
                     applied
@@ -1367,9 +1753,10 @@ impl Element for ComposerElement {
             )
         });
         Prepaint {
-            lines,
+            geometry,
             cursor,
             selection,
+            needs_relayout,
         }
     }
     fn paint(
@@ -1377,7 +1764,7 @@ impl Element for ComposerElement {
         _: Option<&GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
+        layout_state: &mut ComposerLayoutState,
         state: &mut Prepaint,
         window: &mut Window,
         cx: &mut App,
@@ -1388,40 +1775,63 @@ impl Element for ComposerElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        for selection in state.selection.drain(..) {
-            window.paint_quad(selection);
-        }
-        let line_height = window.line_height();
-        let mut origin = bounds.origin;
-        for line in &state.lines {
-            if let Err(error) = line.layout.paint(
-                origin,
-                window.line_height(),
-                gpui::TextAlign::Left,
-                None,
-                window,
-                cx,
-            ) {
-                kvlog::error!("failed to paint composer text", err = %error);
-            }
-            origin.y += line_height;
-        }
-        if focus.is_focused(window)
-            && let Some(cursor) = state.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        let layout = layout_state.0.borrow();
+        let layout = layout
+            .as_ref()
+            .expect("composer layout remains available through paint");
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: state.geometry.text_bounds,
+            }),
+            |window| {
+                for selection in state.selection.drain(..) {
+                    window.paint_quad(selection);
+                }
+                for line in &layout.logical_lines {
+                    let line_end = line.first_visual_line + line.visual_line_count;
+                    if line.first_visual_line >= layout.visible_lines.end
+                        || line_end <= layout.visible_lines.start
+                    {
+                        continue;
+                    }
+                    let origin = point(
+                        state.geometry.text_bounds.left() - layout.horizontal_scroll,
+                        state.geometry.text_bounds.top()
+                            + layout.line_height
+                                * (line.first_visual_line as f32
+                                    - layout.visible_lines.start as f32),
+                    );
+                    if let Err(error) = line.layout.paint(
+                        origin,
+                        layout.line_height,
+                        gpui::TextAlign::Left,
+                        Some(state.geometry.text_bounds),
+                        window,
+                        cx,
+                    ) {
+                        kvlog::error!("failed to paint composer text", err = %error);
+                    }
+                }
+                if focus.is_focused(window)
+                    && let Some(cursor) = state.cursor.take()
+                {
+                    window.paint_quad(cursor);
+                }
+            },
+        );
         self.input.update(cx, |input, _| {
-            input.last_layout = state.lines.clone();
-            input.last_bounds = Some(bounds);
-            input.last_line_height = Some(line_height);
-            let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-            let columns =
-                (f32::from(bounds.size.width) / f32::from(font_size * 0.5)).max(1.0) as u16;
-            input
-                .editor
-                .set_layout(columns, state.lines.len().max(1) as u16);
+            let display_lines = layout.vim_display_lines(input);
+            input.last_layout = Some(state.geometry.clone());
+            input.layout_width = Some(bounds.size.width);
+            input.layout_invalidated = false;
+            input.editor.set_display_lines(
+                display_lines,
+                state.geometry.lines.len().max(1) as u16,
+            );
         });
+        if state.needs_relayout {
+            cx.notify(self.input.entity_id());
+        }
     }
 }
 
@@ -1465,7 +1875,6 @@ impl Render for TextEditor {
         };
         div()
             .flex()
-            .items_center()
             .font_family(family)
             .text_size(size)
             .key_context(key_context)
@@ -1509,7 +1918,6 @@ impl Render for TextEditor {
                 }),
             )
             .w_full()
-            .min_h(self.min_height)
             .child(ComposerElement { input: cx.entity() })
     }
 }
@@ -1559,18 +1967,37 @@ mod tests {
 
     use gpui::{
         Context, Entity, Focusable, IntoElement, MouseButton, Render, Window, div, point,
-        prelude::*,
+        prelude::*, px,
     };
 
     use super::{
-        Composer, ComposerImagePaste, ComposerLine, line_for_offset, logical_line_range,
-        logical_lines, message_ref_insertion, normalize_range, range_from_utf16,
-        should_auto_close_code_fence, visible_line_range, word_range,
+        Composer, ComposerImagePaste, logical_line_range, logical_lines, message_ref_insertion,
+        normalize_range, range_from_utf16, should_auto_close_code_fence, visible_line_range,
+        word_range,
     };
 
     struct CompletionKeyHarness {
         composer: Entity<Composer>,
         actions: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    struct ComposerLayoutHarness {
+        composer: Entity<Composer>,
+        comparison: Option<Entity<Composer>>,
+        width: f32,
+    }
+
+    impl Render for ComposerLayoutHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(self.width))
+                .flex()
+                .flex_col()
+                .child(self.composer.clone())
+                .when_some(self.comparison.clone(), |layout, comparison| {
+                    layout.child(comparison)
+                })
+        }
     }
 
     impl Render for CompletionKeyHarness {
@@ -1915,17 +2342,15 @@ mod tests {
             editor
         });
         let (start, end) = editor.read_with(cx, |editor, _| {
-            let bounds = editor.last_bounds.expect("editor has been painted");
-            let line = &editor.last_layout[0];
+            let layout = editor
+                .last_layout
+                .as_ref()
+                .expect("editor has been painted");
+            let line = &layout.lines[0];
+            let y = layout.text_bounds.top() + layout.line_height / 2.;
             (
-                point(
-                    bounds.left() + line.layout.x_for_index(0),
-                    bounds.center().y,
-                ),
-                point(
-                    bounds.left() + line.layout.x_for_index("alpha".len()),
-                    bounds.center().y,
-                ),
+                point(layout.screen_x_for_offset(line, 0), y),
+                point(layout.screen_x_for_offset(line, "alpha".len()), y),
             )
         });
 
@@ -1946,6 +2371,379 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn wraps_long_unbroken_text_to_the_measured_composer_width(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+        let (harness, cx) = cx.add_window_view(move |_, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value(text, cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 120.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let layout = composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .clone()
+                .expect("composer has been painted")
+        });
+
+        assert!(layout.lines.len() > 1);
+        for line in &layout.lines {
+            assert!(
+                line.x_for_offset(line.range.end) <= layout.text_bounds.size.width + px(1.),
+                "visual line {:?} escaped width {:?}",
+                line.range,
+                layout.text_bounds.size.width
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn empty_composer_remains_valid_when_available_width_collapses(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            let composer = cx.new(|cx| {
+                Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx)
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 0.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+
+        composer.read_with(cx, |composer, _| {
+            let layout = composer
+                .last_layout
+                .as_ref()
+                .expect("empty composer has been painted");
+            assert_eq!(layout.lines.len(), 1);
+            assert_eq!(layout.lines[0].range, 0..0);
+            assert_eq!(layout.line_index_for_offset(0), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn gj_and_gk_follow_the_shaped_visual_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let text = "proportional words ".repeat(20);
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer = Composer::new(cx);
+                composer.set_value(text, cx);
+                composer
+            });
+            window.focus(&composer.focus_handle(cx), cx);
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 120.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let second_row_start = composer.read_with(cx, |composer, _| {
+            let layout = composer
+                .last_layout
+                .as_ref()
+                .expect("composer has been painted");
+            assert!(layout.lines.len() > 1);
+            layout.lines[1].range.start
+        });
+
+        cx.simulate_keystrokes("g j");
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.snapshot().selection),
+            second_row_start..second_row_start
+        );
+
+        cx.simulate_keystrokes("g k");
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.snapshot().selection),
+            0..0
+        );
+    }
+
+    #[gpui::test]
+    fn typing_after_first_layout_grows_using_the_cached_width(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| {
+                Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx)
+            });
+            window.focus(&composer.focus_handle(cx), cx);
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 100.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let initial_height = composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .as_ref()
+                .expect("composer has been painted")
+                .bounds
+                .size
+                .height
+        });
+
+        cx.simulate_input("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+
+        composer.read_with(cx, |composer, _| {
+            let layout = composer
+                .last_layout
+                .as_ref()
+                .expect("composer has been repainted");
+            assert!(layout.lines.len() > 1);
+            assert!(layout.bounds.size.height > initial_height);
+            assert!(!composer.layout_invalidated);
+        });
+    }
+
+    #[gpui::test]
+    fn preserves_single_line_vertical_insets_as_the_composer_grows(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            let single = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value("one", cx);
+                composer
+            });
+            let multiline = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value("one\ntwo\nthree", cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer: single,
+                comparison: Some(multiline),
+                width: 240.,
+            }
+        });
+        let (single, multiline) = harness.read_with(cx, |harness, _| {
+            (
+                harness.composer.clone(),
+                harness.comparison.clone().expect("comparison composer"),
+            )
+        });
+        let single = single.read_with(cx, |composer, _| {
+            composer.last_layout.clone().expect("single-line layout")
+        });
+        let multiline = multiline.read_with(cx, |composer, _| {
+            composer.last_layout.clone().expect("multiline layout")
+        });
+        let single_top = single.text_bounds.top() - single.bounds.top();
+        let single_bottom = single.bounds.bottom() - single.text_bounds.bottom();
+        let multiline_top = multiline.text_bounds.top() - multiline.bounds.top();
+        let multiline_bottom = multiline.bounds.bottom() - multiline.text_bounds.bottom();
+
+        assert_eq!(single_top, single_bottom);
+        assert_eq!(multiline_top, multiline_bottom);
+        assert_eq!(single_top, multiline_top);
+        assert_eq!(
+            multiline.bounds.size.height - single.bounds.size.height,
+            single.line_height * 2.
+        );
+    }
+
+    #[gpui::test]
+    fn caps_long_wrapped_drafts_at_eight_visual_rows_and_keeps_the_cursor_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        let text = "x".repeat(600);
+        let expected_end = text.len();
+        let newline_text = (0..20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let newline_end = newline_text.len();
+        let (harness, cx) = cx.add_window_view(move |_, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value(text, cx);
+                composer
+            });
+            let newline_composer = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value(newline_text, cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: Some(newline_composer),
+                width: 100.,
+            }
+        });
+        let (composer, newline_composer) = harness.read_with(cx, |harness, _| {
+            (
+                harness.composer.clone(),
+                harness.comparison.clone().expect("newline composer"),
+            )
+        });
+        let layout = composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .clone()
+                .expect("composer has been painted")
+        });
+
+        assert_eq!(layout.lines.len(), super::MAX_VISIBLE_LINES);
+        assert_eq!(
+            layout.line_index_for_offset(expected_end),
+            Some(super::MAX_VISIBLE_LINES - 1)
+        );
+        assert_eq!(
+            layout.lines.last().map(|line| line.range.end),
+            Some(expected_end)
+        );
+        let newline_layout = newline_composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .clone()
+                .expect("newline composer has been painted")
+        });
+        assert_eq!(newline_layout.lines.len(), super::MAX_VISIBLE_LINES);
+        assert_eq!(
+            newline_layout.line_index_for_offset(newline_end),
+            Some(super::MAX_VISIBLE_LINES - 1)
+        );
+    }
+
+    #[gpui::test]
+    fn wrapped_hit_testing_uses_visual_row_geometry(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value("alpha beta gamma delta epsilon", cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 110.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let layout = composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .clone()
+                .expect("composer has been painted")
+        });
+        let line = &layout.lines[1];
+        let point = point(
+            layout.screen_x_for_offset(line, line.range.start),
+            layout.text_bounds.top() + layout.line_height * 1.5,
+        );
+
+        assert_eq!(layout.offset_for_point(point), Some(line.range.start));
+        let wrapped_range = layout.lines[0].range.start..line.range.end;
+        let bounds = layout
+            .bounds_for_range(wrapped_range)
+            .expect("wrapped range has platform bounds");
+        assert_eq!(bounds.top(), layout.text_bounds.top());
+        assert_eq!(
+            bounds.bottom(),
+            layout.text_bounds.top() + layout.line_height * 2.
+        );
+        assert!(bounds.left() >= layout.text_bounds.left());
+        assert!(bounds.right() <= layout.text_bounds.right());
+    }
+
+    #[gpui::test]
+    fn remeasures_wrapping_and_height_when_the_available_width_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu".to_owned();
+        let (harness, cx) = cx.add_window_view(move |_, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value(text, cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 120.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let narrow = composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .clone()
+                .expect("narrow composer layout")
+        });
+
+        harness.update(cx, |harness, cx| {
+            harness.width = 320.;
+            cx.notify();
+        });
+        let wide = composer.read_with(cx, |composer, _| {
+            composer.last_layout.clone().expect("wide composer layout")
+        });
+
+        assert!(wide.lines.len() < narrow.lines.len());
+        assert!(wide.bounds.size.height < narrow.bounds.size.height);
+    }
+
+    #[gpui::test]
+    fn single_line_inputs_scroll_horizontally_instead_of_escaping(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let text = "a very long settings value that cannot fit in the input";
+        let text_end = text.len();
+        let (harness, cx) = cx.add_window_view(move |_, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer = Composer::settings_input(
+                    "Edit value",
+                    crate::config::schema::BindingMode::Standard,
+                    cx,
+                );
+                composer.set_value(text, cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 100.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let layout = composer.read_with(cx, |composer, _| {
+            composer
+                .last_layout
+                .clone()
+                .expect("composer has been painted")
+        });
+        let line = &layout.lines[0];
+
+        assert_eq!(layout.lines.len(), 1);
+        assert!(layout.horizontal_scroll > px(0.));
+        assert!(layout.screen_x_for_offset(line, text_end) <= layout.text_bounds.right() + px(0.5));
+    }
+
     #[test]
     fn splits_multiline_content_before_single_line_shaping() {
         let text = "first\n\nthird\n";
@@ -1959,26 +2757,6 @@ mod tests {
             vec![0..5, 6..6, 7..12, 13..13]
         );
         assert!(lines.iter().all(|(_, line)| !line.contains('\n')));
-    }
-
-    #[test]
-    fn maps_offsets_on_newlines_to_the_adjacent_logical_lines() {
-        let lines = logical_lines("one\n\nthree")
-            .map(|(range, _)| ComposerLine {
-                range,
-                layout: Default::default(),
-            })
-            .collect::<Vec<_>>();
-        let line_at = |offset| {
-            line_for_offset(&lines, offset)
-                .map(|line| (line.range.clone(), line.local_offset(offset)))
-        };
-
-        assert_eq!(line_at(3), Some((0..3, 3)));
-        assert_eq!(line_at(4), Some((4..4, 0)));
-        assert_eq!(line_at(5), Some((5..10, 0)));
-        assert_eq!(line_at(10), Some((5..10, 5)));
-        assert!(line_for_offset(&[], 0).is_none());
     }
 
     #[test]

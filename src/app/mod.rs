@@ -33,7 +33,8 @@ use crate::{
         render_code_document,
     },
     composer::{
-        Composer, ComposerChanged, ComposerImagePaste, ComposerStateChanged, PastedImage,
+        Composer, ComposerChanged, ComposerImagePaste, ComposerStateChanged, MIN_COMPOSER_HEIGHT,
+        PastedImage,
         completion::{
             self, ArgumentKind, AssistSession, CompletionContext, CompletionOption,
             CompletionValue, OptionKey,
@@ -107,7 +108,6 @@ use local_rpc::{
 };
 
 const SIDEBAR_WIDTH: f32 = 232.0;
-const MIN_COMPOSER_HEIGHT: f32 = 64.0;
 const TIMELINE_GROUP_GAP: f32 = 7.0;
 const TIMELINE_MESSAGE_ROW_PADDING_TOP: f32 = 2.0;
 const TIMELINE_CONTINUATION_ROW_PADDING_Y: f32 = 2.0;
@@ -5747,7 +5747,6 @@ impl Render for ChattView {
                                         .child(
                                             div()
                                                 .min_w_0()
-                                                .min_h(rems_from_px(40.))
                                                 .flex_1()
                                                 .flex()
                                                 .items_center()

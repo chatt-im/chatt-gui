@@ -153,15 +153,35 @@ impl VimEditor {
         } else {
             self.mode
         };
-        let Some((target, _kind)) =
-            self.resolve_motion(motion, self.cursor, n, motion_mode, captured)
-        else {
-            self.dirty = true;
-            return;
+        let target = if matches!(motion, Motion::DisplayUp | Motion::DisplayDown) {
+            let desired_x = self.desired_display_x.or_else(|| {
+                self.display_line_for_offset(self.cursor_offset())
+                    .and_then(|line| line.x_for_offset(self.cursor_offset()))
+            });
+            let target = self.motion_display_line(
+                self.cursor,
+                n,
+                motion_mode,
+                matches!(motion, Motion::DisplayDown),
+                desired_x,
+            );
+            self.desired_display_x = desired_x;
+            target
+        } else {
+            let Some((target, _kind)) =
+                self.resolve_motion(motion, self.cursor, n, motion_mode, captured)
+            else {
+                self.dirty = true;
+                return;
+            };
+            target
         };
         self.cursor = target;
         match motion {
-            Motion::LineEnd => self.desired_display_col = u16::MAX,
+            Motion::LineEnd => {
+                self.desired_display_col = u16::MAX;
+                self.desired_display_x = None;
+            }
             Motion::Up
             | Motion::Down
             | Motion::DisplayUp
@@ -260,8 +280,12 @@ impl VimEditor {
             Motion::LineFirstNonblank => cursor::motion_caret(&self.buf, start, mode),
             Motion::Down => self.motion_vertical(start, n, mode, true),
             Motion::Up => self.motion_vertical(start, n, mode, false),
-            Motion::DisplayDown => self.motion_display_line(start, n, mode, true),
-            Motion::DisplayUp => self.motion_display_line(start, n, mode, false),
+            Motion::DisplayDown => {
+                self.motion_display_line(start, n, mode, true, self.display_x_for_cursor(start))
+            }
+            Motion::DisplayUp => {
+                self.motion_display_line(start, n, mode, false, self.display_x_for_cursor(start))
+            }
             Motion::HalfPageDown => {
                 self.motion_vertical(start, n.saturating_mul(self.half_page_rows()), mode, true)
             }
@@ -312,64 +336,55 @@ impl VimEditor {
         Some(self.buf.offset_to_rowcol(offset.min(self.buf.len() as u32)))
     }
 
-    fn motion_display_line(&self, start: Cursor, n: u32, mode: Mode, down: bool) -> Cursor {
-        let width = self.width.max(1);
-        if !self.effective_wrap() || width == 0 {
+    fn display_line_for_offset(&self, offset: usize) -> Option<&DisplayLine> {
+        self.display_lines.iter().find(|line| line.contains(offset))
+    }
+
+    fn display_x_for_cursor(&self, cursor: Cursor) -> Option<f32> {
+        let offset = self.buf.rowcol_to_offset(cursor.row, cursor.col) as usize;
+        self.display_line_for_offset(offset)
+            .and_then(|line| line.x_for_offset(offset))
+    }
+
+    fn motion_display_line(
+        &self,
+        start: Cursor,
+        n: u32,
+        mode: Mode,
+        down: bool,
+        desired_x: Option<f32>,
+    ) -> Cursor {
+        if !self.effective_wrap() {
             return self.motion_vertical(start, n, mode, down);
         }
 
-        let desired_display_col = if self.desired_display_col == u16::MAX {
-            self.cursor_display().1
-        } else {
-            self.desired_display_col
+        let start_offset = self.buf.rowcol_to_offset(start.row, start.col) as usize;
+        let Some(line_index) = self
+            .display_lines
+            .iter()
+            .position(|line| line.contains(start_offset))
+        else {
+            return start;
         };
-        let target_visual_col = desired_display_col % width;
-        let mut cursor = start;
-
-        for _ in 0..n.max(1) {
-            let line = self.buf.line(cursor.row);
-            let line = line.as_ref();
-            let display_col = cursor_display_col(line, cursor.col, mode, self.tab_settings.tabstop);
-            let segment = display_col / width;
-            let line_rows = wrapped_line_rows(line, width, self.tab_settings.tabstop);
-
-            let (target_row, target_segment) = if down {
-                if segment + 1 < line_rows {
-                    (cursor.row, segment + 1)
-                } else if cursor.row + 1 < self.buf.line_count() {
-                    (cursor.row + 1, 0)
-                } else {
-                    break;
-                }
-            } else if segment > 0 {
-                (cursor.row, segment - 1)
-            } else if cursor.row > 0 {
-                let prev_row = cursor.row - 1;
-                let prev_line = self.buf.line(prev_row);
-                let prev_rows =
-                    wrapped_line_rows(prev_line.as_ref(), width, self.tab_settings.tabstop);
-                (prev_row, prev_rows.saturating_sub(1))
-            } else {
-                break;
-            };
-
-            let target_line = self.buf.line(target_row);
-            let target_abs_col = target_segment
-                .saturating_mul(width)
-                .saturating_add(target_visual_col);
-            let target_col = cursor::col_from_display(
-                target_line.as_ref(),
-                target_abs_col,
-                mode,
-                self.tab_settings.tabstop,
-            );
-            cursor = Cursor {
-                row: target_row,
-                col: target_col,
-            };
+        // Display lines are intentionally limited to the shaped window around
+        // the cursor. A count larger than that window stops at its edge rather
+        // than shaping the entire draft, which keeps layout work bounded.
+        let target_index = if down {
+            line_index
+                .saturating_add(n.max(1) as usize)
+                .min(self.display_lines.len().saturating_sub(1))
+        } else {
+            line_index.saturating_sub(n.max(1) as usize)
+        };
+        if target_index == line_index {
+            return start;
         }
-
-        cursor
+        let target_line = &self.display_lines[target_index];
+        let Some(target_offset) = target_line.closest_offset(desired_x.unwrap_or(0.), mode) else {
+            return start;
+        };
+        let (row, col) = self.buf.offset_to_rowcol(target_offset.min(self.buf.len()) as u32);
+        Cursor { row, col }
     }
 
     fn enter_insert_at_cursor(&mut self) {
@@ -1023,6 +1038,8 @@ impl VimEditor {
         let inverse = self.buf.apply(edit);
         self.dirty = true;
         self.text_version = self.text_version.wrapping_add(1);
+        self.display_lines.clear();
+        self.desired_display_x = None;
         inverse
     }
 
@@ -1196,6 +1213,7 @@ impl VimEditor {
         // differ for hard tabs in Normal/Visual mode.
         self.desired_display_col =
             cursor_display_col(line, self.cursor.col, self.mode, self.tab_settings.tabstop);
+        self.desired_display_x = None;
     }
 
     fn apply_visual_operator(&mut self, op: Operator) {
@@ -1916,12 +1934,47 @@ fn cursor_display_col(line: &str, byte_col: usize, mode: Mode, tabstop: u16) -> 
     }
 }
 
-fn wrapped_line_rows(line: &str, width: u16, tabstop: u16) -> u16 {
-    if width == 0 {
-        return 0;
+#[derive(Clone, Debug)]
+pub(super) struct DisplayPoint {
+    pub(super) offset: usize,
+    pub(super) x: f32,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DisplayLine {
+    pub(super) range: Range<usize>,
+    pub(super) logical_end: usize,
+    pub(super) is_last_in_logical_line: bool,
+    pub(super) points: Vec<DisplayPoint>,
+}
+
+impl DisplayLine {
+    fn contains(&self, offset: usize) -> bool {
+        offset >= self.range.start
+            && (offset < self.range.end
+                || (self.is_last_in_logical_line && offset <= self.range.end))
     }
-    let cells = byte_col_to_display_col(line, line.len(), tabstop).max(1) as u32;
-    ((cells - 1) / width as u32 + 1) as u16
+
+    fn x_for_offset(&self, offset: usize) -> Option<f32> {
+        self.points
+            .iter()
+            .find(|point| point.offset == offset)
+            .map(|point| point.x)
+    }
+
+    fn closest_offset(&self, x: f32, mode: Mode) -> Option<usize> {
+        self.points
+            .iter()
+            .filter(|point| {
+                point.offset < self.range.end
+                    || (self.is_last_in_logical_line
+                        && (mode == Mode::Insert
+                            || self.range.is_empty()
+                            || point.offset < self.logical_end))
+            })
+            .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
+            .map(|point| point.offset)
+    }
 }
 
 fn char_range(selection: &Selection) -> (Cursor, Cursor) {
@@ -2555,7 +2608,6 @@ pub struct VimEditor {
     yank: Yank,
     yank_revision: u64,
     history: History,
-    width: u16,
     wrap: bool,
     scroll_offset: u16,
     last_viewport_h: u16,
@@ -2563,6 +2615,8 @@ pub struct VimEditor {
     dirty: bool,
     text_version: u64,
     desired_display_col: u16,
+    display_lines: Vec<DisplayLine>,
+    desired_display_x: Option<f32>,
     tab_settings: TabSettings,
     marks: HashMap<char, u32>,
     pending_block_change: Option<PendingBlockChange>,
@@ -2580,7 +2634,6 @@ impl VimEditor {
             yank: Yank::default(),
             yank_revision: 0,
             history: History::new(),
-            width: 1,
             wrap: true,
             scroll_offset: 0,
             last_viewport_h: 8,
@@ -2588,6 +2641,8 @@ impl VimEditor {
             dirty: true,
             text_version: 0,
             desired_display_col: 0,
+            display_lines: Vec::new(),
+            desired_display_x: None,
             tab_settings: TabSettings::default(),
             marks: HashMap::new(),
             pending_block_change: None,
@@ -2610,19 +2665,6 @@ impl VimEditor {
 
     fn half_page_rows(&self) -> u32 {
         (u32::from(self.last_viewport_h) / 2).max(1)
-    }
-
-    fn cursor_display(&self) -> (usize, u16) {
-        let line = self.buf.line(self.cursor.row);
-        (
-            self.cursor.row,
-            cursor_display_col(
-                line.as_ref(),
-                self.cursor.col,
-                self.mode,
-                self.tab_settings.tabstop,
-            ),
-        )
     }
 
     pub fn execute(&mut self, action: VimAction, count: u32, captured: Option<char>) {
@@ -2700,6 +2742,8 @@ impl VimEditor {
         self.history.reset();
         self.marks.clear();
         self.desired_display_col = 0;
+        self.display_lines.clear();
+        self.desired_display_x = None;
         self.dirty = true;
         self.text_version = self.text_version.wrapping_add(1);
         self.fixup_cursor();
@@ -2767,8 +2811,12 @@ impl VimEditor {
         }
     }
 
-    pub fn set_layout(&mut self, width: u16, viewport_rows: u16) {
-        self.width = width.max(1);
+    pub(super) fn set_display_lines(
+        &mut self,
+        lines: Vec<DisplayLine>,
+        viewport_rows: u16,
+    ) {
+        self.display_lines = lines;
         self.last_viewport_h = viewport_rows.max(1);
     }
 
@@ -3340,7 +3388,9 @@ fn text_object_for_char(around: bool, ch: char) -> Option<TextObject> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, VimEditor, VimKey};
+    use std::ops::Range;
+
+    use super::{DisplayLine, DisplayPoint, Mode, VimEditor, VimKey};
 
     fn normal(text: &str) -> VimEditor {
         let mut editor = VimEditor::new();
@@ -3352,6 +3402,45 @@ mod tests {
         for ch in sequence.chars() {
             assert!(editor.send_key(VimKey::Char(ch)), "unhandled key {ch:?}");
         }
+    }
+
+    fn display_line(
+        range: Range<usize>,
+        logical_end: usize,
+        is_last_in_logical_line: bool,
+        points: &[(usize, f32)],
+    ) -> DisplayLine {
+        DisplayLine {
+            range,
+            logical_end,
+            is_last_in_logical_line,
+            points: points
+                .iter()
+                .map(|&(offset, x)| DisplayPoint { offset, x })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn display_line_motions_follow_the_supplied_shaped_layout() {
+        let mut editor = normal("abcdef\nghijkl");
+        editor.set_cursor_offset(1);
+        editor.set_display_lines(
+            vec![
+                display_line(0..2, 6, false, &[(0, 0.), (1, 40.)]),
+                display_line(2..5, 6, false, &[(2, 0.), (3, 25.), (4, 80.)]),
+                display_line(5..6, 6, true, &[(5, 0.), (6, 30.)]),
+                display_line(7..13, 13, true, &[(7, 0.), (8, 35.), (9, 70.)]),
+            ],
+            4,
+        );
+
+        keys(&mut editor, "gj");
+        assert_eq!(editor.cursor_offset(), 3);
+        keys(&mut editor, "gk");
+        assert_eq!(editor.cursor_offset(), 1);
+        keys(&mut editor, "2gj");
+        assert_eq!(editor.cursor_offset(), 5);
     }
 
     #[test]

@@ -75,6 +75,7 @@ impl ChattView {
 
     pub(super) fn refresh_completion(&mut self, cx: &mut Context<Self>) {
         let view = self.completion_view(cx);
+        let had_completion = self.completion_session.is_some();
         let previous_key = self
             .completion_session
             .as_ref()
@@ -121,7 +122,9 @@ impl ChattView {
         self.composer.update(cx, |composer, _| {
             composer.set_completion_state(completion_open, completion_engaged)
         });
-        cx.notify();
+        if had_completion || view.is_some() {
+            cx.notify();
+        }
     }
 
     fn request_command_candidates(&mut self, kind: CommandCandidateKind) {
