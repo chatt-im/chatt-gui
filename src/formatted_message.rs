@@ -17,6 +17,7 @@ use crate::{
     emoji,
     fonts::{CODE_FONT_FAMILY, UI_FONT_FAMILY},
     icons::{IconName, icon},
+    notify::Notify,
     scrollbar::{OverlayScrollbarColors, OverlayScrollbarState, OverlayScrollbars},
     theme::{AppliedSettings, ThemeRole, syntax_role},
     ui_scale::rems_from_px,
@@ -570,6 +571,7 @@ pub struct FormattedMessageElement {
     body_color: Option<gpui::Rgba>,
     on_reference_click: Option<ReferenceClickCallback>,
     on_reference_hover: Option<ReferenceHoverCallback>,
+    notify: Notify,
 }
 
 impl FormattedMessageElement {
@@ -580,7 +582,15 @@ impl FormattedMessageElement {
             body_color: None,
             on_reference_click: None,
             on_reference_hover: None,
+            notify: Notify::default(),
         }
+    }
+
+    /// The view to redraw when starting a text selection or scrolling a fenced
+    /// code block inside this message.
+    pub fn notify(mut self, notify: Notify) -> Self {
+        self.notify = notify;
+        self
     }
 
     pub fn selection_group(
@@ -710,6 +720,7 @@ impl FormattedMessageElement {
                     window,
                     cx,
                     code_rems,
+                    self.notify,
                 ),
                 BlockKind::Blank => div().h(rems_from_px(7.)).into_any_element(),
             };
@@ -777,6 +788,7 @@ impl FormattedMessageElement {
             let rendered = rendered.clone();
             let selection = self.selection.clone();
             let message = self.message.clone();
+            let notify = self.notify;
             move |event: &MouseDownEvent, phase, window, cx| {
                 if !phase.bubble()
                     || event.button != MouseButton::Left
@@ -813,7 +825,7 @@ impl FormattedMessageElement {
                         &rendered,
                     );
                     window.prevent_default();
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -1055,6 +1067,7 @@ fn render_code_block(
     window: &Window,
     cx: &App,
     code_size: gpui::Rems,
+    notify: Notify,
 ) -> AnyElement {
     let applied = cx
         .try_global::<AppliedSettings>()
@@ -1098,6 +1111,7 @@ fn render_code_block(
                     .as_ref()
                     .map(|settings| OverlayScrollbarColors::from_settings(settings))
                     .unwrap_or_default(),
+                notify,
             ))
             .into_any_element()
     };
@@ -2003,14 +2017,16 @@ pub struct MessageSelectionArea<E> {
     inner: E,
     group: MessageSelectionGroup,
     on_vertical_autoscroll: Option<SelectionAutoscrollHandler>,
+    notify: Notify,
 }
 
 impl<E> MessageSelectionArea<E> {
-    pub fn new(inner: E, group: MessageSelectionGroup) -> Self {
+    pub fn new(inner: E, group: MessageSelectionGroup, notify: Notify) -> Self {
         Self {
             inner,
             group,
             on_vertical_autoscroll: None,
+            notify,
         }
     }
 
@@ -2063,7 +2079,7 @@ where
             .inner
             .prepaint(id, inspector_id, bounds, request, window, cx);
         if self.group.update_head_for_position(window.mouse_position()) {
-            cx.refresh_windows();
+            self.notify.notify(cx);
         }
         if self.group.is_pending() {
             let pointer = window.mouse_position();
@@ -2102,6 +2118,7 @@ where
         let mut context = KeyContext::default();
         context.add("ChattFormattedText");
         window.set_key_context(context);
+        let notify = self.notify;
         window.on_action(std::any::TypeId::of::<Copy>(), {
             let group = self.group.clone();
             move |_, phase, _window, cx| {
@@ -2120,7 +2137,7 @@ where
                     window.focus(&group.focus_handle(), cx);
                     if !group.contains_position(event.position) && group.is_active() {
                         group.clear();
-                        cx.refresh_windows();
+                        notify.notify(cx);
                     }
                 }
             }
@@ -2129,7 +2146,7 @@ where
             let group = self.group.clone();
             move |event: &MouseMoveEvent, phase, _window, cx| {
                 if phase.bubble() && group.update_head_for_position(event.position) {
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -2142,7 +2159,7 @@ where
                 {
                     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                     cx.write_to_primary(ClipboardItem::new_string(text));
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -2619,18 +2636,22 @@ mod tests {
         }
 
         impl gpui::Render for TestSelectionView {
-            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let notify = Notify::for_view(&cx.entity());
                 div()
                     .size_full()
                     .track_focus(&self.other_focus)
                     .child(MessageSelectionArea::new(
                         div().w(px(320.)).h(px(100.)).child(
-                            FormattedMessageElement::new(self.message.clone()).selection_group(
-                                self.group.clone(),
-                                MessageSelectionKey::Command(1),
-                            ),
+                            FormattedMessageElement::new(self.message.clone())
+                                .notify(notify)
+                                .selection_group(
+                                    self.group.clone(),
+                                    MessageSelectionKey::Command(1),
+                                ),
                         ),
                         self.group.clone(),
+                        notify,
                     ))
             }
         }

@@ -34,6 +34,20 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+/// Size of one frame's [`Scene`], as reported through
+/// [`crate::profiler::FrameTiming`].
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SceneStats {
+    /// Every primitive the scene holds, across all kinds.
+    pub primitives: u32,
+    /// Glyph and image sprites, which usually dominate the count.
+    pub sprites: u32,
+    /// Quads, the other bulk primitive.
+    pub quads: u32,
+    /// Bytes uploaded to the GPU as instance data for this frame.
+    pub instance_bytes: u32,
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
@@ -70,6 +84,42 @@ impl Scene {
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
+    }
+
+    /// How much the renderer has to hand the GPU for this frame.
+    ///
+    /// The scene is rebuilt and re-uploaded on every draw, so `instance_bytes`
+    /// is memcpy'd into a staging buffer each frame — in a text-heavy window
+    /// that copy can outweigh layout and paint combined. Walking the vectors is
+    /// cheap, but callers should still only ask while frame tracing is on.
+    pub fn stats(&self) -> SceneStats {
+        fn bytes<T>(items: &[T]) -> usize {
+            std::mem::size_of_val(items)
+        }
+
+        let sprites = self.monochrome_sprites.len()
+            + self.subpixel_sprites.len()
+            + self.polychrome_sprites.len();
+        SceneStats {
+            primitives: (self.shadows.len()
+                + self.quads.len()
+                + self.paths.len()
+                + self.underlines.len()
+                + self.hsv_color_wheels.len()
+                + sprites
+                + self.surfaces.len()) as u32,
+            sprites: sprites as u32,
+            quads: self.quads.len() as u32,
+            // Paths are excluded: they are rasterized through their own pass
+            // rather than uploaded as instances.
+            instance_bytes: (bytes(&self.shadows)
+                + bytes(&self.quads)
+                + bytes(&self.underlines)
+                + bytes(&self.hsv_color_wheels)
+                + bytes(&self.monochrome_sprites)
+                + bytes(&self.subpixel_sprites)
+                + bytes(&self.polychrome_sprites)) as u32,
+        }
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {

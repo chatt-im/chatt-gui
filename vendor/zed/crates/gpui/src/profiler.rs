@@ -709,6 +709,14 @@ pub struct FrameTiming {
     pub draw_start: Instant,
     /// When `Window::draw` finished.
     pub draw_end: Instant,
+    /// How much work the layout engine did for this frame.
+    pub layout: crate::LayoutStats,
+    /// How much the renderer had to upload for this frame.
+    pub scene: crate::SceneStats,
+    /// Cached views whose subtree was recycled from the previous frame.
+    pub views_reused: u64,
+    /// Cached views that had to be re-rendered, prepainted and painted.
+    pub views_rendered: u64,
 }
 
 impl FrameTiming {

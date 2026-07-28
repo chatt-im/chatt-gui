@@ -21,6 +21,7 @@ use gpui::{
 use crate::{
     fonts::CODE_FONT_FAMILY,
     formatted_message::syntax_color,
+    notify::Notify,
     theme::{ResolvedSettings, ThemeRole, syntax_role},
 };
 
@@ -932,6 +933,7 @@ struct CodeSelectionArea<E> {
     selection: CodeSelection,
     scroll_handle: UniformListScrollHandle,
     view_state: CodeViewState,
+    notify: Notify,
 }
 
 impl<E> CodeSelectionArea<E> {
@@ -941,6 +943,7 @@ impl<E> CodeSelectionArea<E> {
         selection: CodeSelection,
         scroll_handle: UniformListScrollHandle,
         view_state: CodeViewState,
+        notify: Notify,
     ) -> Self {
         Self {
             inner,
@@ -948,6 +951,7 @@ impl<E> CodeSelectionArea<E> {
             selection,
             scroll_handle,
             view_state,
+            notify,
         }
     }
 }
@@ -999,13 +1003,13 @@ where
             bounds,
             window.line_height(),
         ) {
-            cx.refresh_windows();
+            self.notify.notify(cx);
         }
         if self
             .selection
             .update_head_for_position(window.mouse_position())
         {
-            cx.refresh_windows();
+            self.notify.notify(cx);
         }
         if self.selection.is_pending()
             && autoscroll_selection(
@@ -1017,7 +1021,7 @@ where
                     .unwrap_or_else(|| window.line_height()),
             )
         {
-            cx.refresh_windows();
+            self.notify.notify(cx);
         }
         prepaint
     }
@@ -1035,6 +1039,7 @@ where
         let mut context = KeyContext::default();
         context.add("ChattCodeViewer");
         window.set_key_context(context);
+        let notify = self.notify;
         window.on_action(std::any::TypeId::of::<Copy>(), {
             let selection = self.selection.clone();
             move |_, phase, _window, cx| {
@@ -1051,7 +1056,7 @@ where
             move |_, phase, _window, cx| {
                 if phase == DispatchPhase::Bubble && selection.select_all() {
                     cx.stop_propagation();
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -1064,7 +1069,7 @@ where
                     && selection.is_active()
                 {
                     selection.clear();
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -1072,7 +1077,7 @@ where
             let selection = self.selection.clone();
             move |event: &MouseMoveEvent, phase, _window, cx| {
                 if phase.bubble() && selection.update_head_for_position(event.position) {
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -1085,7 +1090,7 @@ where
                 {
                     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                     cx.write_to_primary(ClipboardItem::new_string(text));
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
@@ -1245,6 +1250,7 @@ pub fn render_code_document(
     selection: CodeSelection,
     active_match: Option<CodeMatchTarget>,
     settings: Option<Arc<ResolvedSettings>>,
+    notify: Notify,
 ) -> impl IntoElement {
     let line_count = document.line_count();
     let widest_line = view_state.widest_line(&document);
@@ -1304,6 +1310,7 @@ pub fn render_code_document(
                             selection: list_selection.clone(),
                             active_match,
                             settings: settings.clone(),
+                            notify,
                         })
                 })
                 .collect::<Vec<_>>()
@@ -1334,7 +1341,14 @@ pub fn render_code_document(
                 }),
         )
         .child(list);
-    CodeSelectionArea::new(contents, document, selection, scroll_handle, view_state)
+    CodeSelectionArea::new(
+        contents,
+        document,
+        selection,
+        scroll_handle,
+        view_state,
+        notify,
+    )
 }
 
 struct CodeLineElement {
@@ -1344,6 +1358,7 @@ struct CodeLineElement {
     selection: CodeSelection,
     active_match: Option<CodeMatchTarget>,
     settings: Option<Arc<ResolvedSettings>>,
+    notify: Notify,
 }
 
 struct CodeLineLayout {
@@ -1433,7 +1448,7 @@ impl Element for CodeLineElement {
             marker_width,
         };
         if self.view_state.record_width(self.line, layout.width()) {
-            cx.refresh_windows();
+            self.notify.notify(cx);
         }
         let mut style = Style::default();
         style.size.width = layout.width().into();
@@ -1489,6 +1504,7 @@ impl Element for CodeLineElement {
             let line = self.line;
             let line_start = self.document.line_source_range(line).start;
             let text_layout = layout.text.clone();
+            let notify = self.notify;
             move |event: &MouseDownEvent, phase, window, cx| {
                 if !phase.bubble()
                     || event.button != MouseButton::Left
@@ -1501,7 +1517,7 @@ impl Element for CodeLineElement {
                 selection.begin_selection(line, offset, event.click_count, event.modifiers.shift);
                 window.focus(&selection.focus_handle(), cx);
                 window.prevent_default();
-                cx.refresh_windows();
+                notify.notify(cx);
             }
         });
         if let Some(target) = self
@@ -1685,7 +1701,8 @@ mod tests {
     }
 
     impl gpui::Render for TestCodeView {
-        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let notify = Notify::for_view(&cx.entity());
             div().size_full().track_focus(&self.focus).child(
                 div().w(px(240.0)).h(px(120.0)).flex().flex_col().child(
                     div()
@@ -1701,12 +1718,14 @@ mod tests {
                             self.selection.clone(),
                             self.active_match,
                             None,
+                            notify,
                         ))
                         .child(OverlayScrollbars::new(
                             "code-viewer-scrollbars",
                             self.scroll_handle.clone(),
                             self.scrollbar_state.clone(),
                             OverlayScrollbarColors::default(),
+                            notify,
                         )),
                 ),
             )

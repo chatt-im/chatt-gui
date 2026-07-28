@@ -383,6 +383,7 @@ impl<V: View> Element for ViewElement<V> {
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
+                            window.views_reused += 1;
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
                             cx.entities
@@ -393,6 +394,7 @@ impl<V: View> Element for ViewElement<V> {
                             return (None, element_state);
                         }
 
+                        window.views_rendered += 1;
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         let prepaint_start = window.prepaint_index();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {

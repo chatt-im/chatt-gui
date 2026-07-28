@@ -31,6 +31,21 @@ type NodeMeasureFn = StackSafe<
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+/// Per-frame counters describing how much work layout did.
+///
+/// `nodes` grows with the size of the element tree; `measure_calls` grows with
+/// how many times layout asked a leaf for its size, which is what nested flex
+/// containers multiply (each level probes its children under `ComputeSize`
+/// before laying them out under `PerformLayout`, and those results do not share
+/// a cache slot). A containment barrier keeps `measure_calls` near `nodes`.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct LayoutStats {
+    /// Taffy nodes created this frame.
+    pub nodes: u64,
+    /// Invocations of a measured leaf's measure closure this frame.
+    pub measure_calls: u64,
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
@@ -38,6 +53,7 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    stats: LayoutStats,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -52,7 +68,13 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            stats: LayoutStats::default(),
         }
+    }
+
+    /// Counters accumulated since the last [`Self::clear`].
+    pub fn stats(&self) -> LayoutStats {
+        self.stats
     }
 
     pub fn clear(&mut self) {
@@ -60,6 +82,7 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.stats = LayoutStats::default();
     }
 
     pub fn request_layout(
@@ -70,6 +93,7 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        self.stats.nodes += 1;
 
         if children.is_empty() {
             self.taffy
@@ -99,6 +123,7 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        self.stats.nodes += 1;
 
         self.taffy
             .new_leaf_with_context(
@@ -237,6 +262,10 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        // Counted locally because `self` is borrowed for the duration of the
+        // measure pass, then folded back into the frame's stats below.
+        let mut measure_calls = 0u64;
+
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
@@ -245,6 +274,7 @@ impl TaffyLayoutEngine {
                     let Some(node_context) = node_context else {
                         return taffy::geometry::Size::default();
                     };
+                    measure_calls += 1;
 
                     let known_dimensions = Size {
                         width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
@@ -270,6 +300,8 @@ impl TaffyLayoutEngine {
                 },
             )
             .expect(EXPECT_MESSAGE);
+
+        self.stats.measure_calls += measure_calls;
     }
 
     // Pixel snapping

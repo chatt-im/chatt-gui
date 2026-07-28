@@ -2102,7 +2102,6 @@ impl Element for ComposerElement {
                     }
                     window.prevent_default();
                     cx.stop_propagation();
-                    cx.refresh_windows();
                 }
             });
             window.on_mouse_event({
@@ -2121,7 +2120,6 @@ impl Element for ComposerElement {
                             input.scrollbar_drag = None;
                             cx.notify();
                         });
-                        cx.refresh_windows();
                         return;
                     }
                     let offset = offset_for_position(
@@ -2132,7 +2130,6 @@ impl Element for ComposerElement {
                     let line = visual_line_for_scroll_offset(offset, line_height);
                     input.update(cx, |input, cx| input.scroll_to_unit(line, cx));
                     cx.stop_propagation();
-                    cx.refresh_windows();
                 }
             });
             window.on_mouse_event({
@@ -2147,7 +2144,6 @@ impl Element for ComposerElement {
                             cx.notify();
                         });
                         cx.stop_propagation();
-                        cx.refresh_windows();
                     }
                 }
             });

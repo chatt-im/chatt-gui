@@ -1020,6 +1020,11 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// Cached views whose subtree was recycled from the previous frame, and
+    /// those that had to be re-rendered. Reset at the start of every draw and
+    /// reported through [`crate::profiler::FrameTiming`].
+    pub(crate) views_reused: u64,
+    pub(crate) views_rendered: u64,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1735,6 +1740,8 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            views_reused: 0,
+            views_rendered: 0,
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -2697,6 +2704,8 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        self.views_reused = 0;
+        self.views_rendered = 0;
 
         // Restore the previously-used input handler.
         // Place it back into a None slot (left by a previous .take()) so that
@@ -2736,7 +2745,12 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
+        let layout_stats = {
+            let layout_engine = self.layout_engine.as_mut().unwrap();
+            let stats = layout_engine.stats();
+            layout_engine.clear();
+            stats
+        };
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -2801,6 +2815,11 @@ impl Window {
                 invalidations: frame_dirty.invalidations,
                 draw_start,
                 draw_end: Instant::now(),
+                layout: layout_stats,
+                // Post-swap, so this is the frame that was just built.
+                scene: self.rendered_frame.scene.stats(),
+                views_reused: self.views_reused,
+                views_rendered: self.views_rendered,
             });
         }
 

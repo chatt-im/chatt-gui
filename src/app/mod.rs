@@ -56,8 +56,10 @@ use crate::{
     identity::{IdentityView, IdentityViewEvent},
     image_cache::{PreviewImageLoader, TimelineImageLoader},
     media_cache::{CachedAttachment, MediaCache},
+    contain::Contain,
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode, VideoAdjustment, VideoEffect},
+    notify::Notify,
     preview::{
         CodePreviewState, DIVIDER_WIDTH as PREVIEW_DIVIDER_WIDTH, ImageViewState, LiveVideo,
         PreviewContent, PreviewHistory, PreviewItem, PreviewLayout, PreviewTab, clamp_chat_width,
@@ -108,6 +110,26 @@ use local_rpc::{
 };
 
 const SIDEBAR_WIDTH: f32 = 232.0;
+
+/// Width of a visible rooms sidebar, halved on a window too narrow to give it
+/// its full width.
+fn sidebar_width(viewport_width: Pixels, rem_size: Pixels) -> Pixels {
+    crate::ui_scale::scaled_px(SIDEBAR_WIDTH, rem_size).min(viewport_width / 2.0)
+}
+
+/// Width flex would hand the chat column: the body less the divider and the
+/// preview panel beside it, or the whole body when no panel is shown.
+///
+/// The root row pins each of its children ([`Contain`]) instead of letting flex
+/// distribute, so these have to add back up to the viewport exactly — see
+/// `root_row_children_fill_the_viewport`.
+fn chat_column_width(body_width: Pixels, panel_width: Option<Pixels>, rem_size: Pixels) -> Pixels {
+    let Some(panel_width) = panel_width else {
+        return body_width;
+    };
+    (body_width - crate::ui_scale::scaled_px(PREVIEW_DIVIDER_WIDTH, rem_size) - panel_width)
+        .max(px(0.))
+}
 const TIMELINE_GROUP_GAP: f32 = 7.0;
 const TIMELINE_MESSAGE_ROW_PADDING_TOP: f32 = 2.0;
 const TIMELINE_CONTINUATION_ROW_PADDING_Y: f32 = 2.0;
@@ -816,6 +838,9 @@ pub struct ChattView {
     next_message_reference_flash_id: u64,
     message_reference_flash_task: Option<Task<()>>,
     timeline_selection: MessageSelectionGroup,
+    /// Handed to the custom elements below this view so they can invalidate it
+    /// without a whole-window refresh. See [`crate::notify`].
+    notify: Notify,
     audios: AttachmentAudioManager,
     videos: AttachmentVideoManager,
     video_thumbnails: VideoThumbnailCache,
@@ -1076,6 +1101,7 @@ impl ChattView {
             next_message_reference_flash_id: 1,
             message_reference_flash_task: None,
             timeline_selection,
+            notify: Notify::for_view(&cx.entity()),
             audios,
             videos,
             video_thumbnails,
@@ -3224,6 +3250,7 @@ impl ChattView {
                     .child(
                         FormattedMessageElement::new(formatted)
                             .body_color(body_color)
+                            .notify(self.notify)
                             .selection_group(
                                 self.timeline_selection.clone(),
                                 MessageSelectionKey::Command(local_id),
@@ -3319,6 +3346,7 @@ impl ChattView {
             let click_view = cx.entity().downgrade();
             let hover_view = cx.entity().downgrade();
             FormattedMessageElement::new(formatted_message)
+                .notify(self.notify)
                 .selection_group(
                     self.timeline_selection.clone(),
                     MessageSelectionKey::Message(message_id),
@@ -4586,11 +4614,13 @@ impl ChattView {
         root
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) -> Div {
         let applied = AppliedSettings::get(cx);
+        // `sidebar_width` resolves the same `min(SIDEBAR_WIDTH, 50%)` the
+        // percentage max-width used to, in the units the containment barrier
+        // needs, and is what `chat_body_width` subtracts.
         let mut sidebar = div()
-            .w(rems_from_px(SIDEBAR_WIDTH))
-            .max_w(relative(0.5))
+            .contain_w(self.sidebar_width(window))
             .h_full()
             .flex_none()
             .flex()
@@ -5212,6 +5242,7 @@ impl Render for ChattView {
                 },
             ),
             self.timeline_selection.clone(),
+            self.notify,
         )
         .on_vertical_autoscroll(move |distance, _, cx| {
             let _ = selection_view.update(cx, |view, cx| {
@@ -5252,23 +5283,22 @@ impl Render for ChattView {
         let tabbed_preview = active_preview
             .as_ref()
             .filter(|_| layout == PreviewLayout::Tabbed)
-            .map(|active| self.render_preview_surface(active, preview_width, preview_viewport, cx));
+            .map(|active| self.render_preview_surface(active, preview_viewport, cx));
         let show_room_view = tabbed_preview.is_none();
         let stacked_preview = (layout == PreviewLayout::Stacked
             && self.preview_history.tab_bar_visible())
         .then(|| {
-            self.render_stacked_preview(
-                active_preview.as_ref(),
-                preview_width,
-                viewer_height,
-                preview_viewport,
-                cx,
-            )
+            self.render_stacked_preview(active_preview.as_ref(), viewer_height, preview_viewport, cx)
         });
         let preview_panel = active_preview
             .as_ref()
             .filter(|_| layout == PreviewLayout::Split)
             .map(|active| self.render_preview_panel(active, preview_width, preview_viewport, cx));
+        let chat_column_width = chat_column_width(
+            body_width,
+            preview_panel.is_some().then_some(preview_width),
+            window.rem_size(),
+        );
         let resizing_preview_pane = self.preview_pane_resize.is_some();
         let resizing_preview_stack = self.preview_stack_resize.is_some();
         let completion_view = self.completion_view(cx).filter(|view| {
@@ -5292,7 +5322,9 @@ impl Render for ChattView {
         let completion_popup = completion_view.map(|view| self.render_completion_popup(view, cx));
         let queued_file_row = (!self.queued_files.is_empty()).then(|| self.render_queued_files(cx));
         let message_reference_preview = self.render_message_reference_preview(window, cx);
-        let sidebar = self.show_rooms_sidebar.then(|| self.render_sidebar(cx));
+        let sidebar = self
+            .show_rooms_sidebar
+            .then(|| self.render_sidebar(window, cx));
         let composer_menu = self
             .composer_menu_open
             .then(|| self.render_composer_menu(cx));
@@ -5407,9 +5439,9 @@ impl Render for ChattView {
             .when_some(sidebar, |root, sidebar| root.child(sidebar))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .contain_w(chat_column_width)
                     .h_full()
+                    .flex_none()
                     .flex()
                     .flex_col()
                     .when_some(live_panel, |column, live_panel| column.child(live_panel))
@@ -5824,7 +5856,10 @@ impl Render for ChattView {
                 root.child(
                     div()
                         .id("preview-pane-resize")
-                        .w(rems_from_px(PREVIEW_DIVIDER_WIDTH))
+                        .contain_w(crate::ui_scale::scaled_px(
+                            PREVIEW_DIVIDER_WIDTH,
+                            window.rem_size(),
+                        ))
                         .h_full()
                         .flex_none()
                         .flex()
@@ -6801,6 +6836,43 @@ mod tests {
 
         assert_eq!(horizontal_fraction(zero_width, px(100.0), 60.0), None);
         assert_eq!(horizontal_fraction(valid, px(100.0), 0.0), None);
+    }
+
+    /// The root row pins every child's width rather than letting flex
+    /// distribute the remainder, so a child that no longer adds up leaves a gap
+    /// or overflows instead of being absorbed.
+    #[test]
+    fn root_row_children_fill_the_viewport() {
+        for (viewport_width, rem_size, sidebar_shown, chat_width) in [
+            (px(1_920.0), px(16.0), true, px(1_100.0)),
+            (px(1_920.0), px(16.0), false, px(1_100.0)),
+            (px(2_560.0), px(20.0), true, px(900.0)),
+            (px(1_280.0), px(16.0), true, px(360.0)),
+            // Chat width past either clamp, so the panel bounds decide instead.
+            (px(1_920.0), px(16.0), true, px(0.0)),
+            (px(1_920.0), px(16.0), true, px(10_000.0)),
+        ] {
+            let sidebar = if sidebar_shown {
+                sidebar_width(viewport_width, rem_size)
+            } else {
+                px(0.)
+            };
+            let body = viewport_width - sidebar;
+            let divider = crate::ui_scale::scaled_px(PREVIEW_DIVIDER_WIDTH, rem_size);
+            let panel = panel_width_for_chat_width(chat_width, body, rem_size);
+            let chat = chat_column_width(body, Some(panel), rem_size);
+
+            assert_eq!(
+                sidebar + chat + divider + panel,
+                viewport_width,
+                "split row at {viewport_width:?}/{rem_size:?} sidebar={sidebar_shown} chat={chat_width:?}",
+            );
+            assert_eq!(
+                sidebar + chat_column_width(body, None, rem_size),
+                viewport_width,
+                "unsplit row at {viewport_width:?}/{rem_size:?} sidebar={sidebar_shown}",
+            );
+        }
     }
 
     #[test]

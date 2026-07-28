@@ -14,13 +14,17 @@ impl ChattView {
         }
     }
 
+    /// Width the rooms sidebar actually occupies, halving on a window too
+    /// narrow to give it its full width.
+    pub(super) fn sidebar_width(&self, window: &Window) -> Pixels {
+        if !self.show_rooms_sidebar {
+            return px(0.);
+        }
+        sidebar_width(window.viewport_size().width, window.rem_size())
+    }
+
     pub(super) fn chat_body_width(&self, window: &Window) -> Pixels {
-        window.viewport_size().width
-            - if self.show_rooms_sidebar {
-                crate::ui_scale::scaled_px(SIDEBAR_WIDTH, window.rem_size())
-            } else {
-                px(0.)
-            }
+        window.viewport_size().width - self.sidebar_width(window)
     }
 
     pub(super) fn preview_layout(&self, window: &Window) -> PreviewLayout {
@@ -1003,7 +1007,6 @@ impl ChattView {
     pub(super) fn render_preview_surface(
         &mut self,
         active: &PreviewItem,
-        width: Pixels,
         viewport: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -1011,13 +1014,16 @@ impl ChattView {
         let code = matches!(active.content, PreviewContent::Code(_));
         let body = match active.content {
             PreviewContent::Image { .. } => self.render_image_preview_body(active, viewport, cx),
-            PreviewContent::Code(_) => self.render_code_preview_body(active, width, cx),
+            PreviewContent::Code(_) => self.render_code_preview_body(active, viewport, cx),
         };
+        // `viewport` is the exact rectangle the viewer was given, so pinning to
+        // its height is the size flex would have resolved anyway — and it stops
+        // the enclosing column probing down through the code viewer.
         div()
             .id("preview-surface")
             .flex_1()
             .min_w_0()
-            .min_h_0()
+            .contain_h(viewport.size.height)
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -1033,7 +1039,6 @@ impl ChattView {
     pub(super) fn render_stacked_preview(
         &mut self,
         active: Option<&PreviewItem>,
-        width: Pixels,
         viewer_height: Pixels,
         viewport: Bounds<Pixels>,
         cx: &mut Context<Self>,
@@ -1041,7 +1046,7 @@ impl ChattView {
         let settings = AppliedSettings::get(cx);
         let resizing = self.preview_stack_resize.is_some();
         let tab_bar = self.render_preview_tab_bar(active, false, viewport, cx);
-        let surface = active.map(|active| self.render_preview_surface(active, width, viewport, cx));
+        let surface = active.map(|active| self.render_preview_surface(active, viewport, cx));
         div()
             .w_full()
             .flex_none()
@@ -1111,11 +1116,13 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) -> Div {
         let tab_bar = self.render_preview_tab_bar(Some(active), false, viewport, cx);
-        let surface = self.render_preview_surface(active, width, viewport, cx);
+        let surface = self.render_preview_surface(active, viewport, cx);
+        // The deepest flex chain in the window hangs off this pane, so it is
+        // the most valuable place to stop the root row probing inwards. Pinning
+        // is free here: `flex_none` already meant flex could not resize it.
         div()
-            .w(width)
+            .contain_w(width)
             .h_full()
-            .min_w_0()
             .flex_none()
             .flex()
             .flex_col()
@@ -1236,10 +1243,12 @@ impl ChattView {
     fn render_code_preview_body(
         &mut self,
         active: &PreviewItem,
-        width: Pixels,
+        viewport: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let settings = AppliedSettings::get(cx);
+        let notify = self.notify;
+        let width = viewport.size.width;
         let preview = active
             .code_preview()
             .expect("code preview panel requires code content")
@@ -1296,6 +1305,7 @@ impl ChattView {
                 .into()
             }
         };
+        let search_bar_shown = self.code_search_open && ready;
         let body = match preview.state {
             CodePreviewState::Fetching { .. } => preview_status("loading…", &settings.theme),
             CodePreviewState::Preparing { .. } => preview_status("highlighting…", &settings.theme),
@@ -1306,6 +1316,13 @@ impl ChattView {
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
+                // The last level above the virtualized line list, so this is
+                // the probe that costs the most to leave open. Only claimed
+                // when the viewport owns the whole body; with the search bar up
+                // its height is the bar's, which is content-derived.
+                .when(!search_bar_shown, |viewport_pane| {
+                    viewport_pane.contain_h(viewport.size.height)
+                })
                 .flex()
                 .overflow_hidden()
                 .bg(settings.theme.color(ThemeRole::MediaViewport))
@@ -1316,23 +1333,27 @@ impl ChattView {
                     self.code_selection.clone(),
                     active_match,
                     Some(settings.clone()),
+                    notify,
                 ))
                 .child(crate::scrollbar::OverlayScrollbars::new(
                     "code-viewer-scrollbars",
                     preview.scroll_handle.clone(),
                     preview.scrollbar_state.clone(),
                     crate::scrollbar::OverlayScrollbarColors::from_settings(&settings),
+                    notify,
                 ))
                 .into_any_element(),
         };
 
+        // Sole child of the contained surface, so it inherits that height and
+        // keeps the search bar and viewport out of the surface's own probe.
         div()
             .flex_1()
             .min_w_0()
-            .min_h_0()
+            .contain_h(viewport.size.height)
             .flex()
             .flex_col()
-            .when(self.code_search_open && ready, |column| {
+            .when(search_bar_shown, |column| {
                 column.child(
                     div()
                         .min_h(rems_from_px(PREVIEW_SEARCH_BAR_HEIGHT))

@@ -85,6 +85,28 @@ fn start_diagnostics(cx: &mut App) {
             let fps = frame_count as f64 / elapsed_seconds;
             let invalidations: u64 = frames.iter().map(|frame| frame.invalidations).sum();
             let invalidations_per_frame = invalidations as f64 / frame_count as f64;
+            let per_frame = |total: u64| total as f64 / frame_count as f64;
+            let layout_nodes = per_frame(frames.iter().map(|frame| frame.layout.nodes).sum());
+            let measure_calls =
+                per_frame(frames.iter().map(|frame| frame.layout.measure_calls).sum());
+            let views_reused = per_frame(frames.iter().map(|frame| frame.views_reused).sum());
+            let views_rendered = per_frame(frames.iter().map(|frame| frame.views_rendered).sum());
+            let sum32 = |total: u32| total as u64;
+            let scene_primitives = per_frame(
+                frames
+                    .iter()
+                    .map(|frame| sum32(frame.scene.primitives))
+                    .sum(),
+            );
+            let scene_sprites =
+                per_frame(frames.iter().map(|frame| sum32(frame.scene.sprites)).sum());
+            let scene_quads = per_frame(frames.iter().map(|frame| sum32(frame.scene.quads)).sum());
+            let scene_kib = per_frame(
+                frames
+                    .iter()
+                    .map(|frame| sum32(frame.scene.instance_bytes))
+                    .sum(),
+            ) / 1024.0;
             let draw_p50 = percentile(&draw_times, 50);
             let draw_p95 = percentile(&draw_times, 95);
             let draw_max = draw_times.last().copied().unwrap_or_default();
@@ -102,6 +124,14 @@ fn start_diagnostics(cx: &mut App) {
                     draw_max_ms = draw_max.as_secs_f64() * 1_000.0,
                     dirty_to_draw_p95_ms = dirty_p95.as_secs_f64() * 1_000.0,
                     invalidations_per_frame,
+                    layout_nodes,
+                    measure_calls,
+                    views_reused,
+                    views_rendered,
+                    scene_primitives,
+                    scene_sprites,
+                    scene_quads,
+                    scene_kib,
                     scroll_input_hz,
                     scroll_update_hz
                 );
@@ -117,6 +147,14 @@ fn start_diagnostics(cx: &mut App) {
                     draw_p95_ms = draw_p95.unwrap_or_default().as_secs_f64() * 1_000.0,
                     draw_max_ms = draw_max.as_secs_f64() * 1_000.0,
                     invalidations_per_frame,
+                    layout_nodes,
+                    measure_calls,
+                    views_reused,
+                    views_rendered,
+                    scene_primitives,
+                    scene_sprites,
+                    scene_quads,
+                    scene_kib,
                     scroll_input_hz,
                     scroll_update_hz
                 );

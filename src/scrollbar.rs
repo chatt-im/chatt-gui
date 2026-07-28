@@ -9,7 +9,10 @@ use gpui::{
     UniformListScrollHandle, Window, point, px, quad, relative, rgba, size,
 };
 
-use crate::theme::{ResolvedSettings, ThemeRole};
+use crate::{
+    notify::Notify,
+    theme::{ResolvedSettings, ThemeRole},
+};
 
 const SCROLLBAR_SIZE: f32 = 12.0;
 const SCROLLBAR_PADDING: f32 = 2.0;
@@ -114,6 +117,9 @@ pub(crate) struct OverlayScrollbars {
     scroll_handle: ScrollHandle,
     state: OverlayScrollbarState,
     colors: OverlayScrollbarColors,
+    /// Dragging the thumb scrolls a handle the owning view reads, so only that
+    /// view needs redrawing.
+    notify: Notify,
 }
 
 impl OverlayScrollbars {
@@ -122,9 +128,10 @@ impl OverlayScrollbars {
         scroll_handle: UniformListScrollHandle,
         state: OverlayScrollbarState,
         colors: OverlayScrollbarColors,
+        notify: Notify,
     ) -> Self {
         let scroll_handle = scroll_handle.0.borrow().base_handle.clone();
-        Self::for_scroll_handle(id, scroll_handle, state, colors)
+        Self::for_scroll_handle(id, scroll_handle, state, colors, notify)
     }
 
     pub(crate) fn for_scroll_handle(
@@ -132,12 +139,14 @@ impl OverlayScrollbars {
         scroll_handle: ScrollHandle,
         state: OverlayScrollbarState,
         colors: OverlayScrollbarColors,
+        notify: Notify,
     ) -> Self {
         Self {
             id: id.into(),
             scroll_handle,
             state,
             colors,
+            notify,
         }
     }
 }
@@ -251,6 +260,7 @@ impl Element for OverlayScrollbars {
         } else {
             DispatchPhase::Bubble
         };
+        let notify = self.notify;
         window.on_mouse_event({
             let layouts = layouts.clone();
             let scroll_handle = self.scroll_handle.clone();
@@ -283,7 +293,7 @@ impl Element for OverlayScrollbars {
                 }
                 window.prevent_default();
                 cx.stop_propagation();
-                cx.refresh_windows();
+                notify.notify(cx);
             }
         });
         window.on_mouse_event({
@@ -299,7 +309,7 @@ impl Element for OverlayScrollbars {
                 };
                 if !event.dragging() {
                     state.0.set(None);
-                    cx.refresh_windows();
+                    notify.notify(cx);
                     return;
                 }
                 let Some(layout) = layouts
@@ -314,7 +324,7 @@ impl Element for OverlayScrollbars {
                     offset_for_position(layout.geometry, event.position, drag.pointer_offset),
                 );
                 cx.stop_propagation();
-                cx.refresh_windows();
+                notify.notify(cx);
             }
         });
         window.on_mouse_event({
@@ -325,7 +335,7 @@ impl Element for OverlayScrollbars {
                     && state.0.take().is_some()
                 {
                     cx.stop_propagation();
-                    cx.refresh_windows();
+                    notify.notify(cx);
                 }
             }
         });
