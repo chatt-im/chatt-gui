@@ -1335,7 +1335,7 @@ impl ChattView {
                 identity.update(cx, |identity, cx| identity.clear_check(cx));
             }
             IdentityResultPayload::Document(document) => {
-                identity.update(cx, |identity, cx| identity.apply_document(document, cx));
+                identity.update(cx, |identity, cx| identity.apply_document(*document, cx));
             }
             IdentityResultPayload::None | IdentityResultPayload::Closed { .. } => {}
         }
@@ -1352,7 +1352,7 @@ impl ChattView {
                 let identity = self.identity_view(window, cx);
                 // The dialog is created before the daemon can describe the peer,
                 // so the paste field only exists to focus once one arrives.
-                if identity.update(cx, |identity, cx| identity.apply_document(document, cx)) {
+                if identity.update(cx, |identity, cx| identity.apply_document(*document, cx)) {
                     window.focus(&identity.focus_handle(cx), cx);
                 }
             }

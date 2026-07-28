@@ -21,7 +21,6 @@ use gpui::{
 use crate::{
     fonts::CODE_FONT_FAMILY,
     formatted_message::syntax_color,
-    scrollbar::{OverlayScrollbarColors, OverlayScrollbarState, OverlayScrollbars},
     theme::{ResolvedSettings, ThemeRole, syntax_role},
 };
 
@@ -1243,7 +1242,6 @@ pub fn render_code_document(
     document: Arc<CodeDocument>,
     scroll_handle: UniformListScrollHandle,
     view_state: CodeViewState,
-    scrollbar_state: OverlayScrollbarState,
     selection: CodeSelection,
     active_match: Option<CodeMatchTarget>,
     settings: Option<Arc<ResolvedSettings>>,
@@ -1317,7 +1315,6 @@ pub fn render_code_document(
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     .size_full();
     let contents = div()
-        .relative()
         .size_full()
         .font_family(
             settings
@@ -1336,16 +1333,7 @@ pub fn render_code_document(
                     ))
                 }),
         )
-        .child(list)
-        .child(OverlayScrollbars::new(
-            "code-viewer-scrollbars",
-            scroll_handle.clone(),
-            scrollbar_state,
-            settings
-                .as_ref()
-                .map(|settings| OverlayScrollbarColors::from_settings(settings))
-                .unwrap_or_default(),
-        ));
+        .child(list);
     CodeSelectionArea::new(contents, document, selection, scroll_handle, view_state)
 }
 
@@ -1684,6 +1672,7 @@ fn line_number(value: usize) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrollbar::{OverlayScrollbarColors, OverlayScrollbarState, OverlayScrollbars};
 
     struct TestCodeView {
         document: Arc<CodeDocument>,
@@ -1697,18 +1686,30 @@ mod tests {
 
     impl gpui::Render for TestCodeView {
         fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .track_focus(&self.focus)
-                .child(div().w(px(240.0)).h(px(120.0)).child(render_code_document(
-                    self.document.clone(),
-                    self.scroll_handle.clone(),
-                    self.view_state.clone(),
-                    self.scrollbar_state.clone(),
-                    self.selection.clone(),
-                    self.active_match,
-                    None,
-                )))
+            div().size_full().track_focus(&self.focus).child(
+                div().w(px(240.0)).h(px(120.0)).flex().flex_col().child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .overflow_hidden()
+                        .child(render_code_document(
+                            self.document.clone(),
+                            self.scroll_handle.clone(),
+                            self.view_state.clone(),
+                            self.selection.clone(),
+                            self.active_match,
+                            None,
+                        ))
+                        .child(OverlayScrollbars::new(
+                            "code-viewer-scrollbars",
+                            self.scroll_handle.clone(),
+                            self.scrollbar_state.clone(),
+                            OverlayScrollbarColors::default(),
+                        )),
+                ),
+            )
         }
     }
 
@@ -2130,10 +2131,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn rendered_scrollbar_drag_reaches_the_end_of_the_code_list(cx: &mut gpui::TestAppContext) {
+    fn eight_thousand_line_viewer_renders_a_scrollbar_that_drags_to_the_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(crate::fonts::init);
         let document = Arc::new(CodeDocument::prepare(
-            (0..100)
+            (0..8_000)
                 .map(|line| format!("line {line}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -2157,14 +2160,17 @@ mod tests {
         let (start, end, maximum) = view.read_with(cx, |view, _| {
             let base_handle = view.scroll_handle.0.borrow().base_handle.clone();
             let maximum = base_handle.max_offset();
-            let geometry = crate::scrollbar::scrollbar_geometries(
-                base_handle.bounds(),
-                maximum,
-                base_handle.offset(),
-            )
-            .into_iter()
-            .find(|geometry| geometry.axis == crate::scrollbar::ScrollbarAxis::Vertical)
-            .expect("long code document has a vertical scrollbar");
+            let geometry = view
+                .scrollbar_state
+                .geometries()
+                .into_iter()
+                .find(|geometry| geometry.axis == crate::scrollbar::ScrollbarAxis::Vertical)
+                .expect("8,000-line code document paints a vertical scrollbar");
+            assert!(
+                geometry.track_bounds.size.height <= px(120.0),
+                "scrollbar escaped the 120px viewport: {:?}",
+                geometry.track_bounds
+            );
             let start = geometry.thumb_bounds.center();
             let end = point(
                 start.x,

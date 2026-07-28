@@ -1,12 +1,13 @@
 use std::{cell::RefCell, collections::VecDeque, ops::Range, rc::Rc, sync::Arc};
 
 use gpui::{
-    App, AvailableSpace, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hsla, KeyDownEvent, LayoutId,
-    LineLayout, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Rems,
+    App, AvailableSpace, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context,
+    Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, KeyDownEvent, LayoutId, LineLayout, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Rems, ScrollWheelEvent,
     SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions,
-    div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    div, fill, point, prelude::*, px, quad, relative, rgb, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -24,6 +25,10 @@ use crate::{
     emoji,
     fonts::CODE_FONT_FAMILY,
     formatted_message::syntax_color,
+    scrollbar::{
+        OverlayScrollbarColors, ScrollbarAxis, ScrollbarGeometry, offset_for_position,
+        scrollbar_geometries_scaled,
+    },
     theme::{AppliedSettings, ResolvedSettings, ThemeRole, syntax_role},
     ui_scale::rems_from_px,
 };
@@ -95,6 +100,8 @@ pub struct TextEditor {
     last_layout: Option<ComposerGeometry>,
     layout_width: Option<Pixels>,
     layout_invalidated: bool,
+    scroll_anchor: Option<ComposerViewportAnchor>,
+    scrollbar_drag: Option<ComposerScrollbarDrag>,
     syntax: Option<ComposerSyntax>,
 }
 
@@ -130,6 +137,8 @@ impl TextEditor {
             last_layout: None,
             layout_width: None,
             layout_invalidated: false,
+            scroll_anchor: None,
+            scrollbar_drag: None,
             syntax: Some(ComposerSyntax::default()),
         }
     }
@@ -158,6 +167,8 @@ impl TextEditor {
             last_layout: None,
             layout_width: None,
             layout_invalidated: false,
+            scroll_anchor: None,
+            scrollbar_drag: None,
             syntax: None,
         }
     }
@@ -263,6 +274,8 @@ impl TextEditor {
         self.reversed = false;
         self.marked = None;
         self.last_layout = None;
+        self.scroll_anchor = None;
+        self.scrollbar_drag = None;
         self.layout_invalidated = true;
         self.refresh_syntax();
         cx.emit(ComposerChanged);
@@ -282,6 +295,8 @@ impl TextEditor {
         self.reversed = false;
         self.marked = None;
         self.last_layout = None;
+        self.scroll_anchor = None;
+        self.scrollbar_drag = None;
         self.layout_invalidated = true;
         self.refresh_syntax();
         cx.emit(ComposerChanged);
@@ -314,6 +329,8 @@ impl TextEditor {
         self.reversed = false;
         self.marked = None;
         self.last_layout = None;
+        self.scroll_anchor = None;
+        self.scrollbar_drag = None;
         self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
@@ -334,6 +351,7 @@ impl TextEditor {
         let offset = self.editor.cursor_offset();
         self.selected = offset..offset;
         self.reversed = false;
+        self.scroll_anchor = None;
         self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
@@ -348,6 +366,7 @@ impl TextEditor {
             self.reversed = !self.reversed;
             self.selected = self.selected.end..self.selected.start;
         }
+        self.scroll_anchor = None;
         self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
@@ -382,6 +401,7 @@ impl TextEditor {
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected = 0..self.editor.len();
+        self.scroll_anchor = None;
         self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
@@ -543,6 +563,7 @@ impl TextEditor {
         self.editor.set_cursor_offset(end);
         self.marked = None;
         self.last_layout = None;
+        self.scroll_anchor = None;
         self.layout_invalidated = true;
         self.refresh_syntax();
         cx.emit(ComposerChanged);
@@ -635,6 +656,80 @@ impl TextEditor {
 
     fn finish_mouse_selection(&mut self, _: &MouseUpEvent, _: &mut Context<Self>) {
         self.mouse_anchor = None;
+    }
+
+    fn scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.multiline {
+            return;
+        }
+        let Some(layout) = self.last_layout.as_ref() else {
+            return;
+        };
+        if layout.scroll_max == 0 {
+            return;
+        }
+        let delta = event.delta.pixel_delta(layout.line_height).y;
+        if delta == Pixels::ZERO {
+            return;
+        }
+        let row_delta = -(delta / layout.line_height);
+        let row_delta = if row_delta.abs() < 1.0 {
+            row_delta.signum() as isize
+        } else {
+            row_delta.round() as isize
+        };
+        if row_delta > 0 && layout.scroll_position >= layout.scroll_max
+            || row_delta < 0 && layout.scroll_position == 0
+        {
+            return;
+        }
+        let Some(anchor) = scrolled_composer_anchor(
+            &layout.shaped_lines,
+            layout.visible_line_start,
+            row_delta,
+            self.editor.line_count(),
+        ) else {
+            return;
+        };
+        if layout
+            .lines
+            .first()
+            .map(ComposerVisualLine::viewport_anchor)
+            == Some(anchor)
+        {
+            return;
+        }
+        self.scroll_anchor = Some(anchor);
+        self.layout_invalidated = true;
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn scroll_to_unit(&mut self, unit: usize, cx: &mut Context<Self>) {
+        let Some(layout) = self.last_layout.as_ref() else {
+            return;
+        };
+        let unit = unit.min(layout.scroll_max);
+        if layout.scroll_position == unit {
+            return;
+        }
+        self.scroll_anchor = Some(if layout.scroll_units_are_visual {
+            ComposerViewportAnchor {
+                logical_row: 0,
+                visual_row: unit,
+            }
+        } else {
+            let fraction = unit as f32 / layout.scroll_max.max(1) as f32;
+            let logical_row =
+                (fraction * self.editor.line_count().saturating_sub(1) as f32).round() as usize;
+            ComposerViewportAnchor {
+                logical_row,
+                visual_row: 0,
+            }
+        });
+        self.layout_invalidated = true;
+        cx.notify();
     }
 
     fn handle_vim_key(
@@ -782,6 +877,7 @@ impl TextEditor {
         self.reversed = false;
         self.marked = None;
         self.last_layout = None;
+        self.scroll_anchor = None;
         self.layout_invalidated = true;
         if self.editor.text_version() != version {
             self.refresh_syntax();
@@ -1009,6 +1105,7 @@ impl EntityInputHandler for TextEditor {
         self.selected = range.clone();
         self.reversed = false;
         self.editor.set_cursor_offset(range.end);
+        self.scroll_anchor = None;
         self.layout_invalidated = true;
         cx.emit(ComposerStateChanged);
         cx.notify();
@@ -1030,6 +1127,8 @@ impl EventEmitter<ComposerImagePaste> for TextEditor {}
 #[derive(Clone, Debug)]
 struct ComposerVisualLine {
     range: Range<usize>,
+    logical_row: usize,
+    visual_row: usize,
     logical_start: usize,
     logical_end: usize,
     layout: Arc<LineLayout>,
@@ -1038,6 +1137,13 @@ struct ComposerVisualLine {
 }
 
 impl ComposerVisualLine {
+    fn viewport_anchor(&self) -> ComposerViewportAnchor {
+        ComposerViewportAnchor {
+            logical_row: self.logical_row,
+            visual_row: self.visual_row,
+        }
+    }
+
     fn local_range(&self) -> Range<usize> {
         self.range.start.saturating_sub(self.logical_start)
             ..self.range.end.saturating_sub(self.logical_start)
@@ -1055,12 +1161,23 @@ impl ComposerVisualLine {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposerViewportAnchor {
+    logical_row: usize,
+    visual_row: usize,
+}
+
 #[derive(Clone, Debug)]
 struct ComposerGeometry {
     bounds: Bounds<Pixels>,
     text_bounds: Bounds<Pixels>,
     line_height: Pixels,
     horizontal_scroll: Pixels,
+    scroll_position: usize,
+    scroll_max: usize,
+    scroll_units_are_visual: bool,
+    visible_line_start: usize,
+    shaped_lines: Vec<ComposerVisualLine>,
     lines: Vec<ComposerVisualLine>,
 }
 
@@ -1157,6 +1274,7 @@ impl ComposerGeometry {
 }
 
 struct ComposerLogicalLine {
+    row: usize,
     range: Range<usize>,
     layout: WrappedLine,
     first_visual_line: usize,
@@ -1167,6 +1285,7 @@ struct ComposerLayout {
     logical_lines: Vec<ComposerLogicalLine>,
     visual_lines: Vec<ComposerVisualLine>,
     visible_lines: Range<usize>,
+    total_logical_lines: usize,
     line_height: Pixels,
     vertical_inset: Pixels,
     horizontal_scroll: Pixels,
@@ -1176,8 +1295,7 @@ struct ComposerLayout {
 
 impl ComposerLayout {
     fn height(&self) -> Pixels {
-        self.vertical_inset * 2.
-            + self.line_height * self.visible_lines.len().max(1) as f32
+        self.vertical_inset * 2. + self.line_height * self.visible_lines.len().max(1) as f32
     }
 
     fn geometry(&self, bounds: Bounds<Pixels>) -> ComposerGeometry {
@@ -1188,12 +1306,37 @@ impl ComposerLayout {
                 self.line_height * self.visible_lines.len().max(1) as f32,
             ),
         );
+        let visible = &self.visual_lines[self.visible_lines.clone()];
+        let logical_line_count = self.total_logical_lines;
+        let scroll_units_are_visual = logical_line_count == 1;
+        let first = visible.first();
+        let first_row = first.map_or(0, |line| line.logical_row);
+        let known_wraps_before = self
+            .logical_lines
+            .iter()
+            .filter(|line| line.row < first_row)
+            .map(|line| line.visual_line_count.saturating_sub(1))
+            .sum::<usize>();
+        let known_extra_wraps = self
+            .logical_lines
+            .iter()
+            .map(|line| line.visual_line_count.saturating_sub(1))
+            .sum::<usize>();
+        let scroll_position =
+            first_row + known_wraps_before + first.map_or(0, |line| line.visual_row);
+        let scroll_max =
+            (logical_line_count + known_extra_wraps).saturating_sub(self.visible_lines.len());
         ComposerGeometry {
             bounds,
             text_bounds,
             line_height: self.line_height,
             horizontal_scroll: self.horizontal_scroll,
-            lines: self.visual_lines[self.visible_lines.clone()].to_vec(),
+            scroll_position: scroll_position.min(scroll_max),
+            scroll_max,
+            scroll_units_are_visual,
+            visible_line_start: self.visible_lines.start,
+            shaped_lines: self.visual_lines.clone(),
+            lines: visible.to_vec(),
         }
     }
 
@@ -1429,6 +1572,7 @@ fn build_composer_layout(
                 }
             };
         ComposerLogicalLine {
+            row,
             range,
             layout,
             first_visual_line: 0,
@@ -1436,20 +1580,25 @@ fn build_composer_layout(
         }
     };
 
+    let total_logical_lines = input.editor.line_count().max(1);
     let mut logical_lines = VecDeque::new();
     if is_placeholder {
         logical_lines.push_back(shape_line(0, 0..0, input.placeholder.clone()));
     } else {
         let cursor_row = input.editor.offset_to_rowcol(input.cursor()).0;
+        let viewport_row = input
+            .scroll_anchor
+            .map_or(cursor_row, |anchor| anchor.logical_row)
+            .min(total_logical_lines - 1);
         let line_for_row = |row| {
             let start = input.editor.line_start(row);
             let text = input.editor.line(row);
             let range = start..start + text.len();
             shape_line(row, range, text.into_owned().into())
         };
-        logical_lines.push_back(line_for_row(cursor_row));
+        logical_lines.push_back(line_for_row(viewport_row));
         let mut preceding_visual_count = 0;
-        let mut first_row = cursor_row;
+        let mut first_row = viewport_row;
         while preceding_visual_count < MAX_VISIBLE_LINES && first_row > 0 {
             first_row -= 1;
             let line = line_for_row(first_row);
@@ -1457,8 +1606,8 @@ fn build_composer_layout(
             logical_lines.push_front(line);
         }
         let mut following_visual_count = 0;
-        let mut next_row = cursor_row + 1;
-        while following_visual_count < MAX_VISIBLE_LINES && next_row < input.editor.line_count() {
+        let mut next_row = viewport_row + 1;
+        while following_visual_count < MAX_VISIBLE_LINES && next_row < total_logical_lines {
             let line = line_for_row(next_row);
             following_visual_count += line.layout.wrap_boundaries().len() + 1;
             logical_lines.push_back(line);
@@ -1488,6 +1637,8 @@ fn build_composer_layout(
             let end = starts.get(index + 1).copied().unwrap_or(local_end);
             visual_lines.push(ComposerVisualLine {
                 range: logical.range.start + start..logical.range.start + end,
+                logical_row: logical.row,
+                visual_row: index,
                 logical_start: logical.range.start,
                 logical_end: logical.range.end,
                 layout: logical.layout.unwrapped_layout.clone(),
@@ -1501,6 +1652,8 @@ fn build_composer_layout(
     if visual_lines.is_empty() {
         visual_lines.push(ComposerVisualLine {
             range: 0..0,
+            logical_row: 0,
+            visual_row: 0,
             logical_start: 0,
             logical_end: 0,
             layout: Arc::new(LineLayout::default()),
@@ -1509,15 +1662,32 @@ fn build_composer_layout(
         });
     }
     let cursor = input.cursor();
-    let cursor_visual_line = visual_lines
-        .iter()
-        .position(|line| {
-            cursor >= line.range.start
-                && (cursor < line.range.end
-                    || (line.is_last_in_logical_line && cursor <= line.range.end))
-        })
-        .unwrap_or_else(|| visual_lines.len() - 1);
-    let visible_lines = visible_line_range(visual_lines.len(), cursor_visual_line);
+    let cursor_visual_line = visual_lines.iter().position(|line| {
+        cursor >= line.range.start
+            && (cursor < line.range.end
+                || (line.is_last_in_logical_line && cursor <= line.range.end))
+    });
+    let visible_lines = if let Some(anchor) = input.scroll_anchor {
+        let anchor_line = visual_lines
+            .iter()
+            .position(|line| {
+                line.logical_row == anchor.logical_row && line.visual_row == anchor.visual_row
+            })
+            .or_else(|| {
+                visual_lines
+                    .iter()
+                    .position(|line| line.logical_row >= anchor.logical_row)
+            })
+            .unwrap_or_else(|| visual_lines.len() - 1);
+        let visible_count = visual_lines.len().clamp(1, MAX_VISIBLE_LINES);
+        let start = anchor_line.min(visual_lines.len().saturating_sub(visible_count));
+        start..start + visible_count
+    } else {
+        visible_line_range(
+            visual_lines.len(),
+            cursor_visual_line.unwrap_or_else(|| visual_lines.len() - 1),
+        )
+    };
     let natural_width = logical_lines
         .iter()
         .map(|line| line.layout.width())
@@ -1526,6 +1696,8 @@ fn build_composer_layout(
     let horizontal_scroll = if input.multiline {
         Pixels::ZERO
     } else {
+        let cursor_visual_line =
+            cursor_visual_line.expect("single-line composer layout contains its cursor");
         let cursor_x = visual_lines[cursor_visual_line].x_for_offset(cursor);
         let cursor_right = cursor_x + style.cursor_width;
         if cursor_right > width {
@@ -1544,6 +1716,7 @@ fn build_composer_layout(
         logical_lines,
         visual_lines,
         visible_lines,
+        total_logical_lines,
         line_height: style.line_height,
         vertical_inset,
         horizontal_scroll,
@@ -1555,10 +1728,23 @@ fn build_composer_layout(
 struct ComposerElement {
     input: Entity<TextEditor>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct ComposerScrollbarDrag {
+    pointer_offset: Pixels,
+}
+
+#[derive(Clone)]
+struct ComposerScrollbarLayout {
+    geometry: ScrollbarGeometry,
+    hitbox: Hitbox,
+}
+
 struct Prepaint {
     geometry: ComposerGeometry,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    scrollbar: Option<ComposerScrollbarLayout>,
     needs_relayout: bool,
 }
 impl IntoElement for ComposerElement {
@@ -1617,10 +1803,7 @@ impl Element for ComposerElement {
                         &layout_style,
                         window,
                     );
-                    let measured = size(
-                        available_width.unwrap_or(layout.width),
-                        layout.height(),
-                    );
+                    let measured = size(available_width.unwrap_or(layout.width), layout.height());
                     measured_state.0.borrow_mut().replace(layout);
                     measured
                 },
@@ -1709,53 +1892,79 @@ impl Element for ComposerElement {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let cursor_line_offset = geometry
+        let cursor = geometry
             .line_index_for_offset(input.cursor())
-            .expect("the measured composer viewport contains its cursor");
-        let cursor_line = &geometry.lines[cursor_line_offset];
-        let cursor_x = geometry.screen_x_for_offset(cursor_line, input.cursor());
-        let cursor_width = if input.vim_enabled && input.editor.mode() != Mode::Insert {
-            let next = input.editor.next_offset(input.cursor());
-            let width = if next <= cursor_line.range.end {
-                geometry.screen_x_for_offset(cursor_line, next) - cursor_x
-            } else {
-                font_size * 0.5
-            };
-            if width > font_size * 0.125 {
-                width
-            } else {
-                font_size * 0.5
-            }
-        } else {
-            crate::ui_scale::scaled_px(2.0, window.rem_size())
-        };
-        let cursor = (input.vim_enabled || input.selected.is_empty()).then(|| {
-            fill(
-                Bounds::new(
-                    point(
-                        cursor_x,
-                        geometry.text_bounds.top()
-                            + geometry.line_height * cursor_line_offset as f32,
-                    ),
-                    size(cursor_width, geometry.line_height),
-                ),
-                if input.vim_enabled && input.editor.mode() != Mode::Insert {
-                    applied
-                        .as_ref()
-                        .map(|settings| settings.theme.color(ThemeRole::StateCursorNormal))
-                        .unwrap_or_else(|| rgba(0x8ca9d888))
+            .map(|cursor_line_offset| {
+                let cursor_line = &geometry.lines[cursor_line_offset];
+                let cursor_x = geometry.screen_x_for_offset(cursor_line, input.cursor());
+                let cursor_width = if input.vim_enabled && input.editor.mode() != Mode::Insert {
+                    let next = input.editor.next_offset(input.cursor());
+                    let width = if next <= cursor_line.range.end {
+                        geometry.screen_x_for_offset(cursor_line, next) - cursor_x
+                    } else {
+                        font_size * 0.5
+                    };
+                    if width > font_size * 0.125 {
+                        width
+                    } else {
+                        font_size * 0.5
+                    }
                 } else {
-                    applied
-                        .as_ref()
-                        .map(|settings| settings.theme.color(ThemeRole::StateCursorInsert))
-                        .unwrap_or_else(|| rgba(0x8ca9d8ff))
-                },
-            )
-        });
+                    crate::ui_scale::scaled_px(2.0, window.rem_size())
+                };
+                (input.vim_enabled || input.selected.is_empty()).then(|| {
+                    fill(
+                        Bounds::new(
+                            point(
+                                cursor_x,
+                                geometry.text_bounds.top()
+                                    + geometry.line_height * cursor_line_offset as f32,
+                            ),
+                            size(cursor_width, geometry.line_height),
+                        ),
+                        if input.vim_enabled && input.editor.mode() != Mode::Insert {
+                            applied
+                                .as_ref()
+                                .map(|settings| settings.theme.color(ThemeRole::StateCursorNormal))
+                                .unwrap_or_else(|| rgba(0x8ca9d888))
+                        } else {
+                            applied
+                                .as_ref()
+                                .map(|settings| settings.theme.color(ThemeRole::StateCursorInsert))
+                                .unwrap_or_else(|| rgba(0x8ca9d8ff))
+                        },
+                    )
+                })
+            })
+            .flatten();
+        let max_scroll = geometry.scroll_max;
+        let scrollbar = (max_scroll > 0)
+            .then(|| {
+                scrollbar_geometries_scaled(
+                    bounds,
+                    point(Pixels::ZERO, geometry.line_height * max_scroll as f32),
+                    point(
+                        Pixels::ZERO,
+                        -geometry.line_height * geometry.scroll_position as f32,
+                    ),
+                    window.rem_size(),
+                )
+                .into_iter()
+                .find(|geometry| geometry.axis == ScrollbarAxis::Vertical)
+            })
+            .flatten()
+            .map(|geometry| ComposerScrollbarLayout {
+                hitbox: window.insert_hitbox(
+                    geometry.track_bounds,
+                    HitboxBehavior::BlockMouseExceptScroll,
+                ),
+                geometry,
+            });
         Prepaint {
             geometry,
             cursor,
             selection,
+            scrollbar,
             needs_relayout,
         }
     }
@@ -1824,11 +2033,125 @@ impl Element for ComposerElement {
             input.last_layout = Some(state.geometry.clone());
             input.layout_width = Some(bounds.size.width);
             input.layout_invalidated = false;
-            input.editor.set_display_lines(
-                display_lines,
-                state.geometry.lines.len().max(1) as u16,
-            );
+            input
+                .editor
+                .set_display_lines(display_lines, state.geometry.lines.len().max(1) as u16);
         });
+        if let Some(scrollbar) = state.scrollbar.clone() {
+            let colors = cx
+                .try_global::<AppliedSettings>()
+                .map(|settings| OverlayScrollbarColors::from_settings(&settings.0))
+                .unwrap_or_default();
+            let dragging = self.input.read(cx).scrollbar_drag.is_some();
+            let hovered = scrollbar.hitbox.is_hovered(window) || dragging;
+            window.paint_quad(quad(
+                scrollbar.geometry.track_bounds,
+                Pixels::ZERO,
+                colors.track,
+                Edges::default(),
+                Hsla::transparent_black(),
+                BorderStyle::default(),
+            ));
+            window.paint_quad(quad(
+                scrollbar.geometry.thumb_bounds,
+                Corners::all(crate::ui_scale::scaled_px(3.0, window.rem_size())),
+                if hovered {
+                    colors.thumb_hovered
+                } else {
+                    colors.thumb
+                },
+                Edges::default(),
+                Hsla::transparent_black(),
+                BorderStyle::default(),
+            ));
+            window.set_cursor_style(CursorStyle::Arrow, &scrollbar.hitbox);
+            if dragging {
+                window.set_window_cursor_style(CursorStyle::Arrow);
+            }
+
+            let capture_phase = if dragging {
+                DispatchPhase::Capture
+            } else {
+                DispatchPhase::Bubble
+            };
+            window.on_mouse_event({
+                let scrollbar = scrollbar.clone();
+                let input = self.input.clone();
+                let line_height = state.geometry.line_height;
+                move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != capture_phase
+                        || event.button != MouseButton::Left
+                        || !scrollbar.hitbox.is_hovered(window)
+                    {
+                        return;
+                    }
+                    if scrollbar.geometry.thumb_bounds.contains(&event.position) {
+                        let pointer_offset =
+                            event.position.y - scrollbar.geometry.thumb_bounds.top();
+                        input.update(cx, |input, cx| {
+                            input.scrollbar_drag = Some(ComposerScrollbarDrag { pointer_offset });
+                            cx.notify();
+                        });
+                        window.capture_pointer(scrollbar.hitbox.id);
+                    } else {
+                        let pointer_offset = scrollbar.geometry.thumb_bounds.size.height / 2.0;
+                        let offset =
+                            offset_for_position(scrollbar.geometry, event.position, pointer_offset);
+                        let line = visual_line_for_scroll_offset(offset, line_height);
+                        input.update(cx, |input, cx| input.scroll_to_unit(line, cx));
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.refresh_windows();
+                }
+            });
+            window.on_mouse_event({
+                let scrollbar = scrollbar.clone();
+                let input = self.input.clone();
+                let line_height = state.geometry.line_height;
+                move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != capture_phase {
+                        return;
+                    }
+                    let Some(drag) = input.read(cx).scrollbar_drag else {
+                        return;
+                    };
+                    if !event.dragging() {
+                        input.update(cx, |input, cx| {
+                            input.scrollbar_drag = None;
+                            cx.notify();
+                        });
+                        cx.refresh_windows();
+                        return;
+                    }
+                    let offset = offset_for_position(
+                        scrollbar.geometry,
+                        event.position,
+                        drag.pointer_offset,
+                    );
+                    let line = visual_line_for_scroll_offset(offset, line_height);
+                    input.update(cx, |input, cx| input.scroll_to_unit(line, cx));
+                    cx.stop_propagation();
+                    cx.refresh_windows();
+                }
+            });
+            window.on_mouse_event({
+                let input = self.input.clone();
+                move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == capture_phase
+                        && event.button == MouseButton::Left
+                        && input.read(cx).scrollbar_drag.is_some()
+                    {
+                        input.update(cx, |input, cx| {
+                            input.scrollbar_drag = None;
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                        cx.refresh_windows();
+                    }
+                }
+            });
+        }
         if state.needs_relayout {
             cx.notify(self.input.entity_id());
         }
@@ -1917,8 +2240,50 @@ impl Render for TextEditor {
                     this.finish_mouse_selection(event, cx)
                 }),
             )
+            .when(self.multiline, |input| {
+                input.on_scroll_wheel(cx.listener(Self::scroll))
+            })
             .w_full()
             .child(ComposerElement { input: cx.entity() })
+    }
+}
+
+fn visual_line_for_scroll_offset(offset: Pixels, line_height: Pixels) -> usize {
+    if line_height <= Pixels::ZERO {
+        return 0;
+    }
+    (-offset / line_height).round().max(0.0) as usize
+}
+
+fn scrolled_composer_anchor(
+    shaped_lines: &[ComposerVisualLine],
+    visible_line_start: usize,
+    row_delta: isize,
+    logical_line_count: usize,
+) -> Option<ComposerViewportAnchor> {
+    let target = visible_line_start as isize + row_delta;
+    if target >= 0
+        && let Some(line) = shaped_lines.get(target as usize)
+    {
+        return Some(line.viewport_anchor());
+    }
+
+    if target < 0 {
+        let first = shaped_lines.first()?;
+        Some(ComposerViewportAnchor {
+            logical_row: first.logical_row.saturating_sub(target.unsigned_abs()),
+            visual_row: 0,
+        })
+    } else {
+        let last = shaped_lines.last()?;
+        let remaining = target as usize - shaped_lines.len().saturating_sub(1);
+        Some(ComposerViewportAnchor {
+            logical_row: last
+                .logical_row
+                .saturating_add(remaining)
+                .min(logical_line_count.saturating_sub(1)),
+            visual_row: 0,
+        })
     }
 }
 
@@ -2408,9 +2773,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn empty_composer_remains_valid_when_available_width_collapses(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn empty_composer_remains_valid_when_available_width_collapses(cx: &mut gpui::TestAppContext) {
         cx.update(crate::fonts::init);
         let (harness, cx) = cx.add_window_view(|_, cx| {
             let composer = cx.new(|cx| {
@@ -2606,6 +2969,7 @@ mod tests {
         });
 
         assert_eq!(layout.lines.len(), super::MAX_VISIBLE_LINES);
+        assert!(layout.scroll_max > 0);
         assert_eq!(
             layout.line_index_for_offset(expected_end),
             Some(super::MAX_VISIBLE_LINES - 1)
@@ -2621,10 +2985,55 @@ mod tests {
                 .expect("newline composer has been painted")
         });
         assert_eq!(newline_layout.lines.len(), super::MAX_VISIBLE_LINES);
+        assert!(newline_layout.scroll_max > 0);
         assert_eq!(
             newline_layout.line_index_for_offset(newline_end),
             Some(super::MAX_VISIBLE_LINES - 1)
         );
+    }
+
+    #[gpui::test]
+    fn wheel_scrolls_an_overflowing_composer_away_from_the_cursor(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let text = (0..20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (harness, cx) = cx.add_window_view(move |_, cx| {
+            let composer = cx.new(|cx| {
+                let mut composer =
+                    Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+                composer.set_value(text, cx);
+                composer
+            });
+            ComposerLayoutHarness {
+                composer,
+                comparison: None,
+                width: 200.,
+            }
+        });
+        let composer = harness.read_with(cx, |harness, _| harness.composer.clone());
+        let (position, delta, initial_row) = composer.read_with(cx, |composer, _| {
+            let layout = composer.last_layout.as_ref().expect("composer layout");
+            (
+                point(layout.bounds.left() + px(8.), layout.bounds.top() + px(8.)),
+                point(px(0.), layout.line_height * 3.),
+                layout.lines.first().expect("visible line").logical_row,
+            )
+        });
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(delta),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+
+        composer.read_with(cx, |composer, _| {
+            let layout = composer.last_layout.as_ref().expect("scrolled layout");
+            assert!(layout.lines.first().expect("visible line").logical_row < initial_row);
+            assert!(composer.scroll_anchor.is_some());
+        });
     }
 
     #[gpui::test]
@@ -2784,6 +3193,16 @@ mod tests {
         assert_eq!(visible_line_range(10_000, 0), 0..8);
         assert_eq!(visible_line_range(10_000, 5_000), 4_993..5_001);
         assert_eq!(visible_line_range(10_000, 9_999), 9_992..10_000);
+    }
+
+    #[test]
+    fn maps_overlay_scroll_offsets_to_visual_rows() {
+        assert_eq!(super::visual_line_for_scroll_offset(px(0.), px(20.)), 0);
+        assert_eq!(super::visual_line_for_scroll_offset(px(-79.), px(20.)), 4);
+        assert_eq!(
+            super::visual_line_for_scroll_offset(px(-10_000.), px(20.)),
+            500
+        );
     }
 
     #[test]

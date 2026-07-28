@@ -383,7 +383,9 @@ impl VimEditor {
         let Some(target_offset) = target_line.closest_offset(desired_x.unwrap_or(0.), mode) else {
             return start;
         };
-        let (row, col) = self.buf.offset_to_rowcol(target_offset.min(self.buf.len()) as u32);
+        let (row, col) = self
+            .buf
+            .offset_to_rowcol(target_offset.min(self.buf.len()) as u32);
         Cursor { row, col }
     }
 
@@ -2811,11 +2813,7 @@ impl VimEditor {
         }
     }
 
-    pub(super) fn set_display_lines(
-        &mut self,
-        lines: Vec<DisplayLine>,
-        viewport_rows: u16,
-    ) {
+    pub(super) fn set_display_lines(&mut self, lines: Vec<DisplayLine>, viewport_rows: u16) {
         self.display_lines = lines;
         self.last_viewport_h = viewport_rows.max(1);
     }

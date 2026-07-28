@@ -1302,19 +1302,26 @@ impl ChattView {
             CodePreviewState::Error(reason) => preview_status(reason, &settings.theme),
             CodePreviewState::Ready(document) => div()
                 .id("preview-code-viewport")
+                .relative()
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
+                .flex()
                 .overflow_hidden()
                 .bg(settings.theme.color(ThemeRole::MediaViewport))
                 .child(render_code_document(
                     document,
                     preview.scroll_handle.clone(),
                     preview.view_state.clone(),
-                    preview.scrollbar_state.clone(),
                     self.code_selection.clone(),
                     active_match,
                     Some(settings.clone()),
+                ))
+                .child(crate::scrollbar::OverlayScrollbars::new(
+                    "code-viewer-scrollbars",
+                    preview.scroll_handle.clone(),
+                    preview.scrollbar_state.clone(),
+                    crate::scrollbar::OverlayScrollbarColors::from_settings(&settings),
                 ))
                 .into_any_element(),
         };

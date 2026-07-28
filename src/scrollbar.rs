@@ -1,9 +1,11 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     App, BorderStyle, Bounds, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Position, Style,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Position, ScrollHandle, Style,
     UniformListScrollHandle, Window, point, px, quad, relative, rgba, size,
 };
 
@@ -43,7 +45,10 @@ struct ScrollbarDrag {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct OverlayScrollbarState(Rc<Cell<Option<ScrollbarDrag>>>);
+pub(crate) struct OverlayScrollbarState(
+    Rc<Cell<Option<ScrollbarDrag>>>,
+    #[cfg(test)] Rc<RefCell<Vec<ScrollbarGeometry>>>,
+);
 
 impl OverlayScrollbarState {
     pub(crate) fn reset(&self) {
@@ -53,6 +58,11 @@ impl OverlayScrollbarState {
     #[cfg(test)]
     pub(crate) fn is_dragging(&self) -> bool {
         self.0.get().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn geometries(&self) -> Vec<ScrollbarGeometry> {
+        self.1.borrow().clone()
     }
 }
 
@@ -101,7 +111,7 @@ impl OverlayScrollbarColors {
 
 pub(crate) struct OverlayScrollbars {
     id: ElementId,
-    scroll_handle: UniformListScrollHandle,
+    scroll_handle: ScrollHandle,
     state: OverlayScrollbarState,
     colors: OverlayScrollbarColors,
 }
@@ -110,6 +120,16 @@ impl OverlayScrollbars {
     pub(crate) fn new(
         id: impl Into<ElementId>,
         scroll_handle: UniformListScrollHandle,
+        state: OverlayScrollbarState,
+        colors: OverlayScrollbarColors,
+    ) -> Self {
+        let scroll_handle = scroll_handle.0.borrow().base_handle.clone();
+        Self::for_scroll_handle(id, scroll_handle, state, colors)
+    }
+
+    pub(crate) fn for_scroll_handle(
+        id: impl Into<ElementId>,
+        scroll_handle: ScrollHandle,
         state: OverlayScrollbarState,
         colors: OverlayScrollbarColors,
     ) -> Self {
@@ -166,22 +186,24 @@ impl Element for OverlayScrollbars {
         window: &mut Window,
         _: &mut App,
     ) -> Self::PrepaintState {
-        let base_handle = self.scroll_handle.0.borrow().base_handle.clone();
-        scrollbar_geometries_scaled(
+        let geometries = scrollbar_geometries_scaled(
             bounds,
-            base_handle.max_offset(),
-            base_handle.offset(),
+            self.scroll_handle.max_offset(),
+            self.scroll_handle.offset(),
             window.rem_size(),
-        )
-        .into_iter()
-        .map(|geometry| ScrollbarLayout {
-            hitbox: window.insert_hitbox(
-                geometry.track_bounds,
-                HitboxBehavior::BlockMouseExceptScroll,
-            ),
-            geometry,
-        })
-        .collect()
+        );
+        #[cfg(test)]
+        self.state.1.replace(geometries.clone());
+        geometries
+            .into_iter()
+            .map(|geometry| ScrollbarLayout {
+                hitbox: window.insert_hitbox(
+                    geometry.track_bounds,
+                    HitboxBehavior::BlockMouseExceptScroll,
+                ),
+                geometry,
+            })
+            .collect()
     }
 
     fn paint(
@@ -319,7 +341,7 @@ pub(crate) fn scrollbar_geometries(
     scrollbar_geometries_scaled(bounds, max_offset, offset, px(16.0))
 }
 
-fn scrollbar_geometries_scaled(
+pub(crate) fn scrollbar_geometries_scaled(
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
     offset: Point<Pixels>,
@@ -417,7 +439,7 @@ fn scrollbar_geometry(
     })
 }
 
-fn offset_for_position(
+pub(crate) fn offset_for_position(
     geometry: ScrollbarGeometry,
     position: Point<Pixels>,
     pointer_offset: Pixels,
@@ -437,10 +459,9 @@ fn offset_for_position(
     -geometry.max_offset * (thumb_position / geometry.thumb_travel)
 }
 
-fn set_scrollbar_offset(handle: &UniformListScrollHandle, axis: ScrollbarAxis, value: Pixels) {
-    let base_handle = handle.0.borrow().base_handle.clone();
-    let offset = base_handle.offset();
-    base_handle.set_offset(match axis {
+fn set_scrollbar_offset(handle: &ScrollHandle, axis: ScrollbarAxis, value: Pixels) {
+    let offset = handle.offset();
+    handle.set_offset(match axis {
         ScrollbarAxis::Horizontal => point(value, offset.y),
         ScrollbarAxis::Vertical => point(offset.x, value),
     });

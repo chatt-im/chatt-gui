@@ -554,6 +554,32 @@ impl IdentityView {
         };
         let offer_confirmation = peer_tab && document.can_verify;
         let confirmed = self.words_confirmed;
+        let confirmation_background = if confirmed {
+            palette.color(ThemeRole::StateSuccess)
+        } else {
+            palette.color(ThemeRole::ControlSurface)
+        };
+        let confirmation_text = if confirmed {
+            readable_button_text(confirmation_background, palette)
+        } else {
+            palette.color(ThemeRole::TextSecondary)
+        };
+        let confirmation_hover = if confirmed {
+            highlighted_button_states(confirmation_background, palette).hover
+        } else {
+            ButtonTone {
+                background: palette.color(ThemeRole::ControlSurfaceHover),
+                foreground: palette.color(ThemeRole::TextSecondary),
+            }
+        };
+        let confirmation_active = if confirmed {
+            highlighted_button_states(confirmation_background, palette).active
+        } else {
+            ButtonTone {
+                background: palette.color(ThemeRole::StatePressed),
+                foreground: palette.color(ThemeRole::TextSecondary),
+            }
+        };
         div()
             .w_full()
             .flex()
@@ -569,15 +595,17 @@ impl IdentityView {
                         .py_1()
                         .cursor_pointer()
                         .text_xs()
-                        .bg(if confirmed {
-                            palette.color(ThemeRole::StateSuccess)
-                        } else {
-                            palette.color(ThemeRole::ControlSurface)
+                        .bg(confirmation_background)
+                        .text_color(confirmation_text)
+                        .hover(move |button| {
+                            button
+                                .bg(confirmation_hover.background)
+                                .text_color(confirmation_hover.foreground)
                         })
-                        .text_color(if confirmed {
-                            palette.color(ThemeRole::TextInverse)
-                        } else {
-                            palette.color(ThemeRole::TextSecondary)
+                        .active(move |button| {
+                            button
+                                .bg(confirmation_active.background)
+                                .text_color(confirmation_active.foreground)
                         })
                         .child(if confirmed {
                             "Words matched ✓".to_string()
@@ -712,6 +740,8 @@ impl IdentityView {
     ) -> Div {
         let action = self.primary_action(document);
         let enabled = action.enabled();
+        let background = action.tone(palette);
+        let states = highlighted_button_states(background, palette);
         div()
             .flex_none()
             .px_5()
@@ -745,13 +775,22 @@ impl IdentityView {
                     .id("identity-primary")
                     .px_3()
                     .py_2()
-                    .bg(action.tone(palette))
-                    .text_color(if enabled {
-                        palette.color(ThemeRole::TextInverse)
-                    } else {
-                        palette.color(ThemeRole::TextSubtle)
+                    .bg(states.rest.background)
+                    .text_color(states.rest.foreground)
+                    .when(enabled, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |button| {
+                                button
+                                    .bg(states.hover.background)
+                                    .text_color(states.hover.foreground)
+                            })
+                            .active(move |button| {
+                                button
+                                    .bg(states.active.background)
+                                    .text_color(states.active.foreground)
+                            })
                     })
-                    .when(enabled, |button| button.cursor_pointer())
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(action.label())
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -824,6 +863,81 @@ impl PrimaryAction {
             Self::Blocked(_) => palette.color(ThemeRole::StateDisabled),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ButtonTone {
+    background: gpui::Rgba,
+    foreground: gpui::Rgba,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HighlightedButtonStates {
+    rest: ButtonTone,
+    hover: ButtonTone,
+    active: ButtonTone,
+}
+
+fn highlighted_button_states(
+    background: gpui::Rgba,
+    palette: &ThemePalette,
+) -> HighlightedButtonStates {
+    let rest_foreground = readable_button_text(background, palette);
+    // Move each interaction state farther from its foreground. This preserves
+    // the semantic status hue while increasing, rather than eroding, contrast.
+    let tint = if relative_luminance(rest_foreground) < 0.5 {
+        gpui::rgb(0xffffff)
+    } else {
+        gpui::rgb(0x000000)
+    };
+    let tone = |amount| {
+        let background = background.blend(tint.alpha(amount));
+        ButtonTone {
+            background,
+            foreground: readable_button_text(background, palette),
+        }
+    };
+    HighlightedButtonStates {
+        rest: ButtonTone {
+            background,
+            foreground: rest_foreground,
+        },
+        hover: tone(0.08),
+        active: tone(0.16),
+    }
+}
+
+/// Picks the higher-contrast neutral foreground for a solid status button.
+///
+/// State colors are user-configurable and may be either light or dark. They
+/// can also be translucent, so compare against the color actually painted over
+/// the dialog rather than assuming the configured state color is opaque.
+fn readable_button_text(background: gpui::Rgba, palette: &ThemePalette) -> gpui::Rgba {
+    let painted_background = palette.color(ThemeRole::Raised).blend(background);
+    let dark = gpui::rgb(0x000000);
+    let light = gpui::rgb(0xffffff);
+    if contrast_ratio(painted_background, dark) >= contrast_ratio(painted_background, light) {
+        dark
+    } else {
+        light
+    }
+}
+
+fn contrast_ratio(first: gpui::Rgba, second: gpui::Rgba) -> f32 {
+    let lighter = relative_luminance(first).max(relative_luminance(second));
+    let darker = relative_luminance(first).min(relative_luminance(second));
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn relative_luminance(color: gpui::Rgba) -> f32 {
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
 }
 
 fn status_banner(status: &wire::IdentityStatus, palette: &ThemePalette) -> Div {
@@ -1003,6 +1117,37 @@ mod tests {
             );
             cx.new(IdentityView::new)
         })
+    }
+
+    #[test]
+    fn highlighted_button_states_are_distinct_and_have_accessible_contrast() {
+        let config = crate::config::schema::ThemeConfig::default();
+        let palette = ThemePalette::from_config(&config);
+
+        for role in [ThemeRole::StateSuccess, ThemeRole::StateWarning] {
+            let background = palette.color(role);
+            let states = highlighted_button_states(background, &palette);
+            assert_ne!(states.rest.background, states.hover.background);
+            assert_ne!(states.hover.background, states.active.background);
+
+            for (state, tone) in [
+                ("rest", states.rest),
+                ("hover", states.hover),
+                ("active", states.active),
+            ] {
+                let painted_background = palette.color(ThemeRole::Raised).blend(tone.background);
+                let ratio = contrast_ratio(painted_background, tone.foreground);
+                assert!(
+                    ratio >= 4.5,
+                    "{role:?} {state} contrast was only {ratio:.2}:1"
+                );
+            }
+        }
+
+        let disabled = palette.color(ThemeRole::StateDisabled);
+        let disabled_background = palette.color(ThemeRole::Raised).blend(disabled);
+        let disabled_foreground = readable_button_text(disabled, &palette);
+        assert!(contrast_ratio(disabled_background, disabled_foreground) >= 4.5);
     }
 
     /// The word grid must never drop, duplicate, or misnumber a word: a reviewer

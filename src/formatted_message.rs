@@ -17,6 +17,7 @@ use crate::{
     emoji,
     fonts::{CODE_FONT_FAMILY, UI_FONT_FAMILY},
     icons::{IconName, icon},
+    scrollbar::{OverlayScrollbarColors, OverlayScrollbarState, OverlayScrollbars},
     theme::{AppliedSettings, ThemeRole, syntax_role},
     ui_scale::rems_from_px,
 };
@@ -93,6 +94,7 @@ enum BlockKind {
     Code {
         text: TextPiece,
         scroll_handle: ScrollHandle,
+        scrollbar_state: OverlayScrollbarState,
         hover_group: SharedString,
     },
     Blank,
@@ -178,6 +180,7 @@ impl FormattedMessage {
                         hover_group: format!("formatted-code-{}", text.range.start).into(),
                         text,
                         scroll_handle: ScrollHandle::new(),
+                        scrollbar_state: OverlayScrollbarState::default(),
                     },
                     PreparedBlockKind::Blank => BlockKind::Blank,
                 },
@@ -694,10 +697,12 @@ impl FormattedMessageElement {
                 BlockKind::Code {
                     text,
                     scroll_handle,
+                    scrollbar_state,
                     hover_group,
                 } => render_code_block(
                     text,
                     scroll_handle,
+                    scrollbar_state,
                     hover_group,
                     block.quote_depth,
                     body_color,
@@ -1042,6 +1047,7 @@ fn render_pieces(
 fn render_code_block(
     piece: &TextPiece,
     scroll_handle: &ScrollHandle,
+    scrollbar_state: &OverlayScrollbarState,
     hover_group: &SharedString,
     quote_depth: usize,
     body_color: gpui::Rgba,
@@ -1071,13 +1077,28 @@ fn render_code_block(
             range: piece.range.clone(),
         });
         div()
-            .id(("formatted-code-scroll", piece.range.start))
-            .flex()
+            .relative()
+            .w_full()
             .min_w_0()
-            .overflow_x_scroll()
-            .track_scroll(scroll_handle)
-            .whitespace_nowrap()
-            .child(styled)
+            .child(
+                div()
+                    .id(("formatted-code-scroll", piece.range.start))
+                    .flex()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .track_scroll(scroll_handle)
+                    .whitespace_nowrap()
+                    .child(styled),
+            )
+            .child(OverlayScrollbars::for_scroll_handle(
+                ("formatted-code-scrollbar", piece.range.start),
+                scroll_handle.clone(),
+                scrollbar_state.clone(),
+                applied
+                    .as_ref()
+                    .map(|settings| OverlayScrollbarColors::from_settings(settings))
+                    .unwrap_or_default(),
+            ))
             .into_any_element()
     };
 
@@ -2152,6 +2173,18 @@ mod tests {
 
     use super::*;
 
+    struct TestFormattedView {
+        message: Rc<FormattedMessage>,
+    }
+
+    impl Render for TestFormattedView {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(240.))
+                .child(FormattedMessageElement::new(self.message.clone()))
+        }
+    }
+
     fn rendered_text(text: &str) -> RenderedText {
         RenderedText {
             visible: text.to_string().into(),
@@ -2269,6 +2302,45 @@ mod tests {
             matches!(span.kind, InlineKind::Syntax(HlClass::Keyword))
                 && syntax_color(HlClass::Keyword.palette_role()) == 0xb49bbb
         }));
+    }
+
+    #[gpui::test]
+    fn fenced_code_overlay_scrollbar_drags_to_the_line_end(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        let source = format!("```\n{}\n```", "wide code ".repeat(80));
+        let message = Rc::new(FormattedMessage::new(source));
+        let drawn = message.clone();
+        let (view, cx) = cx.add_window_view(move |_, _| TestFormattedView { message: drawn });
+        view.update(cx, |_, cx| cx.notify());
+        let BlockKind::Code {
+            scroll_handle,
+            scrollbar_state,
+            ..
+        } = &message.blocks[0].kind
+        else {
+            panic!("expected code block");
+        };
+        let maximum = scroll_handle.max_offset();
+        let geometry = scrollbar_state
+            .geometries()
+            .into_iter()
+            .find(|geometry| geometry.axis == crate::scrollbar::ScrollbarAxis::Horizontal)
+            .expect("wide fenced code has a horizontal scrollbar");
+        let start = geometry.thumb_bounds.center();
+        let end = point(
+            geometry.thumb_track_start
+                + geometry.thumb_travel
+                + geometry.thumb_bounds.size.width / 2.0,
+            start.y,
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        assert!(scrollbar_state.is_dragging());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+
+        assert_eq!(scroll_handle.offset().x, -maximum.x);
+        assert!(!scrollbar_state.is_dragging());
     }
 
     #[test]
