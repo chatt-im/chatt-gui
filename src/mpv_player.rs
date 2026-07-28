@@ -291,7 +291,10 @@ impl MpvPlayer {
                 };
             }
             set_option!("vo", "libmpv");
-            set_option!("keep-open", "no");
+            // Attachment playback must retain the file at EOF so libmpv can
+            // finish rendering and hold its final frame. Live streams still
+            // need a terminal EOF so the share is removed.
+            set_option!("keep-open", keep_open_policy(live));
             set_option!("idle", "yes");
             set_option!("sub", "no");
             set_option!("sub-auto", "no");
@@ -600,7 +603,7 @@ impl MpvPlayer {
     }
 
     pub fn load(&mut self, path: &str) -> Result<()> {
-        self.load_at(path, false, 100.0, 0.0)
+        self.load_at(path, false, 100.0, 1.0, 0.0)
     }
 
     pub(crate) fn load_at(
@@ -608,6 +611,7 @@ impl MpvPlayer {
         path: &str,
         paused: bool,
         volume: f64,
+        speed: f64,
         position: f64,
     ) -> Result<()> {
         let startup = StartupLogContext::new(self.player_id);
@@ -621,7 +625,7 @@ impl MpvPlayer {
             path: path.to_owned(),
             paused,
             volume: volume.clamp(0.0, 100.0),
-            speed: 1.0,
+            speed: speed.clamp(0.25, 4.0),
             position: position.max(0.0),
         })
     }
@@ -660,6 +664,10 @@ impl MpvPlayer {
 
     pub fn set_volume(&self, volume: f64) -> Result<()> {
         self.send_control(ControlCommand::SetVolume(volume.clamp(0.0, 100.0)))
+    }
+
+    pub(crate) fn set_speed(&self, speed: f64) -> Result<()> {
+        self.send_control(ControlCommand::SetSpeed(speed.clamp(0.25, 4.0)))
     }
 
     pub(crate) fn adjust_video(&self, adjustment: VideoAdjustment) -> Result<()> {
@@ -707,6 +715,10 @@ fn observe_playback_properties(mpv: &Mpv) -> Result<()> {
     mpv.observe_property("idle-active", Format::Flag, 5)
         .context("observe mpv property idle-active")?;
     Ok(())
+}
+
+fn keep_open_policy(live: bool) -> &'static str {
+    if live { "no" } else { "yes" }
 }
 
 impl MpvAudioPlayer {
@@ -2177,11 +2189,18 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
     let notify_gpui = match event? {
         Event::PropertyChange { name, change, .. } => match (name, change) {
             ("time-pos", PropertyData::Double(value)) => {
-                state.position = value.max(0.0);
+                state.position = if state.finished && state.duration > 0.0 {
+                    state.duration
+                } else {
+                    value.max(0.0)
+                };
                 false
             }
             ("duration", PropertyData::Double(value)) => {
                 state.duration = value.max(0.0);
+                if state.finished && state.duration > 0.0 {
+                    state.position = state.duration;
+                }
                 true
             }
             ("pause", PropertyData::Flag(value)) => {
@@ -2189,14 +2208,17 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
                 true
             }
             ("eof-reached", PropertyData::Flag(value)) => {
-                let changed = state.finished != value;
-                state.finished = value;
-                changed
+                if value {
+                    finish_playback(state)
+                } else {
+                    let changed = state.finished;
+                    state.finished = false;
+                    changed
+                }
             }
             ("idle-active", PropertyData::Flag(value)) => {
                 let finished = value && state.duration > 0.0;
-                state.finished |= finished;
-                finished
+                finished && finish_playback(state)
             }
             ("hwdec-current", PropertyData::Str(value)) => {
                 if value.ends_with("-copy") {
@@ -2287,8 +2309,7 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
             if reason == libmpv2::mpv_end_file_reason::Error {
                 bail!("mpv could not decode or play the media");
             }
-            state.finished = true;
-            true
+            finish_playback(state)
         }
         Event::Shutdown => {
             kvlog::warn!("mpv core requested shutdown");
@@ -2299,6 +2320,18 @@ fn apply_event(event: libmpv2::Result<Event<'_>>, state: &mut PlaybackState) -> 
         _ => false,
     };
     Ok(notify_gpui)
+}
+
+fn finish_playback(state: &mut PlaybackState) -> bool {
+    let previous_position = state.position;
+    let was_finished = state.finished;
+    if state.duration > 0.0 {
+        // `time-pos` is the presentation timestamp at the start of the
+        // displayed frame, so it normally remains short of `duration` at EOF.
+        state.position = state.duration;
+    }
+    state.finished = true;
+    !was_finished || state.position != previous_position
 }
 
 fn relay_mpv_log(level: libmpv2::LogLevel, prefix: &str, text: &str) {
@@ -2789,6 +2822,48 @@ mod tests {
         );
         assert_eq!(VideoAdjustment::PlaybackSpeed(1.1).effect_delta(), None);
         assert_eq!(VideoEffect::Saturation.property(), "saturation");
+    }
+
+    #[test]
+    fn attachment_video_holds_final_frame_while_live_video_terminates_at_eof() {
+        assert_eq!(keep_open_policy(false), "yes");
+        assert_eq!(keep_open_policy(true), "no");
+    }
+
+    #[test]
+    fn completed_playback_reports_the_end_of_the_timeline() {
+        let mut state = PlaybackState {
+            position: 1.9,
+            duration: 2.0,
+            ..PlaybackState::default()
+        };
+
+        assert!(
+            apply_event(
+                Ok(Event::PropertyChange {
+                    name: "eof-reached",
+                    change: PropertyData::Flag(true),
+                    reply_userdata: 4,
+                }),
+                &mut state,
+            )
+            .unwrap()
+        );
+        assert!(state.finished);
+        assert_eq!(state.position, state.duration);
+
+        assert!(
+            !apply_event(
+                Ok(Event::PropertyChange {
+                    name: "time-pos",
+                    change: PropertyData::Double(1.9),
+                    reply_userdata: 1,
+                }),
+                &mut state,
+            )
+            .unwrap()
+        );
+        assert_eq!(state.position, state.duration);
     }
 
     #[test]

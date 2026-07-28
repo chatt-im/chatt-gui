@@ -79,11 +79,15 @@ impl ChattView {
             .map(|attachment| attachment.descriptor.clone())
     }
 
-    pub(super) fn reset_attachment_source_state(&mut self, window: &mut Window) {
+    pub(super) fn reset_attachment_source_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.audios.clear_sessions();
         self.videos.clear_sessions();
         self.video_thumbnails.clear();
-        self.clear_video_interactions(window);
+        self.clear_video_interactions(window, cx);
         self.pending_video_plays.clear();
         self.pending_audio_plays.clear();
         self.visible_video_keys.clear();
@@ -111,7 +115,7 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         kvlog::error!("daemon attachment source protocol error", err = %reason);
-        self.reset_attachment_source_state(window);
+        self.reset_attachment_source_state(window, cx);
         self.daemon.disconnect_protocol(reason);
         self.status = format!("Attachment source protocol error · {reason}").into();
         cx.notify();
@@ -216,12 +220,17 @@ impl ChattView {
         }
     }
 
-    pub(super) fn clear_video_interactions(&mut self, window: &mut Window) {
+    pub(super) fn clear_video_interactions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.video_scrub = None;
         self.video_volume_drag = None;
         self.video_controls.clear();
-        self.theater_video = None;
+        let theater_was_open = self.theater_video.take().is_some();
         self.exit_native_media_fullscreen_if_inactive(window);
+        if theater_was_open {
+            self.restore_theater_focus(window, cx);
+        } else {
+            self.theater_return_focus = None;
+        }
         self.video_controls_animation_task.take();
         self.video_controls_hide_task.take();
         self.video_volume_hide_task.take();
@@ -229,8 +238,8 @@ impl ChattView {
         self.video_volume_popup_bounds.set(None);
         self.video_volume_button_bounds.set(None);
         self.next_frame_hold = None;
-        self.video_effect_overlay = None;
-        self.video_effect_overlay_hide_task.take();
+        self.video_control_overlay = None;
+        self.video_control_overlay_hide_task.take();
     }
 
     pub(super) fn update_video_visibility(

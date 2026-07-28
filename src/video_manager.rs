@@ -23,6 +23,12 @@ pub(crate) struct VideoEffectChange {
     pub(crate) value: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VideoControlChange {
+    Effect(VideoEffectChange),
+    PlaybackSpeed(f64),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct VideoEffectValues([f64; 4]);
 
@@ -92,6 +98,7 @@ struct VideoSession {
     error: Option<String>,
     display_size: Option<(u32, u32)>,
     effects: VideoEffectValues,
+    playback_speed: f64,
 }
 
 impl VideoSession {
@@ -109,6 +116,7 @@ impl VideoSession {
             error: None,
             display_size: None,
             effects: VideoEffectValues::default(),
+            playback_speed: 1.0,
         }
     }
 }
@@ -223,7 +231,7 @@ impl AttachmentVideoManager {
         session.error = None;
         if let Some(player) = session.player.as_mut() {
             if session.finished {
-                player.load_at(source.url(), false, volume, 0.0)?;
+                player.load_at(source.url(), false, volume, session.playback_speed, 0.0)?;
                 apply_video_effects(player, session.effects)?;
                 session.position = 0.0;
                 session.duration = 0.0;
@@ -312,7 +320,7 @@ impl AttachmentVideoManager {
         &mut self,
         key: VideoKey,
         adjustment: VideoAdjustment,
-    ) -> Result<Option<VideoEffectChange>> {
+    ) -> Result<Option<VideoControlChange>> {
         self.touch(key);
         self.last_interacted = Some(key);
         let Some(session) = self.sessions.get_mut(&key) else {
@@ -321,14 +329,28 @@ impl AttachmentVideoManager {
         let Some(player) = session.player.as_ref() else {
             return Ok(None);
         };
-        let change = adjustment
-            .effect_delta()
-            .map(|(effect, delta)| session.effects.adjusted(effect, delta));
-        player.adjust_video(adjustment)?;
-        if let Some(change) = change {
-            session.effects.set(change);
+        match adjustment {
+            VideoAdjustment::PlaybackSpeed(factor) => {
+                let unbounded_speed = session.playback_speed * factor;
+                let speed = adjusted_playback_speed(session.playback_speed, factor);
+                if speed == unbounded_speed {
+                    player.adjust_video(adjustment)?;
+                } else {
+                    player.set_speed(speed)?;
+                }
+                session.playback_speed = speed;
+                Ok(Some(VideoControlChange::PlaybackSpeed(speed)))
+            }
+            adjustment => {
+                let change = adjustment
+                    .effect_delta()
+                    .map(|(effect, delta)| session.effects.adjusted(effect, delta))
+                    .expect("picture adjustment has an effect delta");
+                player.adjust_video(adjustment)?;
+                session.effects.set(change);
+                Ok(Some(VideoControlChange::Effect(change)))
+            }
         }
-        Ok(change)
     }
 
     pub(crate) fn step_frame(&mut self, key: VideoKey, backwards: bool) -> Result<bool> {
@@ -644,7 +666,13 @@ impl AttachmentVideoManager {
             return;
         };
         if let Err(error) = player
-            .load_at(source.url(), session.paused, self.volume, session.position)
+            .load_at(
+                source.url(),
+                session.paused,
+                self.volume,
+                session.playback_speed,
+                session.position,
+            )
             .and_then(|()| apply_video_effects(&player, session.effects))
         {
             let error = format!("Could not open video: {error}");
@@ -728,6 +756,10 @@ fn apply_video_effects(player: &MpvPlayer, effects: VideoEffectValues) -> Result
     Ok(())
 }
 
+fn adjusted_playback_speed(speed: f64, factor: f64) -> f64 {
+    (speed * factor).clamp(0.25, 4.0)
+}
+
 impl Drop for AttachmentVideoManager {
     fn drop(&mut self) {
         for (_, mut session) in self.sessions.drain() {
@@ -781,6 +813,14 @@ mod tests {
         assert!(view.paused);
         assert_eq!(view.volume, 100.0);
         assert!(!view.loading);
+    }
+
+    #[test]
+    fn playback_speed_adjustment_matches_mpv_steps_and_clamps() {
+        assert_eq!(adjusted_playback_speed(1.0, 1.1), 1.1);
+        assert_eq!(adjusted_playback_speed(1.0, 1.0 / 1.1), 1.0 / 1.1);
+        assert_eq!(adjusted_playback_speed(4.0, 1.1), 4.0);
+        assert_eq!(adjusted_playback_speed(0.25, 1.0 / 1.1), 0.25);
     }
 
     #[test]

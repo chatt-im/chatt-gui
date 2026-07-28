@@ -72,12 +72,18 @@ impl ChattView {
             }
         });
         let aspect_ratio = aspect_ratio(&video, (descriptor.width, descriptor.height));
-        let effect_overlay = self
-            .video_effect_overlay
+        let control_overlay = self
+            .video_control_overlay
             .filter(|overlay| overlay.key == key)
-            .map(|overlay| VideoEffectDisplay {
-                label: overlay.effect.label(),
-                value: overlay.value,
+            .map(|overlay| match overlay.kind {
+                VideoControlOverlayKind::Effect(effect) => VideoControlDisplay::Effect {
+                    label: effect.label(),
+                    value: overlay.value,
+                },
+                VideoControlOverlayKind::Volume => VideoControlDisplay::Volume(overlay.value),
+                VideoControlOverlayKind::PlaybackSpeed => {
+                    VideoControlDisplay::PlaybackSpeed(overlay.value)
+                }
             });
         render_video_player(
             VideoPlayerConfig {
@@ -92,7 +98,7 @@ impl ChattView {
                 controls_phase,
                 controls_pinned,
                 scrub_hover_fraction,
-                effect_overlay,
+                control_overlay,
                 volume_open: active_controls && self.video_controls.volume_open,
                 measure_volume_bounds: active_controls,
             },
@@ -283,7 +289,9 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         if let Some(key) = self.active_video_target() {
-            self.adjust_video_volume(key, -2.0, cx);
+            if let Some(volume) = self.adjust_video_volume(key, -2.0, cx) {
+                self.show_video_control_overlay(key, VideoControlOverlayKind::Volume, volume, cx);
+            }
         }
     }
 
@@ -294,7 +302,9 @@ impl ChattView {
         cx: &mut Context<Self>,
     ) {
         if let Some(key) = self.active_video_target() {
-            self.adjust_video_volume(key, 2.0, cx);
+            if let Some(volume) = self.adjust_video_volume(key, 2.0, cx) {
+                self.show_video_control_overlay(key, VideoControlOverlayKind::Volume, volume, cx);
+            }
         }
     }
 
@@ -437,7 +447,15 @@ impl ChattView {
         };
         self.note_media_interaction(MediaPlaybackTarget::Video(key));
         match self.videos.adjust_video(key, adjustment) {
-            Ok(Some(change)) => self.show_video_effect_overlay(key, change, cx),
+            Ok(Some(VideoControlChange::Effect(change))) => {
+                self.show_video_effect_overlay(key, change, cx)
+            }
+            Ok(Some(VideoControlChange::PlaybackSpeed(speed))) => self.show_video_control_overlay(
+                key,
+                VideoControlOverlayKind::PlaybackSpeed,
+                speed,
+                cx,
+            ),
             Ok(None) => cx.notify(),
             Err(error) => self.report_video_keyboard_control_error(key, error, cx),
         }
@@ -449,27 +467,44 @@ impl ChattView {
         change: VideoEffectChange,
         cx: &mut Context<Self>,
     ) {
-        self.video_effect_overlay_hide_task.take();
-        let serial = self.next_video_effect_overlay_serial;
-        self.next_video_effect_overlay_serial =
-            self.next_video_effect_overlay_serial.wrapping_add(1).max(1);
-        self.video_effect_overlay = Some(VideoEffectOverlay {
+        self.show_video_control_overlay(
             key,
-            effect: change.effect,
-            value: change.value,
+            VideoControlOverlayKind::Effect(change.effect),
+            change.value,
+            cx,
+        );
+    }
+
+    fn show_video_control_overlay(
+        &mut self,
+        key: VideoKey,
+        kind: VideoControlOverlayKind,
+        value: f64,
+        cx: &mut Context<Self>,
+    ) {
+        self.video_control_overlay_hide_task.take();
+        let serial = self.next_video_control_overlay_serial;
+        self.next_video_control_overlay_serial = self
+            .next_video_control_overlay_serial
+            .wrapping_add(1)
+            .max(1);
+        self.video_control_overlay = Some(VideoControlOverlay {
+            key,
+            kind,
+            value,
             serial,
         });
-        self.video_effect_overlay_hide_task = Some(cx.spawn(async move |this, cx| {
+        self.video_control_overlay_hide_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(VIDEO_EFFECT_OVERLAY_HOLD)
+                .timer(VIDEO_CONTROL_OVERLAY_HOLD)
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.video_effect_overlay_hide_task.take();
+                this.video_control_overlay_hide_task.take();
                 if this
-                    .video_effect_overlay
+                    .video_control_overlay
                     .is_some_and(|overlay| overlay.serial == serial)
                 {
-                    this.video_effect_overlay = None;
+                    this.video_control_overlay = None;
                     cx.notify();
                 }
             });
@@ -648,7 +683,11 @@ impl ChattView {
             self.exit_video_theater(window, cx);
             return;
         }
+        if self.theater_video.is_none() {
+            self.theater_return_focus = window.focused(cx).map(|focus| focus.downgrade());
+        }
         self.theater_video = Some(source.clone());
+        window.focus(&self.theater_focus, cx);
         self.enter_native_media_fullscreen(window, cx);
         let source_key = self.source_key(source.key.room_id, source.key.attachment_id);
         self.video_sources
@@ -678,8 +717,24 @@ impl ChattView {
         self.schedule_video_controls_hide(theater.key, cx);
         self.sync_video_source_pins();
         self.pump_video_sources(cx);
+        self.restore_theater_focus(window, cx);
         cx.notify();
         true
+    }
+
+    pub(super) fn restore_theater_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let return_focus = self
+            .theater_return_focus
+            .take()
+            .and_then(|focus| focus.upgrade());
+        if !self.theater_focus.is_focused(window) {
+            return;
+        }
+        if let Some(focus) = return_focus {
+            window.focus(&focus, cx);
+        } else {
+            window.blur();
+        }
     }
 
     pub(super) fn enter_native_media_fullscreen(&mut self, window: &mut Window, cx: &App) {
@@ -965,7 +1020,12 @@ impl ChattView {
         true
     }
 
-    fn adjust_video_volume(&mut self, key: VideoKey, delta: f64, cx: &mut Context<Self>) {
+    fn adjust_video_volume(
+        &mut self,
+        key: VideoKey,
+        delta: f64,
+        cx: &mut Context<Self>,
+    ) -> Option<f64> {
         self.note_media_interaction(MediaPlaybackTarget::Video(key));
         if let Err(error) = self.videos.adjust_volume(key, delta) {
             kvlog::error!(
@@ -978,8 +1038,12 @@ impl ChattView {
                 err = %error
             );
             self.status = format!("Volume failed: {error}").into();
+            self.show_video_controls(key, cx);
+            cx.notify();
+            return None;
         }
         self.show_video_controls(key, cx);
         cx.notify();
+        Some(self.videos.view(key).volume)
     }
 }

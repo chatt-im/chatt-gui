@@ -48,9 +48,10 @@ pub(crate) type VideoPlayerHandler = Rc<dyn Fn(VideoPlayerEvent, &mut Window, &m
 pub(crate) const INLINE_VIDEO_ASPECT_RATIO: f32 = 16.0 / 9.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct VideoEffectDisplay {
-    pub(crate) label: &'static str,
-    pub(crate) value: f64,
+pub(crate) enum VideoControlDisplay {
+    Effect { label: &'static str, value: f64 },
+    Volume(f64),
+    PlaybackSpeed(f64),
 }
 
 pub(crate) struct VideoPlayerConfig {
@@ -65,7 +66,7 @@ pub(crate) struct VideoPlayerConfig {
     pub controls_phase: ControlsPhase,
     pub controls_pinned: bool,
     pub scrub_hover_fraction: Option<f64>,
-    pub effect_overlay: Option<VideoEffectDisplay>,
+    pub control_overlay: Option<VideoControlDisplay>,
     pub volume_open: bool,
     pub measure_volume_bounds: bool,
 }
@@ -89,7 +90,7 @@ pub(crate) fn render_video_player(
         controls_phase,
         controls_pinned,
         scrub_hover_fraction,
-        effect_overlay,
+        control_overlay,
         volume_open,
         measure_volume_bounds,
     } = config;
@@ -219,8 +220,8 @@ pub(crate) fn render_video_player(
         );
     }
 
-    if let Some(effect) = effect_overlay {
-        let effect_fraction = effect_progress(effect.value);
+    if let Some(control) = control_overlay {
+        let presentation = control_overlay_presentation(control);
         viewport = viewport.child(
             div()
                 .absolute()
@@ -253,8 +254,8 @@ pub(crate) fn render_video_player(
                                 .justify_between()
                                 .text_xs()
                                 .text_color(settings.theme.color(ThemeRole::MediaText))
-                                .child(effect.label)
-                                .child(format!("{:+.0}", effect.value)),
+                                .child(presentation.label)
+                                .child(presentation.value),
                         )
                         .child(
                             div()
@@ -269,24 +270,26 @@ pub(crate) fn render_video_player(
                                         .left_0()
                                         .top_0()
                                         .h_full()
-                                        .w(relative(effect_fraction))
+                                        .w(relative(presentation.progress))
                                         .rounded_full()
                                         .bg(settings.theme.color(ThemeRole::MediaProgressFill)),
                                 )
+                                .when_some(presentation.neutral, |bar, neutral| {
+                                    bar.child(
+                                        div()
+                                            .absolute()
+                                            .left(relative(neutral))
+                                            .top(rems_from_px(-2.0))
+                                            .ml(rems_from_px(-0.5))
+                                            .w(rems_from_px(1.0))
+                                            .h(rems_from_px(9.0))
+                                            .bg(settings.theme.color(ThemeRole::MediaText)),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .absolute()
-                                        .left(relative(0.5))
-                                        .top(rems_from_px(-2.0))
-                                        .ml(rems_from_px(-0.5))
-                                        .w(rems_from_px(1.0))
-                                        .h(rems_from_px(9.0))
-                                        .bg(settings.theme.color(ThemeRole::MediaText)),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(relative(effect_fraction))
+                                        .left(relative(presentation.progress))
                                         .top(rems_from_px(-2.0))
                                         .ml(rems_from_px(-4.5))
                                         .size(rems_from_px(9.0))
@@ -660,8 +663,40 @@ pub(crate) fn render_video_player(
         .into_any_element()
 }
 
-fn effect_progress(value: f64) -> f32 {
-    ((value.clamp(-100.0, 100.0) + 100.0) / 200.0) as f32
+struct VideoControlPresentation {
+    label: &'static str,
+    value: String,
+    progress: f32,
+    neutral: Option<f32>,
+}
+
+fn control_overlay_presentation(control: VideoControlDisplay) -> VideoControlPresentation {
+    match control {
+        VideoControlDisplay::Effect { label, value } => {
+            let value = value.clamp(-100.0, 100.0);
+            VideoControlPresentation {
+                label,
+                value: format!("{:+.0}", value),
+                progress: ((value + 100.0) / 200.0) as f32,
+                neutral: Some(0.5),
+            }
+        }
+        VideoControlDisplay::Volume(value) => VideoControlPresentation {
+            label: "Volume",
+            value: format!("{:.0}%", value.clamp(0.0, 100.0)),
+            progress: (value.clamp(0.0, 100.0) / 100.0) as f32,
+            neutral: None,
+        },
+        VideoControlDisplay::PlaybackSpeed(value) => {
+            let value = value.clamp(0.25, 4.0);
+            VideoControlPresentation {
+                label: "Speed",
+                value: format!("{value:.2}×"),
+                progress: ((value.log2() + 2.0) / 4.0) as f32,
+                neutral: Some(0.5),
+            }
+        }
+    }
 }
 
 fn video_control_button(
@@ -754,11 +789,24 @@ mod tests {
     }
 
     #[test]
-    fn video_effect_progress_centers_the_neutral_value_and_clamps_edges() {
-        assert_eq!(effect_progress(-200.0), 0.0);
-        assert_eq!(effect_progress(-100.0), 0.0);
-        assert_eq!(effect_progress(0.0), 0.5);
-        assert_eq!(effect_progress(100.0), 1.0);
-        assert_eq!(effect_progress(200.0), 1.0);
+    fn video_control_presentations_format_values_and_clamp_progress() {
+        let effect = control_overlay_presentation(VideoControlDisplay::Effect {
+            label: "Gamma",
+            value: 200.0,
+        });
+        assert_eq!(effect.label, "Gamma");
+        assert_eq!(effect.value, "+100");
+        assert_eq!(effect.progress, 1.0);
+        assert_eq!(effect.neutral, Some(0.5));
+
+        let volume = control_overlay_presentation(VideoControlDisplay::Volume(-20.0));
+        assert_eq!(volume.value, "0%");
+        assert_eq!(volume.progress, 0.0);
+        assert_eq!(volume.neutral, None);
+
+        let speed = control_overlay_presentation(VideoControlDisplay::PlaybackSpeed(1.0));
+        assert_eq!(speed.value, "1.00×");
+        assert_eq!(speed.progress, 0.5);
+        assert_eq!(speed.neutral, Some(0.5));
     }
 }

@@ -75,9 +75,11 @@ use crate::{
         CONTROLS_ANIMATION_DURATION, CONTROLS_HIDE_DELAY, VideoControlsState, VideoScrub,
         VideoVolumeDrag, horizontal_fraction, vertical_fraction, volume_scroll_delta,
     },
-    video_manager::{AttachmentVideoManager, VideoDrain, VideoEffectChange, VideoKey},
+    video_manager::{
+        AttachmentVideoManager, VideoControlChange, VideoDrain, VideoEffectChange, VideoKey,
+    },
     video_player::{
-        INLINE_VIDEO_ASPECT_RATIO, VideoEffectDisplay, VideoPlayerConfig, VideoPlayerEvent,
+        INLINE_VIDEO_ASPECT_RATIO, VideoControlDisplay, VideoPlayerConfig, VideoPlayerEvent,
         VideoPlayerHandler, aspect_ratio, render_video_player,
     },
     video_thumbnail::{ThumbnailKey, VideoThumbnailCache},
@@ -123,7 +125,7 @@ const MIN_CONSTRAINED_LIVE_PANE_HEIGHT: f32 = 96.0;
 const MIN_CHAT_PANE_HEIGHT: f32 = 140.0;
 const MIN_STACKED_VIEWER_HEIGHT: f32 = 200.0;
 const PREVIEW_SEARCH_BAR_HEIGHT: f32 = 39.0;
-const VIDEO_EFFECT_OVERLAY_HOLD: Duration = Duration::from_millis(400);
+const VIDEO_CONTROL_OVERLAY_HOLD: Duration = Duration::from_millis(1_000);
 
 fn timeline_message_row_padding_top(continuation: bool) -> f32 {
     if continuation {
@@ -269,9 +271,16 @@ enum NextFrameHold {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct VideoEffectOverlay {
+enum VideoControlOverlayKind {
+    Effect(VideoEffect),
+    Volume,
+    PlaybackSpeed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoControlOverlay {
     key: VideoKey,
-    effect: VideoEffect,
+    kind: VideoControlOverlayKind,
     value: f64,
     serial: u64,
 }
@@ -826,10 +835,12 @@ pub struct ChattView {
     video_volume_popup_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     video_volume_button_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     theater_video: Option<TheaterVideo>,
+    theater_focus: FocusHandle,
+    theater_return_focus: Option<WeakFocusHandle>,
     next_frame_hold: Option<NextFrameHold>,
-    video_effect_overlay: Option<VideoEffectOverlay>,
-    video_effect_overlay_hide_task: Option<Task<()>>,
-    next_video_effect_overlay_serial: u64,
+    video_control_overlay: Option<VideoControlOverlay>,
+    video_control_overlay_hide_task: Option<Task<()>>,
+    next_video_control_overlay_serial: u64,
     video_controls_animation_task: Option<Task<()>>,
     video_controls_hide_task: Option<Task<()>>,
     video_volume_hide_task: Option<Task<()>>,
@@ -1082,10 +1093,12 @@ impl ChattView {
             video_volume_popup_bounds: Rc::new(Cell::new(None)),
             video_volume_button_bounds: Rc::new(Cell::new(None)),
             theater_video: None,
+            theater_focus: cx.focus_handle(),
+            theater_return_focus: None,
             next_frame_hold: None,
-            video_effect_overlay: None,
-            video_effect_overlay_hide_task: None,
-            next_video_effect_overlay_serial: 1,
+            video_control_overlay: None,
+            video_control_overlay_hide_task: None,
+            next_video_control_overlay_serial: 1,
             video_controls_animation_task: None,
             video_controls_hide_task: None,
             video_volume_hide_task: None,
@@ -1351,7 +1364,7 @@ impl ChattView {
                 self.pending_message_jump = None;
                 self.message_reference_flash = None;
                 self.message_reference_flash_task = None;
-                self.reset_attachment_source_state(window);
+                self.reset_attachment_source_state(window, cx);
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Offline · Submission outcome unknown; verify the timeline after reconnecting · {reason}"
@@ -1384,7 +1397,7 @@ impl ChattView {
                 self.pending_message_jump = None;
                 self.message_reference_flash = None;
                 self.message_reference_flash_task = None;
-                self.reset_attachment_source_state(window);
+                self.reset_attachment_source_state(window, cx);
                 self.status = if submission_outcome_unknown {
                     format!(
                         "Cannot connect · Submission outcome unknown; verify before retrying · {details}"
@@ -1937,7 +1950,7 @@ impl ChattView {
             self.message_reference_flash_task = None;
         }
         if media_namespace_changed || self.model.selected_room != old_selected_room {
-            self.reset_attachment_source_state(window);
+            self.reset_attachment_source_state(window, cx);
         }
         let available = self
             .model
@@ -2006,7 +2019,7 @@ impl ChattView {
                 .as_ref()
                 .is_some_and(|theater| !retained.contains(&theater.key))
             {
-                self.clear_video_interactions(window);
+                self.clear_video_interactions(window, cx);
             }
         }
         if self.model.selected_room != old_selected_room || effect.messages_changed {
@@ -4905,6 +4918,7 @@ impl Render for ChattView {
             return div()
                 .id("chatt-video-theater")
                 .key_context("Chatt")
+                .track_focus(&self.theater_focus)
                 .on_action(cx.listener(Self::open_settings))
                 .on_action(cx.listener(Self::toggle_playback))
                 .on_action(cx.listener(Self::seek_back))
