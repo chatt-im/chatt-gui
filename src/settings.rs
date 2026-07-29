@@ -2,13 +2,14 @@ mod catalog;
 mod color_picker;
 mod remote;
 
-use std::sync::Arc;
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{
-    AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Global, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, canvas,
-    checkerboard, div, linear_color_stop, linear_gradient, prelude::*, rgba, uniform_list,
+    AnyElement, App, Bounds, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Global, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, SharedString, Subscription, Task, UniformListScrollHandle,
+    WeakEntity, canvas, checkerboard, deferred, div, linear_color_stop, linear_gradient,
+    prelude::*, relative, rgba, uniform_list,
 };
 
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
         schema::{BindCommand, BindingMode, FontRendering, GuiConfig, LayoutConfig, Rgba8},
         validation::{ConfigDiagnostic, DiagnosticSeverity, has_errors, validate},
     },
+    icons::{IconName, icon},
     key_bindings::{self, BindingScope},
     theme::{self, AppliedSettings, FontRole, ThemePalette, ThemeRole},
     ui_scale::rems_from_px,
@@ -198,6 +200,8 @@ pub(crate) struct SettingsView {
     remote_meter_peak: f32,
     recording: Option<(BindingScope, BindCommand)>,
     key_interceptor: Option<Subscription>,
+    section_menu_open: bool,
+    section_menu_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     scroll: UniformListScrollHandle,
     _save_task: Option<Task<()>>,
     appearance_session: local_rpc::appearance::AppearanceSessionId,
@@ -289,6 +293,8 @@ impl SettingsView {
             remote_meter_peak: 0.0,
             recording: None,
             key_interceptor: None,
+            section_menu_open: false,
+            section_menu_trigger_bounds: Rc::new(Cell::new(None)),
             scroll: UniformListScrollHandle::new(),
             _save_task: None,
             appearance_session,
@@ -737,6 +743,7 @@ impl SettingsView {
         if self.saving {
             return;
         }
+        self.section_menu_open = false;
         self.choice_picker = None;
         let was_audio = self.remote_section_is_audio();
         self.active_section = index;
@@ -769,6 +776,19 @@ impl SettingsView {
                 .unwrap_or(SettingsFocus::Search)
         };
         self.focus_target(target, false, window, cx);
+    }
+
+    fn toggle_section_menu(&mut self, cx: &mut Context<Self>) {
+        self.section_menu_open = !self.section_menu_open;
+        cx.notify();
+    }
+
+    fn dismiss_section_menu(&mut self, cx: &mut Context<Self>) {
+        if !self.section_menu_open {
+            return;
+        }
+        self.section_menu_open = false;
+        cx.notify();
     }
 
     fn select_remote_row(
@@ -2562,6 +2582,13 @@ impl SettingsView {
             return;
         }
 
+        if self.section_menu_open && key == "escape" {
+            self.dismiss_section_menu(cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+
         if key == "tab" {
             let delta = if modifiers.shift { -1 } else { 1 };
             let next = (self.active_section as isize + delta)
@@ -2770,7 +2797,11 @@ impl Render for SettingsView {
         let logical_width = f32::from(window.viewport_size().width)
             / f32::from(crate::ui_scale::rem_size(cx))
             * crate::ui_scale::BASE_REM_SIZE;
+        let logical_height = f32::from(window.viewport_size().height)
+            / f32::from(crate::ui_scale::rem_size(cx))
+            * crate::ui_scale::BASE_REM_SIZE;
         let compact = logical_width < 900.0;
+        let compact_menu_max_height = (logical_height - 240.0).clamp(120.0, 420.0);
         let remote_section = self.remote_section();
         let (section_title, section_help) = match remote_section {
             Some(section) => self
@@ -2874,82 +2905,271 @@ impl Render for SettingsView {
             .into_any_element()
         };
 
-        let mut navigation = div()
-            .flex_none()
-            .flex()
-            .gap_1()
-            .p_3()
-            .border_color(palette.color(ThemeRole::BorderSubtle))
-            .when(compact, |navigation| {
-                navigation.w_full().flex_row().flex_wrap().border_b_1()
-            })
-            .when(!compact, |navigation| {
-                navigation.w(rems_from_px(190.)).flex_col().border_r_1()
+        let navigation = if compact {
+            let trigger_view = view.clone();
+            let reset_all_view = view.clone();
+            let section_menu = self.section_menu_open.then(|| {
+                let mut menu = div()
+                    .id("settings-section-menu-popup")
+                    .absolute()
+                    .top(relative(1.))
+                    .left(rems_from_px(12.))
+                    .right(rems_from_px(12.))
+                    .mt(rems_from_px(4.))
+                    .max_h(rems_from_px(compact_menu_max_height))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(palette.color(ThemeRole::BorderStrong))
+                    .bg(palette.color(ThemeRole::Raised))
+                    .shadow_lg()
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if this
+                            .section_menu_trigger_bounds
+                            .get()
+                            .is_some_and(|bounds| bounds.contains(&event.position))
+                        {
+                            return;
+                        }
+                        this.dismiss_section_menu(cx);
+                    }))
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.color(ThemeRole::TextDim))
+                            .child("Renderer"),
+                    );
+                for (index, candidate) in SETTINGS_SECTIONS.iter().enumerate() {
+                    let selected = index == self.active_section;
+                    let section_view = view.clone();
+                    menu = menu.child(
+                        setting_button(candidate.id, candidate.title, selected, &palette)
+                            .w_full()
+                            .on_click(move |_, window, cx| {
+                                let _ = section_view
+                                    .update(cx, |this, cx| this.select_section(index, window, cx));
+                            }),
+                    );
+                }
+                if !self.remote_sections.is_empty() {
+                    menu = menu.child(
+                        div()
+                            .px_2()
+                            .pt_3()
+                            .pb_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.color(ThemeRole::TextDim))
+                            .child("Chatt daemon"),
+                    );
+                }
+                for (remote_index, candidate) in self.remote_sections.iter().enumerate() {
+                    let index = SETTINGS_SECTIONS.len() + remote_index;
+                    let selected = index == self.active_section;
+                    let section_view = view.clone();
+                    menu = menu.child(
+                        setting_button(
+                            candidate.id.clone(),
+                            candidate.title.clone(),
+                            selected,
+                            &palette,
+                        )
+                        .w_full()
+                        .on_click(move |_, window, cx| {
+                            let _ = section_view
+                                .update(cx, |this, cx| this.select_section(index, window, cx));
+                        }),
+                    );
+                }
+                menu.child(
+                    div()
+                        .mt_2()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(palette.color(ThemeRole::BorderSubtle))
+                        .child(
+                            setting_button(
+                                "reset-all",
+                                "Reset all",
+                                focused == SettingsFocus::ResetAll,
+                                &palette,
+                            )
+                            .w_full()
+                            .on_click(move |_, window, cx| {
+                                let _ = reset_all_view.update(cx, |this, cx| {
+                                    this.section_menu_open = false;
+                                    this.focus_target(SettingsFocus::ResetAll, false, window, cx);
+                                    this.reset_all(cx);
+                                });
+                            }),
+                        ),
+                )
             });
-        navigation = navigation.child(
+            let trigger_bounds = self.section_menu_trigger_bounds.clone();
             div()
-                .px_2()
-                .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(palette.color(ThemeRole::TextDim))
-                .child("Renderer"),
-        );
-        for (index, candidate) in SETTINGS_SECTIONS.iter().enumerate() {
-            let selected = index == self.active_section;
-            let section_view = view.clone();
+                .relative()
+                .w_full()
+                .flex_none()
+                .p_3()
+                .border_b_1()
+                .border_color(palette.color(ThemeRole::BorderSubtle))
+                .child(
+                    div()
+                        .id("settings-section-menu")
+                        .relative()
+                        .w_full()
+                        .min_h(rems_from_px(40.))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .cursor_pointer()
+                        .bg(if self.section_menu_open {
+                            palette.color(ThemeRole::ControlActive)
+                        } else {
+                            palette.color(ThemeRole::ControlSurface)
+                        })
+                        .text_color(if self.section_menu_open {
+                            palette.color(ThemeRole::ControlActiveText)
+                        } else {
+                            palette.color(ThemeRole::TextSecondary)
+                        })
+                        .hover({
+                            let hover = palette.color(ThemeRole::ControlSurfaceHover);
+                            move |button| button.bg(hover)
+                        })
+                        .child(
+                            canvas(
+                                move |bounds, _, _| trigger_bounds.set(Some(bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .child(icon(
+                            IconName::Menu,
+                            18.0,
+                            if self.section_menu_open {
+                                palette.color(ThemeRole::ControlActiveText)
+                            } else {
+                                palette.color(ThemeRole::TextSecondary)
+                            },
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(section_title.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(if self.section_menu_open {
+                                    palette.color(ThemeRole::ControlActiveText)
+                                } else {
+                                    palette.color(ThemeRole::TextDim)
+                                })
+                                .child(if self.section_menu_open {
+                                    "Close"
+                                } else {
+                                    "Sections"
+                                }),
+                        )
+                        .on_click(move |_, _, cx| {
+                            let _ =
+                                trigger_view.update(cx, |this, cx| this.toggle_section_menu(cx));
+                        }),
+                )
+                .when_some(section_menu, |navigation, menu| {
+                    navigation.child(deferred(menu))
+                })
+        } else {
+            let reset_all_view = view.clone();
+            let mut navigation = div()
+                .w(rems_from_px(190.))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .border_r_1()
+                .border_color(palette.color(ThemeRole::BorderSubtle))
+                .child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(palette.color(ThemeRole::TextDim))
+                        .child("Renderer"),
+                );
+            for (index, candidate) in SETTINGS_SECTIONS.iter().enumerate() {
+                let selected = index == self.active_section;
+                let section_view = view.clone();
+                navigation = navigation.child(
+                    setting_button(candidate.id, candidate.title, selected, &palette)
+                        .w_full()
+                        .on_click(move |_, window, cx| {
+                            let _ = section_view
+                                .update(cx, |this, cx| this.select_section(index, window, cx));
+                        }),
+                );
+            }
             navigation = navigation.child(
-                setting_button(candidate.id, candidate.title, selected, &palette)
+                div()
+                    .px_2()
+                    .pt_3()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(palette.color(ThemeRole::TextDim))
+                    .child("Chatt daemon"),
+            );
+            for (remote_index, candidate) in self.remote_sections.iter().enumerate() {
+                let index = SETTINGS_SECTIONS.len() + remote_index;
+                let selected = index == self.active_section;
+                let section_view = view.clone();
+                navigation = navigation.child(
+                    setting_button(
+                        candidate.id.clone(),
+                        candidate.title.clone(),
+                        selected,
+                        &palette,
+                    )
                     .w_full()
                     .on_click(move |_, window, cx| {
                         let _ = section_view
                             .update(cx, |this, cx| this.select_section(index, window, cx));
                     }),
-            );
-        }
-        navigation = navigation.child(
-            div()
-                .px_2()
-                .pt_3()
-                .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(palette.color(ThemeRole::TextDim))
-                .child("Chatt daemon"),
-        );
-        for (remote_index, candidate) in self.remote_sections.iter().enumerate() {
-            let index = SETTINGS_SECTIONS.len() + remote_index;
-            let selected = index == self.active_section;
-            let section_view = view.clone();
-            navigation = navigation.child(
+                );
+            }
+            navigation.child(div().flex_1()).child(
                 setting_button(
-                    candidate.id.clone(),
-                    candidate.title.clone(),
-                    selected,
+                    "reset-all",
+                    "Reset all",
+                    focused == SettingsFocus::ResetAll,
                     &palette,
                 )
-                .w_full()
                 .on_click(move |_, window, cx| {
-                    let _ =
-                        section_view.update(cx, |this, cx| this.select_section(index, window, cx));
+                    let _ = reset_all_view.update(cx, |this, cx| {
+                        this.focus_target(SettingsFocus::ResetAll, false, window, cx);
+                        this.reset_all(cx);
+                    });
                 }),
-            );
-        }
-        let reset_all_view = view.clone();
-        navigation = navigation.child(div().flex_1()).child(
-            setting_button(
-                "reset-all",
-                "Reset all",
-                focused == SettingsFocus::ResetAll,
-                &palette,
             )
-            .on_click(move |_, window, cx| {
-                let _ = reset_all_view.update(cx, |this, cx| {
-                    this.focus_target(SettingsFocus::ResetAll, false, window, cx);
-                    this.reset_all(cx);
-                });
-            }),
-        );
+        };
 
         let search_editor = active_editor
             .as_ref()
@@ -4562,6 +4782,56 @@ mod tests {
                 assert!(!settings.local_dirty());
             });
         });
+    }
+
+    #[gpui::test]
+    fn narrow_settings_collapses_sections_into_a_menu(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            let config = GuiConfig::default();
+            let available_families = cx.text_system().all_font_names();
+            theme::apply_appearance(&config, SourceStatus::Missing, &[], &available_families, cx);
+            install_loaded(
+                LoadedConfig {
+                    path: None,
+                    config,
+                    source: None,
+                    status: SourceStatus::Missing,
+                    diagnostics: Vec::new(),
+                },
+                cx,
+            );
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let settings = SettingsView::new(
+                local_rpc::appearance::AppearanceSessionId(1),
+                LayoutConfig::default(),
+                cx,
+            );
+            window.focus(&settings.focus, cx);
+            settings
+        });
+
+        cx.simulate_resize(gpui::size(gpui::px(700.0), gpui::px(600.0)));
+        cx.run_until_parked();
+        let trigger = settings
+            .read_with(cx, |settings, _| settings.section_menu_trigger_bounds.get())
+            .expect("narrow settings renders one section-menu trigger");
+        assert!(f32::from(trigger.size.height) <= 48.0);
+        assert!(!settings.read_with(cx, |settings, _| settings.section_menu_open));
+
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        assert!(settings.read_with(cx, |settings, _| settings.section_menu_open));
+
+        cx.simulate_click(
+            gpui::point(gpui::px(650.0), gpui::px(50.0)),
+            gpui::Modifiers::none(),
+        );
+        assert!(!settings.read_with(cx, |settings, _| settings.section_menu_open));
+
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("escape");
+        assert!(!settings.read_with(cx, |settings, _| settings.section_menu_open));
     }
 
     #[gpui::test]

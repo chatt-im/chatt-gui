@@ -4823,14 +4823,12 @@ impl ChattView {
                 )
                 .child(div().flex_1().min_w_0().text_sm().child(identity))
                 .child(
-                    sidebar_footer_button(
-                        "open-servers",
-                        IconName::ArrowLeftRight,
-                        &applied.theme,
-                    )
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
-                    ),
+                    sidebar_footer_button("open-servers", IconName::ArrowLeftRight, &applied.theme)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.open_server_selector(window, cx)
+                            }),
+                        ),
                 )
                 .child(
                     sidebar_footer_button("open-settings", IconName::Settings, &applied.theme)

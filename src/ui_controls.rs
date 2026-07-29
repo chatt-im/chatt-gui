@@ -157,11 +157,7 @@ pub(crate) fn sidebar_footer_button(
         .justify_center()
         .cursor_pointer()
         .hover(move |button| button.bg(hover))
-        .child(icon(
-            icon_name,
-            18.0,
-            palette.color(ThemeRole::TextMuted),
-        ))
+        .child(icon(icon_name, 18.0, palette.color(ThemeRole::TextMuted)))
 }
 
 pub(crate) fn icon_button(
