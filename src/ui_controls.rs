@@ -143,7 +143,7 @@ pub(crate) fn mini_button(
 
 pub(crate) fn sidebar_footer_button(
     id: &'static str,
-    label: &'static str,
+    icon_name: IconName,
     palette: &ThemePalette,
 ) -> Stateful<Div> {
     let hover = palette.color(ThemeRole::ControlSurfaceHover);
@@ -156,10 +156,12 @@ pub(crate) fn sidebar_footer_button(
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .text_lg()
-        .text_color(palette.color(ThemeRole::TextMuted))
         .hover(move |button| button.bg(hover))
-        .child(label)
+        .child(icon(
+            icon_name,
+            18.0,
+            palette.color(ThemeRole::TextMuted),
+        ))
 }
 
 pub(crate) fn icon_button(

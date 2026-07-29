@@ -6,6 +6,7 @@ use crate::ui_scale::rems_from_px;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IconName {
+    ArrowLeftRight,
     AudioOff,
     AudioOn,
     AtSign,
@@ -31,6 +32,7 @@ pub(crate) enum IconName {
     RepeatOff,
     RotateCcw,
     Search,
+    Settings,
     Shield,
     ShieldAlert,
     ShieldCheck,
@@ -46,6 +48,7 @@ pub(crate) enum IconName {
 impl IconName {
     fn path(self) -> &'static str {
         match self {
+            Self::ArrowLeftRight => "icons/arrow-left-right.svg",
             Self::AudioOff => "icons/audio-off.svg",
             Self::AudioOn => "icons/audio-on.svg",
             Self::AtSign => "icons/at-sign.svg",
@@ -71,6 +74,7 @@ impl IconName {
             Self::RepeatOff => "icons/repeat-off.svg",
             Self::RotateCcw => "icons/rotate-ccw.svg",
             Self::Search => "icons/search.svg",
+            Self::Settings => "icons/settings.svg",
             Self::Shield => "icons/shield.svg",
             Self::ShieldAlert => "icons/shield-alert.svg",
             Self::ShieldCheck => "icons/shield-check.svg",
@@ -116,6 +120,7 @@ impl AssetSource for IconAssets {
 }
 
 const ICON_PATHS: &[&str] = &[
+    "icons/arrow-left-right.svg",
     "icons/audio-off.svg",
     "icons/audio-on.svg",
     "icons/at-sign.svg",
@@ -141,6 +146,7 @@ const ICON_PATHS: &[&str] = &[
     "icons/repeat-off.svg",
     "icons/rotate-ccw.svg",
     "icons/search.svg",
+    "icons/settings.svg",
     "icons/shield.svg",
     "icons/shield-alert.svg",
     "icons/shield-check.svg",
@@ -162,6 +168,9 @@ fn icon_svg(path: &str) -> Option<String> {
     }
 
     let body = match path {
+        "icons/arrow-left-right.svg" => {
+            r#"<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>"#
+        }
         "icons/audio-off.svg" => {
             r#"<path d="M11 5 6 9H2v6h4l5 4z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/>"#
         }
@@ -224,6 +233,9 @@ fn icon_svg(path: &str) -> Option<String> {
         }
         "icons/rotate-ccw.svg" => r#"<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>"#,
         "icons/search.svg" => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>"#,
+        "icons/settings.svg" => {
+            r#"<path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/><circle cx="12" cy="12" r="3"/>"#
+        }
         "icons/shield.svg" => {
             r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>"#
         }

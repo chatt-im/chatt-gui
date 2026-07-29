@@ -407,7 +407,10 @@ impl ChattView {
                     .iter()
                     .position(|item| item.message_id() == Some(target.message_id.0))
                 {
-                    self.list_state.scroll_to_reveal_item(index);
+                    self.pending_scroll = px(0.);
+                    self.scroll_animation_active = false;
+                    self.last_scroll_frame = None;
+                    scroll_message_reference_to_start(&self.list_state, index);
                     self.flash_message_reference(target, cx);
                     self.pending_message_jump = None;
                     self.status = "Jumped to referenced message".into();

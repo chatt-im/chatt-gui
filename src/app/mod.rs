@@ -784,6 +784,13 @@ fn message_reference_jump_decision(
     MessageReferenceJumpDecision::LoadOlder(before)
 }
 
+fn scroll_message_reference_to_start(list_state: &ListState, index: usize) {
+    list_state.scroll_to(gpui::ListOffset {
+        item_ix: index,
+        offset_in_item: px(0.),
+    });
+}
+
 pub struct ChattView {
     model: ChatModel,
     daemon: DaemonClient,
@@ -4816,16 +4823,20 @@ impl ChattView {
                 )
                 .child(div().flex_1().min_w_0().text_sm().child(identity))
                 .child(
-                    sidebar_footer_button("open-servers", "⇄", &applied.theme).on_click(
+                    sidebar_footer_button(
+                        "open-servers",
+                        IconName::ArrowLeftRight,
+                        &applied.theme,
+                    )
+                    .on_click(
                         cx.listener(|this, _, window, cx| this.open_server_selector(window, cx)),
                     ),
                 )
                 .child(
-                    sidebar_footer_button("open-settings", "⚙", &applied.theme).on_click(
-                        cx.listener(|this, _, window, cx| {
+                    sidebar_footer_button("open-settings", IconName::Settings, &applied.theme)
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.open_settings(&OpenSettings, window, cx)
-                        }),
-                    ),
+                        })),
                 ),
         )
     }
@@ -6447,6 +6458,21 @@ mod tests {
             ),
             MessageReferenceJumpDecision::SearchWindowExhausted
         );
+    }
+
+    #[test]
+    fn reference_jump_places_the_start_of_the_target_in_view() {
+        let list_state = ListState::new(5, ListAlignment::Bottom, px(1_600.));
+        list_state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(12.),
+        });
+
+        scroll_message_reference_to_start(&list_state, 3);
+
+        let offset = list_state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 3);
+        assert_eq!(offset.offset_in_item, px(0.));
     }
 
     #[test]
