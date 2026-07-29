@@ -566,6 +566,7 @@ dependencies = [
 [[package]]
 name = "chatt-ids"
 version = "0.1.0"
+source = "git+https://github.com/chatt-im/chatt.git?rev=3f2c994682ccc182962bf50fdeef6cba4ce260ba#3f2c994682ccc182962bf50fdeef6cba4ce260ba"
 dependencies = [
  "jsony",
  "kvlog",
@@ -575,6 +576,7 @@ dependencies = [
 [[package]]
 name = "chatt-local-rpc"
 version = "0.1.0"
+source = "git+https://github.com/chatt-im/chatt.git?rev=3f2c994682ccc182962bf50fdeef6cba4ce260ba#3f2c994682ccc182962bf50fdeef6cba4ce260ba"
 dependencies = [
  "chatt-ids",
  "chatt-video",
@@ -587,6 +589,7 @@ dependencies = [
 [[package]]
 name = "chatt-message-format"
 version = "0.1.0"
+source = "git+https://github.com/chatt-im/chatt.git?rev=3f2c994682ccc182962bf50fdeef6cba4ce260ba#3f2c994682ccc182962bf50fdeef6cba4ce260ba"
 dependencies = [
  "chatt-ids",
  "tinyhl",
@@ -595,6 +598,7 @@ dependencies = [
 [[package]]
 name = "chatt-video"
 version = "0.1.0"
+source = "git+https://github.com/chatt-im/chatt.git?rev=3f2c994682ccc182962bf50fdeef6cba4ce260ba#3f2c994682ccc182962bf50fdeef6cba4ce260ba"
 
 [[package]]
 name = "chrono"
