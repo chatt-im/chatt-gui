@@ -110,6 +110,7 @@ pub fn apply(model: &mut ChatModel, frame: DaemonFrame) -> ReduceEffect {
         }
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
+        | DaemonFrame::LiveShareStatus { .. }
         | DaemonFrame::AttachmentSourceOpened { .. }
         | DaemonFrame::BulkChunk(_)
         | DaemonFrame::BulkFinished(_)
@@ -555,6 +556,7 @@ mod tests {
                     share: local_rpc::model::LiveShare {
                         room_id: RoomId(1),
                         stream_id: local_rpc::ids::StreamId(stream_id),
+                        generation: u64::from(stream_id),
                         sender_name: "alice".into(),
                         codec: "avc1.42C00D".into(),
                         coded_width: 320,
@@ -572,6 +574,28 @@ mod tests {
                 .map(|share| share.stream_id.0)
                 .collect::<Vec<_>>(),
             vec![3, 9]
+        );
+        let mut replacement = model
+            .live_shares
+            .iter()
+            .find(|share| share.stream_id == local_rpc::ids::StreamId(9))
+            .unwrap()
+            .clone();
+        replacement.generation = 99;
+        replacement.sender_name = "bob".into();
+        apply_delta(
+            &mut model,
+            StateDelta::LiveShareUpserted { share: replacement },
+            &mut effect,
+        );
+        assert_eq!(model.live_shares.len(), 2);
+        assert_eq!(
+            model
+                .live_shares
+                .iter()
+                .find(|share| share.stream_id == local_rpc::ids::StreamId(9))
+                .map(|share| (share.generation, share.sender_name.as_str())),
+            Some((99, "bob"))
         );
         apply_delta(
             &mut model,
@@ -820,6 +844,7 @@ mod tests {
         let live_share = local_rpc::model::LiveShare {
             room_id: RoomId(2),
             stream_id: local_rpc::ids::StreamId(9),
+            generation: 1,
             sender_name: "bob".into(),
             codec: "avc1.42C00D".into(),
             coded_width: 320,

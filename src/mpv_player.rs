@@ -700,6 +700,12 @@ impl MpvPlayer {
         Ok(self.playback.snapshot())
     }
 
+    pub(crate) fn live_rendered_sequence(&self) -> u64 {
+        self.live_diagnostics
+            .as_ref()
+            .map_or(0, |diagnostics| diagnostics.rendered_sequence())
+    }
+
     fn send_control(&self, command: ControlCommand) -> Result<()> {
         self.control_sender
             .send(command)

@@ -17,6 +17,7 @@ mod cursor;
 mod highlight;
 mod history;
 mod mode;
+mod paste;
 pub(crate) mod uploads;
 mod vim;
 mod visual;
@@ -35,6 +36,7 @@ use crate::{
 use chatt_message_format::highlight::PaletteRole;
 use highlight::{ComposerColor, ComposerSyntax, ComposerTextStyle, ComposerTypeface};
 pub(crate) use mode::Mode;
+use paste::markdown_paste_insertion;
 use vim::{DisplayLine as VimDisplayLine, DisplayPoint as VimDisplayPoint, VimEditor, VimKey};
 
 const MAX_VISIBLE_LINES: usize = 8;
@@ -444,6 +446,7 @@ impl TextEditor {
         if self.vim_enabled && self.editor.mode() != Mode::Insert {
             self.paste_in_vim_mode(&text, metadata.as_deref(), VimKey::Char('p'), cx);
         } else {
+            let text = self.markdown_paste_text(&text, self.selected.start);
             self.replace_text(None, &text, false, true, window, cx);
         }
     }
@@ -796,6 +799,7 @@ impl TextEditor {
             let (text, metadata) = item
                 .map(|(item, metadata)| (item.text().unwrap_or_default(), metadata))
                 .unwrap_or_default();
+            let text = self.markdown_vim_paste_text(&text, metadata.as_deref(), key);
             self.editor
                 .set_paste_text_with_metadata(&text, metadata.as_deref());
         }
@@ -856,11 +860,51 @@ impl TextEditor {
         key: VimKey,
         cx: &mut Context<Self>,
     ) {
-        self.editor.set_paste_text_with_metadata(text, metadata);
+        let text = self.markdown_vim_paste_text(text, metadata, key);
+        self.editor.set_paste_text_with_metadata(&text, metadata);
         let version = self.editor.text_version();
         if self.editor.send_key(key) {
             self.finish_vim_action(version, cx);
         }
+    }
+
+    fn markdown_paste_text(&self, text: &str, offset: usize) -> String {
+        if self.multiline {
+            markdown_paste_insertion(&self.editor.text(), offset, text)
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn markdown_vim_paste_text(&self, text: &str, metadata: Option<&str>, key: VimKey) -> String {
+        if !self.multiline
+            || matches!(
+                metadata,
+                Some("chatt-vim-register:linewise" | "chatt-vim-register:blockwise")
+            )
+        {
+            return text.to_string();
+        }
+        let offset = if self.editor.mode().is_visual() {
+            self.editor
+                .visual_ranges()
+                .first()
+                .map_or_else(|| self.editor.cursor_offset(), |range| range.start)
+        } else {
+            let cursor = self.editor.cursor_offset();
+            let current_len = (key == VimKey::Char('p'))
+                .then(|| self.editor.text())
+                .and_then(|source| {
+                    source
+                        .get(cursor..)
+                        .and_then(|tail| tail.graphemes(true).next())
+                        .filter(|grapheme| !grapheme.contains('\n'))
+                        .map(str::len)
+                })
+                .unwrap_or(0);
+            cursor.saturating_add(current_len)
+        };
+        self.markdown_paste_text(text, offset)
     }
 
     fn finish_vim_action(&mut self, version: u64, cx: &mut Context<Self>) {
@@ -2451,6 +2495,65 @@ mod tests {
         assert_eq!(
             composer.read_with(cx, |composer, _| composer.text()),
             "first second"
+        );
+    }
+
+    #[gpui::test]
+    fn platform_paste_after_fence_opener_lands_inside_the_code_block(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let mut composer =
+                Composer::with_binding_mode(crate::config::schema::BindingMode::Standard, cx);
+            composer.set_value("```\n```", cx);
+            composer.move_to(3, cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "cargo build\ncargo test".to_string(),
+        ));
+        cx.simulate_keystrokes("secondary-v");
+
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "```\ncargo build\ncargo test\n```"
+        );
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.snapshot().selection),
+            "```\ncargo build\ncargo test".len().."```\ncargo build\ncargo test".len()
+        );
+    }
+
+    #[gpui::test]
+    fn normal_mode_platform_paste_keeps_every_added_line_quoted(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::fonts::init);
+        cx.update(|cx| {
+            crate::key_bindings::install(&crate::config::schema::GuiConfig::default(), cx).unwrap()
+        });
+        let (composer, cx) = cx.add_window_view(|window, cx| {
+            let mut composer = Composer::new(cx);
+            composer.set_value("> quoted", cx);
+            composer.move_to("> quoted".len(), cx);
+            window.focus(&composer.focus, cx);
+            composer
+        });
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("\nmore".to_string()));
+        cx.simulate_keystrokes("p");
+
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.text()),
+            "> quoted\n> more"
+        );
+        assert_eq!(
+            composer.read_with(cx, |composer, _| composer.mode()),
+            super::Mode::Normal
         );
     }
 

@@ -29,6 +29,8 @@ pub enum DaemonEvent {
     LiveShareOpened {
         request_id: RequestId,
         stream_id: local_rpc::ids::StreamId,
+        generation: u64,
+        status: local_rpc::model::LiveShareViewStatus,
         stream: std::os::unix::net::UnixStream,
     },
     AttachmentSourceOpened {
@@ -331,6 +333,8 @@ fn connection_loop(
                             if let DaemonFrame::LiveShareOpened {
                                 request_id,
                                 stream_id,
+                                generation,
+                                status,
                             } = &frame
                             {
                                 if fds.len() != 1 {
@@ -345,6 +349,8 @@ fn connection_loop(
                                     .send_blocking(DaemonEvent::LiveShareOpened {
                                         request_id: *request_id,
                                         stream_id: *stream_id,
+                                        generation: *generation,
+                                        status: *status,
                                         stream,
                                     })
                                     .is_err()

@@ -45,7 +45,7 @@ const MAX_RECYCLED_BYTES: usize = MAX_PENDING_BYTES;
 // A late viewer may receive the web-equivalent cached GOP as a burst. Let mpv
 // consume that burst untimed, then return to the two-frame live queue as soon
 // as it drains once.
-const MAX_BOOTSTRAP_FRAMES: usize = 90;
+const MAX_BOOTSTRAP_FRAMES: usize = local_rpc::video::FAST_START_MAX_FRAMES;
 const LIVE_RECORDING_MAGIC: &[u8] = b"chatt-live-rpc\0";
 const LIVE_RECORDING_VERSION: u32 = 1;
 #[cfg(feature = "diagnostic-logs")]
@@ -75,6 +75,14 @@ impl LiveDiagnostics {
         Self {
             state: Mutex::new(LiveDiagnosticState::default()),
         }
+    }
+
+    pub(crate) fn rendered_sequence(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .latest_render
+            .map_or(0, |(sequence, _, _)| sequence)
     }
 
     fn record_input(
@@ -1274,6 +1282,7 @@ mod tests {
         let share = LiveShare {
             room_id: RoomId(1),
             stream_id: StreamId(42),
+            generation: 1,
             sender_name: "test".into(),
             codec: "avc1.64001F".into(),
             coded_width: 1920,
@@ -1340,6 +1349,7 @@ mod tests {
         let share = LiveShare {
             room_id: RoomId(1),
             stream_id: StreamId(recording.stream_id),
+            generation: 1,
             sender_name: "recording".into(),
             codec: recording.codec,
             coded_width: recording.coded_width,
@@ -1511,6 +1521,30 @@ mod tests {
         assert!(queue.state.lock().unwrap().bootstrapping);
         while queue.try_pop().is_some() {}
         assert!(!queue.state.lock().unwrap().bootstrapping);
+    }
+
+    #[test]
+    fn daemon_fast_start_frame_window_fits_without_requesting_a_new_keyframe() {
+        let queue = NutQueue {
+            stream_id: 1,
+            header: Vec::new(),
+            input_gate: None,
+            state: Mutex::new(QueueState {
+                bootstrapping: true,
+                ..QueueState::default()
+            }),
+            ready: Condvar::new(),
+        };
+
+        for index in 0..local_rpc::video::FAST_START_MAX_FRAMES {
+            assert!(!queue.push(queued(&[(index % 255) as u8]), index == 0));
+        }
+
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.frames.len(), local_rpc::video::FAST_START_MAX_FRAMES);
+        assert!(state.bootstrapping);
+        assert!(!state.awaiting_keyframe);
+        assert_eq!(state.overflow_count, 0);
     }
 
     #[test]
@@ -1730,6 +1764,7 @@ mod tests {
         let share = LiveShare {
             room_id: RoomId(1),
             stream_id: StreamId(7),
+            generation: 1,
             sender_name: "test".into(),
             codec: params.codec,
             coded_width: params.width,
@@ -1876,6 +1911,7 @@ mod tests {
         let share = LiveShare {
             room_id: RoomId(1),
             stream_id: StreamId(8),
+            generation: 1,
             sender_name: "test".into(),
             codec: params.codec,
             coded_width: params.width,

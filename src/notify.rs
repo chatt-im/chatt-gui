@@ -42,8 +42,8 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use gpui::{
-        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-        Pixels, Style, Window, div, prelude::*,
+        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+        LayoutId, Pixels, Style, Window, div, prelude::*,
     };
 
     use super::Notify;

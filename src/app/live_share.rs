@@ -1,31 +1,83 @@
 use super::*;
 
 impl ChattView {
+    pub(super) fn live_share_protocol_error(
+        &mut self,
+        reason: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        kvlog::error!("daemon live-share protocol error", err = %reason);
+        self.release_live_players(window);
+        self.daemon.disconnect_protocol(reason);
+        self.status = format!("Screen share protocol error · {reason}").into();
+        cx.notify();
+    }
+
+    pub(super) fn apply_live_share_status(
+        &mut self,
+        stream_id: StreamId,
+        generation: u64,
+        status: local_rpc::model::LiveShareViewStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.live_players.get_mut(&stream_id) else {
+            return;
+        };
+        if view.generation != generation {
+            return;
+        }
+        view.last_rendered_sequence = view.player.live_rendered_sequence();
+        view.status = status.into();
+        self.status = match status {
+            local_rpc::model::LiveShareViewStatus::WaitingForKeyframe => {
+                "Screen share connected · Waiting for a keyframe"
+            }
+            local_rpc::model::LiveShareViewStatus::Reconnecting => "Reconnecting to screen share…",
+        }
+        .into();
+        cx.notify();
+    }
+
     pub(super) fn advance_live_video(&mut self, window: &mut Window) {
         let mut ended = Vec::new();
         for (stream_id, view) in &mut self.live_players {
             match view.player.drain_events() {
                 Ok(playback) if playback.finished => {
-                    ended.push((*stream_id, "Screen share ended".to_string()));
+                    ended.push((
+                        *stream_id,
+                        view.generation,
+                        "Screen share ended".to_string(),
+                    ));
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    let rendered_sequence = view.player.live_rendered_sequence();
+                    if rendered_sequence != 0 && rendered_sequence != view.last_rendered_sequence {
+                        view.last_rendered_sequence = rendered_sequence;
+                        view.status = LivePlayerStatus::Playing;
+                    }
+                }
                 Err(error) => {
                     kvlog::error!(
                         "screen-share playback failed",
                         stream_id,
                         err = %error
                     );
-                    ended.push((*stream_id, format!("Screen share failed · {error:#}")));
+                    ended.push((
+                        *stream_id,
+                        view.generation,
+                        format!("Screen share failed · {error:#}"),
+                    ));
                 }
             }
         }
-        for (stream_id, status) in ended {
+        for (stream_id, generation, status) in ended {
             self.live_players.remove(&stream_id);
             if self.fullscreen_share == Some(stream_id) {
                 self.fullscreen_share = None;
                 self.fullscreen_live_controls_hovered = false;
             }
-            self.send_stop_live_share(stream_id);
+            self.send_stop_live_share(stream_id, generation);
             self.status = status.into();
         }
         self.exit_native_media_fullscreen_if_inactive(window);
@@ -35,7 +87,22 @@ impl ChattView {
     }
 
     fn start_live_share(&mut self, stream_id: StreamId, cx: &mut Context<Self>) {
-        if self.live_players.contains_key(&stream_id) || !self.model.is_ready() {
+        let Some(share) = self
+            .model
+            .live_shares
+            .iter()
+            .find(|share| share.stream_id == stream_id)
+        else {
+            return;
+        };
+        let generation = share.generation;
+        if self.live_players.contains_key(&stream_id)
+            || self
+                .pending_live_share_opens
+                .values()
+                .any(|pending| *pending == (stream_id, generation))
+            || !self.model.is_ready()
+        {
             return;
         }
         let request_id = self.request_id();
@@ -53,11 +120,15 @@ impl ChattView {
                 transfer_id: None,
             },
         );
+        self.pending_live_share_opens
+            .insert(request_id, (stream_id, generation));
         if let Err(error) = self.daemon.send(ClientFrame::StartLiveShare {
             request_id,
             stream_id,
+            generation,
         }) {
             self.model.pending.remove(&request_id);
+            self.pending_live_share_opens.remove(&request_id);
             self.status = error.into();
         } else {
             self.status = "Starting screen share…".into();
@@ -71,7 +142,10 @@ impl ChattView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.live_players.remove(&stream_id);
+        let generation = self
+            .live_players
+            .remove(&stream_id)
+            .map(|view| view.generation);
         if self.live_players.is_empty() {
             self.live_pane_resize = None;
         }
@@ -80,12 +154,14 @@ impl ChattView {
             self.fullscreen_live_controls_hovered = false;
         }
         self.exit_native_media_fullscreen_if_inactive(window);
-        self.send_stop_live_share(stream_id);
+        if let Some(generation) = generation {
+            self.send_stop_live_share(stream_id, generation);
+        }
         self.status = "Stopped screen share".into();
         cx.notify();
     }
 
-    pub(super) fn send_stop_live_share(&mut self, stream_id: StreamId) {
+    pub(super) fn send_stop_live_share(&mut self, stream_id: StreamId, generation: u64) {
         let request_id = self.request_id();
         self.model.pending.insert(
             request_id,
@@ -101,6 +177,7 @@ impl ChattView {
             .send(ClientFrame::StopLiveShare {
                 request_id,
                 stream_id,
+                generation,
             })
             .is_err()
         {
@@ -375,6 +452,7 @@ impl ChattView {
 
     pub(super) fn release_live_players(&mut self, window: &mut Window) {
         self.live_players.clear();
+        self.pending_live_share_opens.clear();
         self.live_pane_resize = None;
         self.fullscreen_live_controls_hovered = false;
         self.fullscreen_share = None;
@@ -500,6 +578,7 @@ impl ChattView {
                 view.last_mouse_position.is_some(),
                 viewport_bounds,
                 view.coded_size,
+                view.status,
             )
         });
         let active_share = active.is_some();
@@ -511,7 +590,9 @@ impl ChattView {
             .when(fullscreen, |card| card.relative().size_full())
             .when(constrained && active_share, |card| card.flex_1().min_h_0())
             .when(constrained && !active_share, |card| card.flex_none());
-        if let Some((video_surface, zoom, pan, dragging, viewport_bounds, coded_size)) = active {
+        if let Some((video_surface, zoom, pan, dragging, viewport_bounds, coded_size, status)) =
+            active
+        {
             let stop_id = stream_id;
             let reset_id = stream_id;
             let zoom_out_id = stream_id;
@@ -662,7 +743,25 @@ impl ChattView {
                     )
                     .absolute()
                     .size_full(),
-                );
+                )
+                .when(status != LivePlayerStatus::Playing, |viewport| {
+                    viewport.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(settings.theme.color(ThemeRole::MediaViewport))
+                            .text_sm()
+                            .text_color(settings.theme.color(ThemeRole::TextMuted))
+                            .child(match status {
+                                LivePlayerStatus::WaitingForKeyframe => "Waiting for a keyframe…",
+                                LivePlayerStatus::Reconnecting => "Reconnecting to screen share…",
+                                LivePlayerStatus::Playing => "",
+                            }),
+                    )
+                });
             card = if fullscreen {
                 card.child(viewport).child(header)
             } else {

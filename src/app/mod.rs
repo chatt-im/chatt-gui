@@ -44,6 +44,7 @@ use crate::{
             inspect_files, prepare_images,
         },
     },
+    contain::Contain,
     daemon::{
         client::{DaemonClient, DaemonEvent},
         reducer,
@@ -56,7 +57,6 @@ use crate::{
     identity::{IdentityView, IdentityViewEvent},
     image_cache::{PreviewImageLoader, TimelineImageLoader},
     media_cache::{CachedAttachment, MediaCache},
-    contain::Contain,
     model::{ChatModel, ConnectionPhase, PendingRequest},
     mpv_player::{MpvPlayer, SeekMode, VideoAdjustment, VideoEffect},
     notify::Notify,
@@ -268,11 +268,30 @@ struct EagerImageFetch {
 
 struct LivePlayerView {
     player: MpvPlayer,
+    generation: u64,
+    status: LivePlayerStatus,
+    last_rendered_sequence: u64,
     zoom: f32,
     pan: Point<Pixels>,
     last_mouse_position: Option<Point<Pixels>>,
     coded_size: (u32, u32),
     viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LivePlayerStatus {
+    WaitingForKeyframe,
+    Reconnecting,
+    Playing,
+}
+
+impl From<local_rpc::model::LiveShareViewStatus> for LivePlayerStatus {
+    fn from(status: local_rpc::model::LiveShareViewStatus) -> Self {
+        match status {
+            local_rpc::model::LiveShareViewStatus::WaitingForKeyframe => Self::WaitingForKeyframe,
+            local_rpc::model::LiveShareViewStatus::Reconnecting => Self::Reconnecting,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -873,6 +892,7 @@ pub struct ChattView {
     video_surface_click_task: Option<Task<()>>,
     video_wakeup: async_channel::Sender<()>,
     live_players: HashMap<StreamId, LivePlayerView>,
+    pending_live_share_opens: HashMap<RequestId, (StreamId, u64)>,
     fullscreen_share: Option<StreamId>,
     fullscreen_live_controls_hovered: bool,
     media_native_fullscreen: bool,
@@ -1134,6 +1154,7 @@ impl ChattView {
             video_surface_click_task: None,
             video_wakeup,
             live_players: HashMap::new(),
+            pending_live_share_opens: HashMap::new(),
             fullscreen_share: None,
             fullscreen_live_controls_hovered: false,
             media_native_fullscreen: false,
@@ -1594,6 +1615,7 @@ impl ChattView {
                 } else {
                     format!("Cannot connect · {details}").into()
                 };
+                self.release_live_players(window);
                 if let Some(settings) = &self.settings {
                     settings.update(cx, |settings, cx| {
                         settings.remote_disconnected(&details, cx)
@@ -1790,16 +1812,29 @@ impl ChattView {
             DaemonEvent::LiveShareOpened {
                 request_id,
                 stream_id,
+                generation,
+                status,
                 stream,
             } => {
                 self.model.pending.remove(&request_id);
+                let expected = self.pending_live_share_opens.remove(&request_id);
+                if expected != Some((stream_id, generation)) {
+                    drop(stream);
+                    self.live_share_protocol_error(
+                        "live-share response identity does not match its request",
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 let Some(share) = self
                     .model
                     .live_shares
                     .iter()
-                    .find(|share| share.stream_id == stream_id)
+                    .find(|share| share.stream_id == stream_id && share.generation == generation)
                     .cloned()
                 else {
+                    self.send_stop_live_share(stream_id, generation);
                     self.status = "Screen share ended before playback started".into();
                     return;
                 };
@@ -1815,6 +1850,9 @@ impl ChattView {
                             stream_id,
                             LivePlayerView {
                                 player,
+                                generation,
+                                status: status.into(),
+                                last_rendered_sequence: 0,
                                 zoom: 1.0,
                                 pan: point(px(0.), px(0.)),
                                 last_mouse_position: None,
@@ -1822,11 +1860,19 @@ impl ChattView {
                                 viewport_bounds: Rc::new(Cell::new(None)),
                             },
                         );
-                        self.status = "Playing live screen share".into();
+                        self.status = match status {
+                            local_rpc::model::LiveShareViewStatus::WaitingForKeyframe => {
+                                "Screen share connected · Waiting for a keyframe"
+                            }
+                            local_rpc::model::LiveShareViewStatus::Reconnecting => {
+                                "Reconnecting to screen share…"
+                            }
+                        }
+                        .into();
                     }
                     Err(error) => {
                         self.status = format!("Could not play screen share · {error:#}").into();
-                        self.send_stop_live_share(stream_id);
+                        self.send_stop_live_share(stream_id, generation);
                     }
                 }
             }
@@ -2019,6 +2065,14 @@ impl ChattView {
                 self.apply_identity_event(event, window, cx);
                 return;
             }
+            DaemonFrame::LiveShareStatus {
+                stream_id,
+                generation,
+                status,
+            } => {
+                self.apply_live_share_status(stream_id, generation, status, cx);
+                return;
+            }
             DaemonFrame::Welcome(_) => {
                 self.appearance_sync.daemon_reconnected();
                 // A restarted daemon holds no identity sessions, so an open
@@ -2155,13 +2209,13 @@ impl ChattView {
             .model
             .live_shares
             .iter()
-            .map(|share| share.stream_id)
-            .collect::<HashSet<_>>();
+            .map(|share| (share.stream_id, share.generation))
+            .collect::<HashMap<_, _>>();
         self.live_players
-            .retain(|stream_id, _| available.contains(stream_id));
+            .retain(|stream_id, view| available.get(stream_id) == Some(&view.generation));
         if self
             .fullscreen_share
-            .is_some_and(|stream_id| !available.contains(&stream_id))
+            .is_some_and(|stream_id| !self.live_players.contains_key(&stream_id))
         {
             self.fullscreen_share = None;
             self.fullscreen_live_controls_hovered = false;
@@ -2305,6 +2359,29 @@ impl ChattView {
             }
         }
         if let Some(result) = effect.request_result {
+            if result.operation == Operation::StartLiveShare {
+                let pending_open = self.pending_live_share_opens.remove(&result.request_id);
+                if pending_open.is_none()
+                    || pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.operation != Operation::StartLiveShare)
+                {
+                    self.live_share_protocol_error(
+                        "live-share result does not match a pending request",
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                if matches!(&result.outcome, RequestOutcome::Accepted) {
+                    self.live_share_protocol_error(
+                        "live-share open returned an accepted result without a descriptor",
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
             if result.operation == Operation::OpenAttachmentSource {
                 match result.outcome {
                     RequestOutcome::Accepted => {
@@ -5288,7 +5365,12 @@ impl Render for ChattView {
         let stacked_preview = (layout == PreviewLayout::Stacked
             && self.preview_history.tab_bar_visible())
         .then(|| {
-            self.render_stacked_preview(active_preview.as_ref(), viewer_height, preview_viewport, cx)
+            self.render_stacked_preview(
+                active_preview.as_ref(),
+                viewer_height,
+                preview_viewport,
+                cx,
+            )
         });
         let preview_panel = active_preview
             .as_ref()
