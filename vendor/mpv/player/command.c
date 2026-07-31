@@ -27,7 +27,9 @@
 
 #include "config.h" // for HAVE_SUBRANDR
 
+#if HAVE_LIBASS
 #include <ass/ass.h>
+#endif
 #if HAVE_SUBRANDR
 #include <subrandr/subrandr.h>
 #endif

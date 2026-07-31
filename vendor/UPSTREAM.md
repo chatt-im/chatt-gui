@@ -20,6 +20,10 @@ dependency graph are omitted.
 
 Local changes implement same-device Vulkan rendering from libmpv into WGPU-owned textures. The WGPU fork also enables `VK_EXT_image_drm_format_modifier` when supported so libplacebo can import tiled Linux DMA-BUF hardware-decoder surfaces without a GPU-to-CPU-to-GPU copy. The mpv placebo bridge uses a bounded reusable host-memory staging ring for software/copy-decoded planes; this avoids per-plane AUTO-memory PBOs selecting uncached host-visible VRAM on discrete GPUs. Its custom Vulkan teardown mirrors mpv's native Vulkan context ownership and does not call `ra_free` on the self-freeing placebo RA. The source directories, rather than generated patch files, are the maintained forks.
 
+The mpv fork also guards its `ass/ass.h` include with `HAVE_LIBASS`, matching
+the already-guarded version-property implementation and keeping the configured
+libass-disabled build independent of host libass headers.
+
 The libplacebo fork adds a versioned C ABI to Naga 29.0.4 from the pinned WGPU
 tree. It enables only Naga's `glsl-in` and `spv-out` compiler features and
 keeps libplacebo's `pl_spirv` allocation, source hashing, and cache flow. The
