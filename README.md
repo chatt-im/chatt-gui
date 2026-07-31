@@ -71,10 +71,11 @@ whatever FFmpeg or mpv features happen to be installed on the build host.
 ## Reproducible checkout and build
 
 Download and verify the pinned FFmpeg source release and apply the tracked
-build patch:
+build patch, then fetch libplacebo's pinned build-time dependencies:
 
 ```sh
 ./scripts/fetch-ffmpeg.sh
+./scripts/fetch-libplacebo-deps.sh
 ```
 
 Then build or test using the committed dependency lock:
@@ -85,10 +86,10 @@ cargo build --locked
 cargo test --locked
 ```
 
-`vendor/ffmpeg` is intentionally ignored by Git. The fetch script verifies the
-FFmpeg 8.1.2 archive before extracting it, then applies the small configure
-patch in `patches/`. It refuses to overwrite a differing tree unless `--force`
-is supplied.
+`vendor/ffmpeg` and `vendor/libplacebo/3rdparty` are intentionally ignored by
+Git. The fetch scripts verify every archive before extracting it; the FFmpeg
+script also applies the small configure patch in `patches/`. They refuse to
+overwrite a differing tree unless `--force` is supplied.
 
 Run the Chatt daemon separately and point both processes at the same runtime
 directory with `CHATT_RUN_DIR` when the default discovery location is not

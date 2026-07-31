@@ -75,6 +75,22 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
         .canonicalize()
         .expect("vendored libplacebo source directory is missing");
     let vulkan_headers = libplacebo_source.join("3rdparty/Vulkan-Headers/include");
+    require_vendored_file(
+        &vulkan_headers.join("vulkan/vulkan_core.h"),
+        "Vulkan headers",
+    );
+    require_vendored_file(
+        &libplacebo_source.join("3rdparty/Vulkan-Headers/registry/vk.xml"),
+        "Vulkan registry",
+    );
+    require_vendored_file(
+        &libplacebo_source.join("3rdparty/jinja/src/jinja2/__init__.py"),
+        "Jinja",
+    );
+    require_vendored_file(
+        &libplacebo_source.join("3rdparty/markupsafe/src/markupsafe/__init__.py"),
+        "MarkupSafe",
+    );
     write_system_pkg_config(&pkg_config_libdir, &vulkan, Some(&vulkan_headers));
 
     // PKG_CONFIG_LIBDIR replaces pkg-config's default search graph. Never
@@ -113,7 +129,7 @@ fn build_vendored_libmpv(crate_path: &Path, out_path: &Path) {
     let build = out_path.join("mpv-build");
     emit_rerun_tree(&source);
 
-    let reconfigure = build.join("build.ninja").exists();
+    let reconfigure = prepare_meson_build_directory(&build);
     if reconfigure {
         // Refresh Meson's project-option registry before setting newly added
         // options. Meson otherwise rejects a new -D option against an older
@@ -354,7 +370,7 @@ fn build_vendored_libplacebo(source: &Path, out_path: &Path) -> LibplaceboBuild 
     let install = out_path.join("libplacebo-install");
     emit_rerun_tree(source);
 
-    let reconfigure = build.join("build.ninja").exists();
+    let reconfigure = prepare_meson_build_directory(&build);
     if reconfigure {
         run(
             Command::new("meson")
@@ -588,9 +604,63 @@ fn emit_rerun_tree(root: &Path) {
 }
 
 #[cfg(feature = "vendored")]
+fn require_vendored_file(path: &Path, dependency: &str) {
+    assert!(
+        path.is_file(),
+        "vendored libplacebo dependency `{dependency}` is missing at `{}`; run `./scripts/fetch-libplacebo-deps.sh` from the chatt-gui repository root",
+        path.display()
+    );
+}
+
+#[cfg(feature = "vendored")]
+fn prepare_meson_build_directory(build: &Path) -> bool {
+    let configured = build.join("build.ninja").is_file();
+    if build.exists() && !configured {
+        fs::remove_dir_all(build).unwrap_or_else(|error| {
+            panic!(
+                "could not clear incomplete Meson build directory `{}`: {error}",
+                build.display()
+            )
+        });
+    }
+    configured
+}
+
+#[cfg(feature = "vendored")]
 fn run(command: &mut Command, description: &str) {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let working_directory = command.get_current_dir().map(Path::to_path_buf);
     let status = command
         .status()
-        .unwrap_or_else(|error| panic!("failed to {description}: {error}"));
+        .unwrap_or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                if let Some(directory) = working_directory
+                    .as_deref()
+                    .filter(|directory| !directory.is_dir())
+                {
+                    panic!(
+                        "failed to {description}: working directory `{}` does not exist",
+                        directory.display()
+                    );
+                }
+
+                if Path::new(&program).components().count() > 1 {
+                    panic!(
+                        "failed to {description}: could not execute `{program}`; the file or its interpreter was not found"
+                    );
+                }
+
+                let hint = match program.as_str() {
+                    "meson" => "install Meson 1.3.0 or newer and ensure `meson` is in PATH",
+                    "make" => "install Make and ensure `make` is in PATH",
+                    _ => "install it and ensure it is in PATH",
+                };
+                panic!(
+                    "failed to {description}: required build tool `{program}` was not found; {hint}"
+                );
+            }
+
+            panic!("failed to {description}: could not start `{program}`: {error}");
+        });
     assert!(status.success(), "failed to {description}: {status}");
 }
