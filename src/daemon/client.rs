@@ -496,7 +496,12 @@ fn connection_loop(
                 | ConnectError::Permission(details)
                 | ConnectError::Rejected(details),
             ) => {
-                kvlog::error!("daemon RPC connection rejected", err = %details);
+                kvlog::error!(
+                    "daemon RPC connection rejected",
+                    client_protocol_min = hello.min_version,
+                    client_protocol_max = hello.max_version,
+                    err = %details
+                );
                 if events
                     .send_blocking(DaemonEvent::Incompatible(details))
                     .is_err()

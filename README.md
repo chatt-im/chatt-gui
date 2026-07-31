@@ -57,8 +57,8 @@ The current build targets Linux. Install:
 - A current stable Rust toolchain and Cargo.
 - Git, curl, tar with xz support, make, pkg-config, Meson, and Ninja.
 - A C toolchain.
-- Development metadata for ALSA and the Vulkan loader (`alsa.pc` and
-  `vulkan.pc`).
+- Development metadata for XKBcommon, ALSA, and the Vulkan loader
+  (`xkbcommon.pc`, `alsa.pc`, and `vulkan.pc`).
 
 Package names vary by distribution. VAAPI and CUDA/NVDEC are loaded at runtime
 when their system libraries and drivers are available; they are not required to
