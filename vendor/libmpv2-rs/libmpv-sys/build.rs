@@ -319,6 +319,10 @@ fn write_system_pkg_config(
     include_override: Option<&Path>,
 ) {
     let includedir = include_override.unwrap_or(&package.includedir);
+    let version = match (package.name, include_override) {
+        ("vulkan", Some(_)) => vulkan_headers_version(includedir),
+        _ => package.version.clone(),
+    };
     let library = match package.name {
         "alsa" => "asound",
         "vulkan" => "vulkan",
@@ -327,12 +331,54 @@ fn write_system_pkg_config(
     write_pkg_config(
         &pkgconfig.join(format!("{}.pc", package.name)),
         package.name,
-        &package.version,
+        &version,
         includedir,
         &format!("-I{}", includedir.display()),
         &format!("-L{} -l{library}", package.libdir.display()),
         None,
     );
+}
+
+#[cfg(feature = "vendored")]
+fn vulkan_headers_version(includedir: &Path) -> String {
+    let header = includedir.join("vulkan/vulkan_core.h");
+    let source = fs::read_to_string(&header)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", header.display()));
+    let patch = source
+        .lines()
+        .find_map(|line| line.strip_prefix("#define VK_HEADER_VERSION "))
+        .map(str::trim)
+        .expect("vendored Vulkan headers do not define VK_HEADER_VERSION");
+    let complete = source
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                "#define VK_HEADER_VERSION_COMPLETE VK_MAKE_API_VERSION(",
+            )
+        })
+        .and_then(|arguments| arguments.strip_suffix(')'))
+        .expect("vendored Vulkan headers do not define VK_HEADER_VERSION_COMPLETE");
+    let mut arguments = complete.split(',').map(str::trim);
+    let variant = arguments.next();
+    let major = arguments.next();
+    let minor = arguments.next();
+    let patch_reference = arguments.next();
+    assert_eq!(variant, Some("0"), "unsupported Vulkan API variant");
+    assert_eq!(
+        patch_reference,
+        Some("VK_HEADER_VERSION"),
+        "unsupported Vulkan patch version expression"
+    );
+    assert!(
+        arguments.next().is_none(),
+        "unsupported Vulkan version expression"
+    );
+    format!(
+        "{}.{}.{}",
+        major.expect("vendored Vulkan headers omit the major version"),
+        minor.expect("vendored Vulkan headers omit the minor version"),
+        patch
+    )
 }
 
 #[cfg(feature = "vendored")]
